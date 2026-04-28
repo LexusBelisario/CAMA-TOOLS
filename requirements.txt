@@ -1,0 +1,42 @@
+# GUI
+tk
+
+# Database
+psycopg2-binary
+sqlalchemy
+geoalchemy2
+
+# Geospatial
+geopandas
+fiona
+shapely
+pyproj
+rtree
+osmnx
+networkx
+geopy
+rasterio
+
+# Data
+numpy
+pandas
+
+# ML / Stats
+scikit-learn
+xgboost
+joblib
+scipy
+statsmodels
+libpysal
+spreg
+
+# Plotting / Reports
+matplotlib
+seaborn
+reportlab
+
+# Other utils
+Pillow
+pygetwindow
+pyautogui
+rapidfuzz

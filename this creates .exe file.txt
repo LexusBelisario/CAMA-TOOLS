@@ -1,0 +1,41 @@
+pyinstaller --noconsole --onefile --name CAMA-Tools --add-data "icons;icons" --collect-all geopandas --collect-all fiona --collect-all shapely --collect-all pyproj --collect-all rtree MAIN3.py
+
+
+
+
+
+
+pyinstaller --onefile --name CAMA-Tools --add-data "icons;icons" --collect-all geopandas --collect-all fiona --collect-all shapely --collect-all pyproj --collect-all rtree MAIN3.py
+
+
+
+_______________________________________
+
+pyinstaller --onefile --name CAMA-Tools ^
+  --icon "BLGF.ico" ^
+  --add-data "BLGF.png;." ^
+  --add-data "icons;icons" ^
+  --add-data "tools;tools" ^
+  --collect-all geopandas ^
+  --collect-all fiona ^
+  --collect-all shapely ^
+  --collect-all pyproj ^
+  --collect-all rtree ^
+  --collect-all osmnx ^
+  --collect-all networkx ^
+  --collect-all geopy ^
+  --collect-all rasterio ^
+  --collect-all statsmodels ^
+  --collect-all libpysal ^
+  --collect-all spreg ^
+  --collect-all matplotlib ^
+  --collect-all seaborn ^
+  --collect-all reportlab ^
+  --collect-all Pillow ^
+  --collect-all pygetwindow ^
+  --collect-all pyautogui ^
+  --collect-all rapidfuzz ^
+  MAIN3.py
+
+
+
