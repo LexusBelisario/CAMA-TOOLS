@@ -13,6 +13,7 @@ import subprocess
 import json
 from sqlalchemy import create_engine, text, inspect
 import psycopg2
+import statistics
 
 # ----------------- CONFIG -----------------
 GM_EXE_PATH = r"C:\\Program Files\\GlobalMapper26.1_64bit\\global_mapper.exe"
@@ -163,31 +164,88 @@ def process(barangay_gdf, road_gdf, source_name="", progress_cb=None):
         return barangay_gdf
 
     tree = cKDTree(segment_midpoints)
-    road_widths = []
+
+    # Classifier: road buffer union (10m — same tolerance as lot_location.py)
+    from shapely.ops import unary_union
+    road_buffer_union = unary_union(road_gdf.geometry).buffer(10)
+
+    # ------------------------------------------------------------------
+    # PASS 1 — compute raw width + classify each parcel
+    # Road lots  → raw width is valid (parcel boundary IS the road edge)
+    # Inner lots → raw width is wrong (gap measurement); flagged for Pass 3
+    # ------------------------------------------------------------------
+    pass1 = []  # list of dicts: {raw_width, seg_idx, is_road_lot}
+
     for idx, poly in enumerate(barangay_gdf.geometry):
         if progress_cb:
             progress_cb(1)
 
         if poly is None or poly.is_empty:
-            road_widths.append(None)
+            pass1.append({"raw_width": None, "seg_idx": None, "is_road_lot": False})
             continue
 
         if not poly.is_valid:
             poly = poly.buffer(0)
-            if poly.is_empty: 
-                road_widths.append(None); continue
+            if poly.is_empty:
+                pass1.append({"raw_width": None, "seg_idx": None, "is_road_lot": False})
+                continue
+
         boundary = poly.boundary
-        coords = list(boundary.coords) if boundary.geom_type=="LineString" else [c for g in boundary.geoms for c in g.coords]
-        if not coords: 
-            road_widths.append(None); continue
+        coords = list(boundary.coords) if boundary.geom_type == "LineString" \
+            else [c for g in boundary.geoms for c in g.coords]
+        if not coords:
+            pass1.append({"raw_width": None, "seg_idx": None, "is_road_lot": False})
+            continue
+
         dists, indices = tree.query(coords)
-        nearest_segment = segment_geoms[indices[dists.argmin()]]
-        nearest_point = Point(coords[dists.argmin()])
+        best = dists.argmin()
+        seg_idx = int(indices[best])
+        nearest_segment = segment_geoms[seg_idx]
+        nearest_point = Point(coords[best])
         nearest_on_road = nearest_segment.interpolate(nearest_segment.project(nearest_point))
         nearest_on_feature = nearest_points(nearest_on_road, boundary)[1]
-        road_widths.append(nearest_on_road.distance(nearest_on_feature) * 2)
+        raw_width = nearest_on_road.distance(nearest_on_feature) * 2
+
+        is_road_lot = bool(poly.intersects(road_buffer_union))
+
+        pass1.append({
+            "raw_width": raw_width,
+            "seg_idx": seg_idx,
+            "is_road_lot": is_road_lot,
+        })
+
+    # ------------------------------------------------------------------
+    # PASS 2 — build segment_id → median road width from road lots only
+    # ------------------------------------------------------------------
+    seg_widths: dict = {}  # seg_idx -> list of raw widths from road lots
+    for record in pass1:
+        if record["is_road_lot"] and record["raw_width"] is not None and record["seg_idx"] is not None:
+            seg_widths.setdefault(record["seg_idx"], []).append(record["raw_width"])
+
+    segment_width_map: dict = {
+        seg_idx: statistics.median(widths)
+        for seg_idx, widths in seg_widths.items()
+    }
+
+    # ------------------------------------------------------------------
+    # PASS 3 — assemble final ROAD_WIDTH values
+    # Road lots  → use their own raw_width (unchanged from existing logic)
+    # Inner lots → inherit median width of road lots on the same segment;
+    #              None if that segment has no road-touching parcels
+    # ------------------------------------------------------------------
+    road_widths = []
+    for record in pass1:
+        if record["raw_width"] is None:
+            road_widths.append(None)
+        elif record["is_road_lot"]:
+            road_widths.append(record["raw_width"])
+        else:
+            # Inner lot: look up the width associated with its nearest segment
+            road_widths.append(segment_width_map.get(record["seg_idx"], None))
+
     barangay_gdf["ROAD_WIDTH"] = road_widths
-    if original_crs: barangay_gdf = barangay_gdf.to_crs(original_crs)
+    if original_crs:
+        barangay_gdf = barangay_gdf.to_crs(original_crs)
     return barangay_gdf
 
 # ----------------- TKINTER WINDOWS -----------------
