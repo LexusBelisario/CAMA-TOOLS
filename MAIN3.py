@@ -8,6 +8,7 @@ TOOL_PROCESSES = []
 # FORCE WINDOWS APP ICON
 # ============================
 import ctypes
+import ctypes.wintypes
 import sys
 
 def set_app_user_model_id():
@@ -923,6 +924,19 @@ def show_login_and_connect():
 # Hide minimize/maximize, show in taskbar, and disable close
 root.title("CAMA Tools")
 
+# Hide from taskbar using tool window style
+import ctypes
+GWL_EXSTYLE = -20
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_APPWINDOW  = 0x00040000
+
+def hide_from_taskbar():
+    hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
+    style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+    style = (style | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW
+    ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+
+root.after(100, hide_from_taskbar)
 
 # Hide minimize and maximize (tool window style), keep close button
 root.attributes("-topmost", True)
@@ -932,21 +946,147 @@ def do_nothing():
     pass
 root.protocol("WM_DELETE_WINDOW", do_nothing)
 
-# Enable dragging the borderless window
+# ── GM canvas offsets (skip GM's panels/toolbars) ────────────────────
+GM_TITLEBAR_H   = 130
+GM_LEFT_PANEL_W = 240
+
+# ── Get CAMA and GM sizes via Win32 (always accurate) ────────────────
+def get_cama_size():
+    cama_hwnd = ctypes.windll.user32.FindWindowW(None, "CAMA Tools")
+    if cama_hwnd:
+        r = ctypes.wintypes.RECT()
+        ctypes.windll.user32.GetWindowRect(cama_hwnd, ctypes.byref(r))
+        return r.right - r.left, r.bottom - r.top
+    return root.winfo_width(), root.winfo_height()
+
+def get_gm_rect():
+    try:
+        gm_wins = [w for w in gw.getWindowsWithTitle('Global Mapper Pro') if w.visible]
+        if gm_wins:
+            g = gm_wins[0]
+            return g.left, g.top, g.width, g.height
+    except Exception:
+        pass
+    return None
+
+def get_hwnd_by_title(partial_title):
+    found = []
+    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    def cb(hwnd, _):
+        buf = ctypes.create_unicode_buffer(256)
+        ctypes.windll.user32.GetWindowTextW(hwnd, buf, 256)
+        if partial_title.lower() in buf.value.lower():
+            found.append(hwnd)
+        return True
+    ctypes.windll.user32.EnumWindows(WNDENUMPROC(cb), 0)
+    return found[0] if found else None
+
+def clamp_position(new_x, new_y):
+    """Clamp CAMA position strictly inside GM's map canvas area."""
+    gm = get_gm_rect()
+    if not gm:
+        return new_x, new_y
+    gm_left, gm_top, gm_w, gm_h = gm
+    cama_w, cama_h = get_cama_size()
+
+    min_x = gm_left + GM_LEFT_PANEL_W
+    min_y = gm_top  + GM_TITLEBAR_H
+    max_x = gm_left + gm_w - cama_w
+    max_y = gm_top  + gm_h - cama_h
+
+    cx = max(min_x, min(new_x, max_x))
+    cy = max(min_y, min(new_y, max_y))
+
+    # Update relative offset for GM-follow
+    cama_offset[0] = cx - gm_left
+    cama_offset[1] = cy - gm_top
+
+    return cx, cy
+
+# ── Client-area drag (anywhere in the tkinter widget area) ───────────
+_drag_origin = [0, 0]   # screen coords of click minus root origin
+
 def start_move(event):
-    root.x = event.x
-    root.y = event.y
+    _drag_origin[0] = event.x_root - root.winfo_x()
+    _drag_origin[1] = event.y_root - root.winfo_y()
 
 def do_move(event):
-    deltax = event.x - root.x
-    deltay = event.y - root.y
-    x = root.winfo_x() + deltax
-    y = root.winfo_y() + deltay
-    root.geometry(f"+{x}+{y}")
+    new_x = event.x_root - _drag_origin[0]
+    new_y = event.y_root - _drag_origin[1]
+    new_x, new_y = clamp_position(new_x, new_y)
+    root.geometry(f"+{new_x}+{new_y}")
 
-# Bind the movement to the root window
-root.bind("<Button-1>", start_move)
-root.bind("<B1-Motion>", do_move)
+def bind_drag_to_all(widget):
+    # Only bind to frames/labels/root — skip canvases (they have tool bindings)
+    if not isinstance(widget, tk.Canvas):
+        widget.bind("<Button-1>", start_move, add="+")
+        widget.bind("<B1-Motion>", do_move,   add="+")
+    for child in widget.winfo_children():
+        bind_drag_to_all(child)
+
+bind_drag_to_all(root)
+
+# ── Title-bar drag — intercept WM_MOVING at Win32 level ──────────────
+WM_MOVING   = 0x0216
+GWL_WNDPROC = -4
+
+WNDPROCTYPE = ctypes.WINFUNCTYPE(
+    ctypes.c_longlong,
+    ctypes.wintypes.HWND,
+    ctypes.wintypes.UINT,
+    ctypes.wintypes.WPARAM,
+    ctypes.wintypes.LPARAM
+)
+
+# Set correct arg/return types for Win32 calls
+ctypes.windll.user32.SetWindowLongPtrW.restype  = ctypes.c_longlong
+ctypes.windll.user32.SetWindowLongPtrW.argtypes = [
+    ctypes.wintypes.HWND,
+    ctypes.c_int,
+    WNDPROCTYPE
+]
+ctypes.windll.user32.CallWindowProcW.restype  = ctypes.c_longlong
+ctypes.windll.user32.CallWindowProcW.argtypes = [
+    ctypes.c_longlong,
+    ctypes.wintypes.HWND,
+    ctypes.wintypes.UINT,
+    ctypes.wintypes.WPARAM,
+    ctypes.wintypes.LPARAM
+]
+
+_old_wnd_proc = None
+
+def _new_wnd_proc(hwnd, msg, wparam, lparam):
+    try:
+        if msg == WM_MOVING:
+            proposed = ctypes.cast(lparam, ctypes.POINTER(ctypes.wintypes.RECT)).contents
+            cx, cy = clamp_position(proposed.left, proposed.top)
+            cw, ch = get_cama_size()
+            proposed.left   = cx
+            proposed.top    = cy
+            proposed.right  = cx + cw
+            proposed.bottom = cy + ch
+            return 1
+    except Exception as e:
+        print("WndProc error:", e)
+    return ctypes.windll.user32.CallWindowProcW(
+        _old_wnd_proc, hwnd, msg, wparam, lparam
+    )
+
+def install_wm_moving_hook():
+    global _old_wnd_proc
+    cama_hwnd = ctypes.windll.user32.FindWindowW(None, "CAMA Tools")
+    if not cama_hwnd:
+        root.after(300, install_wm_moving_hook)
+        return
+    proc = WNDPROCTYPE(_new_wnd_proc)
+    root._wnd_proc_ref = proc   # prevent GC
+    _old_wnd_proc = ctypes.windll.user32.SetWindowLongPtrW(
+        cama_hwnd, GWL_WNDPROC, proc
+    )
+    print("✅ WM_MOVING hook installed")
+
+root.after(400, install_wm_moving_hook)
 
 root.title("CAMA Tools")
 root.geometry("100x100")
@@ -1367,7 +1507,9 @@ def launch_global_mapper():
     subprocess.Popen([GM_EXE_PATH, patched_path], shell=False)
     wait_for_global_mapper()
 
-prev_position = [None, None]
+prev_position  = [None, None]
+prev_gm_rect   = [None, None, None, None]  # left, top, width, height
+cama_offset    = [None, None]              # CAMA's offset relative to GM
 
 def monitor_gm_state():
     try:
@@ -1377,13 +1519,62 @@ def monitor_gm_state():
 
             if gm_win.isMinimized:
                 if root.state() != 'withdrawn':
-                    root.withdraw()  # hide the tools only if not already hidden
+                    root.withdraw()
             else:
                 if root.state() == 'withdrawn':
-                    root.deiconify()  # show the tools again
+                    root.deiconify()
 
-                # Only lift if not already on top
-                root.lift()
+                cama_hwnd = get_hwnd_by_title("CAMA Tools")
+                gm_hwnd   = get_hwnd_by_title("Global Mapper Pro")
+
+                # --- Z-order: keep CAMA just above GM ---
+                if cama_hwnd and gm_hwnd:
+                    GW_HWNDPREV = 3
+                    above_gm = ctypes.windll.user32.GetWindow(gm_hwnd, GW_HWNDPREV)
+                    if above_gm != cama_hwnd:
+                        ctypes.windll.user32.SetWindowPos(
+                            cama_hwnd, gm_hwnd,
+                            0, 0, 0, 0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+                        )
+
+                # --- Follow GM when it moves ---
+                gm_left   = gm_win.left
+                gm_top    = gm_win.top
+                gm_w      = gm_win.width
+                gm_h      = gm_win.height
+
+                gm_moved = (
+                    prev_gm_rect[0] != gm_left or
+                    prev_gm_rect[1] != gm_top  or
+                    prev_gm_rect[2] != gm_w    or
+                    prev_gm_rect[3] != gm_h
+                )
+
+                if gm_moved:
+                    if cama_offset[0] is None:
+                        # First time — set offset from current CAMA position
+                        cama_offset[0] = root.winfo_x() - gm_left
+                        cama_offset[1] = root.winfo_y() - gm_top
+                    else:
+                        # GM moved — reposition CAMA using saved offset
+                        new_x = gm_left + cama_offset[0]
+                        new_y = gm_top  + cama_offset[1]
+
+                        # Clamp inside GM bounds
+                        cama_w = root.winfo_width()
+                        cama_h = root.winfo_height()
+                        new_x = max(gm_left + GM_LEFT_PANEL_W,
+                                    min(new_x, gm_left + gm_w - cama_w))
+                        new_y = max(gm_top  + GM_TITLEBAR_H,
+                                    min(new_y, gm_top  + gm_h - cama_h))
+
+                        root.geometry(f"+{new_x}+{new_y}")
+
+                    prev_gm_rect[0] = gm_left
+                    prev_gm_rect[1] = gm_top
+                    prev_gm_rect[2] = gm_w
+                    prev_gm_rect[3] = gm_h
 
         else:
             print("❌ Global Mapper closed. Closing Tkinter.")
@@ -1392,8 +1583,7 @@ def monitor_gm_state():
     except Exception as e:
         print("Error in GM monitor:", e)
 
-    # Call again after some time
-    root.after(1000, monitor_gm_state)
+    root.after(200, monitor_gm_state)
 
 def monitor_gm_closure():
     gm_windows = [w for w in gw.getWindowsWithTitle('Global Mapper Pro') if w.visible]
@@ -1415,7 +1605,23 @@ def wait_for_global_mapper():
         print("⏳ Waiting for Global Mapper...")
         root.after(1000, wait_for_global_mapper)
 
-# Step 1: Prompt for .gmw file first
+# Step 1: Resize native dialog to medium centered via ctypes
+import threading
+
+def resize_file_dialog():
+    import time
+    time.sleep(0.25)
+    hwnd = ctypes.windll.user32.FindWindowW(None, "Select Global Mapper Workspace File")
+    if hwnd:
+        screen_w = ctypes.windll.user32.GetSystemMetrics(0)
+        screen_h = ctypes.windll.user32.GetSystemMetrics(1)
+        win_w, win_h = 780, 500
+        x = (screen_w - win_w) // 2
+        y = (screen_h - win_h) // 2
+        ctypes.windll.user32.MoveWindow(hwnd, x, y, win_w, win_h, True)
+
+threading.Thread(target=resize_file_dialog, daemon=True).start()
+
 gmw_file = filedialog.askopenfilename(
     title="Select Global Mapper Workspace File",
     filetypes=[("Global Mapper Workspace", "*.gmw")]
