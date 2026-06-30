@@ -369,11 +369,25 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None):
 
         boundary = geom.boundary
 
-        # ✅ FAST frontage: no segment splitting, no within checks per segment
-        # This returns the boundary portion that lies inside the 10m road buffer.
+        # ✅ FRONTAGE: chord distance (straight-line) between the outermost
+        # boundary nodes intersecting the road buffer.
+        # Per BLGF MAG: "Reduce the irregular lot to the nearest equivalent
+        # rectangular, triangular and trapezoidal sectors."
+        # QA methodology (Global Mapper): point-to-point measure of the two
+        # outermost road-facing nodes — this is the Effective Frontage, not
+        # the arc/perimeter length of the jagged cadastral boundary.
         try:
             inter = boundary.intersection(road_buffer)
-            frontage_total = inter.length if not inter.is_empty else 0.0
+            if inter.is_empty:
+                frontage_total = 0.0
+            else:
+                _fl = _longest_linestring(inter)
+                if _fl is None or len(_fl.coords) < 2:
+                    frontage_total = 0.0
+                else:
+                    _c = list(_fl.coords)
+                    from shapely.geometry import Point as _Point
+                    frontage_total = _Point(_c[0]).distance(_Point(_c[-1]))
         except Exception:
             frontage_total = 0.0
 
