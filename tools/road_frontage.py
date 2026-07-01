@@ -75,6 +75,7 @@ CREDENTIALS_FILE = "pg_credentials.json"
 barangay_source = None
 road_source = None
 output_mode = None
+_app_root = None
 
 
 # ========================= CRS UTILITY =========================
@@ -443,9 +444,9 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None):
         raise RuntimeError("Attribute length mismatch during frontage processing")
 
 
-    brgy_gdf["ROAD_FRONT"] = frontage_lengths
+    brgy_gdf["ROAD_FRONTAGE"] = frontage_lengths
     brgy_gdf["DEPTH"] = depths
-    brgy_gdf["DWR"] = dwrs
+    brgy_gdf["DEPTH_WIDTH_RATIO"] = dwrs
 
     if original_crs:
         brgy_gdf = brgy_gdf.to_crs(original_crs)
@@ -457,7 +458,7 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None):
 
 
 # ========================= MAIN PROCESS =========================
-def run_processing():
+def run_processing(app_root):
     global barangay_source, road_source, output_mode
     if not barangay_source or not road_source or not output_mode:
         messagebox.showerror("Error", "Selections incomplete (Barangay, Road, Output required).")
@@ -473,9 +474,7 @@ def run_processing():
         f"postgresql://{creds['username']}:{creds['password']}@{creds['host']}:{creds['port']}/{creds['database']}"
     )
 
-    root = tk.Toplevel()
-    root.withdraw()
-    progress = ProgressWindow(root, "Road Frontage Progress")
+    progress = ProgressWindow(app_root, "Road Frontage Progress")
 
     q = queue.Queue()
 
@@ -521,9 +520,9 @@ def run_processing():
                 if output_mode[0] == "local":
                     out = os.path.join(
                         output_mode[1],
-                        f"{out_base}_road_frontage.shp"
+                        f"{out_base}_road_frontage.gpkg"
                     )
-                    brgy_gdf.to_file(out)
+                    brgy_gdf.to_file(out, driver="GPKG")
                     q.put(("open_gm", out, None, None))
                 else:
                     brgy_gdf.to_postgis(
@@ -567,163 +566,311 @@ def run_processing():
         except queue.Empty:
             pass
 
-        root.after(100, poll_queue)
+        app_root.after(100, poll_queue)
 
     threading.Thread(target=worker, daemon=True).start()
     poll_queue()
 
 
 # ========================= MAIN APP =========================
-def select_barangay_window(root):
+def _pick_db_tables(parent, tables, multi, on_select):
+    picker = tk.Toplevel(parent)
+    apply_icon(picker)
+    picker.title("Select Table(s)")
+    picker.resizable(False, False)
+    picker.grab_set()
+
+    mode = tk.MULTIPLE if multi else tk.SINGLE
+    lb = Listbox(picker, selectmode=mode, width=55, height=15)
+    for t in tables:
+        lb.insert(tk.END, t)
+    lb.pack(padx=10, pady=10)
+
+    def submit():
+        sel = [lb.get(i) for i in lb.curselection()]
+        if sel:
+            on_select(sel)
+            picker.destroy()
+
+    tk.Button(picker, text="Confirm Selection", command=submit,
+              width=20).pack(pady=(0, 10))
+
+
+def open_main_window(root):
     win = tk.Toplevel(root)
     apply_icon(win)
-    win.title("Select Land Parcel Source")
+    win.title("Road Frontage Tool")
     win.resizable(False, False)
+    win.update_idletasks()
+    win.deiconify()
+    win.lift()
+    win.focus_force()
+    win.attributes("-topmost", True)
+    win.after(100, lambda: win.attributes("-topmost", False))
 
-    def pick_local():
-        global barangay_source
-        files = filedialog.askopenfilenames(filetypes=[("Shapefiles", "*.shp")])
+    # ── state ────────────────────────────────────────────────────
+    parcel_source_type = tk.StringVar(value="local")
+    road_source_type   = tk.StringVar(value="local")
+    output_dest_type   = tk.StringVar(value="local")
+
+    parcel_local_paths = []
+    parcel_db_tables   = []
+    road_local_path    = tk.StringVar()
+    road_db_table      = tk.StringVar()
+    output_local_dir   = tk.StringVar()
+
+    PAD = dict(padx=8, pady=4)
+
+    def section_label(parent, text):
+        frm = tk.Frame(parent)
+        frm.pack(fill="x", padx=10, pady=(10, 2))
+        tk.Label(frm, text=text,
+                 font=("Segoe UI", 9, "bold")).pack(side="left")
+        ttk.Separator(frm, orient="horizontal").pack(
+            side="left", fill="x", expand=True, padx=(6, 0), pady=4)
+
+    # ── SECTION 1: LAND PARCEL ───────────────────────────────────
+    section_label(win, "Land Parcel Source")
+
+    parcel_frame = tk.Frame(win)
+    parcel_frame.pack(fill="x", padx=18, pady=2)
+
+    radio_row = tk.Frame(parcel_frame)
+    radio_row.pack(fill="x")
+    tk.Radiobutton(radio_row, text="Local File(s)",
+                   variable=parcel_source_type, value="local",
+                   command=lambda: _toggle_parcel()).pack(side="left")
+    tk.Radiobutton(radio_row, text="Database Table(s)",
+                   variable=parcel_source_type, value="db",
+                   command=lambda: _toggle_parcel()).pack(side="left", padx=(12, 0))
+
+    # local sub-frame
+    parcel_local_frame = tk.Frame(parcel_frame)
+    parcel_local_frame.pack(fill="x", pady=2)
+
+    parcel_files_var = tk.StringVar(value="No file(s) selected")
+    tk.Label(parcel_local_frame, textvariable=parcel_files_var,
+             fg="gray", anchor="w", width=42).pack(side="left")
+
+    def browse_parcel_files():
+        files = filedialog.askopenfilenames(
+            filetypes=[("Shapefiles", "*.shp"),
+                       ("GeoPackage", "*.gpkg"),
+                       ("All", "*.*")])
         if files:
-            barangay_source = ("local", files)
-            print("✅ Barangay source set:", barangay_source)
-            win.destroy()
-            select_road_window(root)
+            parcel_local_paths.clear()
+            parcel_local_paths.extend(files)
+            parcel_files_var.set(f"{len(files)} file(s) selected")
 
-    def pick_db():
-        global barangay_source
+    tk.Button(parcel_local_frame, text="Browse…", width=10,
+              command=browse_parcel_files).pack(side="left", **PAD)
+
+    # db sub-frame
+    parcel_db_frame  = tk.Frame(parcel_frame)
+    parcel_db_label  = tk.StringVar(value="No table(s) selected")
+    tk.Label(parcel_db_frame, textvariable=parcel_db_label,
+             fg="gray", anchor="w", width=42).pack(side="left")
+
+    def browse_parcel_db():
         creds = load_db_credentials()
-        engine = create_engine(
-            f"postgresql://{creds['username']}:{creds['password']}@{creds['host']}:{creds['port']}/{creds['database']}"
-        )
-        tables = inspect(engine).get_table_names(schema=creds["schema"])
+        if not creds:
+            messagebox.showerror("Error", "Could not load DB credentials.")
+            return
+        tables = fetch_tables(creds["schema"])
+        _pick_db_tables(win, tables, multi=True,
+                        on_select=lambda sel: (
+                            parcel_db_tables.__setitem__(slice(None), sel)
+                            or parcel_db_label.set(f"{len(sel)} table(s) selected")
+                        ))
 
-        db_win = tk.Toplevel(root)
-        apply_icon(db_win)
-        db_win.title("Select Land Parcel Table (DB)")
-        lb = Listbox(db_win, selectmode=tk.MULTIPLE, width=55, height=15)
-        for t in tables:
-            lb.insert(tk.END, t)
-        lb.pack()
+    tk.Button(parcel_db_frame, text="Select…", width=10,
+              command=browse_parcel_db).pack(side="left", **PAD)
 
-        def submit():
-            global barangay_source
-            sel = [lb.get(i) for i in lb.curselection()]
-            if sel:
-                barangay_source = ("db", sel)
-                print("✅ Barangay source set:", barangay_source)
-                db_win.destroy()
-                win.destroy()
-                select_road_window(root)
+    def _toggle_parcel():
+        if parcel_source_type.get() == "local":
+            parcel_db_frame.pack_forget()
+            parcel_local_frame.pack(fill="x", pady=2)
+        else:
+            parcel_local_frame.pack_forget()
+            parcel_db_frame.pack(fill="x", pady=2)
 
-        tk.Button(db_win, text="Select", command=submit).pack(pady=5)
+    # ── SECTION 2: ROAD NETWORK ──────────────────────────────────
+    section_label(win, "Road Network Source")
 
-    btn_frame = tk.Frame(win)
-    btn_frame.pack(padx=25, pady=10)
+    road_frame = tk.Frame(win)
+    road_frame.pack(fill="x", padx=18, pady=2)
 
-    tk.Button(btn_frame, text="Select Local File", width=18, command=pick_local)\
-        .pack(side=tk.LEFT, padx=5)
+    road_radio_row = tk.Frame(road_frame)
+    road_radio_row.pack(fill="x")
+    tk.Radiobutton(road_radio_row, text="Local File",
+                   variable=road_source_type, value="local",
+                   command=lambda: _toggle_road()).pack(side="left")
+    tk.Radiobutton(road_radio_row, text="Database Table",
+                   variable=road_source_type, value="db",
+                   command=lambda: _toggle_road()).pack(side="left", padx=(12, 0))
 
-    tk.Button(btn_frame, text="Select Database Table", width=18, command=pick_db)\
-        .pack(side=tk.LEFT, padx=5)
+    # local sub-frame
+    road_local_frame = tk.Frame(road_frame)
+    road_local_frame.pack(fill="x", pady=2)
 
+    road_file_label = tk.StringVar(value="No file selected")
+    tk.Label(road_local_frame, textvariable=road_file_label,
+             fg="gray", anchor="w", width=42).pack(side="left")
 
-def select_road_window(root):
-    win = tk.Toplevel(root)
-    apply_icon(win)
-    win.title("Select Road Source")
-    win.resizable(False, False)
+    def browse_road_file():
+        f = filedialog.askopenfilename(
+            filetypes=[("Shapefiles", "*.shp"),
+                       ("GeoPackage", "*.gpkg"),
+                       ("All", "*.*")])
+        if f:
+            road_local_path.set(f)
+            road_file_label.set(os.path.basename(f))
 
-    def pick_local():
-        global road_source
-        file = filedialog.askopenfilename(filetypes=[("Shapefiles", "*.shp")])
-        if file:
-            road_source = ("local", [file])
-            print("✅ Road source set:", road_source)
-            win.destroy()
-            select_output_window(root)
+    tk.Button(road_local_frame, text="Browse…", width=10,
+              command=browse_road_file).pack(side="left", **PAD)
 
-    def pick_db():
-        global road_source
+    # db sub-frame
+    road_db_frame = tk.Frame(road_frame)
+    road_db_label = tk.StringVar(value="No table selected")
+    tk.Label(road_db_frame, textvariable=road_db_label,
+             fg="gray", anchor="w", width=42).pack(side="left")
+
+    def browse_road_db():
         creds = load_db_credentials()
-        engine = create_engine(
-            f"postgresql://{creds['username']}:{creds['password']}@{creds['host']}:{creds['port']}/{creds['database']}"
-        )
-        tables = inspect(engine).get_table_names(schema=creds["schema"])
-
-        db_win = tk.Toplevel(root)
-        apply_icon(db_win)
-        db_win.title("Select Road Table (DB)")
-        lb = Listbox(db_win, selectmode=tk.SINGLE, width=55, height=15)
-        for t in tables:
-            lb.insert(tk.END, t)
-        lb.pack()
-
-        def submit():
-            global road_source
-            sel = [lb.get(i) for i in lb.curselection()]
-            if sel:
-                road_source = ("db", sel)
-                print("✅ Road source set:", road_source)
-                db_win.destroy()
-                win.destroy()
-                select_output_window(root)
-
-        tk.Button(db_win, text="Select", command=submit).pack(pady=5)
-
-    btn_frame = tk.Frame(win)
-    btn_frame.pack(padx=25, pady=10)
-
-    tk.Button(btn_frame, text="Select Local File", width=18, command=pick_local)\
-        .pack(side=tk.LEFT, padx=5)
-
-    tk.Button(btn_frame, text="Select Database Table", width=18, command=pick_db)\
-        .pack(side=tk.LEFT, padx=5)
-
-
-def select_output_window(root):
-    win = tk.Toplevel(root)
-    apply_icon(win)
-    win.title("Select Output Destination")
-    win.resizable(False, False)
-
-    def save_local():
-        global output_mode, barangay_source, road_source
-        if not barangay_source or not road_source:
-            messagebox.showerror("Error", "Barangay and Road must be selected first.")
+        if not creds:
+            messagebox.showerror("Error", "Could not load DB credentials.")
             return
-        out_dir = filedialog.askdirectory()
-        if out_dir:
-            output_mode = ("local", out_dir)
-            print("✅ Output mode set:", output_mode)
-            win.destroy()
-            run_processing()
+        tables = fetch_tables(creds["schema"])
+        _pick_db_tables(win, tables, multi=False,
+                        on_select=lambda sel: (
+                            road_db_table.set(sel[0])
+                            or road_db_label.set(sel[0])
+                        ))
 
-    def save_db():
-        global output_mode, barangay_source, road_source
-        if not barangay_source or not road_source:
-            messagebox.showerror("Error", "Barangay and Road must be selected first.")
-            return
-        output_mode = ("db", None)
-        print("✅ Output mode set:", output_mode)
+    tk.Button(road_db_frame, text="Select…", width=10,
+              command=browse_road_db).pack(side="left", **PAD)
+
+    def _toggle_road():
+        if road_source_type.get() == "local":
+            road_db_frame.pack_forget()
+            road_local_frame.pack(fill="x", pady=2)
+        else:
+            road_local_frame.pack_forget()
+            road_db_frame.pack(fill="x", pady=2)
+
+    # ── SECTION 3: OUTPUT ────────────────────────────────────────
+    section_label(win, "Output Destination")
+
+    output_frame = tk.Frame(win)
+    output_frame.pack(fill="x", padx=18, pady=2)
+
+    out_radio_row = tk.Frame(output_frame)
+    out_radio_row.pack(fill="x")
+    tk.Radiobutton(out_radio_row, text="Save to Local Folder",
+                   variable=output_dest_type, value="local",
+                   command=lambda: _toggle_output()).pack(side="left")
+    tk.Radiobutton(out_radio_row, text="Save to Database",
+                   variable=output_dest_type, value="db",
+                   command=lambda: _toggle_output()).pack(side="left", padx=(12, 0))
+
+    # local sub-frame
+    output_local_frame = tk.Frame(output_frame)
+    output_local_frame.pack(fill="x", pady=2)
+
+    tk.Label(output_local_frame, textvariable=output_local_dir,
+             fg="gray", anchor="w", width=42).pack(side="left")
+
+    def browse_output_dir():
+        d = filedialog.askdirectory()
+        if d:
+            output_local_dir.set(d)
+
+    tk.Button(output_local_frame, text="Browse…", width=10,
+              command=browse_output_dir).pack(side="left", **PAD)
+
+    # db sub-frame
+    output_db_frame = tk.Frame(output_frame)
+    tk.Label(output_db_frame,
+             text="Will write back to the connected PostGIS schema.",
+             fg="gray", font=("Segoe UI", 8, "italic")).pack(anchor="w", pady=4)
+
+    def _toggle_output():
+        if output_dest_type.get() == "local":
+            output_db_frame.pack_forget()
+            output_local_frame.pack(fill="x", pady=2)
+        else:
+            output_local_frame.pack_forget()
+            output_db_frame.pack(fill="x", pady=2)
+
+    # ── RUN BUTTON ───────────────────────────────────────────────
+    ttk.Separator(win, orient="horizontal").pack(
+        fill="x", padx=10, pady=(12, 4))
+
+    def on_run():
+        global barangay_source, road_source, output_mode
+
+        # validate parcel
+        if parcel_source_type.get() == "local":
+            if not parcel_local_paths:
+                messagebox.showerror("Missing Input",
+                    "Please select at least one Land Parcel file.")
+                return
+            barangay_source = ("local", tuple(parcel_local_paths))
+        else:
+            if not parcel_db_tables:
+                messagebox.showerror("Missing Input",
+                    "Please select at least one Land Parcel table.")
+                return
+            barangay_source = ("db", parcel_db_tables)
+
+        # validate road
+        if road_source_type.get() == "local":
+            if not road_local_path.get():
+                messagebox.showerror("Missing Input",
+                    "Please select a Road Network file.")
+                return
+            road_source = ("local", [road_local_path.get()])
+        else:
+            if not road_db_table.get():
+                messagebox.showerror("Missing Input",
+                    "Please select a Road Network table.")
+                return
+            road_source = ("db", [road_db_table.get()])
+
+        # validate output
+        if output_dest_type.get() == "local":
+            if not output_local_dir.get():
+                messagebox.showerror("Missing Input",
+                    "Please select an output folder.")
+                return
+            output_mode = ("local", output_local_dir.get())
+        else:
+            output_mode = ("db", None)
+
         win.destroy()
-        run_processing()
+        if _app_root is None:
+            messagebox.showerror("Error", "No root window available. Please restart the tool.")
+            return
+        run_processing(_app_root)
 
-    btn_frame = tk.Frame(win)
-    btn_frame.pack(padx=25, pady=10)
-
-    tk.Button(btn_frame, text="Save to Local", width=18, command=save_local)\
-        .pack(side=tk.LEFT, padx=5)
-
-    tk.Button(btn_frame, text="Save to Database", width=18, command=save_db)\
-        .pack(side=tk.LEFT, padx=5)
+    tk.Button(win, text="▶  Run Processing", command=on_run,
+              bg="#2e7d32", fg="white",
+              font=("Segoe UI", 10, "bold"),
+              relief="flat", padx=16, pady=6).pack(pady=(4, 14))
 
 
-def main():
-    root = tk.Tk()
-    apply_icon(root)
-    root.withdraw()
-    select_barangay_window(root)
-    root.mainloop()
+def main(parent=None):
+    global _app_root
+    if parent is not None:
+        _app_root = parent
+        open_main_window(parent)
+    else:
+        root = tk.Tk()
+        _app_root = root
+        apply_icon(root)
+        root.withdraw()
+        open_main_window(root)
+        root.mainloop()
 
 
 if __name__ == "__main__":
