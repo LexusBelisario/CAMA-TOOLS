@@ -70,13 +70,6 @@ TOOL_MODULES = {
     "PARCEL TERRAIN LEVEL": "tools.terrain",
     "ROAD DENSITY": "tools.road_density",
     "ROAD SURFACE": "tools.road_surface",
-    "LINEAR REGRESSION": "tools.linear_regression",
-    "RANDOM FOREST": "tools.random_forest",
-    "XG BOOST": "tools.XG_Boost",
-    "ORDINARY LEAST SQUARES": "tools.Ordinary_Least_Squares",
-    "SPATIAL LAG MODEL": "tools.Spatial_Lag_Model",
-    "SPATIAL DURBIN MODEL": "tools.Spatial_Durbin_Model",
-    "GEOGRAPHICALLY WEIGHTED REGRESSION": "tools.Geographically_Weighted_Regression",
 }
 
 def dispatch_tool_if_requested():
@@ -109,7 +102,35 @@ def dispatch_tool_if_requested():
     try:
         mod = importlib.import_module(mod_path)
         if hasattr(mod, "main") and callable(mod.main):
-            mod.main()
+            import inspect
+            sig = inspect.signature(mod.main)
+            if sig.parameters:
+                # Create proper hidden root BEFORE any icon calls
+                _tool_root = tk.Tk()
+                _tool_root.withdraw()
+                _tool_root.geometry("1x1+-9999+-9999")
+
+                # Apply icon bound to THIS root — never reuse PhotoImage
+                # from another Tk instance (causes TclError)
+                ico = resource_path("BLGF.ico")
+                png = resource_path("BLGF.png")
+                if os.path.exists(ico):
+                    try:
+                        _tool_root.iconbitmap(ico)
+                    except Exception:
+                        pass
+                if os.path.exists(png):
+                    try:
+                        _img = tk.PhotoImage(file=png, master=_tool_root)
+                        _tool_root.iconphoto(True, _img)
+                        _tool_root._icon_ref = _img  # prevent GC
+                    except Exception:
+                        pass
+
+                mod.main(_tool_root)
+                _tool_root.mainloop()
+            else:
+                mod.main()
         sys.exit(0)
     except Exception:
         import traceback
@@ -130,12 +151,12 @@ confirm_win = None
 confirm_clicked = {'ok': False}
 
 
-DB_HOST = "35.194.255.28"
+DB_HOST = ""
 DB_PORT = "5432"
-DB_NAME = "PH03008"
-DB_SCHEMA = "PH0300807_Mariveles"
+DB_NAME = ""
+DB_SCHEMA = ""
 DEFAULT_DB_USERNAME = "postgres"
-DEFAULT_DB_PASSWORD = "#IGDIwebapp"
+DEFAULT_DB_PASSWORD = ""
 
 selected_gmw_file = None
 
@@ -145,10 +166,13 @@ stored_password = DEFAULT_DB_PASSWORD
 
 if not IS_TOOL_RUN:
     root = tk.Tk()
-    apply_icon(root)
-
-    root.geometry("355x410")
-    root.minsize(355, 220)
+    root.withdraw()
+    root.attributes("-alpha", 0)
+    root.geometry("1x1+-9999+-9999")
+    root.update_idletasks()               # flush any pending window creation events
+    apply_icon(root)                      # safe to call now — window is invisible
+    root.minsize(340, 200)
+    # No fixed geometry — content determines size
     root.title("CAMA Tools")
 
 
@@ -270,9 +294,10 @@ def _find_best_table(layer_name: str, existing_tables: list, schema_prefix: str)
 
 def add_tooltip(widget, icon_path, title, subtitle="", canvas=None, bg_id=None):
     tooltip = tk.Toplevel(widget)
-    apply_icon(tooltip)
     tooltip.withdraw()
-    tooltip.overrideredirect(True)
+    tooltip.overrideredirect(True)        # overrideredirect BEFORE apply_icon
+    # Skip apply_icon on tooltips — they're borderless so icon is never shown
+    # and iconbitmap/iconphoto cause a flash on Toplevel creation
     tooltip.configure(bg="#e0e0e0", padx=1, pady=1)
     tooltip.attributes('-topmost', True)
 
@@ -297,14 +322,58 @@ def add_tooltip(widget, icon_path, title, subtitle="", canvas=None, bg_id=None):
     subtitle_label = tk.Label(content, text=subtitle, font=("Segoe UI", 9), bg="#fefefe", anchor="w", justify="left")
     subtitle_label.grid(row=1, column=1, sticky="w")
 
+    def get_bounding_rect():
+        """Combined bounds of GM window + CAMA window, so tooltip never escapes either."""
+        rects = []
+
+        gm = get_gm_rect()  # (left, top, w, h) or None
+        if gm:
+            gl, gt, gw_, gh = gm
+            rects.append((gl, gt, gl + gw_, gt + gh))
+
+        cw, ch = get_cama_size()
+        cl, ct = root.winfo_x(), root.winfo_y()
+        rects.append((cl, ct, cl + cw, ct + ch))
+
+        if not rects:
+            sw = root.winfo_screenwidth()
+            sh = root.winfo_screenheight()
+            return (0, 0, sw, sh)
+
+        left   = min(r[0] for r in rects)
+        top    = min(r[1] for r in rects)
+        right  = max(r[2] for r in rects)
+        bottom = max(r[3] for r in rects)
+        return (left, top, right, bottom)
+
     def enter(event):
+        tooltip.update_idletasks()
+        tip_w = tooltip.winfo_reqwidth()
+        tip_h = tooltip.winfo_reqheight()
+
+        bl, bt, br, bb = get_bounding_rect()
+
         x = widget.winfo_rootx() + 45
         y = widget.winfo_rooty() + 10
-        tooltip.geometry(f"+{x}+{y}")
+
+        # Clamp horizontally
+        if x + tip_w > br:
+            x = widget.winfo_rootx() - tip_w - 10  # flip to the left of the widget
+            if x < bl:
+                x = br - tip_w  # last resort: pin to right edge of bounds
+        if x < bl:
+            x = bl
+
+        # Clamp vertically
+        if y + tip_h > bb:
+            y = bb - tip_h
+        if y < bt:
+            y = bt
+
+        tooltip.geometry(f"+{int(x)}+{int(y)}")
         tooltip.deiconify()
         tooltip.lift()
         tooltip.attributes("-topmost", True)
-        root.attributes("-topmost", False)
 
         if canvas and bg_id:
             canvas.itemconfig(bg_id, image=hover_bg)
@@ -735,7 +804,9 @@ def update_map_and_select_recorded():
 import json, shutil
 from tkinter import filedialog
 
-GM_PATH_FILE = "gm_exe_path.json"
+_base_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
+            else os.path.dirname(os.path.abspath(__file__))
+GM_PATH_FILE = os.path.join(_base_dir, "gm_exe_path.json")
 
 def get_global_mapper_path() -> str:
     # 1) previously saved?
@@ -766,11 +837,7 @@ def get_global_mapper_path() -> str:
         json.dump({"exe": exe}, open(GM_PATH_FILE, "w"))
     return exe or ""
 
-GM_EXE_PATH = get_global_mapper_path()
-if not GM_EXE_PATH:
-    messagebox.showerror("Global Mapper", "global_mapper.exe not found. Please locate it.")
-    root.destroy()
-    sys.exit(1)
+GM_EXE_PATH = ""  # Will be resolved after login
 
 LAST_EDITED_FILE = "last_edit_source.json"
 
@@ -791,11 +858,10 @@ def track_popup_close(popup, label):
 
 # Launcher: re-run this same EXE with --tool "<LABEL>"
 def run_tool_by_label(label: str):
-    import sys, os
+    import sys, os, threading
 
-    exe_path = sys.executable if getattr(sys, 'frozen', False) else sys.executable
+    IS_FROZEN = getattr(sys, 'frozen', False)
 
-    # Map each label to its icon filename (.ico)
     icon_map = {
         "ANY MAP TO LAND PARCEL": "influencemap.ico",
         "ROAD WIDTH": "roadwidth.ico",
@@ -816,16 +882,57 @@ def run_tool_by_label(label: str):
         "GEOGRAPHICALLY WEIGHTED REGRESSION": "gwr1.ico",
     }
 
-    icon_name = icon_map.get(label, "BLGF.ico")  # fallback icon
+    icon_name = icon_map.get(label, "BLGF.ico")
 
-    # 🔹 Pass icon name as argument to subprocess
-    p = subprocess.Popen(
-        [exe_path, "--tool", label, "--icon", icon_name],
-        shell=False,
-        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP  # Windows-safe
-    )
-    TOOL_PROCESSES.append(p)
-    return p
+    if IS_FROZEN:
+        # ── Production: spawn a new process (existing behaviour) ──
+        exe_path = sys.executable
+        p = subprocess.Popen(
+            [exe_path, "--tool", label, "--icon", icon_name],
+            shell=False,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
+        )
+        TOOL_PROCESSES.append(p)
+        return p
+    else:
+        # ── Dev / VS Code: import and run the tool on a thread ──
+        mod_path = TOOL_MODULES.get(label)
+        if not mod_path:
+            messagebox.showerror("Tool Error", f"No module mapped for: {label}")
+            return None
+
+        def run_in_thread():
+            _active_tool_titles.add(label)
+            try:
+                import importlib
+                mod = importlib.import_module(mod_path)
+                importlib.reload(mod)
+                if hasattr(mod, "main") and callable(mod.main):
+                    # Pass main3's existing hidden root so the tool never
+                    # creates its own tk.Tk() — that's what causes the taskbar icon
+                    import inspect
+                    sig = inspect.signature(mod.main)
+                    if sig.parameters:
+                        mod.main(root)   # tool accepts a parent root
+                    else:
+                        mod.main()       # fallback for tools not yet updated
+            except Exception:
+                import traceback
+                messagebox.showerror("Tool Crash", f"{mod_path}\n\n{traceback.format_exc()}")
+            finally:
+                _active_tool_titles.discard(label)
+
+        t = threading.Thread(target=run_in_thread, daemon=True)
+        t.start()
+
+        # Return a dummy object so callers that check .pid / .poll() don't crash
+        class _FakeProcess:
+            pid = -1
+            def poll(self): return None   # pretend still running
+
+        fake = _FakeProcess()
+        TOOL_PROCESSES.append(fake)
+        return fake
 
 def on_button_click(label):
     print(f"▶ Launching tool: {label}", flush=True)  # debug line
@@ -845,11 +952,30 @@ def show_login_and_connect():
     login_win.grab_set()
     login_win.resizable(False, False)
 
-    # Load saved credentials if available
-    saved = {}
-    if os.path.exists("pg_credentials.json"):
+    def on_login_close():
         try:
-            with open("pg_credentials.json", "r") as f:
+            messagebox.showwarning("Cancelled", "Login cancelled. Exiting.")
+        except Exception:
+            pass
+        try:
+            root.quit()
+            root.destroy()
+        except Exception:
+            pass
+        sys.exit(0)
+
+    login_win.protocol("WM_DELETE_WINDOW", on_login_close)
+
+    # Load saved credentials if available
+    _creds_path = os.path.join(
+        os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
+        else os.path.dirname(os.path.abspath(__file__)),
+        "pg_credentials.json"
+    )
+    saved = {}
+    if os.path.exists(_creds_path):
+        try:
+            with open(_creds_path, "r") as f:
                 saved = json.load(f)
         except Exception:
             saved = {}
@@ -907,7 +1033,12 @@ def show_login_and_connect():
         except Exception as e:
             messagebox.showerror("Login Failed", f"Could not connect:\n{e}")
 
-        with open("pg_credentials.json", "w") as f:
+        _creds_path = os.path.join(
+            os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
+            else os.path.dirname(os.path.abspath(__file__)),
+            "pg_credentials.json"
+        )
+        with open(_creds_path, "w") as f:
             json.dump({
                 "host": DB_HOST,
                 "port": DB_PORT,
@@ -926,9 +1057,16 @@ root.title("CAMA Tools")
 
 # Hide from taskbar using tool window style
 import ctypes
-GWL_EXSTYLE = -20
+GWL_EXSTYLE    = -20
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_APPWINDOW  = 0x00040000
+SWP_NOSIZE     = 0x0001
+SWP_NOMOVE     = 0x0002
+SWP_NOACTIVATE = 0x0010
+HWND_TOPMOST   = -1
+SWP_NOSIZE     = 0x0001
+SWP_NOMOVE     = 0x0002
+SWP_NOACTIVATE = 0x0010
 
 def hide_from_taskbar():
     hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
@@ -937,9 +1075,6 @@ def hide_from_taskbar():
     ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
 
 root.after(100, hide_from_taskbar)
-
-# Hide minimize and maximize (tool window style), keep close button
-root.attributes("-topmost", True)
 
 # Disable the close button functionality
 def do_nothing():
@@ -980,6 +1115,49 @@ def get_hwnd_by_title(partial_title):
         return True
     ctypes.windll.user32.EnumWindows(WNDENUMPROC(cb), 0)
     return found[0] if found else None
+
+# ── Foreground-window focus tracking ──────────────────────────────
+def get_foreground_hwnd():
+    return ctypes.windll.user32.GetForegroundWindow()
+
+def hwnd_title(hwnd):
+    if not hwnd:
+        return ""
+    buf = ctypes.create_unicode_buffer(256)
+    ctypes.windll.user32.GetWindowTextW(hwnd, buf, 256)
+    return buf.value
+
+def hwnd_belongs_to(hwnd, titles_substrings):
+    title = hwnd_title(hwnd).lower()
+    return any(t.lower() in title for t in titles_substrings)
+
+def get_foreground_pid():
+    hwnd = get_foreground_hwnd()
+    pid = ctypes.wintypes.DWORD()
+    ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return pid.value
+
+def is_relevant_window_focused():
+    """
+    True if the foreground window is Global Mapper, CAMA Tools itself,
+    or one of the CAMA tool subprocess windows (Road Width, Land Shape, etc.)
+    """
+    fg = get_foreground_hwnd()
+    if hwnd_belongs_to(fg, ["Global Mapper", "CAMA Tools"]):
+        return True
+
+    # Frozen mode: match by subprocess PID
+    fg_pid = get_foreground_pid()
+    if any(p.pid == fg_pid for p in TOOL_PROCESSES if p.poll() is None):
+        return True
+
+    # Dev mode: match by foreground window title against active tool labels
+    if _active_tool_titles:
+        fg_title = hwnd_title(fg).lower()
+        return any(t.lower() in fg_title or fg_title in t.lower()
+                   for t in _active_tool_titles)
+
+    return False
 
 def clamp_position(new_x, new_y):
     """Clamp CAMA position strictly inside GM's map canvas area."""
@@ -1089,8 +1267,8 @@ def install_wm_moving_hook():
 root.after(400, install_wm_moving_hook)
 
 root.title("CAMA Tools")
-root.geometry("100x100")
 root.resizable(False, False)
+# No fixed geometry — root will wrap tightly around content
 
 
 # === IMAGE HANDLING ===
@@ -1148,22 +1326,9 @@ icons = {label: ImageTk.PhotoImage(Image.open(path).resize((39, 39), Image.Resam
 
 
 # === TOOLBAR BUTTONS PANEL (blue area) ===
-button_frame = tk.Frame(root, bg="#afd0f7", width=310, height=160) #310 height #310 width
-button_frame.pack(padx=3, pady=(5, 0))
-button_frame.pack_propagate(False)
-
-# === TOP ROW AND BOTTOM ROW CONTAINERS ===
-first_row = tk.Frame(button_frame, bg="#afd0f7")
-first_row.pack(side="top", anchor="w", pady=(2, 0))
-
-second_row = tk.Frame(button_frame, bg="#afd0f7")
-second_row.pack(side="top", anchor="w", pady=(0, 4))
-
-third_row = tk.Frame(button_frame, bg="#afd0f7")
-third_row.pack(side="top", anchor="w", pady=(0, 4))
-
-fourth_row = tk.Frame(button_frame, bg="#afd0f7")
-fourth_row.pack(side="top", anchor="w", pady=(0, 6))
+button_frame = tk.Frame(root, bg="#afd0f7", width=310)
+button_frame.pack(padx=8, pady=(6, 6))
+# No pack_propagate(False) — let it size naturally to its content
 
 # === Tooltip descriptions for icon buttons ===
 tooltip_descriptions = {
@@ -1204,19 +1369,6 @@ buttons_2nd_row = [
     "ROAD SURFACE"
 ]
 
-buttons_3rd_row = [
-    "LINEAR REGRESSION",
-    "RANDOM FOREST",
-    "XG BOOST"
-]
-
-buttons_4th_row = [
-    "ORDINARY LEAST SQUARES",
-    "SPATIAL LAG MODEL",
-    "SPATIAL DURBIN MODEL",
-    "GEOGRAPHICALLY WEIGHTED REGRESSION"
-]
-
 popup_windows = {}
 canvas_refs = {}
 
@@ -1224,27 +1376,13 @@ canvas_refs = {}
 
 # === GROUP TITLE: Feature Management Tools ===
 feature_title = tk.Label(button_frame, text="Feature Management Tools", font=("Segoe UI", 9, "bold"), bg="#afd0f7", anchor="w")
-feature_title.pack(side="top", anchor="w", padx=5, pady=(3, 1))
+feature_title.pack(side="top", anchor="w", padx=8, pady=(4, 1))
 
 first_row = tk.Frame(button_frame, bg="#afd0f7")
-first_row.pack(side="top", anchor="w", pady=(0, 2))
+first_row.pack(side="top", anchor="w", padx=4, pady=(0, 2))
 
 second_row = tk.Frame(button_frame, bg="#afd0f7")
-second_row.pack(side="top", anchor="w", pady=(0, 8))
-
-# === GROUP TITLE: AI Model Tools ===
-ai_title = tk.Label(button_frame, text="AI Model Tools", font=("Segoe UI", 9, "bold"), bg="#afd0f7", anchor="w")
-ai_title.pack(side="top", anchor="w", padx=5, pady=(0, 1))
-
-third_row = tk.Frame(button_frame, bg="#afd0f7")
-third_row.pack(side="top", anchor="w", pady=(0, 4))
-
-# === GROUP TITLE: Geostatistical Model Tools ===
-ai_title = tk.Label(button_frame, text="Geostatistical Model Tools", font=("Segoe UI", 9, "bold"), bg="#afd0f7", anchor="w")
-ai_title.pack(side="top", anchor="w", padx=5, pady=(0, 1))
-
-fourth_row = tk.Frame(button_frame, bg="#afd0f7")
-fourth_row.pack(side="top", anchor="w", pady=(0, 4))
+second_row.pack(side="top", anchor="w", padx=4, pady=(0, 6))
 
 # === 1st ROW BUTTONS WITH INDIVIDUAL CONTROL ===
 for label in buttons_1st_row:
@@ -1321,81 +1459,11 @@ for label in buttons_2nd_row:
         canvas.pack(side="left", padx=(2, 2), pady=(2, 2))
     elif label == "ROAD SURFACE":
         canvas.pack(side="left", padx=(2, 2), pady=(2, 2))
-
-# === 3rd ROW BUTTONS WITH INDIVIDUAL CONTROL ===
-for label in buttons_3rd_row:
-    canvas = tk.Canvas(third_row, width=48, height=48, highlightthickness=0, bg="#afd0f7")
-    bg_img_id = canvas.create_image(3, 3, anchor="nw", image=None)
-    icon_img_id = canvas.create_image(2, 2, anchor="nw", image=icons[label])
-
-    canvas_refs[label] = (canvas, bg_img_id)
-    popup_windows[label] = 0
-
-    def make_bindings(c, lbl, bg_id):
-        def on_enter(e):
-            c.itemconfig(bg_id, image=hover_bg)
-        def on_leave(e):
-            c.itemconfig(bg_id, image="")
-        def on_click(e):
-            on_button_click(lbl)
-        c.bind("<Enter>", on_enter)
-        c.bind("<Leave>", on_leave)
-        c.bind("<Button-1>", on_click)
-
-    make_bindings(canvas, label, bg_img_id)
-
-    # ✅ Tooltip with icon and label
-    add_tooltip(canvas, icon_paths[label], label, tooltip_descriptions.get(label, "Launch tool"), canvas=canvas, bg_id=bg_img_id)
-    canvas.pack(side="left", padx=(2, 2), pady=(2, 2))
-
-    # Per-button packing adjustments
-    if label == "LINEAR REGRESSION":
-        canvas.pack(side="left", padx=(2, 2), pady=(2, 2))
-    elif label == "RANDOM FOREST":
-        canvas.pack(side="left", padx=(2, 2), pady=(2, 2))
-    elif label == "XG BOOST":
-        canvas.pack(side="left", padx=(2, 2), pady=(2, 2))
-
-# === 4th ROW BUTTONS WITH INDIVIDUAL CONTROL ===
-for label in buttons_4th_row:
-    canvas = tk.Canvas(fourth_row, width=48, height=48, highlightthickness=0, bg="#afd0f7")
-    bg_img_id = canvas.create_image(3, 3, anchor="nw", image=None)
-    icon_img_id = canvas.create_image(2, 2, anchor="nw", image=icons[label])
-
-    canvas_refs[label] = (canvas, bg_img_id)
-    popup_windows[label] = 0
-
-    def make_bindings(c, lbl, bg_id):
-        def on_enter(e):
-            c.itemconfig(bg_id, image=hover_bg)
-        def on_leave(e):
-            c.itemconfig(bg_id, image="")
-        def on_click(e):
-            on_button_click(lbl)
-        c.bind("<Enter>", on_enter)
-        c.bind("<Leave>", on_leave)
-        c.bind("<Button-1>", on_click)
-
-    make_bindings(canvas, label, bg_img_id)
-
-    # ✅ Tooltip with icon and label
-    add_tooltip(canvas, icon_paths[label], label, tooltip_descriptions.get(label, "Launch tool"), canvas=canvas, bg_id=bg_img_id)
-    canvas.pack(side="left", padx=(2, 2), pady=(2, 2))
-
-    # Per-button packing adjustments
-    if label == "ORDINARY LEAST SQUARES":
-        canvas.pack(side="left", padx=(2, 2), pady=(2, 2))
-    elif label == "SPATIAL LAG MODEL":
-        canvas.pack(side="left", padx=(2, 2), pady=(2, 2))
-    elif label == "SPATIAL DURBIN MODEL":
-        canvas.pack(side="left", padx=(2, 2), pady=(2, 2))
-    elif label == "GEOGRAPHICALLY WEIGHTED REGRESSION":
-        canvas.pack(side="left", padx=(2, 2), pady=(2, 2))
         
 
 # Create a frame to hold both buttons
 btn_frame = tk.Frame(root)
-btn_frame.pack(pady=15)  # One padding for the whole row
+btn_frame.pack(pady=(6, 6))
 
 
 
@@ -1429,21 +1497,46 @@ update_btn.pack(side="left", padx=5)  # Add horizontal spacing
 
 def launch_main_window():
     gm_windows = [w for w in gw.getWindowsWithTitle('Global Mapper Pro') if w.visible]
+    root.update_idletasks()  # ensure actual size is computed first
+    cama_w = root.winfo_reqwidth()
+    cama_h = root.winfo_reqheight()
+
     if gm_windows:
         gm_win = gm_windows[0]
-        root.geometry(
-            f"+{gm_win.left + gm_win.width - 310}"
-            f"+{gm_win.top + gm_win.height - 350}"
-        )
+        new_x = gm_win.left + gm_win.width - cama_w - 10
+        new_y = gm_win.top + gm_win.height - cama_h - 40
+        root.geometry(f"+{new_x}+{new_y}")
+    else:
+        sw = root.winfo_screenwidth()
+        sh = root.winfo_screenheight()
+        root.geometry(f"+{(sw - cama_w) // 2}+{(sh - cama_h) // 2}")
 
+    root.update_idletasks()
+    root.attributes("-alpha", 1)
     root.deiconify()
     root.lift()
-    root.attributes('-topmost', True)
-    root.after(100, lambda: root.attributes('-topmost', False))
+    # Pin as topmost at Win32 level — more reliable than tkinter's -topmost
+    cama_hwnd = get_hwnd_by_title("CAMA Tools")
+    if cama_hwnd:
+        ctypes.windll.user32.SetWindowPos(
+            cama_hwnd, HWND_TOPMOST,
+            0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+        )
 
+    # Force Z-order above GM immediately after showing
+    def _force_z_order():
+        cama_hwnd = get_hwnd_by_title("CAMA Tools")
+        if cama_hwnd:
+            ctypes.windll.user32.SetWindowPos(
+                cama_hwnd, HWND_TOPMOST,
+                0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+            )
 
+    root.after(500, _force_z_order)   # after GM settles
+    root.after(1500, _force_z_order)  # second pass in case GM repaints on top
 
-root.withdraw()  # Hide the UI initially
 
 import pygetwindow as gw
 import time
@@ -1452,6 +1545,13 @@ def launch_global_mapper():
     import re
     import shutil
     import tempfile
+
+    global GM_EXE_PATH
+    if not GM_EXE_PATH:
+        GM_EXE_PATH = get_global_mapper_path()
+    if not GM_EXE_PATH:
+        messagebox.showerror("Global Mapper", "global_mapper.exe not found. Please locate it.")
+        return
 
     gmw_path = selected_gmw_file
     patched_path = gmw_path  # default: use as-is
@@ -1510,6 +1610,8 @@ def launch_global_mapper():
 prev_position  = [None, None]
 prev_gm_rect   = [None, None, None, None]  # left, top, width, height
 cama_offset    = [None, None]              # CAMA's offset relative to GM
+_topmost_recheck_counter = [0]             # throttles repeated SetWindowPos calls to avoid title-bar flicker
+_active_tool_titles = set()               # tracks open tool window titles in dev mode
 
 def monitor_gm_state():
     try:
@@ -1517,26 +1619,36 @@ def monitor_gm_state():
         if gm_windows:
             gm_win = gm_windows[0]
 
-            if gm_win.isMinimized:
+            if gm_win.isMinimized or not is_relevant_window_focused():
                 if root.state() != 'withdrawn':
                     root.withdraw()
             else:
-                if root.state() == 'withdrawn':
+                just_shown = (root.state() == 'withdrawn')
+                if just_shown:
+                    root.attributes("-alpha", 1)
                     root.deiconify()
 
                 cama_hwnd = get_hwnd_by_title("CAMA Tools")
                 gm_hwnd   = get_hwnd_by_title("Global Mapper Pro")
 
-                # --- Z-order: keep CAMA just above GM ---
-                if cama_hwnd and gm_hwnd:
-                    GW_HWNDPREV = 3
-                    above_gm = ctypes.windll.user32.GetWindow(gm_hwnd, GW_HWNDPREV)
-                    if above_gm != cama_hwnd:
+                # --- Z-order: only re-pin topmost when just shown, or occasionally ---
+                # Calling SetWindowPos every 200ms causes visible title-bar flicker.
+                if cama_hwnd:
+                    if just_shown:
                         ctypes.windll.user32.SetWindowPos(
-                            cama_hwnd, gm_hwnd,
+                            cama_hwnd, HWND_TOPMOST,
                             0, 0, 0, 0,
                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
                         )
+                    else:
+                        _topmost_recheck_counter[0] += 1
+                        if _topmost_recheck_counter[0] >= 10:  # ~every 2s instead of every 200ms
+                            _topmost_recheck_counter[0] = 0
+                            ctypes.windll.user32.SetWindowPos(
+                                cama_hwnd, HWND_TOPMOST,
+                                0, 0, 0, 0,
+                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+                            )
 
                 # --- Follow GM when it moves ---
                 gm_left   = gm_win.left
@@ -1594,16 +1706,30 @@ def monitor_gm_closure():
         root.after(2000, monitor_gm_closure)
 
 
+_gm_stable_count = [0]  # needs to be visible twice before we consider it ready
+
 def wait_for_global_mapper():
     gm_windows = [w for w in gw.getWindowsWithTitle('Global Mapper Pro') if w.visible]
-    if gm_windows:
-        print("✅ Global Mapper is open.")
-        launch_main_window()
-        monitor_gm_state()
-        monitor_gm_closure()   # ← ADD THIS
+    # Require GM window to be visible AND non-minimized AND have a real size
+    ready = (
+        gm_windows and
+        not gm_windows[0].isMinimized and
+        gm_windows[0].width > 100 and
+        gm_windows[0].height > 100
+    )
+    if ready:
+        _gm_stable_count[0] += 1
+        if _gm_stable_count[0] >= 2:      # stable for 2 consecutive checks (2s)
+            print("✅ Global Mapper is fully open.")
+            launch_main_window()
+            monitor_gm_state()
+            monitor_gm_closure()
+            return
     else:
-        print("⏳ Waiting for Global Mapper...")
-        root.after(1000, wait_for_global_mapper)
+        _gm_stable_count[0] = 0           # reset if GM disappears or isn't ready
+
+    print("⏳ Waiting for Global Mapper...")
+    root.after(1000, wait_for_global_mapper)
 
 # Step 1: Resize native dialog to medium centered via ctypes
 import threading
@@ -1620,32 +1746,30 @@ def resize_file_dialog():
         y = (screen_h - win_h) // 2
         ctypes.windll.user32.MoveWindow(hwnd, x, y, win_w, win_h, True)
 
-threading.Thread(target=resize_file_dialog, daemon=True).start()
+def startup_sequence():
+    global selected_gmw_file
 
-gmw_file = filedialog.askopenfilename(
-    title="Select Global Mapper Workspace File",
-    filetypes=[("Global Mapper Workspace", "*.gmw")]
-)
+    threading.Thread(target=resize_file_dialog, daemon=True).start()
 
-if not gmw_file:
-    try:
-        # optional: wag na mag-warning kung ayaw mo ng popup
-        messagebox.showwarning("Cancelled", "No GMW file selected. Exiting.")
-    except Exception:
-        pass
+    gmw_file = filedialog.askopenfilename(
+        title="Select Global Mapper Workspace File",
+        filetypes=[("Global Mapper Workspace", "*.gmw")]
+    )
 
-    try:
-        root.quit()
-        root.destroy()
-    except Exception:
-        pass
+    if not gmw_file:
+        try:
+            messagebox.showwarning("Cancelled", "No GMW file selected. Exiting.")
+        except Exception:
+            pass
+        try:
+            root.quit()
+            root.destroy()
+        except Exception:
+            pass
+        sys.exit(0)
 
-    import sys
-    sys.exit(0)   # <-- IMPORTANT: clean exit code for PyInstaller
+    selected_gmw_file = gmw_file
+    show_login_and_connect()
 
-
-selected_gmw_file = gmw_file
-show_login_and_connect()
-
-# Step 4: Enter main loop
+root.after(0, startup_sequence)
 root.mainloop()

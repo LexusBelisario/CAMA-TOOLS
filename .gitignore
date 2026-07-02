@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+tools/__pycache__
+
+# Build outputs
+build/
+dist/
+*.pkg
+*.exe
+*.toc
+
+# PyInstaller
+*.spec
+
+*.json
+*.log

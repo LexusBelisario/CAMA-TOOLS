@@ -8,6 +8,7 @@ import psycopg2, json
 from sqlalchemy import create_engine, text
 from shapely.geometry import Point
 import argparse
+import subprocess
 
 # ============================
 # FORCE WINDOWS APP ICON
@@ -51,7 +52,17 @@ def apply_icon(win):
 
 
 # -------------------- CONFIG --------------------
-CREDENTIALS_FILE = "pg_credentials.json"
+def _get_credentials_path():
+    if getattr(sys, "frozen", False):
+        return os.path.join(os.path.dirname(sys.executable), "pg_credentials.json")
+    else:
+        return os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "pg_credentials.json"
+        )
+
+CREDENTIALS_FILE = _get_credentials_path()
+GM_EXE_PATH = r"C:\Program Files\GlobalMapper26.1_64bit\global_mapper.exe"
 
 barangay_source = None
 influence_source = None
@@ -69,15 +80,16 @@ VECTOR_FILETYPES = [
 # -------------------- DB HELPERS --------------------
 def load_db_credentials():
     """Load pg_credentials.json safely."""
-    if not os.path.exists(CREDENTIALS_FILE):
+    path = _get_credentials_path()
+    if not os.path.exists(path):
         messagebox.showerror(
             "Missing Credentials",
-            f"⚠️ File not found: {os.path.abspath(CREDENTIALS_FILE)}\n\n"
+            f"⚠️ File not found: {path}\n\n"
             "Please create pg_credentials.json with host, port, database, username, password, and schema.",
         )
         return None
     try:
-        with open(CREDENTIALS_FILE, "r") as f:
+        with open(path, "r") as f:
             creds = json.load(f)
         required = ["host", "port", "database", "username", "password", "schema"]
         for key in required:
@@ -339,48 +351,26 @@ def run_processing():
         # --- Save outputs ---
         if output_mode[0] == "local":
             out_dir = output_mode[1]
-            out_path = os.path.join(out_dir, f"{local_name}.shp")
-
-            # ===== HARDEN SHAPEFILE WRITE =====
+            out_path = os.path.join(out_dir, f"{local_name}.gpkg")
 
             # 1️⃣ Ensure CRS exists
             if b_gdf.crs is None:
-                raise RuntimeError("❌ Cannot write shapefile: CRS is None")
+                raise RuntimeError("❌ Cannot write file: CRS is None")
 
-            # 2️⃣ Reproject explicitly (not inline)
+            # 2️⃣ Reproject to WGS84
             b_gdf = b_gdf.to_crs(epsg=4326)
             print("🧭 CRS before save:", b_gdf.crs)
 
-            # 3️⃣ Fix invalid geometries (prevents DBF failure)
+            # 3️⃣ Fix invalid geometries
             if not b_gdf.is_valid.all():
                 print("⚠️ Fixing invalid geometries")
                 b_gdf["geometry"] = b_gdf.geometry.buffer(0)
 
-            # 4️⃣ Remove existing shapefile parts (Windows lock safety)
-            base = os.path.splitext(out_path)[0]
-            for ext in [".shp", ".shx", ".dbf", ".prj", ".cpg"]:
-                try:
-                    os.remove(base + ext)
-                except FileNotFoundError:
-                    pass
+            # 4️⃣ Write GeoPackage
+            b_gdf.to_file(out_path, driver="GPKG")
 
-            # 5️⃣ Write shapefile with explicit driver + encoding
-            b_gdf.to_file(
-                out_path,
-                driver="ESRI Shapefile",
-                encoding="UTF-8"
-            )
-
-            # 6️⃣ Validate output (NO silent failures)
-            required = [".shp", ".shx", ".dbf", ".prj"]
-            missing = [ext for ext in required if not os.path.exists(base + ext)]
-
-            if missing:
-                raise RuntimeError(
-                    f"❌ Shapefile write incomplete. Missing: {', '.join(missing)}"
-                )
-
-            print(f"✅ Valid shapefile written: {out_path}")
+            print(f"✅ Saved: {out_path}")
+            load_in_global_mapper(out_path)
 
         else:
             # --- DB OUTPUT RULES ---
@@ -503,154 +493,329 @@ def run_processing():
     messagebox.showinfo("Success", "✅ Processing done with CAMA logs!")
 
 
-# -------------------- GUI WINDOWS --------------------
-def select_barangay_window(root):
+# REPLACE WITH
+
+# -------------------- GLOBAL MAPPER --------------------
+def load_in_global_mapper(filepath):
+    try:
+        import ctypes.wintypes
+        gm_hwnd = None
+
+        def enum_callback(hwnd, _):
+            nonlocal gm_hwnd
+            length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+            if length == 0:
+                return True
+            buf = ctypes.create_unicode_buffer(length + 1)
+            ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
+            if "Global Mapper" in buf.value:
+                gm_hwnd = hwnd
+                return False
+            return True
+
+        EnumWindowsProc = ctypes.WINFUNCTYPE(
+            ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+        ctypes.windll.user32.EnumWindows(EnumWindowsProc(enum_callback), 0)
+
+        subprocess.Popen([GM_EXE_PATH, filepath])
+        print(f"🗺️ Sent to Global Mapper: {filepath}")
+    except Exception as e:
+        print(f"⚠️ Could not open in Global Mapper: {e}")
+
+
+# -------------------- DB TABLE PICKER --------------------
+def _pick_db_tables(parent, tables, multi, on_select):
+    from tkinter import ttk
+    picker = tk.Toplevel(parent)
+    apply_icon(picker)
+    picker.title("Select Table(s)")
+    picker.resizable(False, False)
+    picker.grab_set()
+
+    mode = tk.MULTIPLE if multi else tk.SINGLE
+    lb = Listbox(picker, selectmode=mode, width=55, height=15)
+    for t in tables:
+        lb.insert(tk.END, t)
+    lb.pack(padx=10, pady=10)
+
+    def submit():
+        sel = [lb.get(i) for i in lb.curselection()]
+        if sel:
+            on_select(sel)
+            picker.destroy()
+
+    tk.Button(picker, text="Confirm Selection", command=submit,
+              width=20).pack(pady=(0, 10))
+
+
+# -------------------- MAIN WINDOW --------------------
+def open_main_window(root):
+    from tkinter import ttk
+
     win = tk.Toplevel(root)
     apply_icon(win)
-    win.title("Select Land Parcel Source")
-    win.geometry("325x80")
+    win.title("Influence to Parcel Tool")
     win.resizable(False, False)
+    win.update_idletasks()
+    win.deiconify()
+    win.lift()
+    win.focus_force()
+    win.attributes("-topmost", True)
+    win.after(100, lambda: win.attributes("-topmost", False))
 
-    def pick_local():
-        global barangay_source
+    # ── state ────────────────────────────────────────────────────
+    parcel_source_type    = tk.StringVar(master=win, value="local")
+    influence_source_type = tk.StringVar(master=win, value="local")
+    output_dest_type      = tk.StringVar(master=win, value="local")
+
+    parcel_local_paths    = []
+    parcel_db_tables      = []
+    influence_local_paths = []
+    influence_db_tables   = []
+    output_local_dir      = tk.StringVar(master=win)
+
+    PAD = dict(padx=8, pady=4)
+
+    def section_label(parent, text):
+        frm = tk.Frame(parent)
+        frm.pack(fill="x", padx=10, pady=(10, 2))
+        tk.Label(frm, text=text,
+                 font=("Segoe UI", 9, "bold")).pack(side="left")
+        ttk.Separator(frm, orient="horizontal").pack(
+            side="left", fill="x", expand=True, padx=(6, 0), pady=4)
+
+    # ── SECTION 1: LAND PARCEL ───────────────────────────────────
+    section_label(win, "Land Parcel Source")
+
+    parcel_frame = tk.Frame(win)
+    parcel_frame.pack(fill="x", padx=18, pady=2)
+
+    radio_row = tk.Frame(parcel_frame)
+    radio_row.pack(fill="x")
+    tk.Radiobutton(radio_row, text="Local File(s)",
+                   variable=parcel_source_type, value="local",
+                   command=lambda: _toggle_parcel()).pack(side="left")
+    tk.Radiobutton(radio_row, text="Database Table(s)",
+                   variable=parcel_source_type, value="db",
+                   command=lambda: _toggle_parcel()).pack(side="left", padx=(12, 0))
+
+    parcel_files_var = tk.StringVar(master=win, value="No file(s) selected")
+    parcel_db_label  = tk.StringVar(master=win, value="No table(s) selected")
+
+    parcel_action_row = tk.Frame(parcel_frame)
+    parcel_action_row.pack(fill="x", pady=2)
+
+    parcel_lbl = tk.Label(parcel_action_row, textvariable=parcel_files_var,
+                          fg="gray", anchor="w", width=42)
+    parcel_lbl.pack(side="left")
+
+    parcel_btn = tk.Button(parcel_action_row, text="Browse…", width=10)
+    parcel_btn.pack(side="left", **PAD)
+
+    def browse_parcel_files():
         files = filedialog.askopenfilenames(
-            title="Select Land Parcel file",
-            filetypes=VECTOR_FILETYPES,
-        )
+            title="Select Land Parcel file(s)",
+            filetypes=VECTOR_FILETYPES)
         if files:
-            barangay_source = ("local", files)
-            print("✅ Barangay source set:", barangay_source)
-            win.destroy()
-            select_influence_window(root)
+            parcel_local_paths.clear()
+            parcel_local_paths.extend(files)
+            parcel_files_var.set(f"{len(files)} file(s) selected")
 
-    def pick_db():
-        global barangay_source
+    def browse_parcel_db():
         creds = load_db_credentials()
         if not creds:
             return
         tables = fetch_tables(creds["schema"])
         if not tables:
-            messagebox.showerror("Error", "No tables found in schema.")
+            messagebox.showwarning("No Tables", "No tables found in the database schema.")
             return
+        _pick_db_tables(win, tables, multi=True,
+            on_select=lambda sel: (
+                parcel_db_tables.__setitem__(slice(None), sel)
+                or parcel_db_label.set(f"{len(sel)} table(s) selected")
+            ))
 
-        db_win = tk.Toplevel(root)
-        apply_icon(db_win)
-        db_win.title("Select Land Parcel Table")
-        lb = Listbox(db_win, selectmode=tk.MULTIPLE, width=50, height=15)
-        for t in tables:
-            lb.insert(tk.END, t)
-        lb.pack()
+    def _toggle_parcel():
+        if parcel_source_type.get() == "local":
+            parcel_lbl.config(textvariable=parcel_files_var)
+            parcel_btn.config(text="Browse…", command=browse_parcel_files)
+        else:
+            parcel_lbl.config(textvariable=parcel_db_label)
+            parcel_btn.config(text="Select…", command=browse_parcel_db)
 
-        def submit():
-            global barangay_source
-            sel = [lb.get(i) for i in lb.curselection()]
-            if sel:
-                barangay_source = ("db", sel)
-                print("✅ Barangay source set:", barangay_source)
-                db_win.destroy()
-                win.destroy()
-                select_influence_window(root)
-            else:
-                messagebox.showwarning("Warning", "Please select at least one table.")
+    # ── SECTION 2: INFLUENCE MAP ─────────────────────────────────
+    section_label(win, "Influence Map Source")
 
-        tk.Button(db_win, text="Select", command=submit).pack(pady=5)
+    influence_frame = tk.Frame(win)
+    influence_frame.pack(fill="x", padx=18, pady=2)
 
-    tk.Button(win, text="Select Local File", command=pick_local).pack(pady=5)
-    tk.Button(win, text="Select Database File", command=pick_db).pack(pady=5)
+    infl_radio_row = tk.Frame(influence_frame)
+    infl_radio_row.pack(fill="x")
+    tk.Radiobutton(infl_radio_row, text="Local File(s)",
+                   variable=influence_source_type, value="local",
+                   command=lambda: _toggle_influence()).pack(side="left")
+    tk.Radiobutton(infl_radio_row, text="Database Table(s)",
+                   variable=influence_source_type, value="db",
+                   command=lambda: _toggle_influence()).pack(side="left", padx=(12, 0))
 
+    infl_files_var = tk.StringVar(master=win, value="No file(s) selected")
+    infl_db_label  = tk.StringVar(master=win, value="No table(s) selected")
 
-def select_influence_window(root):
-    win = tk.Toplevel(root)
-    apply_icon(win)
-    win.title("Select Influence Map Source")
-    tk.Label(win, text="Select Influence Map Source").pack(padx=85, pady=10)
+    infl_action_row = tk.Frame(influence_frame)
+    infl_action_row.pack(fill="x", pady=2)
 
-    def pick_local():
-        global influence_source
+    infl_lbl = tk.Label(infl_action_row, textvariable=infl_files_var,
+                        fg="gray", anchor="w", width=42)
+    infl_lbl.pack(side="left")
+
+    infl_btn = tk.Button(infl_action_row, text="Browse…", width=10)
+    infl_btn.pack(side="left", **PAD)
+
+    def browse_influence_files():
         files = filedialog.askopenfilenames(
-            title="Select Influence Map file",
-            filetypes=VECTOR_FILETYPES,
-        )
+            title="Select Influence Map file(s)",
+            filetypes=VECTOR_FILETYPES)
         if files:
-            influence_source = ("local", files)
-            print("✅ Influence source set:", influence_source)
-            win.destroy()
-            select_output_window(root)
+            influence_local_paths.clear()
+            influence_local_paths.extend(files)
+            infl_files_var.set(f"{len(files)} file(s) selected")
 
-    def pick_db():
-        global influence_source
+    def browse_influence_db():
         creds = load_db_credentials()
         if not creds:
             return
         tables = fetch_tables(creds["schema"])
         if not tables:
-            messagebox.showerror("Error", "No tables found in schema.")
+            messagebox.showwarning("No Tables", "No tables found in the database schema.")
             return
+        _pick_db_tables(win, tables, multi=True,
+            on_select=lambda sel: (
+                influence_db_tables.__setitem__(slice(None), sel)
+                or infl_db_label.set(f"{len(sel)} table(s) selected")
+            ))
 
-        db_win = tk.Toplevel(root)
-        db_win.title("Select Influence Tables")
-        lb = Listbox(db_win, selectmode=tk.MULTIPLE, width=50, height=15)
-        for t in tables:
-            lb.insert(tk.END, t)
-        lb.pack()
+    def _toggle_influence():
+        if influence_source_type.get() == "local":
+            infl_lbl.config(textvariable=infl_files_var)
+            infl_btn.config(text="Browse…", command=browse_influence_files)
+        else:
+            infl_lbl.config(textvariable=infl_db_label)
+            infl_btn.config(text="Select…", command=browse_influence_db)
 
-        def submit():
-            global influence_source
-            sel = [lb.get(i) for i in lb.curselection()]
-            if sel:
-                influence_source = ("db", sel)
-                print("✅ Influence source set:", influence_source)
-                db_win.destroy()
-                win.destroy()
-                select_output_window(root)
-            else:
-                messagebox.showwarning("Warning", "Please select at least one table.")
+    # ── SECTION 3: OUTPUT ────────────────────────────────────────
+    section_label(win, "Output Destination")
 
-        tk.Button(db_win, text="Select", command=submit).pack(pady=5)
+    output_frame = tk.Frame(win)
+    output_frame.pack(fill="x", padx=18, pady=2)
 
-    tk.Button(win, text="Select Local File", command=pick_local).pack(pady=5)
-    tk.Button(win, text="Select Database File", command=pick_db).pack(pady=5)
+    out_radio_row = tk.Frame(output_frame)
+    out_radio_row.pack(fill="x")
+    tk.Radiobutton(out_radio_row, text="Save to Local Folder",
+                   variable=output_dest_type, value="local",
+                   command=lambda: _toggle_output()).pack(side="left")
+    tk.Radiobutton(out_radio_row, text="Save to Database",
+                   variable=output_dest_type, value="db",
+                   command=lambda: _toggle_output()).pack(side="left", padx=(12, 0))
 
+    output_dir_var = tk.StringVar(master=win, value="No folder selected")
+    output_db_var  = tk.StringVar(master=win,
+                                  value="Will write back to the connected PostGIS schema.")
 
-def select_output_window(root):
-    win = tk.Toplevel(root)
-    apply_icon(win)
-    win.title("Select Output Destination")
-    tk.Label(win, text="Save output to:").pack(padx=85, pady=10)
+    out_action_row = tk.Frame(output_frame)
+    out_action_row.pack(fill="x", pady=2)
 
-    def save_local():
-        global output_mode, barangay_source, influence_source
-        if not barangay_source or not influence_source:
-            messagebox.showerror("Error", "Barangay and Influence sources must be selected first.")
-            return
-        out_dir = filedialog.askdirectory()
-        if out_dir:
-            output_mode = ("local", out_dir)
-            print("✅ Output mode set:", output_mode)
-            win.destroy()
-            run_processing()
+    out_lbl = tk.Label(out_action_row, textvariable=output_dir_var,
+                       fg="gray", anchor="w", width=42)
+    out_lbl.pack(side="left")
 
-    def save_db():
-        global output_mode, barangay_source, influence_source
-        if not barangay_source or not influence_source:
-            messagebox.showerror("Error", "Barangay and Influence sources must be selected first.")
-            return
-        output_mode = ("db", None)
-        print("✅ Output mode set:", output_mode)
+    out_btn = tk.Button(out_action_row, text="Browse…", width=10)
+    out_btn.pack(side="left", **PAD)
+
+    def browse_output_dir():
+        d = filedialog.askdirectory()
+        if d:
+            output_local_dir.set(d)
+            output_dir_var.set(d)
+
+    def _toggle_output():
+        if output_dest_type.get() == "local":
+            out_lbl.config(textvariable=output_dir_var,
+                           font=("Segoe UI", 9), fg="gray")
+            out_btn.config(text="Browse…", command=browse_output_dir)
+            out_btn.pack(side="left", **PAD)
+        else:
+            out_lbl.config(textvariable=output_db_var,
+                           font=("Segoe UI", 8, "italic"), fg="gray")
+            out_btn.pack_forget()
+
+    # ── RUN BUTTON ───────────────────────────────────────────────
+    ttk.Separator(win, orient="horizontal").pack(
+        fill="x", padx=10, pady=(12, 4))
+
+    def on_run():
+        global barangay_source, influence_source, output_mode
+
+        # validate parcel
+        if parcel_source_type.get() == "local":
+            if not parcel_local_paths:
+                messagebox.showerror("Missing Input",
+                    "Please select at least one Land Parcel file.")
+                return
+            barangay_source = ("local", tuple(parcel_local_paths))
+        else:
+            if not parcel_db_tables:
+                messagebox.showerror("Missing Input",
+                    "Please select at least one Land Parcel table.")
+                return
+            barangay_source = ("db", parcel_db_tables)
+
+        # validate influence
+        if influence_source_type.get() == "local":
+            if not influence_local_paths:
+                messagebox.showerror("Missing Input",
+                    "Please select at least one Influence Map file.")
+                return
+            influence_source = ("local", tuple(influence_local_paths))
+        else:
+            if not influence_db_tables:
+                messagebox.showerror("Missing Input",
+                    "Please select at least one Influence Map table.")
+                return
+            influence_source = ("db", influence_db_tables)
+
+        # validate output
+        if output_dest_type.get() == "local":
+            if not output_local_dir.get():
+                messagebox.showerror("Missing Input",
+                    "Please select an output folder.")
+                return
+            output_mode = ("local", output_local_dir.get())
+        else:
+            output_mode = ("db", None)
+
         win.destroy()
         run_processing()
 
-    tk.Button(win, text="Save to Local", command=save_local).pack(pady=5)
-    tk.Button(win, text="Save to Database", command=save_db).pack(pady=5)
+    tk.Button(win, text="▶  Run Processing", command=on_run,
+              bg="#2e7d32", fg="white",
+              font=("Segoe UI", 10, "bold"),
+              relief="flat", padx=16, pady=6).pack(pady=(4, 14))
+
+    _toggle_parcel()
+    _toggle_influence()
+    _toggle_output()
 
 
 # -------------------- MAIN --------------------
-def main():
-    root = tk.Tk()
-    apply_icon(root)
-    root.withdraw()
-    select_barangay_window(root)
-    root.mainloop()
+def main(parent=None):
+    if parent is not None:
+        open_main_window(parent)
+    else:
+        root = tk.Tk()
+        apply_icon(root)
+        root.withdraw()
+        open_main_window(root)
+        root.mainloop()
 
 
 if __name__ == "__main__":
