@@ -34,12 +34,16 @@ if not exist "utils_paths.py" (
     exit /b 1
 )
 
-:: ── 2. Clean previous build artifacts ─────────────────────────
+:: ── 2. Kill any running instance + clean build artifacts ───────
 echo.
-echo  [1/4] Cleaning previous build...
-if exist "build"           rmdir /s /q "build"
-if exist "dist"            rmdir /s /q "dist"
-if exist "__pycache__"     rmdir /s /q "__pycache__"
+echo  [1/4] Killing any running CAMA-Tools instance...
+taskkill /f /im "CAMA-Tools.exe" >nul 2>&1
+timeout /t 2 /nobreak >nul
+
+echo  Cleaning previous build...
+if exist "build"             rmdir /s /q "build"
+if exist "dist"              rmdir /s /q "dist"
+if exist "__pycache__"       rmdir /s /q "__pycache__"
 if exist "tools\__pycache__" rmdir /s /q "tools\__pycache__"
 
 :: ── 3. Run PyInstaller ────────────────────────────────────────

@@ -55,7 +55,16 @@ def apply_icon(win):
 
 # Paths to icon and Global Mapper EXE
 GM_EXE_PATH = r"C:\Program Files\GlobalMapper26.1_64bit\global_mapper.exe"
-CREDENTIALS_FILE = "pg_credentials.json"
+def _get_credentials_path():
+    if getattr(sys, "frozen", False):
+        return os.path.join(os.path.dirname(sys.executable), "pg_credentials.json")
+    else:
+        return os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "pg_credentials.json"
+        )
+
+CREDENTIALS_FILE = _get_credentials_path()
 
 barangay_source = None
 road_source = None
@@ -90,10 +99,11 @@ def fix_geometry(geom):
 
 # ---------------- DB Helpers ----------------
 def load_db_credentials():
+    path = _get_credentials_path()
     try:
-        with open(CREDENTIALS_FILE,"r") as f: 
+        with open(path, "r") as f:
             return json.load(f)
-    except: 
+    except Exception:
         return None
 
 def get_geometry_column(table_name, engine, schema):
@@ -252,16 +262,16 @@ def open_main_window(root):
     win.after(100, lambda: win.attributes("-topmost", False))
 
     # ── state ────────────────────────────────────────────────────
-    parcel_source_type = tk.StringVar(value="local")
-    road_source_type   = tk.StringVar(value="local")
-    output_dest_type   = tk.StringVar(value="local")
+    parcel_source_type = tk.StringVar(master=win, value="local")
+    road_source_type   = tk.StringVar(master=win, value="local")
+    output_dest_type   = tk.StringVar(master=win, value="local")
 
     parcel_local_paths = []
     parcel_db_tables   = []
-    road_local_path    = tk.StringVar()
-    road_db_table      = tk.StringVar()
-    output_local_dir   = tk.StringVar()
-    buffer_var         = tk.StringVar(value="1000")
+    road_local_path    = tk.StringVar(master=win)
+    road_db_table      = tk.StringVar(master=win)
+    output_local_dir   = tk.StringVar(master=win)
+    buffer_var         = tk.StringVar(master=win, value="1000")
 
     PAD = dict(padx=8, pady=4)
 
@@ -288,29 +298,26 @@ def open_main_window(root):
                    variable=parcel_source_type, value="db",
                    command=lambda: _toggle_parcel()).pack(side="left", padx=(12, 0))
 
-    parcel_local_frame = tk.Frame(parcel_frame)
-    parcel_local_frame.pack(fill="x", pady=2)
-    parcel_files_var = tk.StringVar(value="No file(s) selected")
-    tk.Label(parcel_local_frame, textvariable=parcel_files_var,
-             fg="gray", anchor="w", width=42).pack(side="left")
+    parcel_files_var = tk.StringVar(master=win, value="No file(s) selected")
+    parcel_db_label  = tk.StringVar(master=win, value="No table(s) selected")
+
+    parcel_action_row = tk.Frame(parcel_frame)
+    parcel_action_row.pack(fill="x", pady=2)
+
+    parcel_lbl = tk.Label(parcel_action_row, textvariable=parcel_files_var,
+                          fg="gray", anchor="w", width=42)
+    parcel_lbl.pack(side="left")
+
+    parcel_btn = tk.Button(parcel_action_row, text="Browse…", width=10)
+    parcel_btn.pack(side="left", **PAD)
 
     def browse_parcel_files():
-        files = filedialog.askopenfilenames(
-            filetypes=[("Shapefiles", "*.shp"),
-                       ("GeoPackage", "*.gpkg"),
-                       ("All", "*.*")])
+        files = filedialog.askopenfilenames(filetypes=[
+            ("Shapefiles", "*.shp"), ("GeoPackage", "*.gpkg"), ("All", "*.*")])
         if files:
             parcel_local_paths.clear()
             parcel_local_paths.extend(files)
             parcel_files_var.set(f"{len(files)} file(s) selected")
-
-    tk.Button(parcel_local_frame, text="Browse…", width=10,
-              command=browse_parcel_files).pack(side="left", **PAD)
-
-    parcel_db_frame = tk.Frame(parcel_frame)
-    parcel_db_label = tk.StringVar(value="No table(s) selected")
-    tk.Label(parcel_db_frame, textvariable=parcel_db_label,
-             fg="gray", anchor="w", width=42).pack(side="left")
 
     def browse_parcel_db():
         creds = load_db_credentials()
@@ -318,22 +325,22 @@ def open_main_window(root):
             messagebox.showerror("Error", "Could not load DB credentials.")
             return
         tables = fetch_tables(creds["schema"])
+        if not tables:
+            messagebox.showwarning("No Tables", "No tables found in the database schema.")
+            return
         _pick_db_tables(win, tables, multi=True,
-                        on_select=lambda sel: (
-                            parcel_db_tables.__setitem__(slice(None), sel)
-                            or parcel_db_label.set(f"{len(sel)} table(s) selected")
-                        ))
-
-    tk.Button(parcel_db_frame, text="Select…", width=10,
-              command=browse_parcel_db).pack(side="left", **PAD)
+            on_select=lambda sel: (
+                parcel_db_tables.__setitem__(slice(None), sel)
+                or parcel_db_label.set(f"{len(sel)} table(s) selected")
+            ))
 
     def _toggle_parcel():
         if parcel_source_type.get() == "local":
-            parcel_db_frame.pack_forget()
-            parcel_local_frame.pack(fill="x", pady=2)
+            parcel_lbl.config(textvariable=parcel_files_var)
+            parcel_btn.config(text="Browse…", command=browse_parcel_files)
         else:
-            parcel_local_frame.pack_forget()
-            parcel_db_frame.pack(fill="x", pady=2)
+            parcel_lbl.config(textvariable=parcel_db_label)
+            parcel_btn.config(text="Select…", command=browse_parcel_db)
 
     # ── SECTION 2: ROAD NETWORK ──────────────────────────────────
     section_label(win, "Road Network Source")
@@ -350,28 +357,25 @@ def open_main_window(root):
                    variable=road_source_type, value="db",
                    command=lambda: _toggle_road()).pack(side="left", padx=(12, 0))
 
-    road_local_frame = tk.Frame(road_frame)
-    road_local_frame.pack(fill="x", pady=2)
-    road_file_label = tk.StringVar(value="No file selected")
-    tk.Label(road_local_frame, textvariable=road_file_label,
-             fg="gray", anchor="w", width=42).pack(side="left")
+    road_file_var = tk.StringVar(master=win, value="No file selected")
+    road_db_var   = tk.StringVar(master=win, value="No table selected")
+
+    road_action_row = tk.Frame(road_frame)
+    road_action_row.pack(fill="x", pady=2)
+
+    road_lbl = tk.Label(road_action_row, textvariable=road_file_var,
+                        fg="gray", anchor="w", width=42)
+    road_lbl.pack(side="left")
+
+    road_btn = tk.Button(road_action_row, text="Browse…", width=10)
+    road_btn.pack(side="left", **PAD)
 
     def browse_road_file():
-        f = filedialog.askopenfilename(
-            filetypes=[("Shapefiles", "*.shp"),
-                       ("GeoPackage", "*.gpkg"),
-                       ("All", "*.*")])
+        f = filedialog.askopenfilename(filetypes=[
+            ("Shapefiles", "*.shp"), ("GeoPackage", "*.gpkg"), ("All", "*.*")])
         if f:
             road_local_path.set(f)
-            road_file_label.set(os.path.basename(f))
-
-    tk.Button(road_local_frame, text="Browse…", width=10,
-              command=browse_road_file).pack(side="left", **PAD)
-
-    road_db_frame = tk.Frame(road_frame)
-    road_db_label = tk.StringVar(value="No table selected")
-    tk.Label(road_db_frame, textvariable=road_db_label,
-             fg="gray", anchor="w", width=42).pack(side="left")
+            road_file_var.set(os.path.basename(f))
 
     def browse_road_db():
         creds = load_db_credentials()
@@ -379,22 +383,22 @@ def open_main_window(root):
             messagebox.showerror("Error", "Could not load DB credentials.")
             return
         tables = fetch_tables(creds["schema"])
+        if not tables:
+            messagebox.showwarning("No Tables", "No tables found in the database schema.")
+            return
         _pick_db_tables(win, tables, multi=False,
-                        on_select=lambda sel: (
-                            road_db_table.set(sel[0])
-                            or road_db_label.set(sel[0])
-                        ))
-
-    tk.Button(road_db_frame, text="Select…", width=10,
-              command=browse_road_db).pack(side="left", **PAD)
+            on_select=lambda sel: (
+                road_db_table.set(sel[0]) if sel else None,
+                road_db_var.set(sel[0] if sel else "No table selected")
+            ))
 
     def _toggle_road():
         if road_source_type.get() == "local":
-            road_db_frame.pack_forget()
-            road_local_frame.pack(fill="x", pady=2)
+            road_lbl.config(textvariable=road_file_var)
+            road_btn.config(text="Browse…", command=browse_road_file)
         else:
-            road_local_frame.pack_forget()
-            road_db_frame.pack(fill="x", pady=2)
+            road_lbl.config(textvariable=road_db_var)
+            road_btn.config(text="Select…", command=browse_road_db)
 
     # ── SECTION 3: BUFFER RADIUS ─────────────────────────────────
     section_label(win, "Buffer Radius")
@@ -421,31 +425,36 @@ def open_main_window(root):
                    variable=output_dest_type, value="db",
                    command=lambda: _toggle_output()).pack(side="left", padx=(12, 0))
 
-    output_local_frame = tk.Frame(output_frame)
-    output_local_frame.pack(fill="x", pady=2)
-    tk.Label(output_local_frame, textvariable=output_local_dir,
-             fg="gray", anchor="w", width=42).pack(side="left")
+    output_dir_var = tk.StringVar(master=win, value="No folder selected")
+    output_db_var  = tk.StringVar(master=win,
+                                  value="Will write back to the connected PostGIS schema.")
+
+    out_action_row = tk.Frame(output_frame)
+    out_action_row.pack(fill="x", pady=2)
+
+    out_lbl = tk.Label(out_action_row, textvariable=output_dir_var,
+                       fg="gray", anchor="w", width=42)
+    out_lbl.pack(side="left")
+
+    out_btn = tk.Button(out_action_row, text="Browse…", width=10)
+    out_btn.pack(side="left", **PAD)
 
     def browse_output_dir():
         d = filedialog.askdirectory()
         if d:
             output_local_dir.set(d)
-
-    tk.Button(output_local_frame, text="Browse…", width=10,
-              command=browse_output_dir).pack(side="left", **PAD)
-
-    output_db_frame = tk.Frame(output_frame)
-    tk.Label(output_db_frame,
-             text="Will write back to the connected PostGIS schema.",
-             fg="gray", font=("Segoe UI", 8, "italic")).pack(anchor="w", pady=4)
+            output_dir_var.set(d)
 
     def _toggle_output():
         if output_dest_type.get() == "local":
-            output_db_frame.pack_forget()
-            output_local_frame.pack(fill="x", pady=2)
+            out_lbl.config(textvariable=output_dir_var,
+                           font=("Segoe UI", 9), fg="gray")
+            out_btn.config(text="Browse…", command=browse_output_dir)
+            out_btn.pack(side="left", **PAD)
         else:
-            output_local_frame.pack_forget()
-            output_db_frame.pack(fill="x", pady=2)
+            out_lbl.config(textvariable=output_db_var,
+                           font=("Segoe UI", 8, "italic"), fg="gray")
+            out_btn.pack_forget()
 
     # ── RUN BUTTON ───────────────────────────────────────────────
     ttk.Separator(win, orient="horizontal").pack(
@@ -509,6 +518,10 @@ def open_main_window(root):
               bg="#2e7d32", fg="white",
               font=("Segoe UI", 10, "bold"),
               relief="flat", padx=16, pady=6).pack(pady=(4, 14))
+
+    _toggle_parcel()
+    _toggle_road()
+    _toggle_output()
 
 
 # ---------------- Main Processing ----------------

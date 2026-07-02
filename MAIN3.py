@@ -105,11 +105,28 @@ def dispatch_tool_if_requested():
             import inspect
             sig = inspect.signature(mod.main)
             if sig.parameters:
-                # tool accepts a parent — create a proper hidden root
+                # Create proper hidden root BEFORE any icon calls
                 _tool_root = tk.Tk()
                 _tool_root.withdraw()
                 _tool_root.geometry("1x1+-9999+-9999")
-                apply_icon(_tool_root)
+
+                # Apply icon bound to THIS root — never reuse PhotoImage
+                # from another Tk instance (causes TclError)
+                ico = resource_path("BLGF.ico")
+                png = resource_path("BLGF.png")
+                if os.path.exists(ico):
+                    try:
+                        _tool_root.iconbitmap(ico)
+                    except Exception:
+                        pass
+                if os.path.exists(png):
+                    try:
+                        _img = tk.PhotoImage(file=png, master=_tool_root)
+                        _tool_root.iconphoto(True, _img)
+                        _tool_root._icon_ref = _img  # prevent GC
+                    except Exception:
+                        pass
+
                 mod.main(_tool_root)
                 _tool_root.mainloop()
             else:
@@ -787,7 +804,9 @@ def update_map_and_select_recorded():
 import json, shutil
 from tkinter import filedialog
 
-GM_PATH_FILE = "gm_exe_path.json"
+_base_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
+            else os.path.dirname(os.path.abspath(__file__))
+GM_PATH_FILE = os.path.join(_base_dir, "gm_exe_path.json")
 
 def get_global_mapper_path() -> str:
     # 1) previously saved?
@@ -948,10 +967,15 @@ def show_login_and_connect():
     login_win.protocol("WM_DELETE_WINDOW", on_login_close)
 
     # Load saved credentials if available
+    _creds_path = os.path.join(
+        os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
+        else os.path.dirname(os.path.abspath(__file__)),
+        "pg_credentials.json"
+    )
     saved = {}
-    if os.path.exists("pg_credentials.json"):
+    if os.path.exists(_creds_path):
         try:
-            with open("pg_credentials.json", "r") as f:
+            with open(_creds_path, "r") as f:
                 saved = json.load(f)
         except Exception:
             saved = {}
@@ -1009,7 +1033,12 @@ def show_login_and_connect():
         except Exception as e:
             messagebox.showerror("Login Failed", f"Could not connect:\n{e}")
 
-        with open("pg_credentials.json", "w") as f:
+        _creds_path = os.path.join(
+            os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
+            else os.path.dirname(os.path.abspath(__file__)),
+            "pg_credentials.json"
+        )
+        with open(_creds_path, "w") as f:
             json.dump({
                 "host": DB_HOST,
                 "port": DB_PORT,
