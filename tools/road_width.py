@@ -191,17 +191,18 @@ def process(barangay_gdf, road_gdf, source_name="", progress_cb=None):
     barangay_gdf = barangay_gdf.to_crs(epsg=zone_epsg)
     road_gdf = road_gdf.to_crs(epsg=zone_epsg)
 
-    # Extract road segments
+    # ── Build road segments + midpoint index ──────────────────────
     segment_geoms, segment_midpoints = [], []
     for geom in road_gdf.geometry:
-        if geom is None or geom.is_empty: 
+        if geom is None or geom.is_empty:
             continue
         parts = geom.geoms if geom.geom_type in ['MultiLineString', 'GeometryCollection'] else [geom]
         for ls in parts:
-            if ls.geom_type != "LineString": continue
+            if ls.geom_type != "LineString":
+                continue
             coords = list(ls.coords)
-            for i in range(len(coords)-1):
-                seg = LineString([coords[i], coords[i+1]])
+            for i in range(len(coords) - 1):
+                seg = LineString([coords[i], coords[i + 1]])
                 segment_geoms.append(seg)
                 midpoint = seg.interpolate(0.5, normalized=True)
                 segment_midpoints.append((midpoint.x, midpoint.y))
@@ -210,11 +211,101 @@ def process(barangay_gdf, road_gdf, source_name="", progress_cb=None):
         if progress_cb:
             for _ in range(len(barangay_gdf)):
                 progress_cb(1)
-
         barangay_gdf["ROAD_WIDTH"] = None
         if original_crs:
             barangay_gdf = barangay_gdf.to_crs(original_crs)
         return barangay_gdf
+
+    seg_tree = cKDTree(segment_midpoints)
+
+    def _measure_width(poly, boundary):
+        """
+        Core measurement for ANY parcel (road lot or inner lot):
+
+        1. Split the parcel boundary into individual segments.
+        2. For each parcel boundary segment, find the nearest road segment
+           using its midpoint.
+        3. Among all parcel boundary segments, pick the one whose midpoint
+           is closest to any road segment midpoint.
+        4. On that chosen parcel boundary segment, find the point on it
+           that is closest to the nearest road segment.
+        5. Find the closest point on the road segment to that boundary point.
+        6. Measure the distance between the two points.
+        7. Multiply by 2 (centerline → edge = half width).
+
+        Returns float width in CRS units (metres after PRS92 reproject),
+        or None if boundary has no usable segments.
+        """
+        # Split parcel boundary into individual segments
+        boundary_segs = []
+        lines = (
+            [boundary] if boundary.geom_type == "LineString"
+            else [g for g in boundary.geoms if g.geom_type == "LineString"]
+        )
+        for line in lines:
+            coords = list(line.coords)
+            for i in range(len(coords) - 1):
+                seg = LineString([coords[i], coords[i + 1]])
+                if seg.length > 0:
+                    boundary_segs.append(seg)
+
+        if not boundary_segs:
+            return None
+
+        # Build midpoints for all parcel boundary segments
+        bseg_mids = [(s.interpolate(0.5, normalized=True).x,
+                      s.interpolate(0.5, normalized=True).y)
+                     for s in boundary_segs]
+
+        # For each parcel boundary segment, find nearest road segment
+        # Pick the parcel boundary segment whose midpoint is closest to
+        # any road segment midpoint
+        best_dist = float("inf")
+        best_bseg = None
+        best_rseg = None
+
+        for i, (bseg, bmid) in enumerate(zip(boundary_segs, bseg_mids)):
+            # Query nearest road segment to this boundary segment midpoint
+            dist_to_rseg, ridx = seg_tree.query(bmid)
+            if dist_to_rseg < best_dist:
+                best_dist = dist_to_rseg
+                best_bseg = bseg
+                best_rseg = segment_geoms[int(ridx)]
+
+        if best_bseg is None or best_rseg is None:
+            return None
+
+        # Find the point on the parcel boundary segment closest to the
+        # road segment, and vice versa
+        # nearest_points(a, b) → (point on a closest to b, point on b closest to a)
+        pt_on_bseg, pt_on_rseg = nearest_points(best_bseg, best_rseg)
+
+        half_width = pt_on_bseg.distance(pt_on_rseg)
+        return round(half_width * 2, 4)
+
+    # ── Measure every parcel ──────────────────────────────────────
+    road_widths = []
+    for idx, poly in enumerate(barangay_gdf.geometry):
+        if progress_cb:
+            progress_cb(1)
+
+        if poly is None or poly.is_empty:
+            road_widths.append(None)
+            continue
+
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+            if poly.is_empty:
+                road_widths.append(None)
+                continue
+
+        width = _measure_width(poly, poly.boundary)
+        road_widths.append(width)
+
+    barangay_gdf["ROAD_WIDTH"] = road_widths
+    if original_crs:
+        barangay_gdf = barangay_gdf.to_crs(original_crs)
+    return barangay_gdf
 
     tree = cKDTree(segment_midpoints)
 
