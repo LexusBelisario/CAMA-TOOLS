@@ -1,17 +1,17 @@
 @echo off
 :: =============================================================
 :: build.bat  —  CAMA-Tools EXE builder
-:: Place this file in the SAME folder as MAIN3.py + CAMA-Tools.spec
+:: Place this file in the SAME folder as MAIN.py + CAMA-Tools.spec
 :: Double-click OR run from cmd inside that folder.
 :: =============================================================
 
 setlocal
 
 :: ── 1. Confirm we are in the right folder ─────────────────────
-if not exist "MAIN3.py" (
+if not exist "MAIN.py" (
     echo.
-    echo  ERROR: MAIN3.py not found in this folder.
-    echo  Please run build.bat from the folder that contains MAIN3.py.
+    echo  ERROR: MAIN.py not found in this folder.
+    echo  Please run build.bat from the folder that contains MAIN.py.
     echo.
     pause
     exit /b 1
@@ -20,7 +20,7 @@ if not exist "MAIN3.py" (
 if not exist "CAMA-Tools.spec" (
     echo.
     echo  ERROR: CAMA-Tools.spec not found in this folder.
-    echo  Please copy CAMA-Tools.spec here alongside MAIN3.py.
+    echo  Please copy CAMA-Tools.spec here alongside MAIN.py.
     echo.
     pause
     exit /b 1
@@ -28,7 +28,7 @@ if not exist "CAMA-Tools.spec" (
 
 if not exist "utils_paths.py" (
     echo.
-    echo  ERROR: utils_paths.py not found. It is imported by MAIN3.py.
+    echo  ERROR: utils_paths.py not found. It is imported by MAIN.py.
     echo.
     pause
     exit /b 1
