@@ -595,6 +595,16 @@ def _wait_for_gpkg_export(save_path, tk_root):
         Mapper → monitor_gm_state() → root.destroy()), update() raises
         TclError; we convert that to a loud abort instead of an
         unhandled traceback.
+
+    UX (added later, no change to timing/logic above):
+        A small, non-focus-stealing status window is shown for the
+        duration of this poll (often 15-30+ seconds) so it doesn't look
+        like the app has frozen — same pattern used elsewhere in this
+        module (overrideredirect, no focus_force()/grab_set()).
+        Wrapped in try/finally so it is destroyed on every exit path
+        (the success return, or any _cleanup_and_raise() failure)
+        without needing to touch each individual exit point. Shared by
+        both callers of this function automatically.
     """
     import time
     start = time.monotonic()
@@ -619,7 +629,53 @@ def _wait_for_gpkg_export(save_path, tk_root):
 
     _log(f"poll start: save_path={save_path}")
 
-    while True:
+    # UX: non-focus-stealing status window for the duration of this
+    # poll. CORRECTED positioning: previously anchored to tk_root (the
+    # CAMA Tools panel's own position, which sits bottom-right near GM
+    # per launch_main_window()'s own placement logic) - this visually
+    # collided with GM's own "Exporting GeoPackage Vector Table"
+    # progress dialog and was inconsistent with the other two status
+    # windows in update_map_and_select_recorded(), which are anchored
+    # to GM's window (upper-left area) instead. Now matches that same
+    # anchor point for a consistent, predictable location across all
+    # three status windows. Falls back to the old tk_root-relative
+    # position only if GM's window cannot be located for any reason.
+    # Never calls focus_force()/grab_set(), so it cannot steal keyboard
+    # focus during the wait.
+    _status_win = None
+    try:
+        _gm_win_for_status = None
+        for _w in gw.getWindowsWithTitle("Global Mapper Pro"):
+            if "global mapper" in _w.title.lower():
+                _gm_win_for_status = _w
+                break
+        if _gm_win_for_status is not None:
+            _status_x = _gm_win_for_status.left + 20
+            _status_y = _gm_win_for_status.top + 20
+        else:
+            _status_x = tk_root.winfo_x() + 40
+            _status_y = tk_root.winfo_y() + 40
+
+        _status_win = tk.Toplevel(tk_root)
+        _status_win.overrideredirect(True)
+        _status_win.attributes("-topmost", True)
+        _status_win.configure(bg="#2b2b2b")
+        _status_label = tk.Label(
+            _status_win,
+            text="Verifying export completed successfully...",
+            bg="#2b2b2b", fg="white", font=("Segoe UI", 9),
+            padx=12, pady=8
+        )
+        _status_label.pack()
+        _status_win.geometry(f"+{_status_x}+{_status_y}")
+        _status_win.update_idletasks()
+    except Exception as status_win_err:
+        _log(f"status window could not be created (non-fatal): "
+             f"{type(status_win_err).__name__}: {status_win_err}")
+        _status_win = None
+
+    try:
+      while True:
         # Pump the Tk/Windows message queue (see docstring).
         try:
             tk_root.update()
@@ -631,6 +687,13 @@ def _wait_for_gpkg_export(save_path, tk_root):
             )
 
         now = time.monotonic()
+        if _status_win is not None:
+            try:
+                _status_label.config(
+                    text=f"Verifying export completed successfully... ({now - start:.0f}s)"
+                )
+            except tk.TclError:
+                _status_win = None
         exists = os.path.exists(save_path)
 
         if exists:
@@ -812,6 +875,12 @@ def _wait_for_gpkg_export(save_path, tk_root):
             )
 
         time.sleep(1)
+    finally:
+        try:
+            if _status_win is not None:
+                _status_win.destroy()
+        except Exception:
+            pass
 
 
 # ── Reentrancy guard for GM keystroke automation ─────────────────────
@@ -932,9 +1001,16 @@ def update_database_from_geopackage():
     # without actually highlighting a layer will still hit the wrong menu
     # downstream. This dialog only prevents the *unattended/forgot* case.
     proceed = messagebox.askyesno(
-        "Confirm Layer Selection",
-        "Make sure at least one layer is highlighted in Global Mapper "
-        "before continuing.\n\nProceed with Update Database?"
+        "Confirm Before Updating Database",
+        "Before continuing, please make sure that:\n\n"
+        "\u2022 At least one layer is highlighted in Global Mapper's Control Center.\n"
+        "\u2022 The highlighted layer is NOT a nested/grouped entry (one "
+        "with a + expand icon in the Control Center) \u2014 nested layers "
+        "are not currently supported and may cause this to fail.\n\n"
+        "Do not switch windows (Alt+Tab) or interact with your computer "
+        "while Update Database is running \u2014 this may interrupt the "
+        "automated process.\n\n"
+        "Proceed with Update Database?"
     )
     if not proceed:
         _log("ABORT: user cancelled at pre-automation confirmation dialog")
@@ -962,6 +1038,31 @@ def update_database_from_geopackage():
         gm_window.restore(); time.sleep(0.1)
         gm_window.activate(); time.sleep(0.3)
         _log(f"GM focused | fg='{_fg_title()}'")
+
+        # DEFENSIVE: re-verify TEMP_DIR exists right before using it,
+        # not just once at app startup. The module-level os.makedirs()
+        # near the top of this file only runs one time, when the app
+        # first launches. If this folder is deleted mid-session (by the
+        # user, antivirus, a cleanup utility, or anything else) — or
+        # simply doesn't reliably exist on every target machine at this
+        # exact moment — every export from this point on would fail
+        # inside Global Mapper's own Save As dialog with "Path does not
+        # exist", a failure this code has no visibility into and cannot
+        # distinguish from other Save As problems. Re-creating here
+        # (exist_ok=True, so this is a no-op in the normal case) closes
+        # that gap with a clear, accurate error if it genuinely cannot
+        # be created (e.g. permissions), instead of a confusing GM-side
+        # dialog error later in the sequence.
+        try:
+            os.makedirs(TEMP_DIR, exist_ok=True)
+        except Exception as e:
+            _log(f"ABORT: could not create/verify {TEMP_DIR}: {e}")
+            messagebox.showerror(
+                "Folder Error",
+                f"Could not create or access the required temp folder:\n"
+                f"{TEMP_DIR}\n\n{e}"
+            )
+            return
 
         # Save path for exported GPKG
         save_path = os.path.join(TEMP_DIR, "savetodb.gpkg")
@@ -1053,10 +1154,48 @@ def update_database_from_geopackage():
         pyautogui.press("down", presses=2, interval=0.05)  # "EXPORT - Export Layer(s) to New File..."
         pyautogui.press("enter")
         _log(f"EXPORT menu item selected | fg='{_fg_title()}'")
-        # === TEMP DIAGNOSTIC SLOWDOWN (remove after root cause confirmed) ===
-        _log("  [diag] pausing 3.0s to observe...")
-        time.sleep(3.0)
-        _log(f"  [diag] after pause | fg='{_fg_title()}'")
+
+        # SAFETY: poll for "Select Layers" to appear, up to a 5.0s
+        # timeout, instead of a fixed sleep - resolves quickly on fast
+        # machines and stays forgiving on slower ones (a slow machine
+        # was confirmed as a real factor: a flat 3.0s sleep previously
+        # here, and a 50ms sleep on the later Save As check, both
+        # caused false aborts on runs where the expected dialog was
+        # about to appear normally, just not within the fixed window).
+        _select_layers_start = time.monotonic()
+        _current_fg = _fg_title()
+        while time.monotonic() - _select_layers_start < 5.0:
+            _current_fg = _fg_title()
+            if "select layers" in _current_fg.lower():
+                _log(f"'Select Layers' dialog appeared after "
+                     f"{time.monotonic() - _select_layers_start:.1f}s | fg='{_current_fg}'")
+                break
+            time.sleep(0.2)
+        else:
+            _log(f"  [diag] 'Select Layers' not seen within 5.0s | fg='{_current_fg}'")
+
+        # SAFETY ABORT (mirrored from update_map_and_select_recorded()
+        # after a live test there confirmed this exact failure mode): if
+        # a nested/grouped layer entry is highlighted instead of a flat
+        # layer, this menu navigation can land somewhere unexpected and
+        # focus stays on GM's main window instead of "Select Layers"
+        # appearing. Previously the next line pressed Enter unconditionally
+        # regardless, sending that keystroke into whatever window had
+        # focus. Now: abort immediately with a clear, actionable error
+        # instead of continuing to send keystrokes blind.
+        if "select layers" not in _current_fg.lower():
+            _dump_windows("export navigation lost focus - Select Layers dialog not found")
+            raise RuntimeError(
+                "Export navigation failed: the 'Select Layers' dialog "
+                f"did not appear as expected (focused window was "
+                f"'{_current_fg}' instead). This can happen when the "
+                "highlighted layer's type changes what options exist "
+                "in Global Mapper's right-click menu (e.g. a nested/"
+                "grouped GeoPackage entry vs. a flat shapefile layer). "
+                "Update Database was aborted before any further "
+                "keystrokes were sent, to avoid typing into the wrong "
+                "window."
+            )
 
         # --- Step 3: "Select Layers" dialog -> OK (no Check All) ---
         #
@@ -1105,30 +1244,85 @@ def update_database_from_geopackage():
         pyautogui.press("enter")  # OK on "Select Export Format" dialog
         _log(f"Select Export Format: OK pressed | fg='{_fg_title()}'")
 
-        # --- Step 5: "Tip" info dialog -> OK ---
+        # --- Steps 5-6: "Tip" (optional) then "GeoPackage Export
+        # Options" (mandatory) ---
         #
-        # Actively poll for the "Tip" window instead of assuming a fixed
-        # sleep is long enough — adapts to slower machines without a
-        # tuned static delay, and leaves a clear WARNING in the log
-        # (rather than silently sending Enter blind into whatever has
-        # focus) if the dialog doesn't appear within the timeout, e.g. if
-        # "Don't Show This Again" was checked in a previous run.
-        if _wait_and_activate("Tip"):
-            _log(f"Tip dialog focused | fg='{_fg_title()}'")
-        else:
-            _log("WARNING: 'Tip' dialog not found within timeout — sending Enter blind")
-        pyautogui.press("enter")
-        _log(f"Tip dialog OK | fg='{_fg_title()}'")
+        # "Tip" is LEGITIMATELY OPTIONAL: if the user previously checked
+        # "Don't Show This Again", GM skips straight to "GeoPackage
+        # Export Options" and "Tip" never appears at all - a normal,
+        # expected case, not a failure. A single fixed-timeout wait on
+        # "Tip" alone cannot distinguish "legitimately skipped, GM
+        # already moved on" from "navigation genuinely broke" - both
+        # look identical (Tip never appears). Fix: poll for EITHER
+        # title appearing, so whichever one GM actually shows is
+        # detected directly, instead of guessing from Tip's absence.
+        #
+        # Two rounds of up to 5.0s each (10s ceiling total) before
+        # giving up, rather than one longer window, so the log can
+        # distinguish "took a bit longer" from "genuinely never
+        # appeared" via which round it resolved in (or failed in).
+        _tip_or_geo_result = None
+        _last_fg_seen = _fg_title()
+        for _poll_round in (1, 2):
+            _round_start = time.monotonic()
+            while time.monotonic() - _round_start < 5.0:
+                _last_fg_seen = _fg_title()
+                if _last_fg_seen.strip() == "Tip":
+                    _tip_or_geo_result = "tip"
+                    break
+                if "geopackage export options" in _last_fg_seen.lower():
+                    _tip_or_geo_result = "export_options"
+                    break
+                time.sleep(0.2)
+            if _tip_or_geo_result is not None:
+                _log(f"combined poll round {_poll_round}: found "
+                     f"'{_tip_or_geo_result}' after "
+                     f"{time.monotonic() - _round_start:.1f}s | fg='{_last_fg_seen}'")
+                break
+            _log(f"combined poll round {_poll_round}: neither 'Tip' nor "
+                 f"'GeoPackage Export Options' seen within 5.0s | "
+                 f"fg='{_last_fg_seen}'")
 
-        # --- Step 6: "GeoPackage Export Options" dialog -> OK ---
-        # Confirmed via screenshot: default focus is already on "OK", and
-        # the default state (Export Areas/Lines/Points all checked,
-        # "Split data by feature layer name" checked) is exactly what's
-        # wanted — no fields need to be touched here, just confirm.
-        if _wait_and_activate("GeoPackage Export Options"):
+        if _tip_or_geo_result == "tip":
+            _log(f"Tip dialog focused | fg='{_fg_title()}'")
+            pyautogui.press("enter")
+            _log(f"Tip dialog OK | fg='{_fg_title()}'")
+            # "Tip" confirmed - now specifically wait for "GeoPackage
+            # Export Options", which is NOT skippable (always appears).
+            if not _wait_and_activate("GeoPackage Export Options", timeout=5.0):
+                _dump_windows("GeoPackage Export Options dialog not found after Tip (update_database)")
+                raise RuntimeError(
+                    "Export navigation failed: the 'GeoPackage Export "
+                    "Options' dialog did not appear after confirming "
+                    "the 'Tip' dialog. Update Database was aborted "
+                    "before any further keystrokes were sent, to avoid "
+                    "typing into the wrong window."
+                )
             _log(f"GeoPackage Export Options focused | fg='{_fg_title()}'")
+
+        elif _tip_or_geo_result == "export_options":
+            _log("'Tip' was not shown (likely 'Don't Show This Again' "
+                 f"was previously checked) - 'GeoPackage Export "
+                 f"Options' already focused | fg='{_fg_title()}'")
+
         else:
-            _log("WARNING: 'GeoPackage Export Options' dialog not found within timeout — sending Enter blind")
+            _dump_windows("neither Tip nor GeoPackage Export Options appeared (update_database)")
+            raise RuntimeError(
+                "Export navigation failed: neither the 'Tip' dialog "
+                "nor the 'GeoPackage Export Options' dialog appeared "
+                f"within the expected time (focused window was "
+                f"'{_last_fg_seen}' instead). Update Database was "
+                "aborted before any further keystrokes were sent, to "
+                "avoid typing into the wrong window."
+            )
+
+        # Confirm "GeoPackage Export Options" - reached only via the
+        # two valid paths above (Tip confirmed then GeoPackage Export
+        # Options found, or GeoPackage Export Options found directly).
+        # Confirmed via screenshot: default focus is already on "OK",
+        # and the default state (Export Areas/Lines/Points all checked,
+        # "Split data by feature layer name" checked) is exactly what's
+        # wanted - no fields need to be touched here, just confirm.
         pyautogui.press("enter")
         _log(f"GeoPackage Export Options OK | fg='{_fg_title()}'")
 
@@ -1136,17 +1330,35 @@ def update_database_from_geopackage():
 
         # Step 4: Navigate Save dialog
         print("Waiting for Save As dialog...")
-        time.sleep(0.05)  # let Save dialog appear
 
-        try:
+        # SAFETY: abort rather than continuing blind if this dialog is
+        # not actually found — a live test in update_map_and_select_recorded()
+        # confirmed exactly this failure typed the export path into an
+        # unrelated browser tab instead of Global Mapper's Save As dialog.
+        #
+        # FIXED: previously used a single one-shot check after only a
+        # 50ms sleep (not enough time for the dialog to actually
+        # render), causing false aborts even when Save As was about to
+        # appear normally, as confirmed by a live test where the dialog
+        # was visibly open when the abort fired. Now uses the same
+        # _wait_and_activate() polling helper already used for Tip and
+        # GeoPackage Export Options above. Timeout standardized to 5.0s
+        # (was briefly 3.0s) across every abort-capable check in this
+        # function, so a slower user machine has consistent, adequate
+        # room before any of them false-aborts.
+        if _wait_and_activate("Save As", timeout=5.0):
             save_win = gw.getWindowsWithTitle("Save As")[0]
             save_win.activate()
             time.sleep(0.05)
             _log(f"Save As dialog found and activated | fg='{_fg_title()}'")
-        except IndexError:
-            print("⚠️ Save As dialog not found, continuing anyway...")
-            _log("Save As dialog NOT found — continuing blind")
+        else:
             _dump_windows("Save As not found (update_database)")
+            raise RuntimeError(
+                "Export navigation failed: the 'Save As' dialog did "
+                "not appear within the expected time. Update Database "
+                "was aborted before typing the export path, to avoid "
+                "typing it into the wrong window."
+            )
 
         # Focus filename field and type the full absolute path directly.
         #
@@ -1753,6 +1965,7 @@ def update_database_from_geopackage():
 @_gm_export_guard
 def update_map_and_select_recorded():
     import os, re, time
+    import traceback
     import pygetwindow as gw
     import pyautogui
     from tkinter import messagebox
@@ -1760,13 +1973,76 @@ def update_map_and_select_recorded():
     from sqlalchemy.engine import URL
     from rapidfuzz import process, fuzz
     import fiona
+    import geopandas as gpd
 
     pyautogui.FAILSAFE = False
     _log_session_start("update_map_and_select_recorded")
 
+    def _wait_and_activate(title, timeout=2.0, poll=0.1):
+        """
+        Poll for a top-level window whose title matches `title` and
+        activate it as soon as it appears, instead of assuming a fixed
+        sleep is long enough on every machine.
+
+        Local to update_map_and_select_recorded() — mirrors the helper
+        of the same name already used inside
+        update_database_from_geopackage(), duplicated here (not
+        promoted to a shared function) per this task's scope: only
+        this function may be modified. Bounded by `timeout` so a
+        dialog that never appears fails safe — the caller logs a
+        WARNING and proceeds with the keystroke anyway, matching the
+        "never hang silently, always leave a log trail" philosophy
+        used throughout this module's GM-automation code.
+        """
+        elapsed = 0.0
+        while elapsed < timeout:
+            wins = gw.getWindowsWithTitle(title)
+            if wins:
+                wins[0].activate()
+                return True
+            time.sleep(poll)
+            elapsed += poll
+        return False
+
     if not all([stored_username, stored_password]):
         _log("ABORT: not logged in")
         messagebox.showerror("Error", "You must log in first before updating the map.")
+        return
+
+    # ── Manual pre-flight confirmation ──────────────────────────────────
+    # Update Map has one required precondition that this automation
+    # cannot verify programmatically (no scripting API is used here —
+    # everything is simulated mouse/keyboard input against GM's own UI,
+    # same as update_database_from_geopackage()): at least one layer
+    # must already be highlighted in Global Mapper's Control Center.
+    # (A second precondition — GM already connected to the target
+    # PostGIS database via File -> Open Spatial Database — applied
+    # under the old architecture, which routed the import through GM's
+    # own database dialogs. That is no longer required: this workflow
+    # now pulls data directly via Python's own SQLAlchemy connection,
+    # per the Phase 1 v3 redesign, so GM's connection state is
+    # irrelevant here.)
+    # This dialog does not check the highlight condition — it is a
+    # reminder only, mirroring the same "manual checkpoint, not real
+    # validation" pattern already established for the pre-flight
+    # confirmation in update_database_from_geopackage(), applied here
+    # for consistency between the two GM-automation entry points. A
+    # user who clicks "Yes" without a layer actually highlighted will
+    # still hit whatever GM does in that state further down.
+    proceed = messagebox.askyesno(
+        "Confirm Before Updating Map",
+        "Before continuing, please make sure that:\n\n"
+        "\u2022 At least one layer is highlighted in Global Mapper's Control Center.\n"
+        "\u2022 The highlighted layer is NOT a nested/grouped entry (one "
+        "with a + expand icon in the Control Center) \u2014 nested layers "
+        "are not currently supported and may cause this to fail.\n\n"
+        "Do not switch windows (Alt+Tab) or interact with your computer "
+        "while Update Map is running \u2014 this may interrupt the "
+        "automated process.\n\n"
+        "Proceed with Update Map?"
+    )
+    if not proceed:
+        _log("ABORT: user cancelled at pre-automation confirmation dialog")
         return
 
     try:
@@ -1789,6 +2065,23 @@ def update_map_and_select_recorded():
         gm_window.activate(); time.sleep(0.1)
         _log(f"GM focused | fg='{_fg_title()}'")
 
+        # DEFENSIVE: re-verify TEMP_DIR exists right before using it,
+        # not just once at app startup - see the matching note in
+        # update_database_from_geopackage() for the full rationale
+        # (module-level os.makedirs() only runs once; this folder could
+        # be deleted mid-session or simply not reliably present on a
+        # given machine at this exact moment).
+        try:
+            os.makedirs(TEMP_DIR, exist_ok=True)
+        except Exception as e:
+            _log(f"ABORT: could not create/verify {TEMP_DIR}: {e}")
+            messagebox.showerror(
+                "Folder Error",
+                f"Could not create or access the required temp folder:\n"
+                f"{TEMP_DIR}\n\n{e}"
+            )
+            return
+
         # ---- Export to GPKG (C:\updatemap.gpkg) ----
         save_path = os.path.join(TEMP_DIR, "updatemap.gpkg")
         if os.path.exists(save_path):
@@ -1802,13 +2095,32 @@ def update_map_and_select_recorded():
         else:
             _log("pre-export cleanup: no stale export file present")
 
-        # Ctrl+S first
+        # ── Export navigation — mirrored from update_database_from_geopackage() ──
+        #
+        # Everything from here through the Save As typing below is a
+        # direct mirror of the confirmed, screenshot-verified export
+        # sequence in update_database_from_geopackage(). It replaces
+        # Update Map's own previous navigation (a fixed "up/right/down
+        # /enter" + "a"/"gggggg" type-ahead), which was the same
+        # unverified/disowned sequence Update Database itself moved
+        # away from. Justification for mirroring now (rather than
+        # waiting on fresh screenshots, per this project's normal
+        # evidence-first discipline): the right-click export menu and
+        # the GDAL/OGR-driven GeoPackage export dialogs (Select
+        # Layers, Select Export Format, Tip, GeoPackage Export
+        # Options) are the same GM/GDAL machinery regardless of which
+        # button triggered the export — and a live test of the
+        # previous Update Map sequence reproduced the exact blank
+        # "File name" symptom already seen and fixed in Update
+        # Database, which is direct evidence (not analogy) that the
+        # same missing dialog-handling applies here.
         _dump_windows("before export right-click")
-        pyautogui.hotkey("ctrl", "s")
-        time.sleep(0.05)
+        pyautogui.hotkey("ctrl", "s")  # Save project first
+        time.sleep(0.3)
 
-        # Simulate right-click in left panel (like Update Database)
         real_mouse_pos = pyautogui.position()
+        gm_window.activate()
+        time.sleep(0.05)
         left_panel_x = gm_window.left + 25
         left_panel_y = gm_window.top + 500
         pyautogui.moveTo(left_panel_x, left_panel_y)
@@ -1816,25 +2128,187 @@ def update_map_and_select_recorded():
         pyautogui.moveTo(real_mouse_pos)
 
         _log(f"export context menu invoked | fg='{_fg_title()}'")
-        time.sleep(0.01)
-        pyautogui.press("up")
-        pyautogui.press("right")
-        pyautogui.press("down")
-        pyautogui.press("enter")
-        time.sleep(0.01)
-        pyautogui.press("enter")
-        time.sleep(0.01)
-        pyautogui.typewrite("a")
-        pyautogui.typewrite("g" * 6)
-        pyautogui.press("enter")
-        _log(f"export format sequence typed | fg='{_fg_title()}'")
+        time.sleep(0.05)
 
-        time.sleep(0.05)
-        pyautogui.hotkey("alt", "d")
-        pyautogui.typewrite("C:")
+        # "Layer" is confirmed (via update_database_from_geopackage's
+        # own screenshot verification) to always be the LAST item in
+        # this context menu regardless of highlighted-layer count. A
+        # single "up" on a freshly-opened menu wraps to the last item
+        # via standard Windows menu wraparound, landing on "Layer"
+        # without depending on how many items precede it.
+        pyautogui.press("up")     # wraps to last item = "Layer"
+        pyautogui.press("enter")  # open "Layer" submenu
+        time.sleep(0.1)
+        pyautogui.press("down", presses=2, interval=0.05)  # "EXPORT - Export Layer(s) to New File..."
         pyautogui.press("enter")
-        time.sleep(0.05)
-        pyautogui.press("tab", presses=3, interval=0.05)
+        _log(f"EXPORT menu item selected | fg='{_fg_title()}'")
+
+        # SAFETY: poll for "Select Layers" to appear, up to a 5.0s
+        # timeout, instead of a fixed sleep - resolves quickly on fast
+        # machines and stays forgiving on slower ones (a slow machine
+        # was confirmed as a real factor: a flat 3.0s sleep here, and a
+        # 50ms sleep on Update Database's Save As check, both caused
+        # false aborts on runs where the expected dialog was about to
+        # appear normally, just not within the fixed window).
+        _select_layers_start = time.monotonic()
+        _current_fg = _fg_title()
+        while time.monotonic() - _select_layers_start < 5.0:
+            _current_fg = _fg_title()
+            if "select layers" in _current_fg.lower():
+                _log(f"'Select Layers' dialog appeared after "
+                     f"{time.monotonic() - _select_layers_start:.1f}s | fg='{_current_fg}'")
+                break
+            time.sleep(0.2)
+        else:
+            _log(f"  [diag] 'Select Layers' not seen within 5.0s | fg='{_current_fg}'")
+
+        # SAFETY ABORT: a live test confirmed a real failure mode
+        # here — when a GeoPackage/nested-layer entry was highlighted
+        # instead of a flat shapefile-type layer, this menu navigation
+        # landed somewhere unexpected and focus stayed on GM's main
+        # window instead of the "Select Layers" dialog appearing. The
+        # previous code pressed Enter unconditionally regardless, which
+        # sent that keystroke into whatever window happened to have
+        # focus - observed to type the export path into a browser tab
+        # in one run. Now: if "Select Layers" is not actually focused
+        # at this point, abort immediately with a clear, actionable
+        # error instead of continuing to send keystrokes blind.
+        if "select layers" not in _current_fg.lower():
+            _dump_windows("export navigation lost focus - Select Layers dialog not found")
+            raise RuntimeError(
+                "Export navigation failed: the 'Select Layers' dialog "
+                f"did not appear as expected (focused window was "
+                f"'{_current_fg}' instead). This can happen when the "
+                "highlighted layer's type changes what options exist "
+                "in Global Mapper's right-click menu (e.g. a nested/"
+                "grouped GeoPackage entry vs. a flat shapefile layer). "
+                "Update Map was aborted before any further keystrokes "
+                "were sent, to avoid typing into the wrong window."
+            )
+
+        # "Select Layers" dialog -> OK. Confirmed (in Update Database)
+        # that "OK" is already default-focused the instant this dialog
+        # opens, and its default checkbox state already reflects
+        # exactly which layer(s) were highlighted beforehand — no
+        # "Check All", no tabbing, a single Enter submits it as-is.
+        pyautogui.press("enter")
+        _log(f"Select Layers dialog confirmed (OK, no Check All, no tab) | fg='{_fg_title()}'")
+
+        # "Select Export Format" dialog -> Geopackage. PageUp x20
+        # resets the dropdown to its first entry ("2DM File" — no Home
+        # key available on this keyboard), then "g" x6 type-ahead
+        # advances the selection to "Geopackage". The type-ahead
+        # commits the combobox value directly, so a single Enter here
+        # activates OK with no separate confirm step needed.
+        pyautogui.press("pageup", presses=20, interval=0.03)  # reset dropdown to top ("2DM File")
+        time.sleep(0.3)
+        for i in range(6):
+            pyautogui.press("g")
+            time.sleep(0.15)
+        _log(f"Select Export Format: Geopackage type-ahead complete | fg='{_fg_title()}'")
+        pyautogui.press("enter")  # OK on "Select Export Format" dialog
+        _log(f"Select Export Format: OK pressed | fg='{_fg_title()}'")
+
+        # "Tip" (optional) then "GeoPackage Export Options" (mandatory).
+        #
+        # "Tip" is LEGITIMATELY OPTIONAL: if the user previously checked
+        # "Don't Show This Again", GM skips straight to "GeoPackage
+        # Export Options" and "Tip" never appears at all - a normal,
+        # expected case, not a failure. A single fixed-timeout wait on
+        # "Tip" alone cannot distinguish "legitimately skipped, GM
+        # already moved on" from "navigation genuinely broke" - both
+        # look identical (Tip never appears). Fix: poll for EITHER
+        # title appearing, so whichever one GM actually shows is
+        # detected directly, instead of guessing from Tip's absence.
+        #
+        # Two rounds of up to 5.0s each (10s ceiling total) before
+        # giving up, rather than one longer window, so the log can
+        # distinguish "took a bit longer" from "genuinely never
+        # appeared" via which round it resolved in (or failed in).
+        _tip_or_geo_result = None
+        _last_fg_seen = _fg_title()
+        for _poll_round in (1, 2):
+            _round_start = time.monotonic()
+            while time.monotonic() - _round_start < 5.0:
+                _last_fg_seen = _fg_title()
+                if _last_fg_seen.strip() == "Tip":
+                    _tip_or_geo_result = "tip"
+                    break
+                if "geopackage export options" in _last_fg_seen.lower():
+                    _tip_or_geo_result = "export_options"
+                    break
+                time.sleep(0.2)
+            if _tip_or_geo_result is not None:
+                _log(f"combined poll round {_poll_round}: found "
+                     f"'{_tip_or_geo_result}' after "
+                     f"{time.monotonic() - _round_start:.1f}s | fg='{_last_fg_seen}'")
+                break
+            _log(f"combined poll round {_poll_round}: neither 'Tip' nor "
+                 f"'GeoPackage Export Options' seen within 5.0s | "
+                 f"fg='{_last_fg_seen}'")
+
+        if _tip_or_geo_result == "tip":
+            _log(f"Tip dialog focused | fg='{_fg_title()}'")
+            pyautogui.press("enter")
+            _log(f"Tip dialog OK | fg='{_fg_title()}'")
+            # "Tip" confirmed - now specifically wait for "GeoPackage
+            # Export Options", which is NOT skippable (always appears).
+            if not _wait_and_activate("GeoPackage Export Options", timeout=5.0):
+                _dump_windows("GeoPackage Export Options dialog not found after Tip (update_map)")
+                raise RuntimeError(
+                    "Export navigation failed: the 'GeoPackage Export "
+                    "Options' dialog did not appear after confirming "
+                    "the 'Tip' dialog. Update Map was aborted before "
+                    "any further keystrokes were sent, to avoid typing "
+                    "into the wrong window."
+                )
+            _log(f"GeoPackage Export Options focused | fg='{_fg_title()}'")
+
+        elif _tip_or_geo_result == "export_options":
+            _log("'Tip' was not shown (likely 'Don't Show This Again' "
+                 f"was previously checked) - 'GeoPackage Export "
+                 f"Options' already focused | fg='{_fg_title()}'")
+
+        else:
+            _dump_windows("neither Tip nor GeoPackage Export Options appeared (update_map)")
+            raise RuntimeError(
+                "Export navigation failed: neither the 'Tip' dialog "
+                "nor the 'GeoPackage Export Options' dialog appeared "
+                f"within the expected time (focused window was "
+                f"'{_last_fg_seen}' instead). Update Map was aborted "
+                "before any further keystrokes were sent, to avoid "
+                "typing into the wrong window."
+            )
+
+        # Confirm "GeoPackage Export Options" - reached only via the
+        # two valid paths above (Tip confirmed then GeoPackage Export
+        # Options found, or GeoPackage Export Options found directly).
+        # Default focus is already on "OK" and the default export
+        # settings are exactly what's wanted - just confirm.
+        pyautogui.press("enter")
+        _log(f"GeoPackage Export Options OK | fg='{_fg_title()}'")
+
+        # "Save As" dialog appears here.
+        # SAFETY: abort rather than typing the export path blind into
+        # whatever has focus if this dialog is not actually found - a
+        # live test confirmed exactly this failure typed the path into
+        # a Brave browser tab instead of Global Mapper's Save As dialog.
+        # Timeout standardized to 5.0s (was the 2.0s default) across
+        # every abort-capable check in this function, so a slower user
+        # machine has consistent, adequate room before any of them
+        # false-aborts.
+        print("Waiting for Save As dialog...")
+        if _wait_and_activate("Save As", timeout=5.0):
+            _log(f"Save As dialog focused | fg='{_fg_title()}'")
+        else:
+            _dump_windows("Save As not found (update_map)")
+            raise RuntimeError(
+                "Export navigation failed: the 'Save As' dialog did "
+                "not appear within the expected time. Update Map was "
+                "aborted before typing the export path, to avoid "
+                "typing it into the wrong window."
+            )
+
         pyautogui.hotkey("alt", "n")
         pyautogui.typewrite(save_path)
         pyautogui.press("enter")
@@ -1842,28 +2316,84 @@ def update_map_and_select_recorded():
 
         # ---- Wait until file is fully saved (bounded poll) ----
         # Raises RuntimeError on timeout, caught by the "Update Map
-        # Failed" handler at the end of this function.
-        print("⏳ Waiting for updatemap.gpkg to be fully written...")
+        # Failed" handler at the end of this function. Shared,
+        # already-fixed helper — unchanged.
+        print("\u23f3 Waiting for updatemap.gpkg to be fully written...")
         _wait_for_gpkg_export(save_path, root)
 
         _log(f"export phase complete: {save_path}")
-        print("✅ File saved:", save_path)
+        print("\u2705 File saved:", save_path)
 
         # ---- Re-type the GPKG path into GM (if dialog still open) ----
-        time.sleep(1.0)
-        try:
-            save_dialog = gw.getWindowsWithTitle("Save As")[0]
-            save_dialog.activate()
-            time.sleep(0.3)
-            _log(f"Save As dialog still open post-export — re-typing path | fg='{_fg_title()}'")
+        # Kept as a defensive fallback in case some other, still-
+        # unidentified GM state leaves "Save As" open even after the
+        # dialog-complete sequence above. Expected to be a no-op in
+        # normal operation now that Tip / GeoPackage Export Options are
+        # explicitly handled — the earlier blank-filename symptom this
+        # was originally band-aiding should no longer occur upstream.
+        if _wait_and_activate("Save As", timeout=3.0):
+            _log(f"Save As dialog still open post-export \u2014 re-typing path | fg='{_fg_title()}'")
             pyautogui.typewrite(save_path)
             pyautogui.press("enter")
-            print("📂 Re-typed path into Save As dialog")
-        except IndexError:
-            print("⚠️ Save As dialog not found — skipping re-type")
+            print("\U0001f4c2 Re-typed path into Save As dialog")
+        else:
+            print("\u26a0\ufe0f Save As dialog not found \u2014 skipping re-type")
             _log("Save As dialog not open post-export — no re-type needed")
 
+        # UX: status window covering the matching / database-read / local
+        # write phase — previously this whole stretch was visually silent
+        # (progress bar finishes, then nothing appears to happen until
+        # Ctrl+O). Same non-focus-stealing pattern as the Ctrl+O wait
+        # indicator (no focus_force()/grab_set(), overrideredirect).
+        _status_win = None
+        try:
+            _status_win = tk.Toplevel(root)
+            _status_win.overrideredirect(True)
+            _status_win.attributes("-topmost", True)
+            _status_win.configure(bg="#2b2b2b")
+            _status_label = tk.Label(
+                _status_win,
+                text="Matching layers and reading data from database...",
+                bg="#2b2b2b", fg="white", font=("Segoe UI", 9),
+                padx=12, pady=8
+            )
+            _status_label.pack()
+            _status_win.geometry(f"+{gm_window.left + 20}+{gm_window.top + 20}")
+            _status_win.update_idletasks()
+            root.update()
+        except Exception as status_win_err:
+            _log(f"status window could not be created (non-fatal): "
+                 f"{type(status_win_err).__name__}: {status_win_err}")
+            _status_win = None
+
+        def _close_status_window():
+            """Safely destroy the status window on any exit path (success
+            continuing to the next phase, or an early return on failure).
+            Never raises - a failure here must not mask the real error
+            already being reported by the caller."""
+            nonlocal _status_win
+            if _status_win is not None:
+                try:
+                    _status_win.destroy()
+                except Exception:
+                    pass
+                _status_win = None
+
         # ---- Match layers with PostgreSQL tables ----
+        #
+        # Phase 2 implementation of the Phase 1 v3 (frozen) analysis
+        # document. Replaces the earlier diagnostic probe, which stood
+        # in the already-exported `save_path` as a placeholder for a
+        # freshly DB-pulled file. This block now does the real pull.
+        #
+        # Structure: several narrower, phase-specific try/except blocks
+        # (matching -> DB read -> local write -> GM load -> delete-old)
+        # instead of one broad try/except, per Section 5's design
+        # implication. Each phase reports its own specific, accurate,
+        # English-only error message and aborts (via `return`) rather
+        # than falling through to a generic catch-all. `engine.dispose()`
+        # in the existing `finally` below still runs on every exit path,
+        # including these early returns.
         connection_url = URL.create(
             drivername="postgresql+psycopg2",
             username=stored_username,
@@ -1873,101 +2403,714 @@ def update_map_and_select_recorded():
             database=DB_NAME
         )
         engine = create_engine(connection_url)
-        with engine.begin() as conn:
-            db_tables = [r[0] for r in conn.execute(
-                text("SELECT table_name FROM information_schema.tables WHERE table_schema=:s AND table_type='BASE TABLE'"),
-                {"s": DB_SCHEMA}
-            )]
-
-        db_lower = {t.lower(): t for t in db_tables}
-        schema_prefix = DB_SCHEMA + "_"
-        matched_tables = []
-
-        for layer in fiona.listlayers(save_path):
-            lyr_name = layer.strip()
-            if lyr_name.lower().startswith(schema_prefix.lower()):
-                stripped = lyr_name[len(schema_prefix):]
-            else:
-                stripped = lyr_name
-            stripped = re.sub(r"\s+", "_", stripped)
-
-            if stripped.lower() in db_lower:
-                matched_tables.append(f"{DB_SCHEMA}.{db_lower[stripped.lower()]}")
-            else:
-                match, score, _ = process.extractOne(
-                    stripped.lower(),
-                    [t.lower() for t in db_tables],
-                    scorer=fuzz.WRatio
-                )
-                if match is not None:
-                    matched_tables.append(f"{DB_SCHEMA}.{db_lower[match]}")
-                else:
-                    matched_tables.append(f"{DB_SCHEMA}.{stripped}")
-
-        print("📄 Matched tables (in memory):", matched_tables)
-        _log(f"matched tables ({len(matched_tables)}): {matched_tables}")
-
-        # ---- Back to GM and type in tables ----
-        gm_window.minimize(); time.sleep(0.1)
-        gm_window.restore();  time.sleep(0.1)
-        gm_window.activate(); time.sleep(0.1)
-
-        # Open the "Table Selection" dialog: Alt+F, Down, Enter, Enter
-        pyautogui.keyDown("alt"); pyautogui.press("f"); pyautogui.keyUp("alt")
-        time.sleep(0.08)
-        pyautogui.press("down"); time.sleep(0.08)
-        pyautogui.press("enter"); time.sleep(0.08)
-        pyautogui.press("enter"); time.sleep(0.6)
-        _log(f"table-selection dialog opened | fg='{_fg_title()}'")
-
-        # Inside your existing function where matched_tables is already populated
-        if matched_tables:
-            # First table
-            print(f"⌨ Typing first table: {matched_tables[0]}")
-            _log(f"typing table 1/{len(matched_tables)}: {matched_tables[0]} "
-                 f"| fg='{_fg_title()}'")
-            pyautogui.typewrite(matched_tables[0], interval=0.01)
-            pyautogui.press("space")
-            time.sleep(0.05)
-
-            # Remaining tables
-            for i, tbl in enumerate(matched_tables[1:], start=2):
-                pyautogui.press("down", presses=5, interval=0.05)
-                time.sleep(0.05)
-                pyautogui.press("tab")
-                time.sleep(0.05)
-                print(f"⌨ Typing next table: {tbl}")
-                _log(f"typing table {i}/{len(matched_tables)}: {tbl} "
-                     f"| fg='{_fg_title()}'")
-                pyautogui.typewrite(tbl, interval=0.01)
-                pyautogui.press("space")
-                time.sleep(0.05)
-
-            print("✅ Finished typing all tables. Pressing Enter...")
-            _log("finished typing all tables — pressing Enter")
-            pyautogui.press("enter")
-
-        _log("Update Map complete")
-        messagebox.showinfo("Update Map", "Updated table into GM.")
-
-        # === Extra step after clicking OK ===
         try:
-            gm_window.minimize(); time.sleep(0.1)
-            gm_window.restore(); time.sleep(0.1)
-            gm_window.activate(); time.sleep(0.1)
+            # ============================================================
+            # PHASE: matching (all-or-nothing validation gate, Section 4)
+            # ============================================================
+            #
+            # `matched_pairs` replaces the earlier flat `matched_tables`
+            # list (Section 3, locked): each entry keeps the original
+            # exported layer name alongside the table it matched to,
+            # instead of discarding that information. Any layer that
+            # fails to match aborts the ENTIRE operation before any data
+            # is read, written, or touched in Global Mapper — no partial
+            # updates (Section 4).
+            try:
+                with engine.begin() as conn:
+                    db_tables = [r[0] for r in conn.execute(
+                        text("SELECT table_name FROM information_schema.tables WHERE table_schema=:s AND table_type='BASE TABLE'"),
+                        {"s": DB_SCHEMA}
+                    )]
 
-            real_mouse_pos = pyautogui.position()
-            left_panel_x = gm_window.left + 25
-            left_panel_y = gm_window.top + 500
-            pyautogui.moveTo(left_panel_x, left_panel_y)
-            pyautogui.rightClick()
-            pyautogui.moveTo(real_mouse_pos)
+                db_lower = {t.lower(): t for t in db_tables}
+                schema_prefix = DB_SCHEMA + "_"
+                matched_pairs = []      # [(original_layer_name, matched_table_name), ...]
+                unmatched_layers = []   # layers with no usable match at all
 
-            pyautogui.press("down", presses=3, interval=0.001)
-            pyautogui.press("enter")
+                for layer in fiona.listlayers(save_path):
+                    lyr_name = layer.strip()
+                    if lyr_name.lower().startswith(schema_prefix.lower()):
+                        stripped = lyr_name[len(schema_prefix):]
+                    else:
+                        stripped = lyr_name
+                    stripped = re.sub(r"\s+", "_", stripped)
 
-        except Exception as e:
-            print("⚠ Error performing post-update GM action:", e)
+                    if stripped.lower() in db_lower:
+                        matched_pairs.append((layer, db_lower[stripped.lower()]))
+                    else:
+                        match, score, _ = process.extractOne(
+                            stripped.lower(),
+                            [t.lower() for t in db_tables],
+                            scorer=fuzz.WRatio
+                        )
+                        if match is not None:
+                            matched_pairs.append((layer, db_lower[match]))
+                        else:
+                            unmatched_layers.append(layer)
+
+                _log(f"matched pairs ({len(matched_pairs)}): {matched_pairs}")
+                if unmatched_layers:
+                    _log(f"unmatched layers ({len(unmatched_layers)}): {unmatched_layers}")
+                    raise RuntimeError(
+                        "The following layer(s) could not be matched to any "
+                        f"table in schema '{DB_SCHEMA}': "
+                        f"{', '.join(unmatched_layers)}. Update Map was "
+                        "aborted before any data was touched."
+                    )
+            except Exception as match_err:
+                _log(f"MATCHING PHASE FAILED: {type(match_err).__name__}: {match_err}")
+                _log(f"MATCHING PHASE traceback:\n{traceback.format_exc()}")
+                _close_status_window()
+                messagebox.showerror("Update Map Failed - Matching", str(match_err))
+                return
+
+            # ============================================================
+            # PHASE: database read (Section 5 - technical + business
+            # validation failures both handled here)
+            # ============================================================
+            try:
+                read_results = []  # [(matched_table_name, GeoDataFrame), ...]
+                for layer_name, table_name in matched_pairs:
+                    sql = f'SELECT * FROM "{DB_SCHEMA}"."{table_name}"'
+                    gdf = gpd.read_postgis(sql, con=engine, geom_col="geom")
+
+                    # Business validation failure (Section 5, locked):
+                    # a table that reads back with zero features is not
+                    # a technical error - read_postgis() succeeded - but
+                    # every matched table is required to contain data.
+                    if gdf.empty:
+                        raise RuntimeError(
+                            f"The table '{DB_SCHEMA}.{table_name}' was read "
+                            "successfully but contains no features. Update "
+                            "Map requires every matched table to contain "
+                            "data, so the operation was aborted before any "
+                            "changes were made to Global Mapper."
+                        )
+                    read_results.append((table_name, gdf))
+                    _log(f"read '{DB_SCHEMA}.{table_name}': {len(gdf)} feature(s)")
+            except Exception as read_err:
+                _log(f"DATABASE READ PHASE FAILED: {type(read_err).__name__}: {read_err}")
+                _log(f"DATABASE READ PHASE traceback:\n{traceback.format_exc()}")
+                _close_status_window()
+                messagebox.showerror("Update Map Failed - Database Read", str(read_err))
+                return
+
+            # ============================================================
+            # PHASE: write local GeoPackage (Section 6 - filename scheme,
+            # mode="w"/"a" write order)
+            # ============================================================
+            try:
+                # DIAGNOSTIC (temporary): log which geopandas write backend
+                # is actually available/active in this build, before doing
+                # anything else. A prior run of this exact write loop
+                # failed on the second (append, mode="a") layer with
+                # "DriverError: NULL pointer error" - this could originate
+                # from either the pyogrio or the fiona/GDAL backend, and
+                # this has not yet been confirmed either way. This logging
+                # exists to answer that question directly rather than
+                # guess. Remove once the root cause is confirmed.
+                try:
+                    import geopandas as _gpd_diag
+                    _log(f"DIAG: geopandas version = {_gpd_diag.__version__}")
+                except Exception as diag_e:
+                    _log(f"DIAG: could not import/check geopandas: {diag_e}")
+                try:
+                    import pyogrio as _pyogrio_diag
+                    _log(f"DIAG: pyogrio version = {_pyogrio_diag.__version__} (available)")
+                except Exception as diag_e:
+                    _log(f"DIAG: pyogrio not available/importable: "
+                         f"{type(diag_e).__name__}: {diag_e}")
+
+                # DIAGNOSTIC (temporary): fiona/GDAL version info, requested
+                # to rule out a known bad Fiona/GDAL version combination
+                # before assuming this is a GDAL-environment-state issue.
+                try:
+                    _log(f"DIAG: fiona version = {fiona.__version__}")
+                except Exception as diag_e:
+                    _log(f"DIAG: could not read fiona.__version__: {diag_e}")
+                gdal_version_logged = False
+                for _attr_path in ("fiona.__gdal_version__",):
+                    try:
+                        _log(f"DIAG: fiona.__gdal_version__ = {fiona.__gdal_version__}")
+                        gdal_version_logged = True
+                        break
+                    except Exception:
+                        pass
+                if not gdal_version_logged:
+                    try:
+                        from fiona.env import GDALVersion as _GDALVersion_diag
+                        _log(f"DIAG: GDAL runtime version = {_GDALVersion_diag.runtime()}")
+                        gdal_version_logged = True
+                    except Exception as diag_e:
+                        _log(f"DIAG: could not determine GDAL version: "
+                             f"{type(diag_e).__name__}: {diag_e}")
+
+                # DIAGNOSTIC (temporary) - Experiment A + B: minimal
+                # reproduction, fully isolated from PostGIS, SQLAlchemy,
+                # and Global Mapper automation. Purpose: determine whether
+                # this build's bundled Fiona/GDAL can append a second
+                # layer to an existing GeoPackage AT ALL, independent of
+                # this pipeline's real data. Self-contained - creates its
+                # own tiny GeoDataFrames and its own temp files, cleans up
+                # after itself, and does not affect `read_results` or the
+                # real write attempt that follows. Remove this whole block
+                # once the root cause is confirmed.
+                try:
+                    from shapely.geometry import Point as _Point_diag
+                    _diag_gdf_1 = gpd.GeoDataFrame(
+                        {"id": [1]}, geometry=[_Point_diag(0, 0)], crs="EPSG:4326"
+                    )
+                    _diag_gdf_2 = gpd.GeoDataFrame(
+                        {"id": [1]}, geometry=[_Point_diag(1, 1)], crs="EPSG:4326"
+                    )
+
+                    # ---- Experiment A: two SEPARATE GeoPackage files ----
+                    _diag_a1_path = os.path.join(TEMP_DIR, "diag_expA_1.gpkg")
+                    _diag_a2_path = os.path.join(TEMP_DIR, "diag_expA_2.gpkg")
+                    _exp_a_ok = True
+                    try:
+                        _diag_gdf_1.to_file(_diag_a1_path, layer="layer1", driver="GPKG",
+                                             mode="w", engine="fiona")
+                        _log("DIAG Experiment A: write to separate file 1 - OK")
+                    except Exception as exp_a_err:
+                        _exp_a_ok = False
+                        _log(f"DIAG Experiment A: write to separate file 1 - FAILED: "
+                             f"{type(exp_a_err).__name__}: {exp_a_err}")
+                        _log(f"DIAG Experiment A (file 1) traceback:\n{traceback.format_exc()}")
+                    try:
+                        _diag_gdf_2.to_file(_diag_a2_path, layer="layer2", driver="GPKG",
+                                             mode="w", engine="fiona")
+                        _log("DIAG Experiment A: write to separate file 2 - OK")
+                    except Exception as exp_a_err:
+                        _exp_a_ok = False
+                        _log(f"DIAG Experiment A: write to separate file 2 - FAILED: "
+                             f"{type(exp_a_err).__name__}: {exp_a_err}")
+                        _log(f"DIAG Experiment A (file 2) traceback:\n{traceback.format_exc()}")
+                    for _p in (_diag_a1_path, _diag_a2_path):
+                        try:
+                            if os.path.exists(_p):
+                                os.remove(_p)
+                        except Exception:
+                            pass
+                    _log(f"DIAG Experiment A overall: {'PASS' if _exp_a_ok else 'FAIL'}")
+
+                    # ---- Experiment B: mode='w' then mode='a' on ONE
+                    # shared file (only run if Experiment A fully passed,
+                    # per the requested order - no point testing the
+                    # append path if even isolated single writes fail) ----
+                    # ---- Experiment B: mode='w' then mode='a' on ONE
+                    # shared file (only run if Experiment A fully passed,
+                    # per the requested order - no point testing the
+                    # append path if even isolated single writes fail) ----
+                    _exp_b_ok = False
+                    if _exp_a_ok:
+                        _diag_b_path = os.path.join(TEMP_DIR, "diag_expB.gpkg")
+                        try:
+                            _diag_gdf_1.to_file(_diag_b_path, layer="layer1", driver="GPKG",
+                                                 mode="w", engine="fiona")
+                            _log("DIAG Experiment B: mode='w' first layer - OK")
+                            _diag_gdf_2.to_file(_diag_b_path, layer="layer2", driver="GPKG",
+                                                 mode="a", engine="fiona")
+                            _log("DIAG Experiment B: mode='a' second layer - OK "
+                                 "(minimal reproduction did NOT fail)")
+                            _exp_b_ok = True
+                        except Exception as exp_b_err:
+                            _log(f"DIAG Experiment B: FAILED at mode='a' append: "
+                                 f"{type(exp_b_err).__name__}: {exp_b_err}")
+                            _log(f"DIAG Experiment B traceback:\n{traceback.format_exc()}")
+                        finally:
+                            try:
+                                if os.path.exists(_diag_b_path):
+                                    os.remove(_diag_b_path)
+                            except Exception:
+                                pass
+                    else:
+                        _log("DIAG Experiment B: skipped (Experiment A did not fully pass)")
+
+                    # ---- Experiment C1: EACH write wrapped in its OWN
+                    # fiona.Env() - tests whether GDAL driver/config state
+                    # is being lost between the "w" and "a" calls. Only
+                    # run if Experiment B failed (no point testing a fix
+                    # for a problem that didn't reproduce). ----
+                    _exp_c1_ok = False
+                    if not _exp_b_ok and _exp_a_ok:
+                        _diag_c1_path = os.path.join(TEMP_DIR, "diag_expC1.gpkg")
+                        try:
+                            with fiona.Env():
+                                _diag_gdf_1.to_file(_diag_c1_path, layer="layer1", driver="GPKG",
+                                                     mode="w", engine="fiona")
+                            _log("DIAG Experiment C1: mode='w' first layer (own fiona.Env) - OK")
+                            with fiona.Env():
+                                _diag_gdf_2.to_file(_diag_c1_path, layer="layer2", driver="GPKG",
+                                                     mode="a", engine="fiona")
+                            _log("DIAG Experiment C1: mode='a' second layer (own fiona.Env) "
+                                 "- OK (did NOT fail)")
+                            _exp_c1_ok = True
+                        except Exception as exp_c1_err:
+                            _log(f"DIAG Experiment C1: FAILED: "
+                                 f"{type(exp_c1_err).__name__}: {exp_c1_err}")
+                            _log(f"DIAG Experiment C1 traceback:\n{traceback.format_exc()}")
+                        finally:
+                            try:
+                                if os.path.exists(_diag_c1_path):
+                                    os.remove(_diag_c1_path)
+                            except Exception:
+                                pass
+                    else:
+                        _log("DIAG Experiment C1: skipped "
+                             f"({'Experiment B already passed' if _exp_b_ok else 'Experiment A did not pass'})")
+
+                    # ---- Experiment C2: ONE shared fiona.Env() wrapping
+                    # BOTH writes - tests a different hypothesis than C1
+                    # (persistent vs. per-call environment). Only run if
+                    # C1 failed. ----
+                    _exp_c2_ok = False
+                    if not _exp_c1_ok and _exp_a_ok and not _exp_b_ok:
+                        _diag_c2_path = os.path.join(TEMP_DIR, "diag_expC2.gpkg")
+                        try:
+                            with fiona.Env():
+                                _diag_gdf_1.to_file(_diag_c2_path, layer="layer1", driver="GPKG",
+                                                     mode="w", engine="fiona")
+                                _log("DIAG Experiment C2: mode='w' first layer (shared fiona.Env) - OK")
+                                _diag_gdf_2.to_file(_diag_c2_path, layer="layer2", driver="GPKG",
+                                                     mode="a", engine="fiona")
+                                _log("DIAG Experiment C2: mode='a' second layer (shared fiona.Env) "
+                                     "- OK (did NOT fail)")
+                            _exp_c2_ok = True
+                        except Exception as exp_c2_err:
+                            _log(f"DIAG Experiment C2: FAILED: "
+                                 f"{type(exp_c2_err).__name__}: {exp_c2_err}")
+                            _log(f"DIAG Experiment C2 traceback:\n{traceback.format_exc()}")
+                        finally:
+                            try:
+                                if os.path.exists(_diag_c2_path):
+                                    os.remove(_diag_c2_path)
+                            except Exception:
+                                pass
+                    else:
+                        _log("DIAG Experiment C2: skipped "
+                             f"({'C1 already passed' if _exp_c1_ok else 'prerequisite not met'})")
+
+                    # ---- Experiment D: PURE fiona API, no GeoPandas
+                    # wrapper at all. If this still fails, GeoPandas is
+                    # completely exonerated and the minimal reproducer is
+                    # Fiona itself - useful for filing an upstream issue.
+                    # Only run if BOTH C1 and C2 failed. ----
+                    if not _exp_c1_ok and not _exp_c2_ok and _exp_a_ok and not _exp_b_ok:
+                        _diag_d_path = os.path.join(TEMP_DIR, "diag_expD.gpkg")
+                        _diag_schema = {"geometry": "Point", "properties": {"id": "int"}}
+                        try:
+                            with fiona.open(_diag_d_path, "w", driver="GPKG", layer="layer1",
+                                             schema=_diag_schema, crs="EPSG:4326") as _diag_col:
+                                _diag_col.write({
+                                    "geometry": {"type": "Point", "coordinates": (0, 0)},
+                                    "properties": {"id": 1},
+                                })
+                            _log("DIAG Experiment D: pure fiona mode='w' first layer - OK")
+                            with fiona.open(_diag_d_path, "a", driver="GPKG", layer="layer2",
+                                             schema=_diag_schema, crs="EPSG:4326") as _diag_col:
+                                _diag_col.write({
+                                    "geometry": {"type": "Point", "coordinates": (1, 1)},
+                                    "properties": {"id": 1},
+                                })
+                            _log("DIAG Experiment D: pure fiona mode='a' second layer - OK "
+                                 "(did NOT fail - bug is in the GeoPandas wrapper layer, "
+                                 "not bare Fiona)")
+                        except Exception as exp_d_err:
+                            _log(f"DIAG Experiment D: FAILED (pure fiona, no GeoPandas): "
+                                 f"{type(exp_d_err).__name__}: {exp_d_err}")
+                            _log(f"DIAG Experiment D traceback:\n{traceback.format_exc()}")
+                            _log("DIAG Experiment D conclusion: bug reproduces in bare Fiona "
+                                 "- GeoPandas is exonerated, this is a Fiona/GDAL/PyInstaller "
+                                 "runtime issue")
+                        finally:
+                            try:
+                                if os.path.exists(_diag_d_path):
+                                    os.remove(_diag_d_path)
+                            except Exception:
+                                pass
+                    else:
+                        _log("DIAG Experiment D: skipped (an earlier experiment already "
+                             "passed, or prerequisites not met)")
+                except Exception as diag_block_err:
+                    _log(f"DIAG block (Experiments A/B/C1/C2/D) itself failed to run: "
+                         f"{type(diag_block_err).__name__}: {diag_block_err}")
+
+                if len(read_results) == 1:
+                    base_stem = f"updatemap_{read_results[0][0]}"
+                else:
+                    base_stem = f"updatemap_{len(read_results)}layers"
+
+                candidate = f"{base_stem}.gpkg"
+                copy_n = 1
+                while os.path.exists(os.path.join(TEMP_DIR, candidate)):
+                    candidate = f"{base_stem}_copy{copy_n}.gpkg"
+                    copy_n += 1
+                new_gpkg_path = os.path.join(TEMP_DIR, candidate)
+
+                # REQUIRED DEPENDENCY CHECK: this workflow's investigation
+                # (see Phase 1 v3 analysis addenda) reproducibly confirmed
+                # that Fiona 1.10.1 + GDAL 3.9.1's write path fails with a
+                # "NULL pointer error" when reopening the same GeoPackage
+                # for append (mode="a") - confirmed independent of this
+                # application (bare Fiona minimal reproduction, both
+                # inside the frozen exe and in a plain Python venv).
+                # pyogrio's write path was confirmed to succeed under the
+                # same conditions (both via GeoPandas' engine="pyogrio"
+                # and via pyogrio's own API directly). Production writes
+                # therefore require pyogrio explicitly - this check
+                # happens here, immediately before the write phase, not
+                # at module import time, so the rest of the application
+                # remains usable even if pyogrio is missing; only Update
+                # Map fails, with a precise cause. There is deliberately
+                # no silent fallback to the Fiona engine: a future
+                # environment missing pyogrio must fail loudly here
+                # rather than quietly reverting to the confirmed-broken
+                # append path.
+                try:
+                    import pyogrio
+                except ImportError as imp_err:
+                    raise ImportError(
+                        "Update Map requires the 'pyogrio' package for "
+                        "GeoPackage writing, but it is unavailable in "
+                        "this environment."
+                    ) from imp_err
+                _log(f"GeoPackage writer: engine=pyogrio {pyogrio.__version__}")
+
+                for i, (table_name, gdf) in enumerate(read_results):
+                    # Only the FIRST layer write may use mode="w" - every
+                    # subsequent layer in the same file must use mode="a"
+                    # (append). Using "w" for every layer would silently
+                    # overwrite each previous one, leaving only the last
+                    # layer in the file (Section 6 implementation note).
+                    write_mode = "w" if i == 0 else "a"
+                    # Production write engine: pyogrio (see dependency
+                    # check above). This is no longer a controlled
+                    # experiment - Experiments A-D and E1/E2 (elsewhere in
+                    # this diagnostic block and in the standalone
+                    # diagnose_append*.py scripts) confirmed Fiona's
+                    # append path reproducibly fails in this environment
+                    # while pyogrio's succeeds, under both the GeoPandas
+                    # wrapper and pyogrio's own direct API. Every other
+                    # stage of this pipeline (matching, DB read, GM load,
+                    # delete-old, cleanup) is unchanged - only the
+                    # GeoPackage write backend changed.
+                    gdf.to_file(new_gpkg_path, layer=table_name, driver="GPKG",
+                                mode=write_mode, engine="pyogrio")
+                    _log(f"wrote layer '{table_name}' "
+                         f"(mode={write_mode}, engine=pyogrio)")
+
+                # Defensive sanity check (Section 5, revised classification):
+                # given the matching gate and the per-table empty check
+                # above, this should never actually fire in normal
+                # operation - if it does, it indicates a programming bug
+                # or a GeoPackage-writer malfunction, not a real data
+                # state. Kept as a guard, not as expected business logic.
+                # Deliberately still verified via fiona.listlayers() (not
+                # pyogrio) - Fiona's read path was never implicated in
+                # the investigation and worked correctly throughout every
+                # experiment, so there is no reason to change it here.
+                written_layers = fiona.listlayers(new_gpkg_path)
+                if not written_layers:
+                    raise RuntimeError(
+                        "The exported GeoPackage contains no layers. "
+                        "Update Map was aborted before loading into "
+                        "Global Mapper."
+                    )
+                _log(f"local GeoPackage written: {new_gpkg_path} "
+                     f"(layers: {written_layers})")
+            except ImportError as dep_err:
+                _log(f"GEOPACKAGE WRITE PHASE FAILED: missing dependency - "
+                     f"{type(dep_err).__name__}: {dep_err}")
+                _log(f"GEOPACKAGE WRITE PHASE traceback:\n{traceback.format_exc()}")
+                _close_status_window()
+                messagebox.showerror(
+                    "Update Map Failed",
+                    "Update Map cannot continue because the required "
+                    "GeoPackage writer is unavailable in this "
+                    "installation. Please contact support."
+                )
+                return
+            except Exception as write_err:
+                _log(f"GEOPACKAGE WRITE PHASE FAILED: {type(write_err).__name__}: {write_err}")
+                _log(f"GEOPACKAGE WRITE PHASE traceback:\n{traceback.format_exc()}")
+                _close_status_window()
+                messagebox.showerror("Update Map Failed - GeoPackage Write", str(write_err))
+                return
+
+            # Matching/DB-read/write phase complete - close this status
+            # window before starting the Ctrl+O phase, which shows its
+            # own status window with its own message.
+            _close_status_window()
+
+            # ============================================================
+            # PHASE: Global Mapper Ctrl+O load
+            # ============================================================
+            #
+            # Section 2.3 (completion-signal detection) — RESOLVED this
+            # pass. A live test revealed GM's own foreground window title
+            # changes to "Loading GeoPackage {name} (X%)" while the file
+            # is being read, then reverts back to GM's normal title once
+            # done. This is a real completion signal, replacing the
+            # earlier flat 15s guess. Two bounded phases below:
+            #   1. Wait (briefly) for "Loading GeoPackage" to appear at
+            #      all - for small/fast files this may never be caught
+            #      (observed: a single-layer load completed inside one
+            #      1s log tick), which is not a failure.
+            #   2. If seen, wait for it to disappear - bounded by a
+            #      safety ceiling in case a large load genuinely takes
+            #      longer than observed so far.
+            try:
+                gm_window.minimize(); time.sleep(0.1)
+                gm_window.restore();  time.sleep(0.1)
+                gm_window.activate(); time.sleep(0.1)
+                _log(f"GM refocused before Ctrl+O | fg='{_fg_title()}'")
+                _dump_windows("before Ctrl+O")
+
+                pyautogui.hotkey("ctrl", "o")
+                _log("Ctrl+O sent")
+                _dump_windows("immediately after Ctrl+O")
+
+                # Exact title of GM's "Open Data File(s)" dialog is not
+                # yet confirmed (same open question as the earlier probe
+                # run) - give it a moment to render, log every visible
+                # window title so the actual title can be read from
+                # cama_automation.log and wired into a precise
+                # _wait_and_activate() call in a future pass.
+                time.sleep(0.5)
+                _dump_windows("0.5s after Ctrl+O")
+
+                pyautogui.typewrite(new_gpkg_path)
+                pyautogui.press("enter")
+                _log(f"typed '{new_gpkg_path}' and pressed Enter | fg='{_fg_title()}'")
+
+                # UX: a small, non-focus-stealing status window so this
+                # wait doesn't look like Update Map has frozen. Uses
+                # overrideredirect (no title bar/taskbar entry) and never
+                # calls focus_force()/grab_set(), so it cannot steal
+                # keyboard focus away from Global Mapper during this
+                # wait. Also pumps the Tk event loop each tick (root.
+                # update()) so Windows doesn't mark CAMA Tools as "(Not
+                # Responding)" during the wait, the same class of issue
+                # _wait_for_gpkg_export() already guards against
+                # elsewhere.
+                _status_win = None
+                try:
+                    _status_win = tk.Toplevel(root)
+                    _status_win.overrideredirect(True)
+                    _status_win.attributes("-topmost", True)
+                    _status_win.configure(bg="#2b2b2b")
+                    _status_label = tk.Label(
+                        _status_win,
+                        text="Verifying that the import completed successfully...",
+                        bg="#2b2b2b", fg="white", font=("Segoe UI", 9),
+                        padx=12, pady=8
+                    )
+                    _status_label.pack()
+                    _status_win.geometry(f"+{gm_window.left + 20}+{gm_window.top + 20}")
+                    _status_win.update_idletasks()
+                except Exception as status_win_err:
+                    _log(f"status window could not be created (non-fatal): "
+                         f"{type(status_win_err).__name__}: {status_win_err}")
+                    _status_win = None
+
+                _LOAD_APPEARANCE_TIMEOUT_S = 5.0   # bounded wait for "Loading GeoPackage" to appear
+                _LOAD_COMPLETION_TIMEOUT_S = 15.0  # bounded ceiling for it to disappear once seen
+
+                def _update_load_status(_text):
+                    try:
+                        if _status_win is not None:
+                            _status_label.config(text=_text)
+                        root.update()
+                    except tk.TclError:
+                        pass  # root/status window destroyed mid-wait (e.g. GM closed) - non-fatal
+
+                # Phase 1: wait briefly for "Loading GeoPackage" to appear
+                _phase1_start = time.monotonic()
+                _loading_seen = False
+                while time.monotonic() - _phase1_start < _LOAD_APPEARANCE_TIMEOUT_S:
+                    _fg = _fg_title()
+                    _log(f"load-wait phase 1: t={time.monotonic() - _phase1_start:.1f}s | fg='{_fg}'")
+                    if "loading geopackage" in _fg.lower():
+                        _loading_seen = True
+                        _log(f"'Loading GeoPackage' window appeared | fg='{_fg}'")
+                        break
+                    _update_load_status("Verifying that the import completed successfully...")
+                    time.sleep(0.2)
+
+                # Phase 2: only if seen - wait (bounded) for it to disappear
+                if _loading_seen:
+                    _phase2_start = time.monotonic()
+                    _loading_done = False
+                    while time.monotonic() - _phase2_start < _LOAD_COMPLETION_TIMEOUT_S:
+                        _fg = _fg_title()
+                        _elapsed = time.monotonic() - _phase2_start
+                        _log(f"load-wait phase 2: t={_elapsed:.1f}s | fg='{_fg}'")
+                        if "loading geopackage" not in _fg.lower():
+                            _loading_done = True
+                            _log(f"'Loading GeoPackage' window closed - load complete | fg='{_fg}'")
+                            break
+                        _update_load_status(
+                            f"Verifying that the import completed successfully... "
+                            f"({_elapsed:.0f}s / {_LOAD_COMPLETION_TIMEOUT_S:.0f}s)"
+                        )
+                        time.sleep(0.2)
+                    if not _loading_done:
+                        _log(f"WARNING: 'Loading GeoPackage' window still present after "
+                             f"{_LOAD_COMPLETION_TIMEOUT_S:.0f}s - proceeding anyway")
+                else:
+                    _log(f"'Loading GeoPackage' window not observed within "
+                         f"{_LOAD_APPEARANCE_TIMEOUT_S:.0f}s - likely too fast to catch "
+                         "(small file); proceeding")
+
+                try:
+                    if _status_win is not None:
+                        _status_win.destroy()
+                except Exception:
+                    pass
+
+                _dump_windows("after Ctrl+O load wait")
+                _log("Ctrl+O load wait complete")
+            except Exception as load_err:
+                _log(f"GLOBAL MAPPER LOAD PHASE FAILED: {type(load_err).__name__}: {load_err}")
+                _log(f"GLOBAL MAPPER LOAD PHASE traceback:\n{traceback.format_exc()}")
+                messagebox.showerror("Update Map Failed - Global Mapper Load", str(load_err))
+                return
+
+            # ============================================================
+            # PHASE: close the old (superseded) layer
+            # ============================================================
+            #
+            # Relies on Section 2.5 (confirmed under live automation):
+            # the previously-highlighted layer stays highlighted through
+            # the Ctrl+O load, so "Close Selected Overlays?" targets the
+            # OLD layer with no re-select step needed. "Yes" is confirmed
+            # (via live screenshot) to be the default-focused button, so
+            # a single Enter accepts it automatically - no manual click
+            # required from the user for this step.
+            close_dialog_appeared = False
+            try:
+                _dump_windows("before post-load right-click")
+                gm_window.minimize(); time.sleep(0.1)
+                gm_window.restore();  time.sleep(0.1)
+                gm_window.activate(); time.sleep(0.1)
+                _log(f"post-load: GM refocused | fg='{_fg_title()}'")
+
+                real_mouse_pos = pyautogui.position()
+                left_panel_x = gm_window.left + 25
+                left_panel_y = gm_window.top + 500
+                pyautogui.moveTo(left_panel_x, left_panel_y)
+                pyautogui.rightClick()
+                pyautogui.moveTo(real_mouse_pos)
+                _log(f"post-load: right-click menu invoked | fg='{_fg_title()}'")
+
+                pyautogui.press("down", presses=3, interval=0.001)
+                pyautogui.press("enter")
+                _log(f"post-load: down x3 + enter sent | fg='{_fg_title()}'")
+
+                close_dialog_appeared = _wait_and_activate("Close Selected Overlays?", timeout=2.0)
+                if close_dialog_appeared:
+                    _log("post-load: 'Close Selected Overlays?' dialog appeared "
+                         f"| fg='{_fg_title()}'")
+                    pyautogui.press("enter")
+                    _log("post-load: 'Close Selected Overlays?' confirmed "
+                         f"(auto Yes) | fg='{_fg_title()}'")
+                else:
+                    _log("post-load: WARNING - 'Close Selected Overlays?' dialog "
+                         f"did not appear within timeout | fg='{_fg_title()}'")
+                _dump_windows("after post-load down x3 + enter")
+            except Exception as delete_err:
+                _log(f"DELETE-OLD-LAYER PHASE FAILED: {type(delete_err).__name__}: {delete_err}")
+                _log(f"DELETE-OLD-LAYER PHASE traceback:\n{traceback.format_exc()}")
+                messagebox.showerror("Update Map Failed - Closing Old Layer", str(delete_err))
+                return
+
+            if not close_dialog_appeared:
+                # Locked (Section 5): this is its own distinct, reported
+                # failure, not a silent fallthrough to a generic success
+                # message. The new data was loaded, but the old layer's
+                # removal could not be confirmed.
+                _log("Update Map FAILED: 'Close Selected Overlays?' dialog "
+                     "did not appear where expected")
+                messagebox.showerror(
+                    "Update Map Failed - Closing Old Layer",
+                    "Global Mapper did not show the 'Close Selected "
+                    "Overlays?' confirmation after loading the new data. "
+                    "The new data was loaded, but the old layer may not "
+                    "have been closed. Please check Global Mapper's "
+                    "Control Center manually before running Update Map "
+                    "again."
+                )
+                return
+
+            # NOTE: no rename step here, by deliberate decision (Phase 1
+            # v3 analysis, Section 7) - not an omission. Layer identity
+            # in this workflow never depends on the display name: it
+            # always comes from fiona.listlayers() output and database
+            # table names (Section 6's guardrail). The locked filename
+            # scheme already signals to the user, by name, that the
+            # layer came from Update Map. Renaming the Control Center
+            # entry would be purely cosmetic, adds the most fragile
+            # UI-automation step in this whole workflow, and fixes no
+            # actual data-correctness concern.
+
+            # ============================================================
+            # PHASE: success + cleanup
+            # ============================================================
+            #
+            # Reaching this point means every phase above completed
+            # without raising an exception (Section 3/8 wording,
+            # deliberately not "everything imported successfully" - this
+            # workflow verifies DB read, GeoPackage write, Ctrl+O load,
+            # and the close-old-layer step, but has no scripting API to
+            # directly inspect Global Mapper's internal Control Center
+            # state). No separate `imported_tables` accumulator is
+            # needed - `matched_pairs` already accurately reflects what
+            # was processed, since any failure above would have already
+            # returned before this point (Section 3, locked).
+            _log(f"Update Map complete. Tables used: {matched_pairs}")
+            mapping_lines = "\n".join(
+                f"  {layer_name}  \u2192  {table_name}"
+                for layer_name, table_name in matched_pairs
+            )
+            messagebox.showinfo(
+                "Update Map",
+                "Update Map completed successfully.\n\n"
+                f"Schema: {DB_SCHEMA}\n\n"
+                "Tables used for this Update Map operation:\n"
+                f"{mapping_lines}\n\n"
+                "The workspace has been updated."
+            )
+
+            # Cleanup: remove BOTH the original export (used only to
+            # read layer names) AND the new local GeoPackage written
+            # above. Non-fatal if this fails - the operation already
+            # succeeded from the user's perspective.
+            try:
+                if os.path.exists(save_path):
+                    os.remove(save_path)
+                if os.path.exists(new_gpkg_path):
+                    os.remove(new_gpkg_path)
+                _log("temporary files cleaned up")
+            except Exception as cleanup_err:
+                _log(f"WARNING: cleanup failed (non-fatal): "
+                     f"{type(cleanup_err).__name__}: {cleanup_err}")
+
+        finally:
+            # FIX: engine (and its connection pool) was previously never
+            # disposed on any exit path other than the whole outer try
+            # block completing successfully. Any exception raised after
+            # `engine = create_engine(...)` above skipped cleanup
+            # entirely, leaving the pool (and, if still checked out, an
+            # active connection) orphaned. Mirrors the equivalent fix
+            # already applied in update_database_from_geopackage().
+            # Wrapped in try/except since dispose() itself must never
+            # raise a new error on top of whatever is already being
+            # reported by the outer except below.
+            try:
+                engine.dispose()
+            except Exception:
+                pass
 
         # ---- Cleanup ----
         if os.path.exists(save_path):
