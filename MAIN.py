@@ -1,6 +1,7 @@
-
 import atexit
 import signal
+import logging
+from datetime import datetime
 
 TOOL_PROCESSES = []
 
@@ -57,6 +58,96 @@ except Exception as e:
     from tkinter import messagebox
     messagebox.showerror("Folder Error", f"Could not create {TEMP_DIR}:\n{e}")
     sys.exit(1)
+
+
+# ── Diagnostic logging for GM export automation ──────────────────────
+# Persistent breadcrumb trail for update_database_from_geopackage() and
+# update_map_and_select_recorded(), so a failed run can be reconstructed
+# after the fact instead of relying on console output that scrolls away
+# or disappears if the app is force-closed.
+#
+# Scope: diagnostic instrumentation only for the two GM-automation
+# entry points and _wait_for_gpkg_export(). Does not touch DB write
+# logic, matching logic, or any other part of the application.
+_LOG_PATH = os.path.join(TEMP_DIR, "cama_automation.log")
+
+
+def _log(msg):
+    """
+    Write one timestamped line to both console and the persistent log
+    file. Logging must never break automation — any failure to write
+    the file is swallowed silently; the console print always happens.
+    Opens/closes the file per call (not a held handle) so a force-kill
+    mid-export loses at most one line.
+    """
+    line = f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] {msg}"
+    print(line, flush=True)
+    try:
+        with open(_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _log_session_start(func_name):
+    """Marks the start of a new automation run in the log file."""
+    _log(f"{'=' * 60}")
+    _log(f"SESSION START: {func_name}")
+
+
+def _fg_title():
+    """
+    Best-effort foreground window title, for logging which window
+    actually has focus at a given automation step. Wraps the existing
+    get_foreground_hwnd()/hwnd_title() helpers (defined later in this
+    module, resolved at call time — safe since this is never invoked
+    before those are defined during normal startup). Never raises.
+    """
+    try:
+        return hwnd_title(get_foreground_hwnd())
+    except Exception as e:
+        return f"<fg lookup failed: {e}>"
+
+
+def _dump_windows(context):
+    """
+    Logs all visible top-level window titles at a decision point, so
+    an unexpected GM dialog (e.g. a filter/license/permission dialog)
+    that intercepted the keystroke sequence shows up by name in the
+    log instead of being invisible.
+    """
+    try:
+        titles = [t for t in gw.getAllTitles() if t.strip()]
+        _log(f"WINDOW DUMP ({context}): {titles}")
+    except Exception as e:
+        _log(f"WINDOW DUMP ({context}) failed: {e}")
+
+
+# ── GM export automation timeouts (seconds) ─────────────────────────
+# These bound the _wait_for_gpkg_export() poll that replaces the old
+# unbounded `while True:` file-stability loops. Tuned against observed
+# production exports of 11,000+ parcel features — see analysis notes.
+#
+# EXPORT_APPEARANCE_TIMEOUT_S:
+#   Max wait for the .gpkg file to EXIST at all. In a healthy run GM
+#   creates the file within seconds of the Save dialog confirming.
+#   If it never appears, the export keystroke sequence was almost
+#   certainly intercepted by an unexpected GM dialog (e.g. "Lidar
+#   Filter Settings", a license prompt). This is the parameter that
+#   catches the reported hang.
+#
+# EXPORT_STALL_TIMEOUT_S:
+#   Max time the file may exist WITHOUT its byte size changing before
+#   we declare the export dead (export started, then died behind a
+#   dialog). GPKG writes are streaming SQLite inserts — a live export
+#   grows continuously.
+#
+# EXPORT_HARD_TIMEOUT_S:
+#   Absolute wall-clock ceiling regardless of activity. Guarantees
+#   boundedness. ~10x margin over the largest observed real export.
+EXPORT_APPEARANCE_TIMEOUT_S = 90
+EXPORT_STALL_TIMEOUT_S = 180
+EXPORT_HARD_TIMEOUT_S = 900
 
 
 TOOL_MODULES = {
@@ -398,6 +489,388 @@ def extract_actual_name(layer_name: str) -> str:
     return layer_name.strip().lower()
 
 
+def _cleanup_and_raise(save_path, msg):
+    """
+    Best-effort removal of a partial/never-completed export file, then
+    fail loud. GM may still hold the file handle if the export is merely
+    slow rather than dead — removal failure is swallowed because the
+    pre-export os.remove() at the start of each update function is the
+    guaranteed recovery path on the next attempt.
+    """
+    try:
+        if os.path.exists(save_path):
+            os.remove(save_path)
+    except Exception:
+        pass
+    raise RuntimeError(msg)
+
+
+def _wait_for_gpkg_export(save_path, tk_root):
+    """
+    Bounded poll that waits for Global Mapper to finish exporting a
+    GeoPackage. Used by both update_database_from_geopackage() and
+    update_map_and_select_recorded().
+
+    SUCCESS — ALL THREE conditions must hold on the same tick:
+      1. File size > 1000 bytes AND unchanged for 2 consecutive 1 s
+         checks (fast pre-filter; original criterion).
+      2. No SQLite sidecar file present (save_path + "-journal" /
+         "-wal"). While a sidecar exists the write is still in flight,
+         even if the main file's size sits perfectly still — SQLite
+         journals activity into the sidecar and only folds it into the
+         main file on commit.
+      3. Validity probe + LAYER-LIST STABILITY: fiona.listlayers(save_path)
+         must succeed, return at least one layer, AND that exact layer
+         list must remain UNCHANGED for LAYER_STABILITY_SECONDS (15)
+         real wall-clock seconds before the export is declared complete.
+         This is time-based, not a fixed count of probe attempts —
+         probe cadence itself varies (it only runs once file size has
+         re-stabilized, which can take a variable number of ticks), so
+         a tick-count threshold would give an inconsistent real-world
+         wait time. Size stability alone is NOT a validity signal — GM
+         can pause > 2 s mid-write (reprojection of large layers),
+         leaving a header-only or mid-transaction file that passes the
+         size check but fails GDAL open with "Failed to open dataset
+         (flags=68)". Observed in production. Layer-list stability was
+         added after confirming (via live instrumentation) that
+         FILE-SIZE stability alone is also insufficient for multi-layer
+         exports: a small layer (e.g. 111 features) can finish and
+         stabilize the file size while GM is still actively appending
+         much larger layers (e.g. an 11,911-feature layer) in the
+         background — a real observed gap of 6.5+ seconds between
+         "file size looks done" and "all layers actually present", and
+         up to 4.6s between two later layers appearing. The 15s window
+         leaves a wide safety margin above that observed worst case for
+         larger datasets on other machines. A failed probe, a
+         zero-layer result, or a CHANGED layer list all mean "not ready
+         yet", never "error" — they reset the relevant tracking and
+         polling continues; the bounded exits below are the only
+         failure paths.
+
+    ACTIVITY SIGNAL (stall clock):
+        last_change resets on ANY of: main file size change, sidecar
+        size change, sidecar appearance/disappearance, OR main file
+        mtime change. The mtime check exists because SQLite can rewrite
+        pages in place during GM's finalize phase (spatial index build,
+        transaction commit on large exports) — the file size stays
+        perfectly flat while real write activity continues. Without
+        this, size-only tracking could start the stall clock on a
+        healthy large export and false-abort it at EXPORT_STALL_TIMEOUT_S
+        even though GM is still actively working. mtime granularity on
+        NTFS (~10 ms) is far finer than the 1 s poll interval, so this
+        adds a reliable activity signal without weakening the existing
+        size/sidecar checks — it only ever makes the stall clock MORE
+        lenient toward genuinely active exports, never less strict
+        about genuinely dead ones.
+
+    FAILURE — all raise RuntimeError with actionable text, which routes
+    through each caller's existing except handler (messagebox.showerror):
+      - EXPORT_APPEARANCE_TIMEOUT_S: file never created — the export
+        keystroke sequence was intercepted by an unexpected GM dialog.
+      - EXPORT_STALL_TIMEOUT_S: no write activity (main file OR sidecar
+        OR mtime) for this long without passing the success gate. The
+        message distinguishes the case where the file was produced but
+        never became a readable GeoPackage (probe kept failing).
+      - EXPORT_HARD_TIMEOUT_S: absolute ceiling; guarantees the loop
+        always terminates.
+
+    DIAGNOSTIC LOGGING:
+        Every tick writes one line to _LOG_PATH via _log() — elapsed
+        time, file existence, size, mtime age, sidecar state, and
+        stability count. Probe exceptions are logged verbatim (never
+        swallowed silently) so a failed run can be reconstructed after
+        the fact to distinguish an export that never became valid
+        (probe kept raising) from one that was simply slow.
+
+    EVENT PUMPING:
+        tk_root.update() is called once per iteration so Tk keeps
+        servicing the Windows message queue. Without this, even a
+        legitimate multi-minute export makes Windows mark the app
+        "(Not Responding)" because this loop runs on the Tk main thread
+        and blocks mainloop(). Side effect: the UI is LIVE during the
+        wait — reentrancy via the two Update buttons is blocked by
+        _gm_export_guard, which must wrap every caller of this helper.
+
+        If tk_root has been destroyed mid-wait (user closed Global
+        Mapper → monitor_gm_state() → root.destroy()), update() raises
+        TclError; we convert that to a loud abort instead of an
+        unhandled traceback.
+    """
+    import time
+    start = time.monotonic()
+    last_size = -1
+    stable_count = 0
+    last_change = start          # last observed write activity (main OR sidecar OR mtime)
+    last_mtime = None            # last observed main-file mtime, for activity tracking
+    sidecar_sizes = {}           # path -> last seen size, for activity tracking
+    probe_ever_failed = False    # drives the stall-timeout message wording
+    tick = 0                     # poll iteration counter, for log readability
+    last_layers = None           # last observed layer list from a successful probe
+    layers_last_change = None    # monotonic timestamp when last_layers last actually changed
+    LAYER_STABILITY_SECONDS = 15 # required seconds of a genuinely UNCHANGED layer list before
+                                  # declaring the export complete. Time-based (not tick-count-based)
+                                  # so it isn't sensitive to how often the probe actually runs (probe
+                                  # cadence depends on file-size stability, which varies). Set well
+                                  # above the largest layer-to-layer gap observed in live testing
+                                  # (4.6s between a LandParcel and RoadNetwork layer appearing) to
+                                  # leave a wide safety margin for larger datasets on other machines.
+
+    sidecar_paths = (save_path + "-journal", save_path + "-wal")
+
+    _log(f"poll start: save_path={save_path}")
+
+    while True:
+        # Pump the Tk/Windows message queue (see docstring).
+        try:
+            tk_root.update()
+        except tk.TclError:
+            _cleanup_and_raise(
+                save_path,
+                "Global Mapper (or the CAMA Tools window) was closed while "
+                "waiting for the export to finish. Export aborted."
+            )
+
+        now = time.monotonic()
+        exists = os.path.exists(save_path)
+
+        if exists:
+            # --- condition 1: size stability (original criterion) ---
+            current_size = os.path.getsize(save_path)
+            if current_size == last_size and current_size > 1000:
+                stable_count += 1
+            else:
+                stable_count = 0
+            if current_size != last_size:
+                last_change = now
+            last_size = current_size
+
+            # --- activity signal: mtime (catches in-place page rewrites) ---
+            # SQLite can rewrite existing pages during GM's finalize phase
+            # (spatial index build, transaction commit) without changing
+            # file size. This counts as write activity for the stall
+            # clock even when condition 1 sees no size change — it never
+            # participates in the success gate itself, only in whether
+            # the stall timer resets.
+            try:
+                current_mtime = os.path.getmtime(save_path)
+            except OSError:
+                current_mtime = last_mtime  # vanished between exists() and getmtime()
+            if last_mtime is not None and current_mtime != last_mtime:
+                last_change = now
+            last_mtime = current_mtime
+
+            # --- condition 2: sidecar activity / presence ---
+            # A present sidecar means the write is in flight regardless
+            # of main-file size. Sidecar growth AND sidecar removal
+            # (= commit) both count as write activity for the stall clock.
+            sidecar_active = False
+            for sp in sidecar_paths:
+                if os.path.exists(sp):
+                    sidecar_active = True
+                    try:
+                        ssz = os.path.getsize(sp)
+                    except OSError:
+                        ssz = -1  # vanished between exists() and getsize()
+                    if sidecar_sizes.get(sp) != ssz:
+                        sidecar_sizes[sp] = ssz
+                        last_change = now
+                elif sp in sidecar_sizes:
+                    del sidecar_sizes[sp]
+                    last_change = now  # commit just happened — activity
+
+            if stable_count >= 2:
+                if sidecar_active:
+                    # Main file looks stable but SQLite is still working.
+                    # Not ready — keep waiting.
+                    stable_count = 0
+                else:
+                    # --- condition 3: validity probe + layer-list stability ---
+                    #
+                    # FIXED: previously returned as soon as this probe
+                    # succeeded with a non-empty layer list. Confirmed via
+                    # live [WATCH] instrumentation (see project history)
+                    # that this is NOT sufficient for multi-layer exports:
+                    # when GM exports several layers of very different
+                    # size (e.g. a 111-feature POI layer alongside an
+                    # 11,911-feature LandParcel layer), the small layer
+                    # can finish first and cause the FILE SIZE to look
+                    # stable (passing condition 1) while GM is still
+                    # actively writing the remaining layers in the
+                    # background. A real observed run: file size stable
+                    # and probe succeeded at t=2.1s showing only 1 of 3
+                    # layers; the 2nd layer did not appear until t=4.0s,
+                    # the 3rd not until t=8.6s — a 6.5s gap the old
+                    # single-probe gate completely missed, silently
+                    # importing only the layers present at that moment.
+                    #
+                    # Fix: a single successful read is not enough — the
+                    # layer LIST returned by the probe must remain
+                    # UNCHANGED for LAYER_STABILITY_SECONDS of real
+                    # elapsed time before declaring the export complete.
+                    # A changed layer list (a new layer appeared) resets
+                    # that clock AND counts as write activity for the
+                    # stall clock, same as size/sidecar/mtime changes.
+                    try:
+                        current_layers = fiona.listlayers(save_path)
+                        if current_layers:
+                            if current_layers != last_layers:
+                                _log(f"poll: layer list changed at tick {tick}: "
+                                     f"{last_layers} -> {current_layers}")
+                                last_layers = current_layers
+                                layers_last_change = now
+                                last_change = now  # a growing layer list is write activity
+
+                            layers_stable_duration = (
+                                now - layers_last_change if layers_last_change is not None else 0.0
+                            )
+                            if layers_stable_duration >= LAYER_STABILITY_SECONDS:
+                                _log(f"poll: probe succeeded and layer list stable for "
+                                     f"{layers_stable_duration:.1f}s at tick {tick} — "
+                                     f"export complete. Final layers: {current_layers}")
+                                return  # success — file is a readable GPKG with a stable layer set
+                            else:
+                                # Not yet layer-stable — require file size to
+                                # re-prove stability again before the next
+                                # probe attempt (same pattern as the other
+                                # "not ready" paths below); the layer-stability
+                                # clock (layers_last_change) is untouched by
+                                # this reset, so it keeps counting correctly
+                                # across multiple probe cycles.
+                                stable_count = 0
+                        else:
+                            probe_ever_failed = True   # zero layers: not ready
+                            stable_count = 0
+                            last_layers = None
+                            layers_last_change = None
+                            _log(f"poll: probe returned zero layers at tick {tick} — not ready")
+                    except Exception as probe_err:
+                        probe_ever_failed = True
+                        stable_count = 0
+                        last_layers = None
+                        layers_last_change = None
+                        _log(f"poll: probe FAILED at tick {tick}: "
+                             f"{type(probe_err).__name__}: {probe_err}")
+
+        # --- per-tick diagnostic log ---
+        mtime_age = (now - last_change)
+        _layers_stable_for = (
+            f"{now - layers_last_change:.1f}s" if layers_last_change is not None else "n/a"
+        )
+        _log(
+            f"poll t={now - start:.1f}s tick={tick} exists={exists} "
+            f"size={last_size if exists else '-'} "
+            f"stall_age={mtime_age:.1f}s stable={stable_count} "
+            f"layers_stable_for={_layers_stable_for} last_layers={last_layers} "
+            f"sidecars={list(sidecar_sizes.keys())}"
+        )
+        tick += 1
+
+        # --- bounded exits (fail loud, never spin forever) ---
+        if not exists and (now - start) > EXPORT_APPEARANCE_TIMEOUT_S:
+            _log(f"poll ABORT: appearance timeout at t={now - start:.1f}s")
+            _dump_windows("export appearance timeout")
+            _cleanup_and_raise(
+                save_path,
+                f"Global Mapper never created the export file within "
+                f"{EXPORT_APPEARANCE_TIMEOUT_S} seconds.\n\n"
+                f"The export keystroke sequence was most likely intercepted "
+                f"by an unexpected dialog in Global Mapper (e.g. 'Lidar "
+                f"Filter Settings', a license prompt, or a permission "
+                f"dialog).\n\n"
+                f"Close any open dialog in Global Mapper and try again."
+            )
+        if exists and (now - last_change) > EXPORT_STALL_TIMEOUT_S:
+            _log(f"poll ABORT: stall timeout at t={now - start:.1f}s "
+                 f"(probe_ever_failed={probe_ever_failed})")
+            _dump_windows("export stall timeout")
+            if probe_ever_failed:
+                _cleanup_and_raise(
+                    save_path,
+                    f"Global Mapper produced an export file, but it never "
+                    f"became a readable GeoPackage within "
+                    f"{EXPORT_STALL_TIMEOUT_S} seconds of the last write "
+                    f"activity — the export likely died mid-write behind "
+                    f"a dialog.\n\n"
+                    f"Check Global Mapper for an open dialog or error, "
+                    f"close it, and try again."
+                )
+            _cleanup_and_raise(
+                save_path,
+                f"The export file stopped growing for "
+                f"{EXPORT_STALL_TIMEOUT_S} seconds without completing. "
+                f"Global Mapper may be blocked by a dialog.\n\n"
+                f"Close any open dialog in Global Mapper and try again."
+            )
+        if (now - start) > EXPORT_HARD_TIMEOUT_S:
+            _log(f"poll ABORT: hard timeout at t={now - start:.1f}s")
+            _dump_windows("export hard timeout")
+            _cleanup_and_raise(
+                save_path,
+                f"Export did not complete within "
+                f"{EXPORT_HARD_TIMEOUT_S // 60} minutes.\n\n"
+                f"Close any open Global Mapper dialog and retry."
+            )
+
+        time.sleep(1)
+
+
+# ── Reentrancy guard for GM keystroke automation ─────────────────────
+_gm_automation_in_flight = False
+
+
+def _gm_export_guard(func):
+    """
+    Serializes the GM keystroke-automation entry points
+    (update_database_from_geopackage / update_map_and_select_recorded).
+
+    Why this exists: _wait_for_gpkg_export() pumps the Tk event loop
+    (root.update()) to prevent Windows marking the app "(Not
+    Responding)" during a slow export. That makes the UI live during
+    the wait, so a second click on EITHER Update button could start a
+    second blind keystroke sequence against the same Global Mapper
+    window. Previously the frozen UI accidentally acted as a mutex;
+    this guard makes that protection explicit.
+
+    - Disables BOTH update buttons for the duration — both drive
+      keystroke automation against the same GM window, so cross-
+      function interleaving is as dangerous as same-function reentry.
+    - The module-level flag is belt-and-braces against click events
+      queued before the disable takes effect. Re-entry is a silent
+      no-op by design: with the buttons disabled it can only trip via
+      that race, and it is not a user-facing state.
+    - The finally block covers every exit path: early returns
+      (credential guard, GM window not found, locked temp file),
+      export failure/timeout, DB failure, and success. Widget access
+      is wrapped because root may have been destroyed mid-operation
+      (GM closed → monitor_gm_state() → root.destroy()).
+
+    NOTE: buttons are looked up as globals at CALL time, so decorating
+    these functions before update_btn / update_map_btn exist is safe —
+    both buttons are created before any click can occur.
+    """
+    def wrapper(*args, **kwargs):
+        global _gm_automation_in_flight
+        if _gm_automation_in_flight:
+            return  # silent no-op on re-entry attempt (see docstring)
+        _gm_automation_in_flight = True
+        try:
+            for b in (update_btn, update_map_btn):
+                try:
+                    b.config(state="disabled")
+                except Exception:
+                    pass
+            return func(*args, **kwargs)
+        finally:
+            _gm_automation_in_flight = False
+            for b in (update_btn, update_map_btn):
+                try:
+                    b.config(state="normal")
+                except Exception:
+                    pass
+    return wrapper
+
+
+@_gm_export_guard
 def update_database_from_geopackage():
     import pygetwindow as gw
     import pyautogui
@@ -411,9 +884,60 @@ def update_database_from_geopackage():
     from geoalchemy2 import Geometry  # needed for dtype in to_postgis
 
     pyautogui.FAILSAFE = False
+    _log_session_start("update_database_from_geopackage")
+
+    def _wait_and_activate(title, timeout=2.0, poll=0.1):
+        """
+        Poll for a top-level window whose title matches `title` and
+        activate it as soon as it appears, instead of assuming a fixed
+        sleep is long enough on every machine. Used before the Tip and
+        GeoPackage Export Options dialogs' confirming Enter keypress —
+        both are GM-rendered dialogs whose appearance timing is not
+        guaranteed to be constant across machines/load.
+
+        Bounded by `timeout` so a dialog that never appears (e.g. GM's
+        flow changed, or "Don't Show This Again" was previously checked
+        on the Tip dialog) fails safe: the caller logs a WARNING and
+        still sends the keystroke, matching this function's existing
+        "never hang silently, always leave a log trail" pattern (see
+        _wait_for_gpkg_export's diagnostic logging for the same philosophy).
+
+        Local to update_database_from_geopackage() — not shared with
+        update_map_and_select_recorded() or any other function, per this
+        task's scope (only this function may be modified).
+        """
+        elapsed = 0.0
+        while elapsed < timeout:
+            wins = gw.getWindowsWithTitle(title)
+            if wins:
+                wins[0].activate()
+                return True
+            time.sleep(poll)
+            elapsed += poll
+        return False
+
+
 
     if not all([stored_username, stored_password]):
+        _log("ABORT: not logged in")
         messagebox.showerror("Error", "You must log in first before updating the database.")
+        return
+
+    # ── Manual pre-flight confirmation ──────────────────────────────────
+    # The GM right-click context menu has NO "Layer -> EXPORT..." path at
+    # all when zero layers are highlighted (a different, canvas-level menu
+    # opens instead — confirmed by screenshot). There is no scripting API
+    # in use here to detect highlight state programmatically, so this is a
+    # manual checkpoint, not real validation: a user who clicks "Yes"
+    # without actually highlighting a layer will still hit the wrong menu
+    # downstream. This dialog only prevents the *unattended/forgot* case.
+    proceed = messagebox.askyesno(
+        "Confirm Layer Selection",
+        "Make sure at least one layer is highlighted in Global Mapper "
+        "before continuing.\n\nProceed with Update Database?"
+    )
+    if not proceed:
+        _log("ABORT: user cancelled at pre-automation confirmation dialog")
         return
 
     try:
@@ -424,12 +948,20 @@ def update_database_from_geopackage():
                 gm_window = w
                 break
         if not gm_window:
+            _log("ABORT: Global Mapper window not found")
+            _dump_windows("GM window not found")
             messagebox.showerror("Error", "Global Mapper window not found.")
             return
+
+        _log(f"GM window found: '{gm_window.title}' "
+             f"rect=({gm_window.left}, {gm_window.top}, "
+             f"{gm_window.width}x{gm_window.height}) "
+             f"minimized={gm_window.isMinimized}")
 
         gm_window.minimize(); time.sleep(0.1)
         gm_window.restore(); time.sleep(0.1)
         gm_window.activate(); time.sleep(0.3)
+        _log(f"GM focused | fg='{_fg_title()}'")
 
         # Save path for exported GPKG
         save_path = os.path.join(TEMP_DIR, "savetodb.gpkg")
@@ -438,11 +970,16 @@ def update_database_from_geopackage():
         if os.path.exists(save_path):
             try:
                 os.remove(save_path)
+                _log(f"pre-export cleanup: removed stale {save_path}")
             except Exception as e:
+                _log(f"ABORT: could not delete stale export file: {e}")
                 messagebox.showerror("File Error", f"Could not delete existing file:\n{e}")
                 return
+        else:
+            _log("pre-export cleanup: no stale export file present")
 
         # Step 2: Trigger Save via virtual right-click in left panel
+        _dump_windows("before export right-click")
         pyautogui.hotkey("ctrl", "s")  # Save project first
         time.sleep(0.3)
 
@@ -456,17 +993,146 @@ def update_database_from_geopackage():
         pyautogui.moveTo(real_mouse_pos)
 
         # Step 3: Keyboard sequence for export
+        #
+        # VERIFIED MANUALLY (screenshots + user confirmation) — the real
+        # GM flow from this right-click context menu is SEVEN distinct
+        # dialogs/steps, not the four the old sequence assumed:
+        #   1. Right-click menu -> hover "Layer" submenu (LAST item in the
+        #      menu — item count above it is NOT stable, see fix below)
+        #   2. "Layer" submenu -> "EXPORT - Export Layer(s) to New File..."
+        #   3. "Select Layers" dialog -> OK (submits the highlight-derived
+        #      default state as-is — Check All is no longer pressed)
+        #   4. "Select Export Format" dialog -> pick "Geopackage"
+        #   5. "Tip" info dialog -> OK
+        #   6. "GeoPackage Export Options" dialog -> OK
+        #   7. "Save As" dialog -> type path -> Save
+        #
+        # The old 4-action sequence (up/right/down/enter/enter/"a"/"gggggg"
+        # /enter) skipped steps 3 and 6 entirely and used an unreliable
+        # type-ahead guess for step 4 — confirmed via _wait_for_gpkg_export
+        # logging to always fail the fiona validity probe (flags=68),
+        # because the exported "savetodb.gpkg" was never a real export:
+        # the keystrokes were landing on the wrong dialogs from the start.
+        _log(f"export context menu invoked | fg='{_fg_title()}'")
         time.sleep(0.05)
-        pyautogui.press("up", presses=1, interval=0.05)
-        pyautogui.press("right", presses=1, interval=0.05)
-        pyautogui.press("down", presses=1, interval=0.05)
+
+        # --- Step 1-2: navigate to Layer submenu -> EXPORT ---
+        #
+        # FIXED (was): a fixed "down x16" count assumed 16 non-submenu
+        # items always precede "Layer". Confirmed via screenshot this is
+        # NOT stable — the menu has 17 items above "Layer" when 1 layer is
+        # highlighted, and 19 when 2+ are highlighted (two extra items,
+        # "DESCRIPTION - Edit the Selected Layer's Description..." and
+        # "Open Selected Map Folder in Windows Explorer...", appear only
+        # in the multi-select case). The fixed count consistently
+        # overshot by landing on "Layer Order" (the sibling submenu
+        # directly above "Layer") instead of "Layer" itself.
+        #
+        # FIX: count from the bottom instead of the top. "Layer" is
+        # confirmed (via screenshot, both 1-layer and 2-layer highlighted
+        # cases) to always be the LAST item in this context menu,
+        # regardless of how many items precede it. A single "up" press on
+        # a freshly-opened menu relies on standard Windows menu
+        # wraparound (Up on the first-focused item wraps to the last
+        # item), landing directly on "Layer" without needing to know the
+        # item count above it at all.
+        #
+        # The "Layer" submenu itself has a fixed, confirmed 2-item order
+        # regardless of highlight count: 1) "Create Workspace File from
+        # Selected Layer(s)...", 2) "EXPORT - Export Layer(s) to New
+        # File...". Submenu opens with nothing focused, so down x2 reaches
+        # "EXPORT...".
+        #
+        # NOTE: this does not handle the zero-layers-highlighted case —
+        # that opens a different, canvas-level menu entirely (no "Layer"
+        # submenu present at all). That case is addressed upstream via the
+        # manual confirmation dialog, not here; see docstring note there.
+        pyautogui.press("up")     # wraps to last item = "Layer"
+        pyautogui.press("enter")  # open "Layer" submenu
+        time.sleep(0.1)
+        pyautogui.press("down", presses=2, interval=0.05)  # "EXPORT - Export Layer(s) to New File..."
         pyautogui.press("enter")
-        time.sleep(0.05)
+        _log(f"EXPORT menu item selected | fg='{_fg_title()}'")
+        # === TEMP DIAGNOSTIC SLOWDOWN (remove after root cause confirmed) ===
+        _log("  [diag] pausing 3.0s to observe...")
+        time.sleep(3.0)
+        _log(f"  [diag] after pause | fg='{_fg_title()}'")
+
+        # --- Step 3: "Select Layers" dialog -> OK (no Check All) ---
+        #
+        # CHANGED (was): Tab x3 -> "Check All" button -> Enter (activate)
+        # -> Tab x2 -> "OK" -> Enter. This forced every export to include
+        # ALL layers regardless of what the user had highlighted in the
+        # GM layer panel before clicking "Update Database".
+        #
+        # Confirmed via manual testing: this dialog's default checkbox
+        # state, when it opens, already reflects exactly which layer(s)
+        # were highlighted beforehand (highlighted -> pre-checked,
+        # non-highlighted -> unchecked) — multiple highlighted layers are
+        # all pre-checked together. So the user's highlight selection IS
+        # the intended export selection; "Check All" was silently
+        # overriding that choice every time.
+        #
+        # CHANGED AGAIN — the intermediate 5-tab fix (tab through the same
+        # focus path to "OK" without activating Check All) is no longer
+        # needed either: confirmed via screenshot + live test that "OK" is
+        # ALREADY the default-focused button the instant this dialog
+        # opens (visible blue focus ring around OK in the screenshot,
+        # before any keystroke is sent). Tabbing was only ever routing
+        # around Check All — with Check All never touched, tabbing at all
+        # is unnecessary. A single Enter submits the dialog's own
+        # highlight-derived checkbox state immediately.
+        pyautogui.press("enter")  # "OK" — confirmed default-focused on dialog open
+        _log(f"Select Layers dialog confirmed (OK, no Check All, no tab) | fg='{_fg_title()}'")
+
+        # --- Step 4: "Select Export Format" dialog -> Geopackage ---
+        #
+        # CONFIRMED via live test + screenshots: PageUp x20 resets the
+        # dropdown to its first entry ("2DM File" — no Home key available
+        # on this keyboard, so PageUp is the reliable reset point),
+        # followed by "g" x6 type-ahead to advance the selection to
+        # "Geopackage". Confirmed sufficient on its own: the type-ahead
+        # commits the combobox value directly, so — unlike the old
+        # up/down arrow-count approach this replaces — NO separate
+        # "confirm dropdown selection" Enter is needed before OK. A
+        # single Enter here activates the dialog's OK button.
+        pyautogui.press("pageup", presses=20, interval=0.03)  # reset dropdown to top ("2DM File")
+        time.sleep(0.3)
+        for i in range(6):
+            pyautogui.press("g")
+            time.sleep(0.15)
+        _log(f"Select Export Format: Geopackage type-ahead complete | fg='{_fg_title()}'")
+        pyautogui.press("enter")  # OK on "Select Export Format" dialog
+        _log(f"Select Export Format: OK pressed | fg='{_fg_title()}'")
+
+        # --- Step 5: "Tip" info dialog -> OK ---
+        #
+        # Actively poll for the "Tip" window instead of assuming a fixed
+        # sleep is long enough — adapts to slower machines without a
+        # tuned static delay, and leaves a clear WARNING in the log
+        # (rather than silently sending Enter blind into whatever has
+        # focus) if the dialog doesn't appear within the timeout, e.g. if
+        # "Don't Show This Again" was checked in a previous run.
+        if _wait_and_activate("Tip"):
+            _log(f"Tip dialog focused | fg='{_fg_title()}'")
+        else:
+            _log("WARNING: 'Tip' dialog not found within timeout — sending Enter blind")
         pyautogui.press("enter")
-        time.sleep(0.05)
-        pyautogui.typewrite("a")
-        pyautogui.typewrite("g" * 6)
+        _log(f"Tip dialog OK | fg='{_fg_title()}'")
+
+        # --- Step 6: "GeoPackage Export Options" dialog -> OK ---
+        # Confirmed via screenshot: default focus is already on "OK", and
+        # the default state (Export Areas/Lines/Points all checked,
+        # "Split data by feature layer name" checked) is exactly what's
+        # wanted — no fields need to be touched here, just confirm.
+        if _wait_and_activate("GeoPackage Export Options"):
+            _log(f"GeoPackage Export Options focused | fg='{_fg_title()}'")
+        else:
+            _log("WARNING: 'GeoPackage Export Options' dialog not found within timeout — sending Enter blind")
         pyautogui.press("enter")
+        _log(f"GeoPackage Export Options OK | fg='{_fg_title()}'")
+
+        # --- Step 7: "Save As" dialog appears here (verified) ---
 
         # Step 4: Navigate Save dialog
         print("Waiting for Save As dialog...")
@@ -476,43 +1142,51 @@ def update_database_from_geopackage():
             save_win = gw.getWindowsWithTitle("Save As")[0]
             save_win.activate()
             time.sleep(0.05)
+            _log(f"Save As dialog found and activated | fg='{_fg_title()}'")
         except IndexError:
             print("⚠️ Save As dialog not found, continuing anyway...")
+            _log("Save As dialog NOT found — continuing blind")
+            _dump_windows("Save As not found (update_database)")
 
-        # Go to address bar
-        pyautogui.keyDown("alt")
-        pyautogui.press("d")
-        pyautogui.keyUp("alt")
-        time.sleep(0.5)
-
-        # Navigate to C:\
-        pyautogui.typewrite(r"C:\\")
-        pyautogui.press("enter")
-        time.sleep(0.5)
-
-        # Focus filename field and type the full path inside TEMP_DIR
+        # Focus filename field and type the full absolute path directly.
+        #
+        # REMOVED: a prior "Alt+D -> type C:\\ -> Enter" address-bar
+        # navigation step here had a bug (typewrite(r"C:\\") is a raw
+        # string literal containing TWO backslashes, not one — confirmed
+        # by the resulting Windows error "Windows can't find 'C:\\'."
+        # which matches that exact literal 1:1).
+        #
+        # More importantly, that whole step was redundant, not just
+        # buggy: this dialog is the standard Windows common Save dialog
+        # (confirmed by its chrome — Organize/New folder ribbon, breadcrumb
+        # address bar, OneDrive/This PC/Quick Access nav pane, sortable
+        # Name/Date modified/Type/Size columns — identical to any native
+        # Windows Save/Open picker, not something GM renders itself). This
+        # dialog type accepts a full absolute path typed directly into the
+        # filename field and navigates + saves there in one step, with no
+        # need to pre-navigate the address bar first. `save_path` is
+        # already absolute (os.path.join(TEMP_DIR, "savetodb.gpkg"), and
+        # TEMP_DIR = r"C:\Global Mapper Temp" is created at app startup on
+        # every machine), so typing it directly is both simpler and more
+        # reliable — it no longer depends on whatever folder the dialog
+        # happened to be showing beforehand (dialog "recent location"
+        # state, which this code does not control).
         pyautogui.hotkey("alt", "n")
         pyautogui.typewrite(save_path)
         pyautogui.press("enter")
 
-        # Step 5: Wait until the file is fully saved (size stable)
+        # Step 5: Wait until the file is fully saved (size stable AND
+        # layer-list stable — see _wait_for_gpkg_export() for the
+        # layer-stability fix added after this was confirmed necessary).
+        # Bounded poll — raises RuntimeError on timeout, which is caught
+        # by the "Export Failed" handler below (DB block never entered).
         print("Waiting for file to be fully written...")
-        last_size = -1
-        stable_count = 0
-        while True:
-            if os.path.exists(save_path):
-                current_size = os.path.getsize(save_path)
-                if current_size == last_size and current_size > 1000:
-                    stable_count += 1
-                    if stable_count >= 2:
-                        break
-                else:
-                    stable_count = 0
-                last_size = current_size
-            time.sleep(1)
+        _wait_for_gpkg_export(save_path, root)
+        _log(f"export phase complete: {save_path}")
         print("File saved:", save_path)
 
     except Exception as e:
+        _log(f"EXPORT FAILED: {type(e).__name__}: {e}")
         messagebox.showerror("Export Failed", f"Export failed:\n{e}")
         return
 
@@ -527,11 +1201,145 @@ def update_database_from_geopackage():
             database=DB_NAME
         )
         engine = create_engine(connection_url)
+
+        # ── TEMPORARY DIAGNOSTIC ONLY ─────────────────────────────────
+        # Added solely to trace the "idx_roadnetwork_staging_geom already
+        # exists" DuplicateTable investigation. Must be REMOVED once that
+        # root cause is identified — this is not permanent instrumentation.
+        #
+        # Disabled by default: no-op unless CAMA_DEBUG_SQL=1 is set in the
+        # environment before launching the exe. Does not touch any
+        # staging, validation, swap, or PK-resolution logic below — it
+        # only observes the SQL SQLAlchemy sends to PostgreSQL.
+        #
+        # Writes to a dedicated file (not the console) so it works under
+        # the --noconsole PyInstaller build. Verified empirically (not
+        # assumed) that attaching a plain logging.FileHandler to the
+        # "sqlalchemy.engine" logger at INFO level captures the full SQL
+        # text — including DDL from to_postgis()/GeoAlchemy2 — without
+        # needing engine echo=True.
+        #
+        # Idempotent handler attachment: update_database_from_geopackage()
+        # can be invoked multiple times in the same running process (the
+        # "Update Database" button can be clicked more than once per
+        # session). The "sqlalchemy.engine" logger is a process-wide
+        # singleton, so attaching a new FileHandler on every call would
+        # duplicate every log line once per prior call (2nd run logs each
+        # statement twice, 3rd run logs it three times, etc.) — which
+        # would look like a real duplicate-SQL bug even though it's only
+        # a logging artifact. Guarded here via a marker attribute checked
+        # against already-attached handlers before adding a new one.
+        if os.environ.get("CAMA_DEBUG_SQL") == "1":
+            _sql_log_path = os.path.join(TEMP_DIR, "cama_sql_debug.log")
+            _sql_logger = logging.getLogger("sqlalchemy.engine")
+            _sql_logger.setLevel(logging.INFO)
+            _already_attached = any(
+                getattr(h, "_cama_debug_sql_handler", False)
+                for h in _sql_logger.handlers
+            )
+            if not _already_attached:
+                _sql_handler = logging.FileHandler(_sql_log_path, encoding="utf-8")
+                _sql_handler.setLevel(logging.INFO)
+                _sql_handler._cama_debug_sql_handler = True  # marker: prevents duplicate attachment on repeat calls
+                _sql_logger.addHandler(_sql_handler)
+                _log(f"CAMA_DEBUG_SQL enabled — SQL trace will be written to {_sql_log_path}")
+            else:
+                _log("CAMA_DEBUG_SQL enabled — SQL trace handler already attached from a prior call this session")
+        # ── END TEMPORARY DIAGNOSTIC ──────────────────────────────────
+
         conn = engine.connect()
         cursor = conn.connection.cursor()
 
         # make sure PostGIS types exist
         ensure_postgis(conn.connection)
+
+        def _get_spatial_index_name(schema, table_name, column_name="geom"):
+            """
+            Look up the actual name of the GIST spatial index attached to a
+            given column, using PostgreSQL's own catalog tables (pg_class,
+            pg_index, pg_am, pg_attribute) — never assumes any naming
+            convention such as "idx_<table>_geom". This makes the index
+            rename step in Step E immune to identifier truncation
+            (PostgreSQL's 63-char NAMEDATALEN limit) or any future change
+            in how GeoPandas/GeoAlchemy2 names auto-generated spatial
+            indexes. Verified empirically against a deliberately
+            unrelated index name during development — the lookup found
+            it correctly regardless of what it was named.
+
+            Returns None if no spatial index exists on this column (e.g.
+            brand-new table before any index was ever created).
+
+            Raises RuntimeError if MORE than one GIST index is found on
+            the same column — this should never happen in the normal
+            single-spatial-index-per-geometry-column case this pipeline
+            creates, so silently picking one (e.g. via fetchone()) would
+            hide a genuinely unexpected schema state instead of
+            surfacing it.
+            """
+            cursor.execute(
+                """
+                SELECT ix.relname AS index_name
+                FROM pg_class t
+                JOIN pg_namespace n ON n.oid = t.relnamespace
+                JOIN pg_index idx ON idx.indrelid = t.oid
+                JOIN pg_class ix ON ix.oid = idx.indexrelid
+                JOIN pg_am am ON am.oid = ix.relam
+                JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(idx.indkey)
+                WHERE n.nspname = %s AND t.relname = %s
+                  AND a.attname = %s AND am.amname = 'gist';
+                """,
+                (schema, table_name, column_name)
+            )
+            rows = cursor.fetchall()
+            if len(rows) == 0:
+                return None
+            elif len(rows) == 1:
+                return rows[0][0]
+            else:
+                raise RuntimeError(
+                    f"Expected at most one GIST spatial index on "
+                    f"\"{schema}\".\"{table_name}\".\"{column_name}\", but found "
+                    f"{len(rows)}: {[r[0] for r in rows]}. Schema is in an "
+                    f"unexpected state — aborting rather than guessing "
+                    f"which index to rename."
+                )
+
+        def _index_exists(schema, index_name):
+            """Check whether an index of this exact name already exists
+            in the given schema, used as a pre-flight check before
+            renaming so a collision produces a clear diagnostic instead
+            of a generic PostgreSQL duplicate-object error."""
+            cursor.execute(
+                "SELECT 1 FROM pg_indexes WHERE schemaname = %s AND indexname = %s;",
+                (schema, index_name)
+            )
+            return cursor.fetchone() is not None
+
+        def _rename_spatial_index(schema, table_name, desired_name, column_name="geom"):
+            """
+            Find the actual spatial index on table_name/column_name via
+            _get_spatial_index_name() and rename it to desired_name.
+            No-op if no spatial index exists on this column. Raises a
+            clear diagnostic (rather than letting PostgreSQL fail with a
+            generic DuplicateTable/DuplicateObject error) if desired_name
+            is already taken by something else in the schema.
+            """
+            current_name = _get_spatial_index_name(schema, table_name, column_name)
+            if current_name is None:
+                return  # nothing to rename — table has no spatial index yet
+            if current_name == desired_name:
+                return  # already correctly named, nothing to do
+            if _index_exists(schema, desired_name):
+                raise RuntimeError(
+                    f"Spatial index rename aborted. Target index name "
+                    f"'{desired_name}' already exists in schema '{schema}'. "
+                    f"Schema state is inconsistent — a previous swap likely "
+                    f"left an index behind under this name. Manual cleanup "
+                    f"may be required."
+                )
+            cursor.execute(
+                f'ALTER INDEX "{schema}"."{current_name}" RENAME TO "{desired_name}";'
+            )
 
         cursor.execute(
             "SELECT table_name FROM information_schema.tables WHERE table_schema = %s;",
@@ -542,34 +1350,117 @@ def update_database_from_geopackage():
         layers = fiona.listlayers(save_path)
         schema_prefix = DB_SCHEMA
 
+        # TEMPORARY DIAGNOSTIC — proving/disproving the "connection closes
+        # mid-loop" hypothesis by showing exactly what fiona reports the
+        # .gpkg contains, and confirming the loop actually reaches each
+        # layer. Remove once the multi-layer investigation is closed.
+        _log(f"Layers returned by fiona.listlayers(): {layers}")
+
+        # Tracks which tables actually reached a successful swap COMMIT,
+        # for the summary dialog below. A layer only lands here after its
+        # atomic rename swap (Step E) has committed — layers skipped via
+        # the empty-layer user decline (Step D "soft warning: zero rows")
+        # or that raised during the swap (caught by the except block,
+        # which re-raises and aborts the whole run) never reach this list.
+        updated_tables = []
+
+        # Ordered candidate list for primary-key resolution (Step D.5,
+        # below). Case-insensitive match against staging_columns. First
+        # candidate found with zero NULLs and zero duplicates is promoted
+        # to PRIMARY KEY; none exist and none qualify -> a surrogate
+        # ud_id SERIAL PRIMARY KEY is created instead. Deliberately flat
+        # and deterministic — the importer does not attempt to judge
+        # whether a column is a "real" business identifier vs. an export
+        # artifact (e.g. objectid/fid); it only checks NOT NULL + UNIQUE.
+        # To support a future shapefile schema with its own identifier
+        # column (e.g. BUILDING_ID, LOT_ID), add one line here — no other
+        # code in this function needs to change.
+        PK_CANDIDATES = [
+            "id",
+            "pin",
+            "parcel_id",
+            "road_id",
+            "poi_id",
+            "bldg_id",
+            "gid",
+            "objectid",
+            "fid",
+        ]
+
         for layer in layers:
-            # read layer
+            # TEMPORARY DIAGNOSTIC — remove once the multi-layer
+            # investigation is closed. Confirms the loop is actually
+            # reached for this layer (vs. layers list only containing
+            # one entry in the first place).
+            _log(f"Starting layer: {layer}")
+            # ---------------------------------------------------------------
+            # SAFE REPLACE WORKFLOW
+            #
+            # Previous behavior (UNSAFE):
+            #   DROP existing table → commit → write new data
+            #   If write failed after commit: old data permanently lost.
+            #
+            # Current behavior (SAFE):
+            #   Write new data to _staging → validate → atomic rename swap
+            #   → drop backup only after successful commit.
+            #   Old table is never dropped until new data is confirmed live.
+            #
+            # Failure handling:
+            #   Any exception at any step cleans up the _staging orphan and
+            #   leaves the original table completely untouched.
+            # ---------------------------------------------------------------
+
+            # Step A: Read layer from GPKG into memory.
             gdf = gpd.read_file(save_path, layer=layer)
             gdf.columns = [col.lower() for col in gdf.columns]
 
-            # force Geographic lat/long WGS84
+            # Force WGS84 — all layers stored as EPSG:4326 in PostGIS.
             gdf = to_wgs84(gdf)
             gdf = gdf.rename_geometry("geom")
 
-            # tell pandas→PostGIS to store with SRID 4326
-            dtype = {"geom": Geometry(geometry_type="GEOMETRY", srid=4326)}
+            # Geometry type stored as generic GEOMETRY with SRID 4326.
+            # Using GEOMETRY (not MULTIPOLYGON etc.) because GM exports
+            # may promote geometry types (Polygon → MultiPolygon) and
+            # strict type enforcement causes false validation failures.
+            #
+            # spatial_index=False: GeoAlchemy2's Geometry type defaults to
+            # spatial_index=True, which creates a GIST index
+            # (idx_<table>_<column>) via a DDL event the moment the table
+            # is created. GeoPandas' to_postgis() separately creates its
+            # own spatial index on the geometry column after loading data,
+            # using the same naming convention. Both mechanisms racing to
+            # create the identically-named index caused:
+            #   psycopg2.errors.DuplicateTable: relation
+            #   "idx_<table>_staging_geom" already exists
+            # Confirmed via live test (Database Update Failed dialog).
+            # GeoPandas' own index creation already covers this, so
+            # GeoAlchemy2's is disabled here to avoid the collision.
+            dtype = {"geom": Geometry(geometry_type="GEOMETRY", srid=4326, spatial_index=False)}
 
-            # decide target table
+            # Step B: Determine target table name via fuzzy match.
+            # _find_best_table() is unchanged — only the replacement
+            # strategy below has been modified.
             match_table = _find_best_table(layer, existing_tables, schema_prefix=schema_prefix)
             if match_table:
-                print(f"Replacing table via match: {match_table}  <- layer: {layer}")
-                cursor.execute(f'DROP TABLE IF EXISTS "{DB_SCHEMA}"."{match_table}" CASCADE;')
-                conn.connection.commit()
                 target_name = match_table
+                print(f"Safe-replacing table: {target_name}  <- layer: {layer}")
             else:
                 new_table = _normalize_name(layer, schema_prefix=schema_prefix + "_")
                 if not new_table:
                     new_table = "layer_" + str(abs(hash(layer)))
-                print(f"Creating new table: {new_table}  <- layer: {layer}")
                 target_name = new_table
+                print(f"Creating new table: {target_name}  <- layer: {layer}")
 
+            staging_name = f"{target_name}_staging"
+            backup_name  = f"{target_name}_backup"
+
+            # Step C: Write new data to staging table.
+            # The existing target table is completely untouched at this point.
+            # if_exists="replace" handles orphaned staging tables from a
+            # previous interrupted run — idempotent on retry.
+            print(f"  Writing to staging: {staging_name}")
             gdf.to_postgis(
-                name=target_name,
+                name=staging_name,
                 con=engine,
                 schema=DB_SCHEMA,
                 if_exists="replace",
@@ -577,18 +1468,289 @@ def update_database_from_geopackage():
                 dtype=dtype
             )
 
-        conn.close()
-        engine.dispose()
-        messagebox.showinfo("Success", "Database updated from GeoPackage.")
+            # Step D: Validate staging table.
+            #
+            # Hard requirements (abort if either fails):
+            #   1. Staging table exists in information_schema — confirms
+            #      to_postgis completed and PostgreSQL registered the table.
+            #   2. Geometry column "geom" exists in staging — confirms the
+            #      spatial data was written, not just attribute columns.
+            #      A missing geometry column means a non-spatial layer was
+            #      matched against a spatial target (wrong layer mapping).
+            #
+            # Soft warnings (user confirms, does not abort):
+            #   - Zero rows: may be intentional (user cleared a layer) but
+            #     unusual enough to require explicit confirmation.
+            #   - Geometry type mismatch: common due to GM export promotions
+            #     (Polygon → MultiPolygon), shown as informational warning only.
+
+            cursor.execute(
+                """
+                SELECT column_name, udt_name
+                FROM information_schema.columns
+                WHERE table_schema = %s AND table_name = %s;
+                """,
+                (DB_SCHEMA, staging_name)
+            )
+            staging_columns = {row[0]: row[1] for row in cursor.fetchall()}
+
+            # Hard requirement 1: staging table must exist.
+            if not staging_columns:
+                raise RuntimeError(
+                    f"Staging table '{staging_name}' was not found in the database "
+                    f"after import. The write may have failed silently."
+                )
+
+            # Hard requirement 2: geometry column must be present.
+            # Missing geometry column indicates a non-spatial layer was
+            # matched to a spatial target — high probability of wrong mapping.
+            if "geom" not in staging_columns:
+                cursor.execute(f'DROP TABLE IF EXISTS "{DB_SCHEMA}"."{staging_name}" CASCADE;')
+                conn.connection.commit()
+                raise RuntimeError(
+                    f"Staging table '{staging_name}' has no geometry column. "
+                    f"The incoming layer '{layer}' may be non-spatial or incorrectly matched. "
+                    f"Staging table has been dropped. Existing table '{target_name}' is untouched."
+                )
+
+            # Step D.5: Primary key resolution.
+            #
+            # Walk PK_CANDIDATES in order (case-insensitive match against
+            # staging_columns). For each candidate present in the table,
+            # verify it has zero NULLs and zero duplicate values across
+            # ALL rows (not just non-null ones) — a candidate is only
+            # usable if every row has a distinct, non-null value. The
+            # first candidate that qualifies is promoted to PRIMARY KEY
+            # via ALTER TABLE (no data is modified, altered, or dropped —
+            # the column is used exactly as the source data provided it).
+            #
+            # If no candidate qualifies (none present, or all present
+            # candidates have NULLs/duplicates), a surrogate ud_id SERIAL
+            # PRIMARY KEY column is added instead. The original candidate
+            # column(s), if any, are left completely untouched — e.g. a
+            # duplicate 'pin' value is never modified, deleted, or forced
+            # into uniqueness; ud_id exists alongside it as the table's
+            # stable row identity.
+            pk_chosen = None
+            for candidate in PK_CANDIDATES:
+                # staging_columns keys are already lowercase (from the
+                # earlier information_schema.columns query), and gdf
+                # columns were lowercased in Step A, so a direct lowercase
+                # comparison is sufficient here.
+                if candidate not in staging_columns:
+                    continue
+                cursor.execute(
+                    f'SELECT COUNT(*), COUNT("{candidate}"), COUNT(DISTINCT "{candidate}") '
+                    f'FROM "{DB_SCHEMA}"."{staging_name}";'
+                )
+                total, non_null, distinct = cursor.fetchone()
+                null_count = total - non_null
+                dup_count = non_null - distinct
+                if null_count == 0 and dup_count == 0:
+                    cursor.execute(
+                        f'ALTER TABLE "{DB_SCHEMA}"."{staging_name}" '
+                        f'ADD PRIMARY KEY ("{candidate}");'
+                    )
+                    conn.connection.commit()
+                    pk_chosen = candidate
+                    _log(f"  PK: '{candidate}' promoted to PRIMARY KEY for {staging_name} "
+                         f"(rows={total}, nulls=0, duplicates=0)")
+                    break
+                else:
+                    _log(f"  PK: candidate '{candidate}' rejected for {staging_name} "
+                         f"(rows={total}, nulls={null_count}, duplicates={dup_count})")
+
+            if pk_chosen is None:
+                cursor.execute(
+                    f'ALTER TABLE "{DB_SCHEMA}"."{staging_name}" '
+                    f'ADD COLUMN ud_id SERIAL PRIMARY KEY;'
+                )
+                conn.connection.commit()
+                _log(f"  PK: no qualifying candidate found for {staging_name} — "
+                     f"created surrogate 'ud_id' SERIAL PRIMARY KEY")
+
+            # Soft warning: zero rows.
+            cursor.execute(
+                f'SELECT COUNT(*) FROM "{DB_SCHEMA}"."{staging_name}";'
+            )
+            staging_row_count = cursor.fetchone()[0]
+            if staging_row_count == 0:
+                proceed = messagebox.askyesno(
+                    "Empty Layer Warning",
+                    f"Layer '{layer}' imported zero features into staging.\n\n"
+                    f"This will replace the existing table '{target_name}' with an empty table.\n\n"
+                    f"Proceed?"
+                )
+                if not proceed:
+                    print(f"  User cancelled empty-layer swap for: {target_name}")
+                    cursor.execute(f'DROP TABLE IF EXISTS "{DB_SCHEMA}"."{staging_name}" CASCADE;')
+                    conn.connection.commit()
+                    continue  # skip this layer, leave target untouched
+
+            # Soft warning: geometry type mismatch.
+            # Informational only — does not block the swap.
+            # Common cause: GM exports Polygon as MultiPolygon.
+            if match_table:
+                cursor.execute(
+                    """
+                    SELECT udt_name
+                    FROM information_schema.columns
+                    WHERE table_schema = %s AND table_name = %s AND column_name = 'geom';
+                    """,
+                    (DB_SCHEMA, target_name)
+                )
+                existing_geom_row = cursor.fetchone()
+                if existing_geom_row:
+                    existing_geom_type = existing_geom_row[0]
+                    incoming_geom_type = staging_columns.get("geom", "")
+                    if existing_geom_type != incoming_geom_type:
+                        print(
+                            f"  ⚠ Geometry type mismatch for '{target_name}': "
+                            f"existing={existing_geom_type}, incoming={incoming_geom_type}. "
+                            f"Proceeding — this is normal for GM exports."
+                        )
+
+            # Step E: Atomic swap inside a single PostgreSQL transaction.
+            #
+            # Both RENAME operations are inside one BEGIN/COMMIT block.
+            # PostgreSQL guarantees: either both succeed or neither does.
+            # If the connection dies mid-transaction, PostgreSQL rolls back
+            # automatically — the original table survives under its original name.
+            #
+            # Swap only applies when a matching target already exists.
+            # New tables (no match_table) go straight to rename from staging.
+            print(f"  Swapping staging → target (atomic rename)...")
+            try:
+                cursor.execute("BEGIN;")
+
+                if match_table:
+                    # Rename existing table to backup first.
+                    # Backup exists only for the duration of this transaction
+                    # plus the DROP below — it is not a long-term backup.
+                    cursor.execute(
+                        f'ALTER TABLE "{DB_SCHEMA}"."{target_name}" '
+                        f'RENAME TO "{backup_name}";'
+                    )
+                    # Renaming a TABLE does not rename any index attached to
+                    # it — PostgreSQL treats these as independent objects.
+                    # Without this, the old spatial index keeps living under
+                    # a name derived from `target_name`, which then blocks
+                    # the next swap's attempt to claim that same name for
+                    # the newly-promoted table below. Confirmed via
+                    # empirical lifecycle testing during development.
+                    _rename_spatial_index(DB_SCHEMA, backup_name, f"idx_{backup_name}_geom")
+
+                # Rename staging to target — this is the moment the new data goes live.
+                cursor.execute(
+                    f'ALTER TABLE "{DB_SCHEMA}"."{staging_name}" '
+                    f'RENAME TO "{target_name}";'
+                )
+                # Same reasoning as above: rename the newly-live table's
+                # spatial index to match, now that the backup step (if it
+                # ran) has freed up this name.
+                _rename_spatial_index(DB_SCHEMA, target_name, f"idx_{target_name}_geom")
+
+                cursor.execute("COMMIT;")
+                print(f"  ✅ Swap committed: {target_name} is now live.")
+                # Only record here — after COMMIT succeeds. A failure
+                # before this point raises (see except below) and aborts
+                # the run before the success dialog is ever shown; a
+                # user-declined empty-layer skip (Step D) never reaches
+                # this line via its own `continue` above.
+                updated_tables.append(target_name)
+
+            except Exception as swap_err:
+                # Transaction failed — roll back to preserve original table.
+                # staging table is still present under staging_name.
+                try:
+                    cursor.execute("ROLLBACK;")
+                except Exception:
+                    pass
+                # Clean up orphaned staging table before re-raising.
+                try:
+                    cursor.execute(
+                        f'DROP TABLE IF EXISTS "{DB_SCHEMA}"."{staging_name}" CASCADE;'
+                    )
+                    conn.connection.commit()
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    f"Atomic swap failed for layer '{layer}'. "
+                    f"Original table '{target_name}' is untouched. "
+                    f"Staging table has been dropped.\n\nCause: {swap_err}"
+                )
+
+            # Step F: Drop backup table now that new data is confirmed live.
+            # This DROP is outside the swap transaction intentionally.
+            # If the process crashes here, the worst outcome is an orphaned
+            # backup table — the new live data is already committed and intact.
+            if match_table:
+                try:
+                    cursor.execute(
+                        f'DROP TABLE IF EXISTS "{DB_SCHEMA}"."{backup_name}" CASCADE;'
+                    )
+                    conn.connection.commit()
+                    print(f"  Backup dropped: {backup_name}")
+                except Exception as drop_err:
+                    # Non-fatal: orphaned backup table does not affect live data.
+                    # Log and continue — user can manually drop if needed.
+                    print(
+                        f"  ⚠ Could not drop backup table '{backup_name}': {drop_err}. "
+                        f"Live data is intact. Backup may be dropped manually."
+                    )
+
+        # NOTE: conn.close()/engine.dispose() no longer called here directly —
+        # the finally block below (wrapping this whole try/except) now
+        # guarantees cleanup runs exactly once, on both the success and
+        # failure paths, instead of only on success as before.
+        _log(f"DB phase complete: all layers processed successfully. "
+             f"Updated tables in schema '{DB_SCHEMA}': {updated_tables}")
+        if updated_tables:
+            messagebox.showinfo(
+                "Success",
+                f"Database updated successfully.\n\n"
+                f"Schema: {DB_SCHEMA}\n"
+                f"Updated tables:\n" + "\n".join(f"  • {t}" for t in updated_tables)
+            )
+        else:
+            # All layers in the export were user-declined (empty-layer
+            # warning) — the GPKG export succeeded but nothing was
+            # actually swapped into the database. Distinct from the error
+            # path: this is not a failure, just a no-op run.
+            messagebox.showinfo(
+                "No Changes",
+                f"No tables were updated in schema '{DB_SCHEMA}'.\n\n"
+                f"All exported layer(s) were skipped (see prompts during import)."
+            )
 
         # Step 7: Cleanup
         if os.path.exists(save_path):
             os.remove(save_path)
 
     except Exception as e:
+        _log(f"DB PHASE FAILED: {type(e).__name__}: {e}")
         messagebox.showerror("Database Update Failed", f"Database load failed:\n{e}")
+    finally:
+        # FIX: previously conn.close()/engine.dispose() only ran on the
+        # success path (see above, right before the Success dialog).
+        # Every failed DB phase left the connection open indefinitely —
+        # confirmed via pg_stat_activity showing an "idle in transaction"
+        # session from a prior failed run that never got cleaned up.
+        # Wrapped in try/except since conn/engine may not even be
+        # assigned yet if create_engine()/engine.connect() itself failed
+        # before reaching this point — cleanup must never raise a new
+        # error on top of the one already being reported above.
+        try:
+            conn.close()
+        except Exception:
+            pass
+        try:
+            engine.dispose()
+        except Exception:
+            pass
 
 
+@_gm_export_guard
 def update_map_and_select_recorded():
     import os, re, time
     import pygetwindow as gw
@@ -600,8 +1762,10 @@ def update_map_and_select_recorded():
     import fiona
 
     pyautogui.FAILSAFE = False
+    _log_session_start("update_map_and_select_recorded")
 
     if not all([stored_username, stored_password]):
+        _log("ABORT: not logged in")
         messagebox.showerror("Error", "You must log in first before updating the map.")
         return
 
@@ -613,22 +1777,33 @@ def update_map_and_select_recorded():
                 gm_window = w
                 break
         if not gm_window:
+            _log("ABORT: Global Mapper window not found")
+            _dump_windows("GM window not found")
             messagebox.showerror("Error", "Global Mapper window not found.")
             return
+        _log(f"GM window found: '{gm_window.title}' "
+             f"rect=({gm_window.left}, {gm_window.top}, "
+             f"{gm_window.width}x{gm_window.height})")
         gm_window.minimize(); time.sleep(0.1)
         gm_window.restore();  time.sleep(0.1)
         gm_window.activate(); time.sleep(0.1)
+        _log(f"GM focused | fg='{_fg_title()}'")
 
         # ---- Export to GPKG (C:\updatemap.gpkg) ----
         save_path = os.path.join(TEMP_DIR, "updatemap.gpkg")
         if os.path.exists(save_path):
             try:
                 os.remove(save_path)
+                _log(f"pre-export cleanup: removed stale {save_path}")
             except Exception as e:
+                _log(f"ABORT: could not delete stale export file: {e}")
                 messagebox.showerror("File Error", f"Could not delete existing file:\n{e}")
                 return
+        else:
+            _log("pre-export cleanup: no stale export file present")
 
         # Ctrl+S first
+        _dump_windows("before export right-click")
         pyautogui.hotkey("ctrl", "s")
         time.sleep(0.05)
 
@@ -640,6 +1815,7 @@ def update_map_and_select_recorded():
         pyautogui.rightClick()
         pyautogui.moveTo(real_mouse_pos)
 
+        _log(f"export context menu invoked | fg='{_fg_title()}'")
         time.sleep(0.01)
         pyautogui.press("up")
         pyautogui.press("right")
@@ -651,6 +1827,7 @@ def update_map_and_select_recorded():
         pyautogui.typewrite("a")
         pyautogui.typewrite("g" * 6)
         pyautogui.press("enter")
+        _log(f"export format sequence typed | fg='{_fg_title()}'")
 
         time.sleep(0.05)
         pyautogui.hotkey("alt", "d")
@@ -661,24 +1838,15 @@ def update_map_and_select_recorded():
         pyautogui.hotkey("alt", "n")
         pyautogui.typewrite(save_path)
         pyautogui.press("enter")
+        _log(f"save path typed | fg='{_fg_title()}'")
 
-        # ---- Wait until file is fully saved ----
+        # ---- Wait until file is fully saved (bounded poll) ----
+        # Raises RuntimeError on timeout, caught by the "Update Map
+        # Failed" handler at the end of this function.
         print("⏳ Waiting for updatemap.gpkg to be fully written...")
-        last_size = -1
-        stable_count = 0
+        _wait_for_gpkg_export(save_path, root)
 
-        while True:
-            if os.path.exists(save_path):
-                current_size = os.path.getsize(save_path)
-                if current_size == last_size and current_size > 1000:
-                    stable_count += 1
-                    if stable_count >= 2:  # Stable for 2 consecutive checks (2s)
-                        break
-                else:
-                    stable_count = 0
-                last_size = current_size
-            time.sleep(1)
-
+        _log(f"export phase complete: {save_path}")
         print("✅ File saved:", save_path)
 
         # ---- Re-type the GPKG path into GM (if dialog still open) ----
@@ -687,11 +1855,13 @@ def update_map_and_select_recorded():
             save_dialog = gw.getWindowsWithTitle("Save As")[0]
             save_dialog.activate()
             time.sleep(0.3)
+            _log(f"Save As dialog still open post-export — re-typing path | fg='{_fg_title()}'")
             pyautogui.typewrite(save_path)
             pyautogui.press("enter")
             print("📂 Re-typed path into Save As dialog")
         except IndexError:
             print("⚠️ Save As dialog not found — skipping re-type")
+            _log("Save As dialog not open post-export — no re-type needed")
 
         # ---- Match layers with PostgreSQL tables ----
         connection_url = URL.create(
@@ -735,6 +1905,7 @@ def update_map_and_select_recorded():
                     matched_tables.append(f"{DB_SCHEMA}.{stripped}")
 
         print("📄 Matched tables (in memory):", matched_tables)
+        _log(f"matched tables ({len(matched_tables)}): {matched_tables}")
 
         # ---- Back to GM and type in tables ----
         gm_window.minimize(); time.sleep(0.1)
@@ -747,29 +1918,36 @@ def update_map_and_select_recorded():
         pyautogui.press("down"); time.sleep(0.08)
         pyautogui.press("enter"); time.sleep(0.08)
         pyautogui.press("enter"); time.sleep(0.6)
+        _log(f"table-selection dialog opened | fg='{_fg_title()}'")
 
         # Inside your existing function where matched_tables is already populated
         if matched_tables:
             # First table
             print(f"⌨ Typing first table: {matched_tables[0]}")
+            _log(f"typing table 1/{len(matched_tables)}: {matched_tables[0]} "
+                 f"| fg='{_fg_title()}'")
             pyautogui.typewrite(matched_tables[0], interval=0.01)
             pyautogui.press("space")
             time.sleep(0.05)
 
             # Remaining tables
-            for tbl in matched_tables[1:]:
+            for i, tbl in enumerate(matched_tables[1:], start=2):
                 pyautogui.press("down", presses=5, interval=0.05)
                 time.sleep(0.05)
                 pyautogui.press("tab")
                 time.sleep(0.05)
                 print(f"⌨ Typing next table: {tbl}")
+                _log(f"typing table {i}/{len(matched_tables)}: {tbl} "
+                     f"| fg='{_fg_title()}'")
                 pyautogui.typewrite(tbl, interval=0.01)
                 pyautogui.press("space")
                 time.sleep(0.05)
 
             print("✅ Finished typing all tables. Pressing Enter...")
+            _log("finished typing all tables — pressing Enter")
             pyautogui.press("enter")
 
+        _log("Update Map complete")
         messagebox.showinfo("Update Map", "Updated table into GM.")
 
         # === Extra step after clicking OK ===
@@ -796,6 +1974,7 @@ def update_map_and_select_recorded():
             os.remove(save_path)
 
     except Exception as e:
+        _log(f"UPDATE MAP FAILED: {type(e).__name__}: {e}")
         messagebox.showerror("Update Map Failed", str(e))
 
 
@@ -1146,8 +2325,18 @@ def is_relevant_window_focused():
     if hwnd_belongs_to(fg, ["Global Mapper", "CAMA Tools"]):
         return True
 
-    # Frozen mode: match by subprocess PID
     fg_pid = get_foreground_pid()
+
+    # Our own process: covers every window this process creates —
+    # messageboxes ("Database Update Failed", etc.), the login window,
+    # file dialogs — whose titles match neither string above. Without
+    # this, the main window withdraws behind its OWN dialogs and, with
+    # no taskbar icon (WS_EX_TOOLWINDOW), appears to vanish until the
+    # user happens to click Global Mapper again.
+    if fg_pid == os.getpid():
+        return True
+
+    # Frozen mode: tool subprocesses, matched by PID
     if any(p.pid == fg_pid for p in TOOL_PROCESSES if p.poll() is None):
         return True
 
