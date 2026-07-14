@@ -1003,10 +1003,11 @@ def update_database_from_geopackage():
     proceed = messagebox.askyesno(
         "Confirm Before Updating Database",
         "Before continuing, please make sure that:\n\n"
-        "\u2022 At least one layer is highlighted in Global Mapper's Control Center.\n"
-        "\u2022 The highlighted layer is NOT a nested/grouped entry (one "
-        "with a + expand icon in the Control Center) \u2014 nested layers "
-        "are not currently supported and may cause this to fail.\n\n"
+        "\u2022 The layer you want to update is the only one highlighted in Global Mapper's Control Center.\n"
+        "\u2022 The highlighted layer is a single file/child layer, NOT "
+        "the parent/group entry (one with a + expand icon in the "
+        "Control Center) \u2014 selecting the parent node is not "
+        "supported; select the child layer(s) inside it instead.\n\n"
         "Do not switch windows (Alt+Tab) or interact with your computer "
         "while Update Database is running \u2014 this may interrupt the "
         "automated process.\n\n"
@@ -1155,133 +1156,147 @@ def update_database_from_geopackage():
         pyautogui.press("enter")
         _log(f"EXPORT menu item selected | fg='{_fg_title()}'")
 
-        # SAFETY: poll for "Select Layers" to appear, up to a 5.0s
-        # timeout, instead of a fixed sleep - resolves quickly on fast
-        # machines and stays forgiving on slower ones (a slow machine
-        # was confirmed as a real factor: a flat 3.0s sleep previously
-        # here, and a 50ms sleep on the later Save As check, both
-        # caused false aborts on runs where the expected dialog was
-        # about to appear normally, just not within the fixed window).
-        _select_layers_start = time.monotonic()
+        # ============================================================
+        # COMBINED POLL across "Select Layers" / "Tip" / "Select Export
+        # Format" (new) - a live test confirmed GM can skip straight to
+        # "Select Export Format" after the EXPORT menu item is
+        # selected, bypassing "Select Layers" entirely for reasons not
+        # yet understood. Detect whichever of the three actually
+        # appears and skip the confirming keystroke(s) for any earlier
+        # step(s) GM already bypassed, instead of treating a missing
+        # "Select Layers" as an automatic failure. Same two-round,
+        # 5.0s-each pattern as the existing Tip/GeoPackage Export
+        # Options poll below, for the same reason (distinguish "took a
+        # bit longer" from "genuinely never appeared").
+        # ============================================================
+        _step1_result = None
         _current_fg = _fg_title()
-        while time.monotonic() - _select_layers_start < 5.0:
-            _current_fg = _fg_title()
-            if "select layers" in _current_fg.lower():
-                _log(f"'Select Layers' dialog appeared after "
-                     f"{time.monotonic() - _select_layers_start:.1f}s | fg='{_current_fg}'")
+        for _poll_round in (1, 2):
+            _round_start = time.monotonic()
+            while time.monotonic() - _round_start < 5.0:
+                _current_fg = _fg_title()
+                if "select layers" in _current_fg.lower():
+                    _step1_result = "select_layers"
+                    break
+                if _current_fg.strip() == "Tip":
+                    _step1_result = "tip"
+                    break
+                if "select export format" in _current_fg.lower():
+                    _step1_result = "select_export_format"
+                    break
+                time.sleep(0.2)
+            if _step1_result is not None:
+                _log(f"combined poll (Select Layers/Tip/Select Export "
+                     f"Format) round {_poll_round}: found "
+                     f"'{_step1_result}' after "
+                     f"{time.monotonic() - _round_start:.1f}s | fg='{_current_fg}'")
                 break
-            time.sleep(0.2)
-        else:
-            _log(f"  [diag] 'Select Layers' not seen within 5.0s | fg='{_current_fg}'")
+            _log(f"combined poll (Select Layers/Tip/Select Export "
+                 f"Format) round {_poll_round}: none seen within 5.0s "
+                 f"| fg='{_current_fg}'")
 
-        # SAFETY ABORT (mirrored from update_map_and_select_recorded()
-        # after a live test there confirmed this exact failure mode): if
-        # a nested/grouped layer entry is highlighted instead of a flat
-        # layer, this menu navigation can land somewhere unexpected and
-        # focus stays on GM's main window instead of "Select Layers"
-        # appearing. Previously the next line pressed Enter unconditionally
-        # regardless, sending that keystroke into whatever window had
-        # focus. Now: abort immediately with a clear, actionable error
-        # instead of continuing to send keystrokes blind.
-        if "select layers" not in _current_fg.lower():
-            _dump_windows("export navigation lost focus - Select Layers dialog not found")
+        # SAFETY ABORT: if none of the three appeared after both
+        # rounds, this is a genuine navigation failure (e.g. a
+        # nested/grouped layer entry changed what options exist in
+        # GM's right-click menu) - abort with a clear, actionable
+        # error instead of continuing to send keystrokes blind.
+        if _step1_result is None:
+            _dump_windows("export navigation lost focus after EXPORT menu item (update_database)")
             raise RuntimeError(
-                "Export navigation failed: the 'Select Layers' dialog "
-                f"did not appear as expected (focused window was "
-                f"'{_current_fg}' instead). This can happen when the "
-                "highlighted layer's type changes what options exist "
-                "in Global Mapper's right-click menu (e.g. a nested/"
-                "grouped GeoPackage entry vs. a flat shapefile layer). "
-                "Update Database was aborted before any further "
-                "keystrokes were sent, to avoid typing into the wrong "
-                "window."
+                "Export navigation failed: none of 'Select Layers', "
+                "'Tip', or 'Select Export Format' appeared as expected "
+                f"(focused window was '{_current_fg}' instead). This "
+                "can happen when the highlighted layer's type changes "
+                "what options exist in Global Mapper's right-click "
+                "menu (e.g. a nested/grouped GeoPackage entry vs. a "
+                "flat shapefile layer). Update Database was aborted "
+                "before any further keystrokes were sent, to avoid "
+                "typing into the wrong window."
             )
 
         # --- Step 3: "Select Layers" dialog -> OK (no Check All) ---
         #
-        # CHANGED (was): Tab x3 -> "Check All" button -> Enter (activate)
-        # -> Tab x2 -> "OK" -> Enter. This forced every export to include
-        # ALL layers regardless of what the user had highlighted in the
-        # GM layer panel before clicking "Update Database".
-        #
         # Confirmed via manual testing: this dialog's default checkbox
         # state, when it opens, already reflects exactly which layer(s)
         # were highlighted beforehand (highlighted -> pre-checked,
-        # non-highlighted -> unchecked) — multiple highlighted layers are
-        # all pre-checked together. So the user's highlight selection IS
-        # the intended export selection; "Check All" was silently
-        # overriding that choice every time.
-        #
-        # CHANGED AGAIN — the intermediate 5-tab fix (tab through the same
-        # focus path to "OK" without activating Check All) is no longer
-        # needed either: confirmed via screenshot + live test that "OK" is
-        # ALREADY the default-focused button the instant this dialog
-        # opens (visible blue focus ring around OK in the screenshot,
-        # before any keystroke is sent). Tabbing was only ever routing
-        # around Check All — with Check All never touched, tabbing at all
-        # is unnecessary. A single Enter submits the dialog's own
-        # highlight-derived checkbox state immediately.
-        pyautogui.press("enter")  # "OK" — confirmed default-focused on dialog open
-        _log(f"Select Layers dialog confirmed (OK, no Check All, no tab) | fg='{_fg_title()}'")
+        # non-highlighted -> unchecked) — the user's highlight selection
+        # IS the intended export selection. "OK" is already the
+        # default-focused button the instant this dialog opens, so a
+        # single Enter submits it as-is. Skipped entirely if GM already
+        # bypassed this dialog (detected via the combined poll above).
+        if _step1_result == "select_layers":
+            pyautogui.press("enter")  # "OK" — confirmed default-focused on dialog open
+            _log(f"Select Layers dialog confirmed (OK, no Check All, no tab) | fg='{_fg_title()}'")
+        elif _step1_result == "select_export_format":
+            _log("'Select Layers' was not shown - 'Select Export "
+                 f"Format' already focused | fg='{_fg_title()}'")
+        else:
+            _log("'Select Layers' and 'Select Export Format' were both "
+                 f"not shown - 'Tip' already focused | fg='{_fg_title()}'")
 
         # --- Step 4: "Select Export Format" dialog -> Geopackage ---
         #
         # CONFIRMED via live test + screenshots: PageUp x20 resets the
-        # dropdown to its first entry ("2DM File" — no Home key available
-        # on this keyboard, so PageUp is the reliable reset point),
-        # followed by "g" x6 type-ahead to advance the selection to
-        # "Geopackage". Confirmed sufficient on its own: the type-ahead
-        # commits the combobox value directly, so — unlike the old
-        # up/down arrow-count approach this replaces — NO separate
-        # "confirm dropdown selection" Enter is needed before OK. A
-        # single Enter here activates the dialog's OK button.
-        pyautogui.press("pageup", presses=20, interval=0.03)  # reset dropdown to top ("2DM File")
-        time.sleep(0.3)
-        for i in range(6):
-            pyautogui.press("g")
-            time.sleep(0.15)
-        _log(f"Select Export Format: Geopackage type-ahead complete | fg='{_fg_title()}'")
-        pyautogui.press("enter")  # OK on "Select Export Format" dialog
-        _log(f"Select Export Format: OK pressed | fg='{_fg_title()}'")
+        # dropdown to its first entry ("2DM File"), followed by "g" x6
+        # type-ahead to advance the selection to "Geopackage". The
+        # type-ahead commits the combobox value directly, so a single
+        # Enter here activates the dialog's OK button. Skipped entirely
+        # if GM already bypassed this dialog too (jumped straight to
+        # "Tip").
+        if _step1_result in ("select_layers", "select_export_format"):
+            pyautogui.press("pageup", presses=20, interval=0.03)  # reset dropdown to top ("2DM File")
+            time.sleep(0.3)
+            for i in range(6):
+                pyautogui.press("g")
+                time.sleep(0.15)
+            _log(f"Select Export Format: Geopackage type-ahead complete | fg='{_fg_title()}'")
+            pyautogui.press("enter")  # OK on "Select Export Format" dialog
+            _log(f"Select Export Format: OK pressed | fg='{_fg_title()}'")
 
         # --- Steps 5-6: "Tip" (optional) then "GeoPackage Export
         # Options" (mandatory) ---
         #
         # "Tip" is LEGITIMATELY OPTIONAL: if the user previously checked
         # "Don't Show This Again", GM skips straight to "GeoPackage
-        # Export Options" and "Tip" never appears at all - a normal,
-        # expected case, not a failure. A single fixed-timeout wait on
-        # "Tip" alone cannot distinguish "legitimately skipped, GM
-        # already moved on" from "navigation genuinely broke" - both
-        # look identical (Tip never appears). Fix: poll for EITHER
-        # title appearing, so whichever one GM actually shows is
-        # detected directly, instead of guessing from Tip's absence.
-        #
-        # Two rounds of up to 5.0s each (10s ceiling total) before
-        # giving up, rather than one longer window, so the log can
-        # distinguish "took a bit longer" from "genuinely never
-        # appeared" via which round it resolved in (or failed in).
-        _tip_or_geo_result = None
-        _last_fg_seen = _fg_title()
-        for _poll_round in (1, 2):
-            _round_start = time.monotonic()
-            while time.monotonic() - _round_start < 5.0:
-                _last_fg_seen = _fg_title()
-                if _last_fg_seen.strip() == "Tip":
-                    _tip_or_geo_result = "tip"
+        # Export Options" and "Tip" never appears at all — a normal,
+        # expected case, not a failure. If the combined poll above
+        # already landed on "Tip" directly, skip this second poll
+        # entirely and go straight to confirming it.
+        if _step1_result == "tip":
+            _tip_or_geo_result = "tip"
+        else:
+            _tip_or_geo_result = None
+            _last_fg_seen = _fg_title()
+            for _poll_round in (1, 2):
+                _round_start = time.monotonic()
+                while time.monotonic() - _round_start < 5.0:
+                    _last_fg_seen = _fg_title()
+                    if _last_fg_seen.strip() == "Tip":
+                        _tip_or_geo_result = "tip"
+                        break
+                    if "geopackage export options" in _last_fg_seen.lower():
+                        _tip_or_geo_result = "export_options"
+                        break
+                    time.sleep(0.2)
+                if _tip_or_geo_result is not None:
+                    _log(f"combined poll round {_poll_round}: found "
+                         f"'{_tip_or_geo_result}' after "
+                         f"{time.monotonic() - _round_start:.1f}s | fg='{_last_fg_seen}'")
                     break
-                if "geopackage export options" in _last_fg_seen.lower():
-                    _tip_or_geo_result = "export_options"
-                    break
-                time.sleep(0.2)
-            if _tip_or_geo_result is not None:
-                _log(f"combined poll round {_poll_round}: found "
-                     f"'{_tip_or_geo_result}' after "
-                     f"{time.monotonic() - _round_start:.1f}s | fg='{_last_fg_seen}'")
-                break
-            _log(f"combined poll round {_poll_round}: neither 'Tip' nor "
-                 f"'GeoPackage Export Options' seen within 5.0s | "
-                 f"fg='{_last_fg_seen}'")
+                _log(f"combined poll round {_poll_round}: neither 'Tip' nor "
+                     f"'GeoPackage Export Options' seen within 5.0s | "
+                     f"fg='{_last_fg_seen}'")
+
+            if _tip_or_geo_result is None:
+                _dump_windows("neither Tip nor GeoPackage Export Options appeared (update_database)")
+                raise RuntimeError(
+                    "Export navigation failed: neither the 'Tip' dialog "
+                    "nor the 'GeoPackage Export Options' dialog appeared "
+                    f"within the expected time (focused window was "
+                    f"'{_last_fg_seen}' instead). Update Database was "
+                    "aborted before any further keystrokes were sent, to "
+                    "avoid typing into the wrong window."
+                )
 
         if _tip_or_geo_result == "tip":
             _log(f"Tip dialog focused | fg='{_fg_title()}'")
@@ -1300,22 +1315,10 @@ def update_database_from_geopackage():
                 )
             _log(f"GeoPackage Export Options focused | fg='{_fg_title()}'")
 
-        elif _tip_or_geo_result == "export_options":
+        else:
             _log("'Tip' was not shown (likely 'Don't Show This Again' "
                  f"was previously checked) - 'GeoPackage Export "
                  f"Options' already focused | fg='{_fg_title()}'")
-
-        else:
-            _dump_windows("neither Tip nor GeoPackage Export Options appeared (update_database)")
-            raise RuntimeError(
-                "Export navigation failed: neither the 'Tip' dialog "
-                "nor the 'GeoPackage Export Options' dialog appeared "
-                f"within the expected time (focused window was "
-                f"'{_last_fg_seen}' instead). Update Database was "
-                "aborted before any further keystrokes were sent, to "
-                "avoid typing into the wrong window."
-            )
-
         # Confirm "GeoPackage Export Options" - reached only via the
         # two valid paths above (Tip confirmed then GeoPackage Export
         # Options found, or GeoPackage Export Options found directly).
@@ -2032,10 +2035,11 @@ def update_map_and_select_recorded():
     proceed = messagebox.askyesno(
         "Confirm Before Updating Map",
         "Before continuing, please make sure that:\n\n"
-        "\u2022 At least one layer is highlighted in Global Mapper's Control Center.\n"
-        "\u2022 The highlighted layer is NOT a nested/grouped entry (one "
-        "with a + expand icon in the Control Center) \u2014 nested layers "
-        "are not currently supported and may cause this to fail.\n\n"
+        "\u2022 The layer you want to update is the only one highlighted in Global Mapper's Control Center.\n"
+        "\u2022 The highlighted layer is a single file/child layer, NOT "
+        "the parent/group entry (one with a + expand icon in the "
+        "Control Center) \u2014 selecting the parent node is not "
+        "supported; select the child layer(s) inside it instead.\n\n"
         "Do not switch windows (Alt+Tab) or interact with your computer "
         "while Update Map is running \u2014 this may interrupt the "
         "automated process.\n\n"
@@ -2143,109 +2147,142 @@ def update_map_and_select_recorded():
         pyautogui.press("enter")
         _log(f"EXPORT menu item selected | fg='{_fg_title()}'")
 
-        # SAFETY: poll for "Select Layers" to appear, up to a 5.0s
-        # timeout, instead of a fixed sleep - resolves quickly on fast
-        # machines and stays forgiving on slower ones (a slow machine
-        # was confirmed as a real factor: a flat 3.0s sleep here, and a
-        # 50ms sleep on Update Database's Save As check, both caused
-        # false aborts on runs where the expected dialog was about to
-        # appear normally, just not within the fixed window).
-        _select_layers_start = time.monotonic()
+        # ============================================================
+        # COMBINED POLL across "Select Layers" / "Tip" / "Select Export
+        # Format" (new) - a live test confirmed GM can skip straight to
+        # "Select Export Format" after the EXPORT menu item is
+        # selected, bypassing "Select Layers" entirely for reasons not
+        # yet understood. Detect whichever of the three actually
+        # appears and skip the confirming keystroke(s) for any earlier
+        # step(s) GM already bypassed, instead of treating a missing
+        # "Select Layers" as an automatic failure. Same two-round,
+        # 5.0s-each pattern as the Tip/GeoPackage Export Options poll
+        # below, for the same reason (distinguish "took a bit longer"
+        # from "genuinely never appeared").
+        # ============================================================
+        _step1_result = None
         _current_fg = _fg_title()
-        while time.monotonic() - _select_layers_start < 5.0:
-            _current_fg = _fg_title()
-            if "select layers" in _current_fg.lower():
-                _log(f"'Select Layers' dialog appeared after "
-                     f"{time.monotonic() - _select_layers_start:.1f}s | fg='{_current_fg}'")
+        for _poll_round in (1, 2):
+            _round_start = time.monotonic()
+            while time.monotonic() - _round_start < 5.0:
+                _current_fg = _fg_title()
+                if "select layers" in _current_fg.lower():
+                    _step1_result = "select_layers"
+                    break
+                if _current_fg.strip() == "Tip":
+                    _step1_result = "tip"
+                    break
+                if "select export format" in _current_fg.lower():
+                    _step1_result = "select_export_format"
+                    break
+                time.sleep(0.2)
+            if _step1_result is not None:
+                _log(f"combined poll (Select Layers/Tip/Select Export "
+                     f"Format) round {_poll_round}: found "
+                     f"'{_step1_result}' after "
+                     f"{time.monotonic() - _round_start:.1f}s | fg='{_current_fg}'")
                 break
-            time.sleep(0.2)
-        else:
-            _log(f"  [diag] 'Select Layers' not seen within 5.0s | fg='{_current_fg}'")
+            _log(f"combined poll (Select Layers/Tip/Select Export "
+                 f"Format) round {_poll_round}: none seen within 5.0s "
+                 f"| fg='{_current_fg}'")
 
-        # SAFETY ABORT: a live test confirmed a real failure mode
-        # here — when a GeoPackage/nested-layer entry was highlighted
-        # instead of a flat shapefile-type layer, this menu navigation
-        # landed somewhere unexpected and focus stayed on GM's main
-        # window instead of the "Select Layers" dialog appearing. The
-        # previous code pressed Enter unconditionally regardless, which
-        # sent that keystroke into whatever window happened to have
-        # focus - observed to type the export path into a browser tab
-        # in one run. Now: if "Select Layers" is not actually focused
-        # at this point, abort immediately with a clear, actionable
+        # SAFETY ABORT: if none of the three appeared after both
+        # rounds, this is a genuine navigation failure (e.g. a
+        # nested/grouped layer entry changed what options exist in
+        # GM's right-click menu) - abort with a clear, actionable
         # error instead of continuing to send keystrokes blind.
-        if "select layers" not in _current_fg.lower():
-            _dump_windows("export navigation lost focus - Select Layers dialog not found")
+        if _step1_result is None:
+            _dump_windows("export navigation lost focus after EXPORT menu item (update_map)")
             raise RuntimeError(
-                "Export navigation failed: the 'Select Layers' dialog "
-                f"did not appear as expected (focused window was "
-                f"'{_current_fg}' instead). This can happen when the "
-                "highlighted layer's type changes what options exist "
-                "in Global Mapper's right-click menu (e.g. a nested/"
-                "grouped GeoPackage entry vs. a flat shapefile layer). "
-                "Update Map was aborted before any further keystrokes "
-                "were sent, to avoid typing into the wrong window."
+                "Export navigation failed: none of 'Select Layers', "
+                "'Tip', or 'Select Export Format' appeared as expected "
+                f"(focused window was '{_current_fg}' instead). This "
+                "can happen when the highlighted layer's type changes "
+                "what options exist in Global Mapper's right-click "
+                "menu (e.g. a nested/grouped GeoPackage entry vs. a "
+                "flat shapefile layer). Update Map was aborted before "
+                "any further keystrokes were sent, to avoid typing "
+                "into the wrong window."
             )
 
-        # "Select Layers" dialog -> OK. Confirmed (in Update Database)
-        # that "OK" is already default-focused the instant this dialog
-        # opens, and its default checkbox state already reflects
-        # exactly which layer(s) were highlighted beforehand — no
-        # "Check All", no tabbing, a single Enter submits it as-is.
-        pyautogui.press("enter")
-        _log(f"Select Layers dialog confirmed (OK, no Check All, no tab) | fg='{_fg_title()}'")
+        # "Select Layers" dialog -> OK. Confirmed that "OK" is already
+        # default-focused the instant this dialog opens, and its
+        # default checkbox state already reflects exactly which
+        # layer(s) were highlighted beforehand — no "Check All", no
+        # tabbing, a single Enter submits it as-is. Skipped entirely if
+        # GM already bypassed this dialog (detected via the combined
+        # poll above).
+        if _step1_result == "select_layers":
+            pyautogui.press("enter")
+            _log(f"Select Layers dialog confirmed (OK, no Check All, no tab) | fg='{_fg_title()}'")
+        elif _step1_result == "select_export_format":
+            _log("'Select Layers' was not shown - 'Select Export "
+                 f"Format' already focused | fg='{_fg_title()}'")
+        else:
+            _log("'Select Layers' and 'Select Export Format' were both "
+                 f"not shown - 'Tip' already focused | fg='{_fg_title()}'")
 
         # "Select Export Format" dialog -> Geopackage. PageUp x20
         # resets the dropdown to its first entry ("2DM File" — no Home
         # key available on this keyboard), then "g" x6 type-ahead
         # advances the selection to "Geopackage". The type-ahead
         # commits the combobox value directly, so a single Enter here
-        # activates OK with no separate confirm step needed.
-        pyautogui.press("pageup", presses=20, interval=0.03)  # reset dropdown to top ("2DM File")
-        time.sleep(0.3)
-        for i in range(6):
-            pyautogui.press("g")
-            time.sleep(0.15)
-        _log(f"Select Export Format: Geopackage type-ahead complete | fg='{_fg_title()}'")
-        pyautogui.press("enter")  # OK on "Select Export Format" dialog
-        _log(f"Select Export Format: OK pressed | fg='{_fg_title()}'")
+        # activates OK with no separate confirm step needed. Skipped
+        # entirely if GM already bypassed this dialog too (jumped
+        # straight to "Tip").
+        if _step1_result in ("select_layers", "select_export_format"):
+            pyautogui.press("pageup", presses=20, interval=0.03)  # reset dropdown to top ("2DM File")
+            time.sleep(0.3)
+            for i in range(6):
+                pyautogui.press("g")
+                time.sleep(0.15)
+            _log(f"Select Export Format: Geopackage type-ahead complete | fg='{_fg_title()}'")
+            pyautogui.press("enter")  # OK on "Select Export Format" dialog
+            _log(f"Select Export Format: OK pressed | fg='{_fg_title()}'")
 
         # "Tip" (optional) then "GeoPackage Export Options" (mandatory).
         #
         # "Tip" is LEGITIMATELY OPTIONAL: if the user previously checked
         # "Don't Show This Again", GM skips straight to "GeoPackage
         # Export Options" and "Tip" never appears at all - a normal,
-        # expected case, not a failure. A single fixed-timeout wait on
-        # "Tip" alone cannot distinguish "legitimately skipped, GM
-        # already moved on" from "navigation genuinely broke" - both
-        # look identical (Tip never appears). Fix: poll for EITHER
-        # title appearing, so whichever one GM actually shows is
-        # detected directly, instead of guessing from Tip's absence.
-        #
-        # Two rounds of up to 5.0s each (10s ceiling total) before
-        # giving up, rather than one longer window, so the log can
-        # distinguish "took a bit longer" from "genuinely never
-        # appeared" via which round it resolved in (or failed in).
-        _tip_or_geo_result = None
-        _last_fg_seen = _fg_title()
-        for _poll_round in (1, 2):
-            _round_start = time.monotonic()
-            while time.monotonic() - _round_start < 5.0:
-                _last_fg_seen = _fg_title()
-                if _last_fg_seen.strip() == "Tip":
-                    _tip_or_geo_result = "tip"
+        # expected case, not a failure. If the combined poll above
+        # already landed on "Tip" directly, skip this second poll
+        # entirely and go straight to confirming it.
+        if _step1_result == "tip":
+            _tip_or_geo_result = "tip"
+        else:
+            _tip_or_geo_result = None
+            _last_fg_seen = _fg_title()
+            for _poll_round in (1, 2):
+                _round_start = time.monotonic()
+                while time.monotonic() - _round_start < 5.0:
+                    _last_fg_seen = _fg_title()
+                    if _last_fg_seen.strip() == "Tip":
+                        _tip_or_geo_result = "tip"
+                        break
+                    if "geopackage export options" in _last_fg_seen.lower():
+                        _tip_or_geo_result = "export_options"
+                        break
+                    time.sleep(0.2)
+                if _tip_or_geo_result is not None:
+                    _log(f"combined poll round {_poll_round}: found "
+                         f"'{_tip_or_geo_result}' after "
+                         f"{time.monotonic() - _round_start:.1f}s | fg='{_last_fg_seen}'")
                     break
-                if "geopackage export options" in _last_fg_seen.lower():
-                    _tip_or_geo_result = "export_options"
-                    break
-                time.sleep(0.2)
-            if _tip_or_geo_result is not None:
-                _log(f"combined poll round {_poll_round}: found "
-                     f"'{_tip_or_geo_result}' after "
-                     f"{time.monotonic() - _round_start:.1f}s | fg='{_last_fg_seen}'")
-                break
-            _log(f"combined poll round {_poll_round}: neither 'Tip' nor "
-                 f"'GeoPackage Export Options' seen within 5.0s | "
-                 f"fg='{_last_fg_seen}'")
+                _log(f"combined poll round {_poll_round}: neither 'Tip' nor "
+                     f"'GeoPackage Export Options' seen within 5.0s | "
+                     f"fg='{_last_fg_seen}'")
+
+            if _tip_or_geo_result is None:
+                _dump_windows("neither Tip nor GeoPackage Export Options appeared (update_map)")
+                raise RuntimeError(
+                    "Export navigation failed: neither the 'Tip' dialog "
+                    "nor the 'GeoPackage Export Options' dialog appeared "
+                    f"within the expected time (focused window was "
+                    f"'{_last_fg_seen}' instead). Update Map was aborted "
+                    "before any further keystrokes were sent, to avoid "
+                    "typing into the wrong window."
+                )
 
         if _tip_or_geo_result == "tip":
             _log(f"Tip dialog focused | fg='{_fg_title()}'")
@@ -2264,22 +2301,10 @@ def update_map_and_select_recorded():
                 )
             _log(f"GeoPackage Export Options focused | fg='{_fg_title()}'")
 
-        elif _tip_or_geo_result == "export_options":
+        else:
             _log("'Tip' was not shown (likely 'Don't Show This Again' "
                  f"was previously checked) - 'GeoPackage Export "
                  f"Options' already focused | fg='{_fg_title()}'")
-
-        else:
-            _dump_windows("neither Tip nor GeoPackage Export Options appeared (update_map)")
-            raise RuntimeError(
-                "Export navigation failed: neither the 'Tip' dialog "
-                "nor the 'GeoPackage Export Options' dialog appeared "
-                f"within the expected time (focused window was "
-                f"'{_last_fg_seen}' instead). Update Map was aborted "
-                "before any further keystrokes were sent, to avoid "
-                "typing into the wrong window."
-            )
-
         # Confirm "GeoPackage Export Options" - reached only via the
         # two valid paths above (Tip confirmed then GeoPackage Export
         # Options found, or GeoPackage Export Options found directly).
