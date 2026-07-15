@@ -383,6 +383,54 @@ def _find_best_table(layer_name: str, existing_tables: list, schema_prefix: str)
     return None
 
 
+# Tracks only the currently-visible tooltip Toplevel(s) — not a
+# registry of every tooltip ever created. A tooltip is a fully
+# independent Toplevel (overrideredirect + its own -topmost), so its
+# visibility was previously decoupled from CAMA's own show/hide state:
+# if CAMA withdraws (e.g. focus moves to another application) while a
+# tooltip is showing, nothing ever told that tooltip to withdraw too,
+# leaving it floating on screen even over unrelated windows. This set
+# lets monitor_gm_state() withdraw whatever tooltip(s) happen to be
+# visible at the moment CAMA itself withdraws. Entries are added in
+# enter() and removed in leave() below, so the set only ever contains
+# tooltips that are actually on screen right now.
+_active_tooltips = set()
+
+
+def _repin_active_tooltips():
+    """
+    Z-order fix (independent of the tooltip lifecycle fix above): restores
+    topmost status for any currently-visible tooltip(s) right after the
+    main CAMA window has just been re-pinned topmost.
+
+    On Windows, when two windows are both marked topmost, whichever one
+    was most recently (re-)pinned wins the Z-order. CAMA's own window is
+    repeatedly re-pinned topmost (launch, _force_z_order, and the
+    periodic recheck in monitor_gm_state) independently of whether a
+    tooltip happens to be showing at that moment — so a repin can push
+    an already-visible tooltip behind CAMA even though the tooltip's own
+    -topmost was set correctly when it first appeared.
+
+    Re-applies the exact same mechanism add_tooltip()'s enter() uses when
+    first showing a tooltip (lift() + the "-topmost" attribute) rather
+    than lift() alone, since lift() by itself is not always sufficient
+    to regain topmost precedence immediately after another window's own
+    SetWindowPos(HWND_TOPMOST, ...) call.
+
+    _active_tooltips is expected to contain only currently-visible
+    tooltip(s) (enter()/leave() and the withdraw-on-hide path in
+    monitor_gm_state() keep it that way) — if a tracked tooltip was
+    destroyed out from under us, drop the stale reference instead of
+    raising.
+    """
+    for _tip in list(_active_tooltips):
+        try:
+            _tip.lift()
+            _tip.attributes("-topmost", True)
+        except tk.TclError:
+            _active_tooltips.discard(_tip)
+
+
 def add_tooltip(widget, icon_path, title, subtitle="", canvas=None, bg_id=None):
     tooltip = tk.Toplevel(widget)
     tooltip.withdraw()
@@ -465,12 +513,14 @@ def add_tooltip(widget, icon_path, title, subtitle="", canvas=None, bg_id=None):
         tooltip.deiconify()
         tooltip.lift()
         tooltip.attributes("-topmost", True)
+        _active_tooltips.add(tooltip)  # now visible — track it
 
         if canvas and bg_id:
             canvas.itemconfig(bg_id, image=hover_bg)
 
     def leave(event):
         tooltip.withdraw()
+        _active_tooltips.discard(tooltip)  # no longer visible — stop tracking it
         root.attributes("-topmost", True)
         if canvas and bg_id:
             canvas.itemconfig(bg_id, image="")
@@ -3441,12 +3491,93 @@ def get_cama_size():
         return r.right - r.left, r.bottom - r.top
     return root.winfo_width(), root.winfo_height()
 
+# ── Locked GM window (session-scoped HWND lock) ──────────────────────
+# Root cause being fixed here: gw.getWindowsWithTitle('Global Mapper
+# Pro') is a TITLE-SUBSTRING search, and GM's own native alert/message
+# dialogs (e.g. "No hidden layers were found to close.") also carry a
+# window title starting with "Global Mapper Pro v26.0.2 (b121824)
+# [64-bit]" - confirmed via live window-title dump. Any function that
+# re-runs this search after startup risks locking onto a transient
+# dialog instead of the real main application window, corrupting
+# position-following / topmost-stacking / closure detection.
+#
+# Fix: discover the real GM main window ONCE, in
+# wait_for_global_mapper(), the same way as before (title-substring
+# search + stability check). At the moment it is confirmed ready,
+# capture its actual Win32 HWND and store it here. Every other
+# GM-window consumer below (get_gm_rect, launch_main_window,
+# monitor_gm_state, monitor_gm_closure) reads this locked HWND
+# directly via raw ctypes calls (IsWindow / GetWindowRect /
+# IsWindowVisible / IsIconic) instead of performing another title
+# search. The lock is intentionally never re-acquired mid-session -
+# if the locked HWND stops being a valid window, that means the
+# original GM instance actually closed (see monitor_gm_closure()),
+# which is the existing, unchanged shutdown signal.
+#
+# Scope note: this does NOT change is_relevant_window_focused(), which
+# solely answers "does the CURRENTLY FOCUSED window belong to GM (or
+# CAMA)" for show/hide purposes. Locking that one to a single HWND
+# would break the intended behavior of keeping CAMA Tools visible
+# while a GM dialog has focus.
+_locked_gm_hwnd = [None]
+# PID of the locked GM process, derived once from _locked_gm_hwnd at
+# lock time (see wait_for_global_mapper()). Used by
+# is_relevant_window_focused() as a process-identity check instead of
+# matching window titles — a window belongs to "GM" because it's
+# owned by this PID, not because its title happens to contain the
+# text "Global Mapper" (which unrelated windows, e.g. a browser tab
+# titled after a GM-related chat conversation, could also contain).
+_locked_gm_pid = [None]
+
+
+def _extract_hwnd(win32window):
+    """
+    Pulls the raw Win32 HWND out of a pygetwindow Win32Window object.
+
+    pygetwindow (checked against v0.0.9, the current PyPI release -
+    there is no newer version, and no published version has ever
+    added a public accessor) does not expose the handle publicly; it
+    only exists as the private attribute `_hWnd` set in
+    Win32Window.__init__(). This function is the ONLY place in this
+    file that touches that private attribute, so if a future
+    pygetwindow release renames/removes it, there is exactly one line
+    to fix.
+
+    Verified against the actual pygetwindow source for the
+    getWindowsWithTitle() code path: EnumWindows' callback is declared
+    with a plain `ctypes.c_int` hWnd parameter, so the value stored in
+    `_hWnd` is a plain Python int here - directly usable in raw
+    ctypes.windll.user32 calls (IsWindow, GetWindowRect, etc.), same
+    as the hwnd values get_hwnd_by_title() already returns elsewhere
+    in this file.
+    """
+    return win32window._hWnd
+
+
+def _locked_gm_snapshot():
+    """
+    Returns (left, top, width, height, visible, minimized) read
+    directly from the locked GM HWND via ctypes - no title search.
+    Returns None if no window has been locked yet, or if the locked
+    HWND is no longer a valid window (GM closed).
+    """
+    hwnd = _locked_gm_hwnd[0]
+    if not hwnd or not ctypes.windll.user32.IsWindow(hwnd):
+        return None
+    r = ctypes.wintypes.RECT()
+    if not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(r)):
+        return None
+    visible = bool(ctypes.windll.user32.IsWindowVisible(hwnd))
+    minimized = bool(ctypes.windll.user32.IsIconic(hwnd))
+    return r.left, r.top, r.right - r.left, r.bottom - r.top, visible, minimized
+
+
 def get_gm_rect():
     try:
-        gm_wins = [w for w in gw.getWindowsWithTitle('Global Mapper Pro') if w.visible]
-        if gm_wins:
-            g = gm_wins[0]
-            return g.left, g.top, g.width, g.height
+        snap = _locked_gm_snapshot()
+        if snap and snap[4]:  # snap[4] = visible - preserves old .visible filter
+            left, top, width, height, _visible, _minimized = snap
+            return left, top, width, height
     except Exception:
         pass
     return None
@@ -3486,14 +3617,26 @@ def get_foreground_pid():
 
 def is_relevant_window_focused():
     """
-    True if the foreground window is Global Mapper, CAMA Tools itself,
-    or one of the CAMA tool subprocess windows (Road Width, Land Shape, etc.)
-    """
-    fg = get_foreground_hwnd()
-    if hwnd_belongs_to(fg, ["Global Mapper", "CAMA Tools"]):
-        return True
+    True if the foreground window belongs to the locked Global Mapper
+    process, to CAMA Tools' own process, or to one of the CAMA tool
+    subprocess windows (Road Width, Land Shape, etc.)
 
+    Uses process identity (PID), not window-title text. A title-substring
+    check here used to treat ANY window as "relevant" if its title merely
+    contained the text "Global Mapper" or "CAMA Tools" — which produced
+    false positives for completely unrelated windows, e.g. a browser tab
+    showing a chat conversation titled "CAMA Tools Workflow". Checking
+    which process actually owns the foreground window avoids that: GM's
+    own dialogs share GM's real PID (so they still count as relevant,
+    same as before), while an unrelated application never will, no
+    matter what text happens to appear in its title.
+    """
     fg_pid = get_foreground_pid()
+
+    # Belongs to the locked Global Mapper process — covers GM's own main
+    # window as well as its child dialogs/alerts (same process, same PID).
+    if _locked_gm_pid[0] is not None and fg_pid == _locked_gm_pid[0]:
+        return True
 
     # Our own process: covers every window this process creates —
     # messageboxes ("Database Update Failed", etc.), the login window,
@@ -3587,6 +3730,29 @@ ctypes.windll.user32.CallWindowProcW.argtypes = [
     ctypes.wintypes.UINT,
     ctypes.wintypes.WPARAM,
     ctypes.wintypes.LPARAM
+]
+
+# SINGLE-VARIABLE TEST (Z-order investigation): SetWindowPos() had no
+# explicit argtypes/restype declared anywhere in this file. Every logged
+# call — across every call site, across multiple independent live-test
+# runs — returned ret=0, even when the target HWND was separately
+# confirmed valid (IsWindow=1) and correctly identified (title='CAMA
+# Tools'). With the HWND itself ruled out, an incorrect/incomplete
+# ctypes declaration for SetWindowPos() is the remaining leading
+# hypothesis and the next controlled variable to test. This follows the
+# same pattern already proven above for SetWindowLongPtrW/CallWindowProcW.
+# In particular, hWndInsertAfter (HWND_TOPMOST = -1) must marshal as a
+# full pointer-width HWND, not a default (32-bit) C int, for
+# SetWindowPos to recognize it as the special "topmost" sentinel value.
+ctypes.windll.user32.SetWindowPos.restype  = ctypes.wintypes.BOOL
+ctypes.windll.user32.SetWindowPos.argtypes = [
+    ctypes.wintypes.HWND,   # hWnd
+    ctypes.wintypes.HWND,   # hWndInsertAfter
+    ctypes.c_int,           # X
+    ctypes.c_int,           # Y
+    ctypes.c_int,           # cx
+    ctypes.c_int,           # cy
+    ctypes.wintypes.UINT    # uFlags
 ]
 
 _old_wnd_proc = None
@@ -3853,15 +4019,15 @@ update_btn.pack(side="left", padx=5)  # Add horizontal spacing
 
 
 def launch_main_window():
-    gm_windows = [w for w in gw.getWindowsWithTitle('Global Mapper Pro') if w.visible]
+    snap = _locked_gm_snapshot()
     root.update_idletasks()  # ensure actual size is computed first
     cama_w = root.winfo_reqwidth()
     cama_h = root.winfo_reqheight()
 
-    if gm_windows:
-        gm_win = gm_windows[0]
-        new_x = gm_win.left + gm_win.width - cama_w - 10
-        new_y = gm_win.top + gm_win.height - cama_h - 40
+    if snap and snap[4]:  # snap[4] = visible - preserves old .visible filter
+        gm_left, gm_top, gm_width, gm_height, _visible, _minimized = snap
+        new_x = gm_left + gm_width - cama_w - 10
+        new_y = gm_top + gm_height - cama_h - 40
         root.geometry(f"+{new_x}+{new_y}")
     else:
         sw = root.winfo_screenwidth()
@@ -3873,26 +4039,88 @@ def launch_main_window():
     root.deiconify()
     root.lift()
     # Pin as topmost at Win32 level — more reliable than tkinter's -topmost
-    cama_hwnd = get_hwnd_by_title("CAMA Tools")
+    # NOTE: switched from get_hwnd_by_title("CAMA Tools") to the same
+    # GetParent(root.winfo_id()) pattern hide_from_taskbar() already uses.
+    # Diagnostic log evidence (SetWindowPos failing with
+    # ERROR_INVALID_WINDOW_HANDLE=1400 on every single call, across every
+    # call site, for the entire session) showed get_hwnd_by_title() was
+    # returning an hwnd that does not correspond to a live window.
+    # DIAGNOSTIC ONLY — one-time comparison log, so we can see whether
+    # root.winfo_id() and GetParent(root.winfo_id()) resolve to the hwnd
+    # we then pass to SetWindowPos() below. No behavior change.
+    _log(f"HWND STARTUP CHECK | root.winfo_id()={root.winfo_id()} | GetParent(root.winfo_id())={ctypes.windll.user32.GetParent(root.winfo_id())}")
+
+    cama_hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
     if cama_hwnd:
-        ctypes.windll.user32.SetWindowPos(
+        # DIAGNOSTIC ONLY — confirm the hwnd is actually a live window
+        # (IsWindow) and which window it actually refers to (title),
+        # immediately before the existing SetWindowPos() call below.
+        # No change to arguments/timing/behavior.
+        _is_valid = ctypes.windll.user32.IsWindow(cama_hwnd)
+        _title_buf = ctypes.create_unicode_buffer(256)
+        ctypes.windll.user32.GetWindowTextW(cama_hwnd, _title_buf, 256)
+        if _is_valid:
+            _log(f"HWND CHECK | caller=launch_main_window | hwnd={cama_hwnd} | IsWindow={_is_valid} | title='{_title_buf.value}'")
+        else:
+            _iw_err = ctypes.windll.kernel32.GetLastError()
+            _log(f"HWND CHECK | caller=launch_main_window | hwnd={cama_hwnd} | IsWindow={_is_valid} | title='{_title_buf.value}' | GetLastError={_iw_err}")
+
+        # DIAGNOSTIC ONLY (Z-order race investigation) — logs around the
+        # existing call, no change to arguments/timing/behavior.
+        _log(f"SetWindowPos CALL | caller=launch_main_window | hwnd={cama_hwnd} | flags=SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE")
+        _swp_ret = ctypes.windll.user32.SetWindowPos(
             cama_hwnd, HWND_TOPMOST,
             0, 0, 0, 0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
         )
+        if _swp_ret == 0:
+            _swp_err = ctypes.windll.kernel32.GetLastError()
+            _log(f"SetWindowPos RESULT | caller=launch_main_window | hwnd={cama_hwnd} | ret={_swp_ret} | GetLastError={_swp_err}")
+        else:
+            _log(f"SetWindowPos RESULT | caller=launch_main_window | hwnd={cama_hwnd} | ret={_swp_ret}")
 
     # Force Z-order above GM immediately after showing
     def _force_z_order():
-        cama_hwnd = get_hwnd_by_title("CAMA Tools")
+        # DIAGNOSTIC ONLY — logs when this delayed callback actually
+        # fires (vs. its scheduled 500ms/1500ms), for race analysis.
+        _log("_force_z_order() fired")
+        # See note above launch_main_window()'s cama_hwnd assignment.
+        cama_hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
         if cama_hwnd:
-            ctypes.windll.user32.SetWindowPos(
+            # DIAGNOSTIC ONLY — see note in launch_main_window().
+            _is_valid = ctypes.windll.user32.IsWindow(cama_hwnd)
+            _title_buf = ctypes.create_unicode_buffer(256)
+            ctypes.windll.user32.GetWindowTextW(cama_hwnd, _title_buf, 256)
+            if _is_valid:
+                _log(f"HWND CHECK | caller=_force_z_order | hwnd={cama_hwnd} | IsWindow={_is_valid} | title='{_title_buf.value}'")
+            else:
+                _iw_err = ctypes.windll.kernel32.GetLastError()
+                _log(f"HWND CHECK | caller=_force_z_order | hwnd={cama_hwnd} | IsWindow={_is_valid} | title='{_title_buf.value}' | GetLastError={_iw_err}")
+
+            _log(f"SetWindowPos CALL | caller=_force_z_order | hwnd={cama_hwnd} | flags=SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE")
+            _swp_ret = ctypes.windll.user32.SetWindowPos(
                 cama_hwnd, HWND_TOPMOST,
                 0, 0, 0, 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
             )
+            if _swp_ret == 0:
+                _swp_err = ctypes.windll.kernel32.GetLastError()
+                _log(f"SetWindowPos RESULT | caller=_force_z_order | hwnd={cama_hwnd} | ret={_swp_ret} | GetLastError={_swp_err}")
+            else:
+                _log(f"SetWindowPos RESULT | caller=_force_z_order | hwnd={cama_hwnd} | ret={_swp_ret}")
+
+            # Z-order fix: CAMA was just re-pinned topmost above — restore
+            # any currently-visible tooltip's topmost status so it doesn't
+            # end up behind CAMA. See _repin_active_tooltips().
+            _repin_active_tooltips()
 
     root.after(500, _force_z_order)   # after GM settles
     root.after(1500, _force_z_order)  # second pass in case GM repaints on top
+
+    # DIAGNOSTIC ONLY — marks completion of launch_main_window() for
+    # race-timing analysis against the _force_z_order()/monitor_gm_state()
+    # log lines above/below.
+    _log("launch_main_window() complete")
 
 
 import pygetwindow as gw
@@ -3968,51 +4196,105 @@ prev_position  = [None, None]
 prev_gm_rect   = [None, None, None, None]  # left, top, width, height
 cama_offset    = [None, None]              # CAMA's offset relative to GM
 _topmost_recheck_counter = [0]             # throttles repeated SetWindowPos calls to avoid title-bar flicker
+_monitor_first_tick_logged = [False]       # DIAGNOSTIC ONLY — ensures the "first tick" log fires once, not every 200ms
 _active_tool_titles = set()               # tracks open tool window titles in dev mode
 
 def monitor_gm_state():
-    try:
-        gm_windows = [w for w in gw.getWindowsWithTitle('Global Mapper Pro') if w.visible]
-        if gm_windows:
-            gm_win = gm_windows[0]
+    # DIAGNOSTIC ONLY — logs once, the first time this loop ever ticks,
+    # for race-timing analysis against launch_main_window()'s log lines.
+    if not _monitor_first_tick_logged[0]:
+        _monitor_first_tick_logged[0] = True
+        _log("monitor_gm_state() first tick")
 
-            if gm_win.isMinimized or not is_relevant_window_focused():
+    try:
+        snap = _locked_gm_snapshot()
+        if snap and snap[4]:  # snap[4] = visible - preserves old .visible filter
+            gm_left, gm_top, gm_w, gm_h, _visible, gm_minimized = snap
+
+            if gm_minimized or not is_relevant_window_focused():
                 if root.state() != 'withdrawn':
                     root.withdraw()
+                    # CAMA itself is going invisible — any tooltip that
+                    # happened to be showing has no business staying on
+                    # screen (it would float over whatever other window
+                    # the user switched to). It intentionally does NOT
+                    # come back when CAMA is shown again below — it only
+                    # reappears through the normal hover (enter) path.
+                    if _active_tooltips:
+                        for _tip in list(_active_tooltips):
+                            _tip.withdraw()
+                        _active_tooltips.clear()
             else:
                 just_shown = (root.state() == 'withdrawn')
                 if just_shown:
                     root.attributes("-alpha", 1)
                     root.deiconify()
 
-                cama_hwnd = get_hwnd_by_title("CAMA Tools")
-                gm_hwnd   = get_hwnd_by_title("Global Mapper Pro")
+                # See note above launch_main_window()'s cama_hwnd assignment.
+                cama_hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
 
                 # --- Z-order: only re-pin topmost when just shown, or occasionally ---
                 # Calling SetWindowPos every 200ms causes visible title-bar flicker.
                 if cama_hwnd:
                     if just_shown:
-                        ctypes.windll.user32.SetWindowPos(
+                        # DIAGNOSTIC ONLY — see note in launch_main_window().
+                        _is_valid = ctypes.windll.user32.IsWindow(cama_hwnd)
+                        _title_buf = ctypes.create_unicode_buffer(256)
+                        ctypes.windll.user32.GetWindowTextW(cama_hwnd, _title_buf, 256)
+                        if _is_valid:
+                            _log(f"HWND CHECK | caller=monitor_gm_state just_shown | hwnd={cama_hwnd} | IsWindow={_is_valid} | title='{_title_buf.value}'")
+                        else:
+                            _iw_err = ctypes.windll.kernel32.GetLastError()
+                            _log(f"HWND CHECK | caller=monitor_gm_state just_shown | hwnd={cama_hwnd} | IsWindow={_is_valid} | title='{_title_buf.value}' | GetLastError={_iw_err}")
+
+                        # DIAGNOSTIC ONLY — logs around the existing call,
+                        # no change to arguments/timing/behavior.
+                        _log(f"SetWindowPos CALL | caller=monitor_gm_state just_shown | hwnd={cama_hwnd} | flags=SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE")
+                        _swp_ret = ctypes.windll.user32.SetWindowPos(
                             cama_hwnd, HWND_TOPMOST,
                             0, 0, 0, 0,
                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
                         )
+                        if _swp_ret == 0:
+                            _swp_err = ctypes.windll.kernel32.GetLastError()
+                            _log(f"SetWindowPos RESULT | caller=monitor_gm_state just_shown | hwnd={cama_hwnd} | ret={_swp_ret} | GetLastError={_swp_err}")
+                        else:
+                            _log(f"SetWindowPos RESULT | caller=monitor_gm_state just_shown | hwnd={cama_hwnd} | ret={_swp_ret}")
+
+                        # Z-order fix: see _repin_active_tooltips().
+                        _repin_active_tooltips()
                     else:
                         _topmost_recheck_counter[0] += 1
                         if _topmost_recheck_counter[0] >= 10:  # ~every 2s instead of every 200ms
                             _topmost_recheck_counter[0] = 0
-                            ctypes.windll.user32.SetWindowPos(
+                            # DIAGNOSTIC ONLY — see note in launch_main_window().
+                            _is_valid = ctypes.windll.user32.IsWindow(cama_hwnd)
+                            _title_buf = ctypes.create_unicode_buffer(256)
+                            ctypes.windll.user32.GetWindowTextW(cama_hwnd, _title_buf, 256)
+                            if _is_valid:
+                                _log(f"HWND CHECK | caller=monitor_gm_state throttled | hwnd={cama_hwnd} | IsWindow={_is_valid} | title='{_title_buf.value}'")
+                            else:
+                                _iw_err = ctypes.windll.kernel32.GetLastError()
+                                _log(f"HWND CHECK | caller=monitor_gm_state throttled | hwnd={cama_hwnd} | IsWindow={_is_valid} | title='{_title_buf.value}' | GetLastError={_iw_err}")
+
+                            # DIAGNOSTIC ONLY — logs around the existing call,
+                            # no change to arguments/timing/behavior.
+                            _log(f"SetWindowPos CALL | caller=monitor_gm_state throttled | hwnd={cama_hwnd} | flags=SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE")
+                            _swp_ret = ctypes.windll.user32.SetWindowPos(
                                 cama_hwnd, HWND_TOPMOST,
                                 0, 0, 0, 0,
                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
                             )
+                            if _swp_ret == 0:
+                                _swp_err = ctypes.windll.kernel32.GetLastError()
+                                _log(f"SetWindowPos RESULT | caller=monitor_gm_state throttled | hwnd={cama_hwnd} | ret={_swp_ret} | GetLastError={_swp_err}")
+                            else:
+                                _log(f"SetWindowPos RESULT | caller=monitor_gm_state throttled | hwnd={cama_hwnd} | ret={_swp_ret}")
+
+                            # Z-order fix: see _repin_active_tooltips().
+                            _repin_active_tooltips()
 
                 # --- Follow GM when it moves ---
-                gm_left   = gm_win.left
-                gm_top    = gm_win.top
-                gm_w      = gm_win.width
-                gm_h      = gm_win.height
-
                 gm_moved = (
                     prev_gm_rect[0] != gm_left or
                     prev_gm_rect[1] != gm_top  or
@@ -4055,8 +4337,8 @@ def monitor_gm_state():
     root.after(200, monitor_gm_state)
 
 def monitor_gm_closure():
-    gm_windows = [w for w in gw.getWindowsWithTitle('Global Mapper Pro') if w.visible]
-    if not gm_windows:
+    snap = _locked_gm_snapshot()
+    if not snap or not snap[4]:  # not found, or found but not visible - preserves old .visible filter
         print("❌ Global Mapper closed. Exiting tools.")
         root.destroy()
     else:
@@ -4077,7 +4359,16 @@ def wait_for_global_mapper():
     if ready:
         _gm_stable_count[0] += 1
         if _gm_stable_count[0] >= 2:      # stable for 2 consecutive checks (2s)
-            print("✅ Global Mapper is fully open.")
+            # Lock onto the exact Win32Window instance pygetwindow just
+            # confirmed as ready — not a fresh title lookup. This is
+            # the single point where the session-wide lock is set; see
+            # _locked_gm_hwnd for why every other GM-window consumer
+            # below reads this instead of searching by title again.
+            _locked_gm_hwnd[0] = _extract_hwnd(gm_windows[0])
+            _pid_buf = ctypes.wintypes.DWORD()
+            ctypes.windll.user32.GetWindowThreadProcessId(_locked_gm_hwnd[0], ctypes.byref(_pid_buf))
+            _locked_gm_pid[0] = _pid_buf.value
+            _log(f"Global Mapper is fully open. Locked HWND: {_locked_gm_hwnd[0]} | Locked PID: {_locked_gm_pid[0]}")
             launch_main_window()
             monitor_gm_state()
             monitor_gm_closure()
