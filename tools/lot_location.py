@@ -1,12 +1,15 @@
 import os
 import re
 import tkinter as tk
-from tkinter import filedialog, messagebox, Listbox
+from tkinter import filedialog, messagebox, Listbox, ttk
 import geopandas as gpd
 import pandas as pd
+import numpy as np
 import subprocess
 import json
 import psycopg2
+import threading
+import queue
 from shapely.validation import make_valid
 from shapely.geometry import Point
 from itertools import combinations
@@ -97,23 +100,89 @@ def load_in_global_mapper(filepath):
 
     except Exception as e:
         print(f"⚠️ Could not open in Global Mapper: {e}")
+
+
 road_source = None
 output_mode = None
 
+# road_type_excluded_values: list[str] of ROAD_TYPE values (exact,
+# case-sensitive) that the user unchecked in the Section 2 "Filter by
+# Road Type" checklist. Set by on_run() inside open_main_window(), read
+# by run_processing() and threaded into process_lot_location(). Empty
+# list => no filtering (default / backward-compatible behavior).
+road_type_excluded_values = []
+
+# _road_gdf_cache: holds the most recently, successfully read road layer
+# so run_processing() can reuse it instead of re-reading the same file/DB
+# table that was already read to populate the Section 2 checklist.
+# Keyed by (source_type, path_or_table) so a stale cache from a different
+# selection is never silently reused. See _clear_road_type_filter() and
+# _poll_road_read_queue() inside open_main_window() for the write side.
+_road_gdf_cache = {"key": None, "gdf": None}
+
 # ----------------- CRS UTILITY -----------------
-def get_prs92_zone(gdfs):
-    centroids = []
+# PRS92 zones are non-overlapping 2-degree longitude bands (EPSG registry):
+#   Zone I   (3121): west of 118°E
+#   Zone II  (3122): 118°E – 120°E  (Palawan, Calamian Islands)
+#   Zone III (3123): 120°E – 122°E  (Luzon west of 122°E, Mindoro)
+#   Zone IV  (3124): 122°E – 124°E  (SE Luzon, Panay, Cebu, Negros, west Mindanao)
+#   Zone V   (3125): east of 124°E  (east Mindanao, east Visayas)
+PRS92_ZONE_BOUNDS = [
+    (-180.0, 118.0, 3121, "Zone I"),
+    (118.0,  120.0, 3122, "Zone II"),
+    (120.0,  122.0, 3123, "Zone III"),
+    (122.0,  124.0, 3124, "Zone IV"),
+    (124.0,  180.0, 3125, "Zone V"),
+]
+
+
+def detect_prs92_zone(gdfs):
+    """
+    Auto-detect the PRS92 zone EPSG code from the COMBINED bounding-box
+    midpoint longitude of one or more input GeoDataFrames.
+
+    Canonical CRS-detection logic, standardized across CAMA GIS tools
+    (see road_frontage.py, the reference implementation): total_bounds
+    (not a unioned-geometry centroid — a known source of GEOS
+    TopologyExceptions on real-world cadastral data with invalid
+    geometries), the same PRS92_ZONE_BOUNDS table, and the same
+    missing-CRS fallback/warning behavior.
+
+    Integration note (lot_location-specific): this tool has no progress
+    callback, so unlike road_frontage.py's (epsg, warning) tuple return,
+    this returns only the EPSG code — any warning is printed directly.
+    Also, since process_lot_location() reprojects both the parcel and
+    road layers together, this accepts a list of GeoDataFrames and uses
+    their COMBINED extent, rather than a single GeoDataFrame.
+    """
+    all_bounds = []
     for gdf in gdfs:
-        if gdf.crs is None:
-            gdf = gdf.set_crs(epsg=4326)
-        gdf_wgs84 = gdf.to_crs(epsg=4326)
-        centroids.append(gdf_wgs84.unary_union.centroid)
-    avg_lon = sum(c.x for c in centroids) / len(centroids)
-    if avg_lon < 118: return 3121
-    elif avg_lon < 120: return 3122
-    elif avg_lon < 122: return 3123
-    elif avg_lon < 124: return 3124
-    else: return 3125
+        g = gdf
+        if g.crs is None:
+            g = g.set_crs(epsg=4326)
+            print("⚠️ No CRS found in one of the input datasets -- assuming "
+                  "WGS84. Measurements may be incorrect if the actual CRS "
+                  "is different.")
+        g_wgs84 = g.to_crs(epsg=4326) if g.crs.to_epsg() != 4326 else g
+        all_bounds.append(g_wgs84.total_bounds)
+
+    minx = min(b[0] for b in all_bounds)
+    maxx = max(b[2] for b in all_bounds)
+    center_lon = (minx + maxx) / 2
+
+    for lon_min, lon_max, epsg, zone_label in PRS92_ZONE_BOUNDS:
+        if lon_min <= center_lon < lon_max:
+            if not (lon_min <= minx and maxx < lon_max):
+                print(f"⚠️ Dataset longitude range ({minx:.4f}° to {maxx:.4f}°E) "
+                      f"extends outside the detected {zone_label} bounds "
+                      f"({lon_min}°E–{lon_max}°E). Features near the dataset "
+                      f"edge may be very slightly less accurate.")
+            print(f"ℹ️ Auto-detected PRS92 {zone_label} (EPSG:{epsg}) "
+                  f"from combined bbox-midpoint longitude {center_lon:.4f}°E")
+            return epsg
+
+    raise ValueError(f"Could not determine PRS92 zone for longitude {center_lon}")
+
 
 # ----------------- Geometry Fix -----------------
 def fix_geometry(geom):
@@ -226,47 +295,99 @@ def _deduplicate_road_ids(id_list, road_name_map):
     return deduped
 
 
+# ROAD_TYPE_COLUMN_CANDIDATES: case-insensitive column-name aliases used to
+# locate a road-classification column in a user-supplied road layer. Shared
+# between process_lot_location() (server-side filtering) and the GUI's
+# road-type checklist (Section 2 of open_main_window()) so both agree on
+# what counts as a "ROAD_TYPE-like" column.
+#
+# NOTE: "highway" was already part of the pre-existing PUBLIC_ROAD_TYPES
+# detection logic before this feature — kept as-is for backward
+# compatibility with any dataset that uses OSM-style column naming. Do not
+# remove without confirming no dataset depends on it; that decision is out
+# of scope for this feature.
+ROAD_TYPE_COLUMN_CANDIDATES = ("road_type", "roadtype", "highway")
+
+
+def _detect_road_type_column(gdf):
+    """
+    Case-insensitive lookup of a ROAD_TYPE-like column in a GeoDataFrame.
+    Returns the actual column name (original casing preserved) or None.
+    """
+    if gdf is None:
+        return None
+    return next(
+        (c for c in gdf.columns if c.lower() in ROAD_TYPE_COLUMN_CANDIDATES),
+        None
+    )
+
+
 def label_lot_location(val):
     return {0: "Inner Lot", 1: "Road Lot", 2: "Corner Lot"}.get(val, "Unknown")
 
 
-def process_lot_location(barangay_gdf, road_gdf, source_name=""):
+def process_lot_location(barangay_gdf, road_gdf, source_name="", excluded_road_types=None, progress=None):
+    """
+    Core classification engine. Unchanged from the prior "Double Frontage"
+    fix (Intersection Buffer Test / road-name deduplication below) except
+    for the road-type filtering step, which replaces the old hardcoded
+    PUBLIC_ROAD_TYPES allowlist with a fully optional, user-driven filter.
+
+    Parameters
+    ----------
+    excluded_road_types : optional list/set of str — ROAD_TYPE values
+        (exact, case-sensitive match) to exclude from the road layer
+        before the 10m buffer / Intersection Buffer Test / classification
+        steps run. None or empty => no filtering, every road feature in
+        the layer is used. This is the default and is backward-compatible
+        with any existing caller that doesn't pass this argument.
+    progress : optional callable progress(message, value=None, maximum=None)
+        — called at coarse milestones and, throttled, during the
+        classification loop. None (default) disables progress reporting
+        entirely — every call site below is guarded, so this remains
+        backward-compatible with any existing caller that doesn't pass it.
+    """
     orig_crs = barangay_gdf.crs
-    zone_epsg = get_prs92_zone([barangay_gdf, road_gdf])
+    zone_epsg = detect_prs92_zone([barangay_gdf, road_gdf])
     print(f"🌍 [{source_name}] Using EPSG:{zone_epsg}")
+    if progress:
+        progress(f"Reprojecting {source_name} to EPSG:{zone_epsg}")
     brgy_proj = barangay_gdf.to_crs(epsg=zone_epsg)
     road_proj = road_gdf.to_crs(epsg=zone_epsg)
 
     # ------------------------------------------------------------------
-    # Filter: public roads only for Corner Lot classification.
-    # Private Roads, Alleys, Driveways, and Bridges are excluded because
-    # corner lot premium (per BLGF Mass Appraisal Guidebook) applies only
-    # to publicly accessible roads (National, Provincial, Barangay).
-    # Internal subdivision roads and alleys do not generate corner influence.
-    # Falls back to full road layer if no road_type column exists.
+    # Optional, user-driven road-type filter (replaces the old hardcoded
+    # PUBLIC_ROAD_TYPES allowlist). There is no built-in list of "public"
+    # road types anymore — ROAD_TYPE label conventions vary by LGU, so
+    # the GUI (Section 2, "Filter by Road Type") lets the user exclude
+    # whichever values exist in their own dataset, if they choose to.
+    #
+    # Default behavior (excluded_road_types is None/empty): no filtering,
+    # every road feature is used for classification.
+    #
+    # Safety net: since the hardcoded filter is gone, the Intersection
+    # Buffer Test (_is_corner_lot, 15m tolerance, above) is the sole
+    # automatic defense against false Corner Lot classification. This
+    # filter is an optional refinement on top of it, not a required
+    # safety mechanism.
     # ------------------------------------------------------------------
-    PUBLIC_ROAD_TYPES = {
-        "National Road", "Provincial Road", "Barangay Road",
-        "Municipal Road", "City Road"
-    }
-    road_type_col = next(
-        (c for c in road_proj.columns if c.lower() in ("road_type", "roadtype", "highway")),
-        None
-    )
-    if road_type_col:
+    road_type_col = _detect_road_type_column(road_proj)
+    if road_type_col and excluded_road_types:
         original_count = len(road_proj)
         road_proj = road_proj[
-            road_proj[road_type_col].isin(PUBLIC_ROAD_TYPES)
+            ~road_proj[road_type_col].isin(excluded_road_types)
         ].copy()
         filtered_count = len(road_proj)
         print(f"ℹ️  [{source_name}] Road type filter: {filtered_count}/{original_count} "
-              f"public roads retained (column: '{road_type_col}')")
+              f"roads retained after excluding {len(excluded_road_types)} type(s) "
+              f"(column: '{road_type_col}')")
         if filtered_count == 0:
-            print(f"⚠️  [{source_name}] No public roads found after filter — "
+            print(f"⚠️  [{source_name}] All roads excluded by filter — "
                   f"falling back to full road layer.")
             road_proj = road_gdf.to_crs(epsg=zone_epsg)
     else:
-        print(f"ℹ️  [{source_name}] No road_type column found — using full road layer.")
+        print(f"ℹ️  [{source_name}] No road type filtering applied — "
+              f"using full road layer ({len(road_proj)} features).")
 
     # Assign a row-level integer ROAD_ID if not already present
     if "ROAD_ID" not in road_proj.columns:
@@ -310,12 +431,47 @@ def process_lot_location(barangay_gdf, road_gdf, source_name=""):
               f"— geometry-only classification.")
 
     # ------------------------------------------------------------------
-    # Spatial join: which roads does each parcel's 10m buffer touch?
-    # (unchanged from original — only the classification step changes)
+    # Fixed geometry — computed ONCE per parcel, used ONLY for topological
+    # operations below (spatial join, Intersection Buffer Test). The
+    # ORIGINAL geometry in brgy_proj/result is never modified — this
+    # keeps the exported output faithful to the source data, matching
+    # the pattern already used in road_frontage.py's
+    # process_frontage_single(). A parcel whose geometry cannot be
+    # repaired (fix_geometry returns None) simply can't participate in
+    # the spatial join below, which naturally falls back to an empty
+    # ROAD_ID (-> Inner Lot) for that row — the same conservative
+    # default already used elsewhere in this function for missing
+    # geometry, not a new failure mode.
     # ------------------------------------------------------------------
+    if progress:
+        progress("Cleaning parcel geometries...")
+    brgy_fixed_geom = brgy_proj.geometry.apply(fix_geometry)
+
+    _PIN_CANDIDATES = ["PIN", "pin", "Pin", "ARP_NO", "TD_NO", "PARCEL_ID"]
+    _pin_col = next((c for c in _PIN_CANDIDATES if c in brgy_proj.columns), None)
+    unfixable_mask = brgy_fixed_geom.isna() & brgy_proj.geometry.notna()
+    if unfixable_mask.any():
+        ids = (brgy_proj.loc[unfixable_mask, _pin_col].astype(str).tolist()
+               if _pin_col else [str(i) for i in brgy_proj.index[unfixable_mask]])
+        print(f"⚠️  [{source_name}] {unfixable_mask.sum()} parcel(s) have "
+              f"unfixable geometry — kept as original shape in output, "
+              f"excluded from road-touch testing: {ids[:20]}"
+              f"{' ...' if len(ids) > 20 else ''}")
+
+    # ------------------------------------------------------------------
+    # Spatial join: which roads does each parcel's 10m buffer touch?
+    # Uses the fixed geometry (sjoin_input) so intersects() runs on valid
+    # topology; the output (result) is built from brgy_proj separately,
+    # below, keeping the original geometry untouched.
+    # ------------------------------------------------------------------
+    sjoin_input = brgy_proj.copy()
+    sjoin_input["geometry"] = brgy_fixed_geom
+
+    if progress:
+        progress("Running spatial join...")
     road_buffer = road_proj.copy()
     road_buffer["geometry"] = road_proj.geometry.buffer(10, cap_style=2)
-    joined = gpd.sjoin(brgy_proj, road_buffer[["ROAD_ID", "geometry"]],
+    joined = gpd.sjoin(sjoin_input, road_buffer[["ROAD_ID", "geometry"]],
                        how="left", predicate="intersects")
     grouped = joined.groupby(joined.index).agg({
         "ROAD_ID": lambda x: ",".join(
@@ -323,14 +479,18 @@ def process_lot_location(barangay_gdf, road_gdf, source_name=""):
         )
     })
 
-    result = brgy_proj.copy()
+    result = brgy_proj.copy()   # ORIGINAL geometry — never overwritten
     result["ROAD_ID"] = result.index.map(grouped["ROAD_ID"].to_dict()).fillna("")
 
     # ------------------------------------------------------------------
     # Classification — replaces the old compute_lot_location() string check
     # ------------------------------------------------------------------
     lot_locations = []
-    for idx, row in result.iterrows():
+    total = len(result)
+    for i, (idx, row) in enumerate(result.iterrows(), start=1):
+        if progress and (i % 200 == 0 or i == 1 or i == total):
+            progress(f"Classifying {source_name}: {i}/{total}", i, total)
+
         road_id_str = row["ROAD_ID"]
 
         # --- Inner Lot: no road contact ---
@@ -360,7 +520,13 @@ def process_lot_location(barangay_gdf, road_gdf, source_name=""):
         # Retrieve the actual road geometries for the deduped IDs
         road_geoms = [road_geom_map[rid] for rid in deduped_ids if rid in road_geom_map]
 
-        parcel_geom = row["geometry"]
+        # Uses the FIXED geometry (not row["geometry"], which is now the
+        # original/possibly-invalid shape) — .loc[idx] rather than .get():
+        # brgy_fixed_geom and result both derive from brgy_proj with no
+        # filtering/reindexing in between, so their indices are guaranteed
+        # aligned. A KeyError here would mean that invariant was broken by
+        # a future change — better to fail loudly than silently fall back.
+        parcel_geom = brgy_fixed_geom.loc[idx]
         if parcel_geom is None or parcel_geom.is_empty:
             lot_locations.append(1)  # Can't test → default Road Lot (conservative)
             continue
@@ -372,6 +538,9 @@ def process_lot_location(barangay_gdf, road_gdf, source_name=""):
 
     result["LOT_LOCATION"] = lot_locations
     result["LOT_LABEL"] = result["LOT_LOCATION"].apply(label_lot_location)
+
+    if progress:
+        progress(f"Finished {source_name}", total, total)
 
     if orig_crs:
         result = result.to_crs(orig_crs)
@@ -474,6 +643,15 @@ def open_main_window(root):
     road_db_table      = tk.StringVar(master=win)
     output_local_dir   = tk.StringVar(master=win)
 
+    # Road-type filter state (Section 2). road_is_reading / road_read_ok
+    # are plain closure locals (not Tkinter variables) mutated via
+    # `nonlocal` from the nested functions below.
+    road_type_filter_check_var = tk.BooleanVar(master=win, value=False)
+    road_type_value_vars = {}   # {str(value): tk.BooleanVar(value=True)}
+    road_read_status_var = tk.StringVar(master=win, value="")
+    road_is_reading = False     # True while the background read thread is active
+    road_read_ok = False        # True once the current road source has been read successfully
+
     PAD = dict(padx=8, pady=4)
 
     def section_label(parent, text):
@@ -483,6 +661,87 @@ def open_main_window(root):
                  font=("Segoe UI", 9, "bold")).pack(side="left")
         ttk.Separator(frm, orient="horizontal").pack(
             side="left", fill="x", expand=True, padx=(6, 0), pady=4)
+
+    def _run_status_message():
+        """
+        Returns the current status text for the permanent label under
+        the Run button — always a string, including the "ready" case
+        (unlike the earlier hover-tooltip design, this has no "None"
+        state since something is always shown).
+
+        Priority order (checked top to bottom, first match wins):
+          1. Land Parcel not selected
+          2. Road Network not selected
+          3. Output Destination not selected
+          4. Road Network currently being read (background thread)
+          5. Road Network selected but not yet successfully read
+             (covers: read failed, or hasn't completed for any other
+             reason) — same corrective action as case 2, since a
+             working road source isn't actually available yet either
+             way, so it reuses that message rather than introducing a
+             separate "something went wrong" message here.
+          6. Ready.
+        Selection-completeness (1-3) is checked before road-read status
+        (4-5) so the more actionable "please select X" messages take
+        priority over the passive "reading..." status — the user can go
+        pick an output folder while the road is still loading, for
+        instance, rather than stare at a status that gives them nothing
+        to do.
+        """
+        parcel_ok = (
+            bool(parcel_local_paths) if parcel_source_type.get() == "local"
+            else bool(parcel_db_tables)
+        )
+        road_selected = (
+            bool(road_local_path.get()) if road_source_type.get() == "local"
+            else bool(road_db_table.get())
+        )
+        output_ok = (
+            bool(output_local_dir.get()) if output_dest_type.get() == "local"
+            else True
+        )
+        if not parcel_ok:
+            return "Please select one or more Land Parcel sources."
+        if not road_selected:
+            return "Please select a Road Network source."
+        if not output_ok:
+            return "Please select an Output Destination."
+        if road_is_reading:
+            return "Reading Road Network..."
+        if not road_read_ok:
+            return "Please select a Road Network source."
+        return "Ready to run."
+
+    def _update_run_button_state():
+        """
+        Called after every relevant input change (parcel/road/output
+        selection, road read start/finish/failure). Uses Tkinter's real
+        state="disabled"/"normal", with explicit colors for both states
+        (Tkinter does NOT automatically gray out a classic tk.Button's
+        background when disabled — only `disabledforeground` gets a
+        built-in default, and it doesn't coordinate with a custom `bg`,
+        which is what produced the dark-text-on-dark-green-background
+        readability problem before this fix).
+
+        Cursor is also toggled explicitly here: confirmed empirically
+        that Tkinter does NOT suppress a widget's assigned `cursor` just
+        because state="disabled" — the last-assigned cursor keeps
+        showing regardless, so "no" (Windows "not-allowed" cursor) must
+        be set for the disabled state the same deliberate way "hand2"
+        is set for the enabled one, rather than assuming one "reverts"
+        automatically.
+
+        This also drives the permanent status label under the button,
+        so the reason is always visible without needing to hover.
+        """
+        message = _run_status_message()
+        run_status_var.set(message)
+        if message == "Ready to run.":
+            run_btn.config(state="normal", cursor="hand2",
+                            bg="#2e7d32", fg="white")
+        else:
+            run_btn.config(state="disabled", cursor="no",
+                            bg="#e0e0e0", fg="#888888", disabledforeground="#888888")
 
     # ── SECTION 1: LAND PARCEL ───────────────────────────────────
     section_label(win, "Land Parcel Source")
@@ -509,7 +768,7 @@ def open_main_window(root):
                           fg="gray", anchor="w", width=42)
     parcel_lbl.pack(side="left")
 
-    parcel_btn = tk.Button(parcel_action_row, text="Browse…", width=10)
+    parcel_btn = tk.Button(parcel_action_row, text="Browse…", width=10, cursor="hand2")
     parcel_btn.pack(side="left", **PAD)
 
     def browse_parcel_files():
@@ -519,6 +778,7 @@ def open_main_window(root):
             parcel_local_paths.clear()
             parcel_local_paths.extend(files)
             parcel_files_var.set(f"{len(files)} file(s) selected")
+        _update_run_button_state()
 
     def browse_parcel_db():
         creds = load_db_credentials()
@@ -529,11 +789,14 @@ def open_main_window(root):
         if not tables:
             messagebox.showwarning("No Tables", "No tables found in the database schema.")
             return
-        _pick_db_tables(win, tables, multi=True,
-            on_select=lambda sel: (
-                parcel_db_tables.__setitem__(slice(None), sel)
-                or parcel_db_label.set(f"{len(sel)} table(s) selected")
-            ))
+
+        def _on_parcel_tables_selected(sel):
+            if sel:
+                parcel_db_tables[:] = sel
+                parcel_db_label.set(f"{len(sel)} table(s) selected")
+            _update_run_button_state()
+
+        _pick_db_tables(win, tables, multi=True, on_select=_on_parcel_tables_selected)
 
     def _toggle_parcel():
         if parcel_source_type.get() == "local":
@@ -542,6 +805,7 @@ def open_main_window(root):
         else:
             parcel_lbl.config(textvariable=parcel_db_label)
             parcel_btn.config(text="Select…", command=browse_parcel_db)
+        _update_run_button_state()
 
     # ── SECTION 2: ROAD NETWORK ──────────────────────────────────
     section_label(win, "Road Network Source")
@@ -551,12 +815,14 @@ def open_main_window(root):
 
     road_radio_row = tk.Frame(road_frame)
     road_radio_row.pack(fill="x")
-    tk.Radiobutton(road_radio_row, text="Local File",
+    road_radio_local = tk.Radiobutton(road_radio_row, text="Local File",
                    variable=road_source_type, value="local",
-                   command=lambda: _toggle_road()).pack(side="left")
-    tk.Radiobutton(road_radio_row, text="Database Table",
+                   command=lambda: _toggle_road())
+    road_radio_local.pack(side="left")
+    road_radio_db = tk.Radiobutton(road_radio_row, text="Database Table",
                    variable=road_source_type, value="db",
-                   command=lambda: _toggle_road()).pack(side="left", padx=(12, 0))
+                   command=lambda: _toggle_road())
+    road_radio_db.pack(side="left", padx=(12, 0))
 
     road_file_var = tk.StringVar(master=win, value="No file selected")
     road_db_var   = tk.StringVar(master=win, value="No table selected")
@@ -568,8 +834,229 @@ def open_main_window(root):
                         fg="gray", anchor="w", width=42)
     road_lbl.pack(side="left")
 
-    road_btn = tk.Button(road_action_row, text="Browse…", width=10)
+    road_btn = tk.Button(road_action_row, text="Browse…", width=10, cursor="hand2")
     road_btn.pack(side="left", **PAD)
+
+    # --- Road-type filter UI (new) -----------------------------------
+    # road_filter_frame is only packed when the currently selected road
+    # source has a ROAD_TYPE-like column (see _detect_road_type_column).
+    # Until then, Section 2 looks and behaves exactly as it did before
+    # this feature existed.
+    road_filter_frame = tk.Frame(road_frame)
+
+    road_type_filter_checkbox = tk.Checkbutton(
+        road_filter_frame, text="Filter by Road Type",
+        variable=road_type_filter_check_var,
+        command=lambda: _toggle_road_type_checklist())
+    road_type_filter_checkbox.pack(anchor="w")
+
+    # Holds one Checkbutton per unique ROAD_TYPE value found in the
+    # currently selected road layer. Rebuilt from scratch on every new
+    # successful read (see _poll_road_read_queue). Only packed while
+    # road_type_filter_check_var is True.
+    road_type_checklist_container = tk.Frame(road_filter_frame)
+
+    road_read_status_lbl = tk.Label(
+        road_frame, textvariable=road_read_status_var,
+        fg="#b36b00", font=("Segoe UI", 8, "italic"), anchor="w")
+    # packed/unpacked by _set_road_reading_state()
+
+    def _read_road_layer_worker(source_type, path_or_table):
+        """
+        Runs on a background thread. Reads the road layer for the given
+        selection and returns (gdf, error) — never touches any Tkinter
+        widget or variable, since Tkinter is not thread-safe. The caller
+        places the result on a queue for the main thread to pick up.
+        """
+        try:
+            if source_type == "local":
+                gdf = gpd.read_file(path_or_table)
+            else:
+                creds = load_db_credentials()
+                if not creds:
+                    return None, "Could not load DB credentials."
+                engine = create_engine(
+                    f"postgresql://{creds['username']}:{creds['password']}@"
+                    f"{creds['host']}:{creds['port']}/{creds['database']}"
+                )
+                gdf = read_postgis_clean(path_or_table, engine, creds["schema"])
+            return gdf, None
+        except Exception as e:
+            return None, str(e)
+
+    def _set_road_reading_state(is_reading):
+        """
+        Toggle GUI responsiveness while a road-layer read is in progress.
+
+        Disables the road Browse/Select button and the Local/Database
+        radio buttons for the duration of the read. This prevents the
+        user from starting a second, concurrent read — it removes the
+        only realistic concurrent-read scenario in this workflow (the
+        user re-triggering a read through this UI), not every
+        conceivable race; the window itself (e.g. its close button)
+        is intentionally left interactive.
+        """
+        nonlocal road_is_reading
+        road_is_reading = is_reading
+        if is_reading:
+            road_read_status_var.set("⏳ Reading road network…")
+            road_read_status_lbl.pack(fill="x", pady=(2, 0))
+            road_btn.config(state="disabled")
+            road_radio_local.config(state="disabled")
+            road_radio_db.config(state="disabled")
+        else:
+            road_read_status_lbl.pack_forget()
+            road_btn.config(state="normal")
+            road_radio_local.config(state="normal")
+            road_radio_db.config(state="normal")
+        _update_run_button_state()
+
+    def _toggle_road_type_checklist():
+        if road_type_filter_check_var.get():
+            for display_text, (real_value, var) in road_type_value_vars.items():
+                tk.Checkbutton(road_type_checklist_container, text=display_text,
+                                variable=var).pack(anchor="w")
+            road_type_checklist_container.pack(fill="x", padx=(20, 0))
+        else:
+            for child in road_type_checklist_container.winfo_children():
+                child.destroy()
+            road_type_checklist_container.pack_forget()
+
+    def _clear_road_type_filter():
+        """
+        Reset the road-type filter UI and its backing cache/state to
+        "no valid source selected". Called whenever the previously
+        selected road source is no longer trustworthy: switching
+        Local <-> Database, or immediately before starting a new read
+        for a newly selected file/table.
+
+        The cache is cleared here, before any new read starts, so a
+        stale road layer from a previous selection can never be reused
+        by run_processing() — whether or not the new read succeeds.
+        """
+        nonlocal road_read_ok
+        global _road_gdf_cache
+
+        road_type_filter_check_var.set(False)
+        for child in road_type_checklist_container.winfo_children():
+            child.destroy()
+        road_type_value_vars.clear()
+        road_type_checklist_container.pack_forget()
+        road_filter_frame.pack_forget()
+
+        road_read_ok = False
+        _road_gdf_cache = {"key": None, "gdf": None}
+        _update_run_button_state()
+
+    def _poll_road_read_queue(result_queue, source_key):
+        """
+        Runs on the main thread via win.after() polling. Picks up the
+        result placed on the queue by the background worker and applies
+        it to the GUI — this is the only place the worker's result is
+        allowed to touch Tkinter widgets/variables.
+
+        The winfo_exists() guard below only protects this callback from
+        running after the window has been destroyed (e.g. the user
+        closed the window while a read was still in progress) — it does
+        not stop or cancel the background thread itself, which simply
+        finishes and has its result discarded here.
+        """
+        if not win.winfo_exists():
+            return
+
+        try:
+            gdf, error = result_queue.get_nowait()
+        except queue.Empty:
+            win.after(100, lambda: _poll_road_read_queue(result_queue, source_key))
+            return
+
+        nonlocal road_read_ok
+        global _road_gdf_cache
+
+        if error is not None or gdf is None:
+            print(f"⚠️ Could not read road layer: {error}")
+            _road_gdf_cache = {"key": None, "gdf": None}
+            road_read_ok = False
+            _set_road_reading_state(False)
+            return
+
+        # Success — unconditionally replace the cache with the new layer.
+        # A failed read (handled above) never falls back to a previous
+        # cache entry; the cache is either the current selection's data
+        # or empty, never stale data from an earlier selection.
+        _road_gdf_cache = {"key": source_key, "gdf": gdf}
+        road_read_ok = True
+
+        col = _detect_road_type_column(gdf)
+        if col:
+            # Three distinct data states, never merged into one bucket:
+            #   - NULL/NaN            -> "(NULL / No Road Type)"
+            #   - literal empty string -> "(Empty String)"
+            #   - any other literal string (including "-") -> shown as-is,
+            #     not special-cased — "-" is just an ordinary value here.
+            # road_type_value_vars maps the DISPLAY label (with feature
+            # count) to (real_value, BooleanVar). real_value is the actual
+            # underlying value (np.nan, "", or the literal string) used
+            # for filtering — process_lot_location()'s existing
+            # `.isin(excluded_road_types)` call already matches np.nan and
+            # "" correctly when they're literally present in that list, so
+            # no change is needed there; only the display layer changes.
+            counts = {}  # display_label -> [real_value, count]
+            for v in gdf[col]:
+                if pd.isna(v):
+                    real_value, label = np.nan, "(NULL / No Road Type)"
+                elif str(v) == "":
+                    real_value, label = "", "(Empty String)"
+                else:
+                    real_value, label = str(v), str(v)
+                if label not in counts:
+                    counts[label] = [real_value, 0]
+                counts[label][1] += 1
+
+            if len(counts) > 1:
+                # Auto-hide: only one distinct value in the whole column
+                # means there's nothing meaningful to filter — leave
+                # road_filter_frame unpacked, Section 2 stays unchanged.
+                for label in sorted(counts.keys()):
+                    real_value, count = counts[label]
+                    display_text = f"{label} ({count})"
+                    road_type_value_vars[display_text] = (
+                        real_value, tk.BooleanVar(master=win, value=True)
+                    )
+                road_filter_frame.pack(fill="x", pady=(4, 2))
+            # else: column exists but has only one distinct value (or is
+            # entirely NULL/empty) — nothing to filter on.
+        # else: no ROAD_TYPE-like column — leave road_filter_frame
+        # unpacked, Section 2 behaves exactly as before this feature.
+
+        _set_road_reading_state(False)
+
+    def _refresh_road_type_filter():
+        """
+        Entry point called whenever the user finishes selecting a road
+        source (new file chosen, or new DB table chosen). Clears any
+        prior filter state/cache, then kicks off a background read to
+        detect the ROAD_TYPE column and populate the checklist, without
+        blocking the GUI.
+        """
+        _clear_road_type_filter()
+
+        source_type = road_source_type.get()
+        path_or_table = (road_local_path.get() if source_type == "local"
+                          else road_db_table.get())
+        if not path_or_table:
+            return  # nothing selected yet, nothing to read
+
+        source_key = (source_type, path_or_table)
+        result_queue = queue.Queue()
+
+        def worker():
+            gdf, error = _read_road_layer_worker(source_type, path_or_table)
+            result_queue.put((gdf, error))
+
+        _set_road_reading_state(True)
+        threading.Thread(target=worker, daemon=True).start()
+        win.after(100, lambda: _poll_road_read_queue(result_queue, source_key))
 
     def browse_road_file():
         f = filedialog.askopenfilename(filetypes=[
@@ -577,6 +1064,9 @@ def open_main_window(root):
         if f:
             road_local_path.set(f)
             road_file_var.set(os.path.basename(f))
+            _refresh_road_type_filter()
+        else:
+            _update_run_button_state()
 
     def browse_road_db():
         creds = load_db_credentials()
@@ -587,19 +1077,39 @@ def open_main_window(root):
         if not tables:
             messagebox.showwarning("No Tables", "No tables found in the database schema.")
             return
-        _pick_db_tables(win, tables, multi=False,
-            on_select=lambda sel: (
-                road_db_table.set(sel[0]) if sel else None,
-                road_db_var.set(sel[0] if sel else "No table selected")
-            ))
+
+        def _on_road_table_selected(sel):
+            if sel:
+                road_db_table.set(sel[0])
+                road_db_var.set(sel[0])
+                _refresh_road_type_filter()
+            else:
+                _update_run_button_state()
+
+        _pick_db_tables(win, tables, multi=False, on_select=_on_road_table_selected)
 
     def _toggle_road():
+        # Switching Local <-> Database does NOT clear the other type's
+        # remembered selection — that per-type memory is pre-existing
+        # behavior in this file and is intentionally left untouched.
         if road_source_type.get() == "local":
             road_lbl.config(textvariable=road_file_var)
             road_btn.config(text="Browse…", command=browse_road_file)
         else:
             road_lbl.config(textvariable=road_db_var)
             road_btn.config(text="Select…", command=browse_road_db)
+
+        # The road-type filter cache/UI, however, always belongs to
+        # whichever source is currently active. If the newly active type
+        # already has a remembered selection, re-read it in the
+        # background so the cache and Run-button gating stay consistent
+        # with what's shown in the label. Otherwise just hide/reset.
+        has_selection = (road_local_path.get() if road_source_type.get() == "local"
+                          else road_db_table.get())
+        if has_selection:
+            _refresh_road_type_filter()
+        else:
+            _clear_road_type_filter()
 
     # ── SECTION 3: OUTPUT ────────────────────────────────────────
     section_label(win, "Output Destination")
@@ -627,7 +1137,7 @@ def open_main_window(root):
                        fg="gray", anchor="w", width=42)
     out_lbl.pack(side="left")
 
-    out_btn = tk.Button(out_action_row, text="Browse…", width=10)
+    out_btn = tk.Button(out_action_row, text="Browse…", width=10, cursor="hand2")
     out_btn.pack(side="left", **PAD)
 
     def browse_output_dir():
@@ -635,6 +1145,7 @@ def open_main_window(root):
         if d:
             output_local_dir.set(d)
             output_dir_var.set(d)
+        _update_run_button_state()
 
     def _toggle_output():
         if output_dest_type.get() == "local":
@@ -646,13 +1157,14 @@ def open_main_window(root):
             out_lbl.config(textvariable=output_db_var,
                            font=("Segoe UI", 8, "italic"), fg="gray")
             out_btn.pack_forget()
+        _update_run_button_state()
 
     # ── RUN BUTTON ───────────────────────────────────────────────
     ttk.Separator(win, orient="horizontal").pack(
         fill="x", padx=10, pady=(12, 4))
 
     def on_run():
-        global barangay_source, road_source, output_mode
+        global barangay_source, road_source, output_mode, road_type_excluded_values
 
         if parcel_source_type.get() == "local":
             if not parcel_local_paths:
@@ -680,6 +1192,15 @@ def open_main_window(root):
                 return
             road_source = ("db", [road_db_table.get()])
 
+        # Defensive fallback: the Run button is normally disabled until
+        # road_read_ok is True (see _update_run_button_state), but this
+        # check is kept in case that state is ever reached inconsistently.
+        if not road_read_ok:
+            messagebox.showerror("Missing Input",
+                "Please wait for the road network to finish loading "
+                "(or re-select a valid road source) before running.")
+            return
+
         if output_dest_type.get() == "local":
             if not output_local_dir.get():
                 messagebox.showerror("Missing Input",
@@ -689,68 +1210,219 @@ def open_main_window(root):
         else:
             output_mode = ("db", None)
 
+        road_type_excluded_values = (
+            [real_value for display_text, (real_value, var) in road_type_value_vars.items()
+             if not var.get()]
+            if road_type_filter_check_var.get() else []
+        )
+
         win.destroy()
-        run_processing()
+        run_processing(root)
 
-    tk.Button(win, text="▶  Run Processing", command=on_run,
-              bg="#2e7d32", fg="white",
+    run_btn = tk.Button(win, text="▶  Run Processing", command=on_run,
               font=("Segoe UI", 10, "bold"),
-              relief="flat", padx=16, pady=6).pack(pady=(4, 14))
+              relief="flat", padx=16, pady=6)
+    run_btn.pack(pady=(4, 4))
 
-    # set initial button commands to match default radio state
+    # Permanent status line under the Run button — always visible, no
+    # hover required. Says exactly what's missing, or "Ready to run."
+    run_status_var = tk.StringVar(master=win, value="")
+    run_status_lbl = tk.Label(win, textvariable=run_status_var,
+                               font=("Segoe UI", 8), fg="gray")
+    run_status_lbl.pack(pady=(0, 12))
+
+    # set initial button commands/state to match default radio state
     _toggle_parcel()
     _toggle_road()
     _toggle_output()
+    _update_run_button_state()
 
 
 # ----------------- Processing -----------------
-def run_processing():
-    global barangay_source, road_source, output_mode
+class ProgressWindow:
+    """
+    Simple progress dialog shown while run_processing() works on a
+    background thread. Adapted from road_frontage.py's ProgressWindow
+    (the reference implementation) — generic status label + determinate
+    progress bar. No cancel/stop_flag support by design: this tool's
+    first progress dialog intentionally stays as simple as
+    road_frontage.py's; cancellation is a separate future task if needed.
+    """
+    def __init__(self, root, title="Processing"):
+        self.win = tk.Toplevel(root)
+        apply_icon(self.win)
+        self.win.title(title)
+        self.win.minsize(400, 120)
+        self.win.resizable(False, False)
+        self.status_var = tk.StringVar(master=self.win)
+        self.status_var.set("Starting...")
+        tk.Label(
+            self.win, textvariable=self.status_var, anchor="center",
+            justify="left", wraplength=380,
+        ).pack(pady=10, padx=10, fill="x")
+        self.progress = ttk.Progressbar(self.win, orient="horizontal", mode="determinate", length=350)
+        self.progress.pack(pady=10)
+        self.win.attributes("-topmost", True)
+        self.win.update()
+
+        self.win.focus_force()
+        self.win.lift()
+        self.win.attributes("-topmost", True)
+        self.win.after(100, lambda: self.win.attributes("-topmost", False))
+
+    def update(self, message, value=None, maximum=None):
+        self.status_var.set(message)
+        if maximum is not None:
+            self.progress["maximum"] = maximum
+        if value is not None:
+            self.progress["value"] = value
+        self.win.update_idletasks()
+        self.win.geometry("")
+        self.win.update()
+
+    def close(self):
+        self.win.destroy()
+
+
+def run_processing(app_root):
+    """
+    Runs the full batch (all selected parcel sources) on a background
+    thread, reporting progress via a ProgressWindow.
+
+    Threading discipline: the worker thread never touches Tkinter
+    directly — it only puts messages on `q`. All widget updates happen
+    in poll_queue(), on the main thread, via app_root.after(100,
+    poll_queue) — the same pattern already used for the Section 2
+    road-type background read in open_main_window().
+
+    app_root is passed in directly from on_run()'s closure (which
+    already has it as open_main_window()'s own `root` parameter) rather
+    than a module-level `_app_root` global — smaller diff, no new global
+    state, since this tool's architecture already makes it available.
+
+    Per-source failure isolation: if one parcel source (file or DB
+    table) fails, it's skipped and the rest of the batch continues —
+    outputs already written for earlier sources are kept. A summary of
+    any skipped sources is shown at the end instead of a raw crash
+    aborting the whole batch.
+    """
+    global barangay_source, road_source, output_mode, road_type_excluded_values, _road_gdf_cache
     if not barangay_source or not road_source or not output_mode:
         messagebox.showerror("Error", "Selections incomplete (Barangay, Road, Output required).")
         return
 
-    creds = load_db_credentials()
-    schema = creds["schema"]
-    engine = create_engine(
-        f"postgresql://{creds['username']}:{creds['password']}@{creds['host']}:{creds['port']}/{creds['database']}"
-    )
+    progress = ProgressWindow(app_root, "Lot Location Progress")
+    q = queue.Queue()
 
-    road_gdf = gpd.read_file(road_source[1][0]) if road_source[0] == "local" \
-        else read_postgis_clean(road_source[1][0], engine, schema)
+    def worker():
+        try:
+            def progress_cb(msg, val=None, maxv=None):
+                q.put(("update", msg, val, maxv))
 
-    if barangay_source[0] == "local":
-        for path in barangay_source[1]:
-            brgy_gdf = gpd.read_file(path)
-            brgy_gdf["geometry"] = brgy_gdf["geometry"].apply(fix_geometry)
-            result = process_lot_location(brgy_gdf, road_gdf, os.path.basename(path))
-            if output_mode[0] == "local":
-                base = os.path.splitext(os.path.basename(path))[0]
-                out = os.path.join(output_mode[1], f"{base}_lot_location.gpkg")
-                result.to_file(out, driver="GPKG")
-                print(f"✅ Saved {out}")
-                load_in_global_mapper(out)
+            creds = load_db_credentials()
+            schema = creds["schema"]
+            engine = create_engine(
+                f"postgresql://{creds['username']}:{creds['password']}@"
+                f"{creds['host']}:{creds['port']}/{creds['database']}"
+            )
+
+            q.put(("update", "Loading road network...", None, None))
+            # Reuse the road layer already read by the Section 2 filter UI
+            # when it matches the currently selected source (avoids a
+            # second full file/DB read). Falls back to a fresh read if the
+            # cache is missing or doesn't match.
+            road_cache_key = (road_source[0], road_source[1][0])
+            if _road_gdf_cache.get("key") == road_cache_key and _road_gdf_cache.get("gdf") is not None:
+                road_gdf = _road_gdf_cache["gdf"]
+                print("ℹ️  Reusing cached road network (already read during source selection).")
             else:
-                local_name = os.path.splitext(os.path.basename(path))[0]
-                match = find_matching_table(local_name, schema)
-                table = match if match else local_name.lower()
-                result.to_postgis(table, engine, schema=schema, if_exists="replace", index=False)
-                print(f"🔄 Saved to DB: {table}")
-    else:
-        for table in barangay_source[1]:
-            brgy_gdf = read_postgis_clean(table, engine, schema)
-            brgy_gdf["geometry"] = brgy_gdf["geometry"].apply(fix_geometry)
-            result = process_lot_location(brgy_gdf, road_gdf, table)
-            if output_mode[0] == "local":
-                out = os.path.join(output_mode[1], f"{table}_lot_location.gpkg")
-                result.to_file(out, driver="GPKG")
-                print(f"✅ Saved {out}")
-                load_in_global_mapper(out)
-            else:
-                result.to_postgis(table, engine, schema=schema, if_exists="replace", index=False)
-                print(f"🔄 Updated DB table: {table}")
+                road_gdf = gpd.read_file(road_source[1][0]) if road_source[0] == "local" \
+                    else read_postgis_clean(road_source[1][0], engine, schema)
 
-    messagebox.showinfo("Success", "✅ Processing done!")
+            excluded_road_types = road_type_excluded_values or []
+
+            sources = ([("local", p) for p in barangay_source[1]] if barangay_source[0] == "local"
+                       else [("db", t) for t in barangay_source[1]])
+
+            skipped = []
+            for src_type, src in sources:
+                name = os.path.basename(src) if src_type == "local" else src
+                try:
+                    q.put(("update", f"Loading {name}", None, None))
+                    if src_type == "local":
+                        brgy_gdf = gpd.read_file(src)
+                        out_base = os.path.splitext(name)[0]
+                    else:
+                        brgy_gdf = read_postgis_clean(src, engine, schema)
+                        out_base = name
+
+                    # NOTE: fix_geometry() is applied inside
+                    # process_lot_location() only — scoped to spatial-test
+                    # operations, never mutating brgy_gdf's geometry
+                    # column, so the exported output stays faithful to
+                    # the original source shapes.
+                    result = process_lot_location(brgy_gdf, road_gdf, name,
+                                                   excluded_road_types=excluded_road_types,
+                                                   progress=progress_cb)
+
+                    if output_mode[0] == "local":
+                        out = os.path.join(output_mode[1], f"{out_base}_lot_location.gpkg")
+                        result.to_file(out, driver="GPKG")
+                        print(f"✅ Saved {out}")
+                        q.put(("open_gm", out, None, None))
+                    else:
+                        if src_type == "local":
+                            match = find_matching_table(out_base, schema)
+                            table = match if match else out_base.lower()
+                        else:
+                            table = out_base
+                        result.to_postgis(table, engine, schema=schema, if_exists="replace", index=False)
+                        print(f"🔄 Saved to DB: {table}")
+
+                except Exception as source_err:
+                    # Isolate failures per source: log/report and move on
+                    # to the next source instead of aborting the entire
+                    # batch. Sources already written before this one keep
+                    # their output — only this one is skipped.
+                    skipped.append((name, str(source_err)))
+                    q.put(("update", f"Skipped {name}: {source_err}", None, None))
+                    continue
+
+            if skipped:
+                summary = "Done, but some sources were skipped:\n" + "\n".join(
+                    f"- {n}: {err}" for n, err in skipped
+                )
+            else:
+                summary = "✅ Processing done!"
+            q.put(("done", summary, None, None))
+
+        except Exception as e:
+            q.put(("error", str(e), None, None))
+
+    def poll_queue():
+        if not app_root.winfo_exists():
+            return
+        try:
+            while True:
+                kind, *rest = q.get_nowait()
+                if kind == "update":
+                    progress.update(rest[0], rest[1], rest[2])
+                elif kind == "open_gm":
+                    load_in_global_mapper(rest[0])
+                elif kind == "done":
+                    progress.close()
+                    messagebox.showinfo("Success", rest[0])
+                    return
+                elif kind == "error":
+                    progress.close()
+                    messagebox.showerror("Error", rest[0])
+                    return
+        except queue.Empty:
+            pass
+        app_root.after(100, poll_queue)
+
+    threading.Thread(target=worker, daemon=True).start()
+    poll_queue()
 
 
 # ----------------- MAIN -----------------
