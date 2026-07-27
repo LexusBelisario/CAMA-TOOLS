@@ -6,14 +6,17 @@ import tkinter as tk
 from tkinter import ttk
 from tkinter import filedialog, messagebox, Listbox
 import geopandas as gpd
-from shapely.geometry import Point, LineString, MultiPolygon
-from shapely.ops import nearest_points
-from scipy.spatial import cKDTree
+import pandas as pd
+import numpy as np
+from shapely.geometry import Point, LineString
+from shapely.ops import unary_union, nearest_points
+from shapely.validation import make_valid
 import subprocess
 import json
 from sqlalchemy import create_engine, text, inspect
 import psycopg2
-import statistics
+import threading
+import queue
 
 # ----------------- CONFIG -----------------
 GM_EXE_PATH = r"C:\\Program Files\\GlobalMapper26.1_64bit\\global_mapper.exe"
@@ -34,9 +37,106 @@ def _get_credentials_path():
 
 CREDENTIALS_FILE = _get_credentials_path()
 
+# MAX_ROAD_DISTANCE: sanity cutoff (meters, in the PRS92 projected CRS
+# used internally by process()) applied to every width candidate in the
+# frontage-first _measure_width() algorithm (see ROAD_FRONT_TOLERANCE
+# below for the frontage-detection stage itself). Originally added when
+# the measurement algorithm did an unbounded nearest-road search with no
+# built-in distance limit -- a parcel with no real nearby road (layer
+# misalignment, wrong CRS, a road type just excluded via Filter by Road
+# Type, or a genuine data gap) could silently receive a large,
+# meaningless ROAD_WIDTH instead of being flagged as unmeasurable (None),
+# unlike every other bail-out case in process(). Kept as a defensive
+# safeguard under the current frontage-first algorithm even though every
+# width candidate there is already confined to ROAD_FRONT_TOLERANCE (so
+# this check should not be structurally reachable in practice) -- not
+# removed without evidence it's genuinely unnecessary.
+#
+# 50m is a starting point, not a fixed law -- distinct in purpose from
+# the smaller (10-15m) proximity tolerances used elsewhere in this
+# codebase for "is this touching/adjacent" classification decisions
+# (e.g. the 10m road-touch buffer referenced in this file's own history,
+# and lot_location.py's own tolerances). MAX_ROAD_DISTANCE instead
+# answers "is this measurement still physically plausible at all" --
+# it needs to comfortably cover genuine local/barangay road corridor
+# widths, sidewalk/drainage/easement space between a parcel boundary and
+# a road centerline, and typical misalignment between separately
+# digitized parcel and road layers, while still catching real error
+# cases (hundreds of meters off, or no nearby road at all). Adjust here
+# if production data shows it's too strict or too loose.
+MAX_ROAD_DISTANCE = 50
+
+# ROAD_FRONT_TOLERANCE: adjacency tolerance (meters, same projected CRS)
+# used by the frontage-first measurement algorithm to decide whether a
+# parcel boundary segment is genuinely road-adjacent at all ("is this
+# the road front"). Distinct business rule from MAX_ROAD_DISTANCE above
+# -- that one answers "is this measurement still physically plausible,"
+# this one answers "is this edge actually touching a road." Matches the
+# established codebase convention for this kind of adjacency test (the
+# same 10m used by road_frontage.py's _edge_covered_portion() default,
+# and by lot_location.py's own tolerances).
+ROAD_FRONT_TOLERANCE = 10
+
 barangay_source = None
 road_source = None
 output_mode = None
+
+# ----------------- ROAD CLASSIFICATION STATE (new) -----------------
+# Ported from road_frontage.py's Road Classification feature. Same
+# philosophy: parcel_classification_selection is a PER-SOURCE dict
+# ({path_or_table: bool}) since a batch of Land Parcel sources may mix
+# files that should and shouldn't have classification applied.
+# filter_by_road_type_active is a single flag (Road Network only ever
+# has one selected source). The two are mutually exclusive at the GUI
+# level (see open_main_window()'s checkbox wiring). Set by
+# open_main_window()'s on_run(), read by run_processing() and
+# resolve_classification() (below).
+parcel_classification_selection = {}
+filter_by_road_type_active = False
+
+# road_type_excluded_values: list[str] of ROAD_TYPE values (exact,
+# case-sensitive) the user unchecked in the "Filter by Road Type"
+# checklist. Only ever consulted when filter_by_road_type_active is
+# True.
+road_type_excluded_values = []
+
+# parcel_road_width_column_overrides: {path_or_table: existing_col_name}
+# -- for any Land Parcel source where a pre-existing "ROAD_WIDTH"-like
+# column was detected (see the merged Land Parcel background read below
+# -- the SAME read that already checks for LOT_LOCATION classification
+# columns, extended to also check for this) and the user confirmed
+# proceeding via the single combined dialog in on_run(). Threaded into
+# process() as output_column_name, so the tool writes back into the
+# EXACT existing column (preserving its original casing) instead of
+# always writing a hardcoded "ROAD_WIDTH" -- the latter would silently
+# create a confusing duplicate column whenever the existing one used
+# different casing (e.g. "road_width" alongside a new "ROAD_WIDTH"). A
+# source with no entry here uses the default "ROAD_WIDTH" name.
+parcel_road_width_column_overrides = {}
+
+# _road_gdf_cache: dual-slot cache -- one independent slot for "local"
+# and one for "db", so switching the Road Network Source radio back and
+# forth never re-reads a selection that's still valid, and never mixes
+# up which selection belongs to which mode. See
+# _refresh_road_classification() below for exactly how each field is
+# used.
+_road_gdf_cache = {
+    "local": {"key": None, "gdf": None, "value_vars": {}, "filter_active": False},
+    "db": {"key": None, "gdf": None, "value_vars": {}, "filter_active": False},
+}
+
+# _parcel_classification_cache: same dual-slot idea, adapted for Land
+# Parcel Source. Deliberately does NOT cache the GeoDataFrames themselves
+# -- Land Parcel can have MANY selected sources at once, so holding every
+# one of their full GeoDataFrames in memory just to make radio-toggling
+# instant would be a real memory cost for a large batch. Instead, each
+# slot caches only the lightweight per-source detection results (tiny
+# tuples) plus the per-source checkbox BooleanVars, keyed by the exact
+# tuple of currently selected sources for that mode.
+_parcel_classification_cache = {
+    "local": {"key": None, "details": None, "vars": {}},
+    "db": {"key": None, "details": None, "vars": {}},
+}
 
 # ----------------- HELPERS -----------------
 def load_db_credentials():
@@ -69,17 +169,94 @@ def fetch_tables(schema):
         messagebox.showerror("DB Error", str(e))
         return []
 
-def normalize_name(name: str) -> str:
-    return re.sub(r'[^a-z]', '', name.lower())
+# NOTE: normalize_name() and find_matching_table() previously existed
+# here -- removed entirely. find_matching_table() used SUBSTRING
+# matching (normalize_name() strips non-letters, then checks "a in b or
+# b in a"), which was a real bug: a desired table name could match and
+# overwrite a completely unrelated existing table just because one name
+# happened to contain the other as a substring after normalization. The
+# db-output write logic now uses exact matching only (see the
+# local-source -> db-output branch in run_processing()), consistent
+# with the db-source -> db-output branch, which already did this
+# correctly.
 
-def find_matching_table(local_name, schema):
-    all_tables = fetch_tables(schema)
-    lname = normalize_name(local_name)
-    for t in all_tables:
-        tnorm = normalize_name(t)
-        if lname in tnorm or tnorm in lname:
-            return t
-    return None
+def _split_trailing_number(base_name: str):
+    """
+    Splits a base name into (root, existing_number) if it ends with
+    "_<digits>" (e.g. "landparcel_1" -> ("landparcel", 1)), else returns
+    (base_name, None) unchanged.
+    """
+    m = re.match(r'^(.*)_(\d+)$', base_name)
+    if m:
+        return m.group(1), int(m.group(2))
+    return base_name, None
+
+
+def resolve_output_base_name(folder: str, desired_base_name: str, ext: str = "gpkg") -> str:
+    """
+    Determines the actual output base name (no extension) to use for a
+    NEW file in `folder`, given the DESIRED name -- normally the Land
+    Parcel source's own filename, unchanged, with no tool-name suffix
+    appended (no "_road_width", "_road_frontage", etc. -- this tool
+    reuses the source's own name as its default output name).
+
+    Rule: reuse the desired name exactly if nothing of that name exists
+    yet in `folder`. If it already exists, NEVER overwrite -- instead,
+    strip any existing trailing "_<N>" from the desired name to get a
+    root (e.g. "landparcel_1" -> root "landparcel"), scan `folder` for
+    every file matching "<root>_<N>.<ext>", and use "<root>_<max(N)+1>"
+    -- the highest N found ANYWHERE in the folder, not just "the source
+    file's own N + 1". This matters: if the selected source happens to
+    be named "landparcel_1" but the folder already has files up through
+    "landparcel_2" (or higher, or with gaps), naively trying
+    "landparcel_2" next could still collide -- scanning for the true
+    max avoids that regardless of what number the source itself had.
+
+    This function decides the number ONCE, for the MAIN output only.
+    Every other output belonging to the same processing run (e.g. the
+    VM/visual-measurement layer) must reuse this exact returned name as
+    its own base -- see with_qa_suffix() below -- never re-run this scan
+    independently, or the two could drift out of the paired numbering a
+    user expects (e.g. "landparcel_1.gpkg" should always pair with
+    "landparcel_1_VM.gpkg", never with a mismatched "landparcel_VM.gpkg"
+    from an independent scan).
+    """
+    candidate_path = os.path.join(folder, f"{desired_base_name}.{ext}")
+    if not os.path.exists(candidate_path):
+        return desired_base_name
+
+    root, _existing_number = _split_trailing_number(desired_base_name)
+
+    pattern = re.compile(rf'^{re.escape(root)}_(\d+)\.{re.escape(ext)}$', re.IGNORECASE)
+    max_n = 0
+    try:
+        for fname in os.listdir(folder):
+            m = pattern.match(fname)
+            if m:
+                max_n = max(max_n, int(m.group(1)))
+    except OSError:
+        pass  # folder unreadable for some reason -- fall through with max_n=0, worst case reuses N=1
+
+    return f"{root}_{max_n + 1}"
+
+
+def with_qa_suffix(main_base_name: str) -> str:
+    """
+    Derives the QA/visual-measurement layer's base name from the
+    ALREADY-FINALIZED main output base name (see
+    resolve_output_base_name()) -- never scans the folder independently
+    for its own numbering, so the two stay paired: "landparcel.gpkg" +
+    "landparcel_VM.gpkg", "landparcel_1.gpkg" + "landparcel_1_VM.gpkg",
+    etc. Main output is always the source of truth for the number; this
+    layer just follows it.
+
+    Suffix is "_VM" (Visual Measurement) -- kept as the function/variable
+    name "qa" internally throughout this file (qa_gdf, qa_out, qa_table,
+    etc.) since that still describes this layer's role (a validation/QA
+    aid), even though the actual file/table name it produces uses the
+    "_VM" suffix instead of "_QA_lines".
+    """
+    return f"{main_base_name}_VM"
 
 def get_geometry_column(table_name, engine, schema):
     try:
@@ -113,18 +290,23 @@ def read_postgis_clean(table, engine, schema):
 
     return gpd.read_postgis(query, engine, geom_col="geometry")
 
-def fix_geometry(geom):
-    if geom is None:
-        return None
-    try:
-        if not geom.is_valid:
-            geom = geom.buffer(0)
-        if isinstance(geom, MultiPolygon):
-            return max(geom.geoms, key=lambda a: a.area)
-        return geom
-    except Exception:
-        return None
-    
+# NOTE: a module-level fix_geometry() helper previously existed here,
+# applied via barangay_gdf["geometry"].apply(fix_geometry) directly onto
+# the OUTPUT geometry column inside process() -- removed entirely. Two
+# real problems with it: (1) it wrote the "fixed" geometry back into the
+# exported column instead of scoping the fix to internal use only, and
+# (2) for a MultiPolygon result (which buffer(0) can produce on complex/
+# self-intersecting input), it kept only the LARGEST piece and silently
+# discarded the rest -- if the discarded piece sat right next to the
+# kept one, this showed up as a visible hole/missing chunk in the parcel
+# output. The per-parcel measurement loop below already has its own,
+# safe, LOCAL-SCOPE geometry repair (poly = poly.buffer(0), now with a
+# make_valid() fallback -- see the loop) that never touches
+# barangay_gdf's own geometry column at all, matching the same
+# principle lot_location.py's fix_geometry() + brgy_fixed_geom pattern
+# already established: repair for internal spatial-operation use only,
+# keep the original shape in the exported output.
+
 def load_in_global_mapper(filepath):
     """Open or load a file into Global Mapper if it is already running,
     otherwise launch Global Mapper with the file as an argument."""
@@ -163,234 +345,748 @@ def load_in_global_mapper(filepath):
         print(f"⚠️ Could not open in Global Mapper: {e}")
 
 # ----------------- CRS UTILITY -----------------
-def get_prs92_zone(gdf):
-    if gdf.crs is None:
-        gdf = gdf.set_crs(epsg=4326)
-    lon = gdf.unary_union.centroid.x
-    if lon < 118:
-        return 3121
-    elif lon < 120:
-        return 3122
-    elif lon < 122:
-        return 3123
-    elif lon < 124:
-        return 3124
+# PRS92_ZONE_BOUNDS: same zone boundary numbers road_width.py already
+# used, restructured into the table-driven form shared with
+# lot_location.py / road_frontage.py, so all three tools stay in sync if
+# the boundaries are ever revised.
+PRS92_ZONE_BOUNDS = [
+    (-180.0, 118.0, 3121, "Zone I"),
+    (118.0,  120.0, 3122, "Zone II"),
+    (120.0,  122.0, 3123, "Zone III"),
+    (122.0,  124.0, 3124, "Zone IV"),
+    (124.0,  180.0, 3125, "Zone V"),
+]
+
+
+def detect_prs92_zone(gdfs):
+    """
+    Auto-detect the PRS92 zone EPSG code from the COMBINED bounding-box
+    midpoint longitude of one or more input GeoDataFrames.
+
+    Ported from lot_location.py (itself standardized from
+    road_frontage.py, the original canonical reference) -- replaces
+    road_width.py's own former get_prs92_zone(), which had two real
+    correctness gaps this version fixes:
+
+    1. Used gdf.unary_union.centroid.x -- a real source of GEOS
+       TopologyExceptions (crashes) on real-world cadastral data with
+       invalid geometries. total_bounds (plain numeric min/max of each
+       feature's bounding box) needs no geometric operation at all, so
+       it can't fail this way.
+    2. Read .centroid.x directly with no check or reprojection first --
+       if the input CRS was already projected (e.g. already in meters,
+       not degrees), the lon < 118 / < 120 / etc. thresholds (which are
+       degree-based) would silently produce a WRONG zone. This version
+       explicitly reprojects to EPSG:4326 first when the CRS isn't
+       already WGS84.
+
+    Also takes the COMBINED extent of every GeoDataFrame passed in
+    (road_width.py's process() passes both the parcel and road layers)
+    rather than deciding from the parcel layer alone -- avoids picking a
+    zone based on one layer that doesn't reflect where the other layer
+    actually is.
+    """
+    all_bounds = []
+    for gdf in gdfs:
+        g = gdf
+        if g.crs is None:
+            g = g.set_crs(epsg=4326)
+            print("⚠️ No CRS found in one of the input datasets -- assuming "
+                  "WGS84. Measurements may be incorrect if the actual CRS "
+                  "is different.")
+        g_wgs84 = g.to_crs(epsg=4326) if g.crs.to_epsg() != 4326 else g
+        all_bounds.append(g_wgs84.total_bounds)
+
+    minx = min(b[0] for b in all_bounds)
+    maxx = max(b[2] for b in all_bounds)
+    center_lon = (minx + maxx) / 2
+
+    for lon_min, lon_max, epsg, zone_label in PRS92_ZONE_BOUNDS:
+        if lon_min <= center_lon < lon_max:
+            if not (lon_min <= minx and maxx < lon_max):
+                print(f"⚠️ Dataset longitude range ({minx:.4f}°E to {maxx:.4f}°E) "
+                      f"extends outside the detected {zone_label} bounds "
+                      f"({lon_min}°E-{lon_max}°E). Features near the dataset "
+                      f"edge may be very slightly less accurate.")
+            return epsg
+
+    raise ValueError(f"Could not determine PRS92 zone for longitude {center_lon}")
+
+# ----------------- ROAD CLASSIFICATION UTILITIES (new) -----------------
+# Ported verbatim from road_frontage.py's Road Classification feature
+# (the canonical, approved reference implementation).
+
+# ROAD_TYPE_COLUMN_CANDIDATES: case-insensitive column-name aliases used
+# to locate a road-classification column in a user-supplied road layer.
+# Copied verbatim from lot_location.py / road_frontage.py so all three
+# tools agree on what counts as a "ROAD_TYPE-like" column. Do not
+# diverge without updating all three files.
+ROAD_TYPE_COLUMN_CANDIDATES = ("road_type", "roadtype", "highway")
+
+
+def _detect_road_type_column(gdf):
+    """
+    Case-insensitive lookup of a ROAD_TYPE-like column in a GeoDataFrame.
+    Returns the actual column name (original casing preserved) or None.
+    """
+    if gdf is None:
+        return None
+    return next(
+        (c for c in gdf.columns if c.lower() in ROAD_TYPE_COLUMN_CANDIDATES),
+        None
+    )
+
+
+# ROAD_NAME_COLUMN_CANDIDATES: reuses the EXACT candidate list already
+# established in lot_location.py's own road_name_col detection (see
+# lot_location.py's _deduplicate_road_ids()/process_lot_location()) --
+# not a new, independently-invented convention.
+ROAD_NAME_COLUMN_CANDIDATES = ("road_name", "roadname", "name", "street", "road_no")
+
+
+def _detect_road_name_column(gdf):
+    """
+    Case-insensitive lookup of a ROAD_NAME-like column in a GeoDataFrame.
+    Returns the actual column name (original casing preserved) or None.
+    """
+    if gdf is None:
+        return None
+    return next(
+        (c for c in gdf.columns if c.lower() in ROAD_NAME_COLUMN_CANDIDATES),
+        None
+    )
+
+
+# _PIN_CANDIDATES: exact-case column-name candidates for a parcel's own
+# identifier, in priority order. Reuses the SAME list already
+# established in lot_location.py (used there to identify unfixable-
+# geometry parcels for logging) -- not a new, independently-invented
+# convention.
+_PIN_CANDIDATES = ["PIN", "pin", "Pin", "ARP_NO", "TD_NO", "PARCEL_ID"]
+
+
+def _detect_pin_column(gdf):
+    """
+    Identifier-column lookup for a parcel GeoDataFrame, shared by every
+    place road_width.py needs to label a row (the QA layer's PIN field,
+    and the CAMA_Table PIN write in run_processing()). Tries, in order:
+
+      1. _PIN_CANDIDATES, exact case match first (PIN, pin, Pin, ARP_NO,
+         TD_NO, PARCEL_ID) -- matches lot_location.py's own convention.
+      2. Any of those same names, case-insensitive (catches e.g. "Arp_No").
+      3. "FID" (case-insensitive) -- road_width.py-specific: lot_location.py
+         has no equivalent need for this fallback since it doesn't
+         produce a QA layer that has to label individual rows; road_width.py
+         does, so a last-resort identifier is worth having even if it's
+         not a real cadastral PIN.
+
+    Returns the actual column name (original casing preserved) or None
+    if the parcel source has none of the above -- callers are expected
+    to drop the PIN/identifier field entirely in that case rather than
+    emit an all-None column.
+    """
+    if gdf is None:
+        return None
+    for candidate in _PIN_CANDIDATES:
+        if candidate in gdf.columns:
+            return candidate
+    lower_candidates = {c.lower() for c in _PIN_CANDIDATES}
+    found = next((c for c in gdf.columns if c.lower() in lower_candidates), None)
+    if found:
+        return found
+    return next((c for c in gdf.columns if c.lower() == "fid"), None)
+
+
+# LOT_LOCATION_COLUMN_CANDIDATES: case-insensitive column-name alias for
+# lot_location.py's single output column.
+#
+# lot_location.py now writes ONE column, "LOT_LOCATION", containing the
+# human-readable classification directly ("Inner Lot"/"Road Lot"/
+# "Corner Lot") -- per project decision, the column named after the tool
+# should hold the actual classification, not an internal numeric code,
+# and there is no reason for an end user to see a code column in the
+# attribute table. The old two-column format (numeric LOT_LOCATION +
+# text LOT_LABEL) is still fully supported for backward compatibility
+# with files produced by the earlier version of the tool -- detection
+# below is CONTENT-based, not column-name-based: whichever format is
+# actually found in the "lot_location" column's values is what's used.
+# There is no longer a separate LOT_LABEL column to check -- every file
+# lot_location.py has ever produced, old or new format, always has
+# "lot_location" present, so no real dataset depends on a label-only
+# fallback.
+KNOWN_LOT_LABEL_VALUES = {"Inner Lot", "Road Lot", "Corner Lot"}
+LOT_LOCATION_COLUMN_CANDIDATES = ("lot_location",)
+
+# Tri-state result of inspecting a parcel layer for a usable
+# classification column -- kept as named states rather than a bare
+# has_lot_location bool so "column present but unusable" (e.g. an
+# all-NULL LOT_LOCATION column) stays distinguishable from "column
+# absent entirely".
+LOT_STATE_NOT_FOUND = "not_found"   # no LOT_LOCATION column at all
+LOT_STATE_UNUSABLE = "unusable"     # column present but no usable values
+LOT_STATE_FOUND = "found"           # a usable column was found
+
+def _detect_lot_classification(gdf):
+    """
+    Inspect a parcel GeoDataFrame for a usable Inner/Road/Corner Lot
+    classification source. Checks a single column, "lot_location"
+    (case-insensitive), and determines which of two supported CONTENT
+    formats it holds:
+      - "text"    : values are (at least partly) the known, literal
+                    strings "Inner Lot"/"Road Lot"/"Corner Lot" -- the
+                    current lot_location.py output format. Trusted
+                    directly, since these values are self-describing and
+                    can be verified by reading them.
+      - "numeric" : values are 0/1/2 -- the OLD lot_location.py output
+                    format (kept for backward compatibility with files
+                    already generated by earlier versions of the tool).
+                    Only used when no recognizable text value is present,
+                    since a user-authored column that merely happens to
+                    be named "lot_location" could use different numbering
+                    entirely, and there's no way to catch that mismatch
+                    from the number alone.
+
+    Returns (state, column_name, kind, inner_lot_mask):
+      state          : LOT_STATE_NOT_FOUND / LOT_STATE_UNUSABLE / LOT_STATE_FOUND
+      column_name    : the actual column name found, or None
+      kind           : "text" or "numeric", or None
+      inner_lot_mask : pandas boolean Series (index-aligned to gdf), True
+                       where the row is classified as Inner Lot -- only
+                       populated when state == LOT_STATE_FOUND, else None.
+    """
+    if gdf is None or len(gdf) == 0:
+        return (LOT_STATE_NOT_FOUND, None, None, None)
+
+    loc_col = next(
+        (c for c in gdf.columns if c.lower() in LOT_LOCATION_COLUMN_CANDIDATES),
+        None
+    )
+    if not loc_col:
+        return (LOT_STATE_NOT_FOUND, None, None, None)
+
+    str_vals = gdf[loc_col].astype(str).str.strip()
+    recognized = str_vals.isin(KNOWN_LOT_LABEL_VALUES)
+    if recognized.any():
+        # At least one row has a value we can trust literally -- any row
+        # whose value ISN'T one of the three known labels (typo, blank,
+        # unrelated text) is simply treated as "not Inner Lot" (never
+        # skipped) rather than guessed at.
+        return (LOT_STATE_FOUND, loc_col, "text", str_vals == "Inner Lot")
+
+    numeric = pd.to_numeric(gdf[loc_col], errors="coerce")
+    if numeric.notna().any():
+        return (LOT_STATE_FOUND, loc_col, "numeric", numeric == 0)
+
+    return (LOT_STATE_UNUSABLE, loc_col, None, None)
+
+
+def resolve_classification(brgy_gdf, use_lot_classification, filter_by_road_type_active, excluded_road_types):
+    """
+    Single, centralized decision point for "what should this parcel
+    source's Road Classification behavior be". Resolves the GUI's
+    checkbox states plus ONE specific parcel layer's actual columns into
+    one effective processing directive, so process() never branches on
+    this logic itself -- it only consumes the result. Called once per
+    parcel source in run_processing(), since sources are evaluated
+    independently (a batch may mix sources that do and don't have a
+    usable LOT_LOCATION column, AND the user may have only
+    checked the per-source classification checkbox for some of them).
+
+    use_lot_classification here is already resolved to THIS specific
+    source (run_processing() looks it up from the per-source
+    parcel_classification_selection dict before calling this function --
+    each selected Land Parcel file/table gets its own checkbox in the
+    GUI). filter_by_road_type_active, by contrast, is a single flag,
+    since Road Network only ever has one selected source. The two are
+    mutually exclusive at the GUI level (see open_main_window()'s
+    checkbox wiring): checking Filter by Road Type unchecks every
+    per-source classification checkbox, and checking any per-source
+    classification checkbox unchecks Filter by Road Type -- but "neither
+    checked, for this source" is a normal, valid state (today's
+    original, ungated behavior: all roads used, no parcels skipped). If
+    both were somehow True at once (shouldn't happen given the GUI
+    wiring), use_lot_classification wins as a defensive default -- this
+    is unrelated to, and does not override, _detect_lot_classification()'s
+    own content-based LOT_LABEL-vs-LOT_LOCATION priority (see that
+    function's docstring).
+
+    Parameters
+    ----------
+    brgy_gdf                    : the parcel GeoDataFrame for ONE source.
+    use_lot_classification      : whether THIS source's own "Use
+                                   LOT_LOCATION" checkbox is checked.
+    filter_by_road_type_active  : "Filter by Road Type" checkbox state.
+    excluded_road_types         : list of ROAD_TYPE values unchecked in the
+                                   Filter by Road Type checklist. Only
+                                   consulted when filter_by_road_type_active.
+
+    Returns a dict:
+      {
+        "mode": "lot_classification" | "filter_by_road_type" | "no_gating",
+        "skip_mask": pandas boolean Series or None,
+        "excluded_road_types": list[str],  # always [] unless mode is
+                               "filter_by_road_type".
+        "lot_column": str or None,
+        "lot_kind": "text" | "numeric" | None,
+      }
+    """
+    if use_lot_classification:
+        state, col_name, kind, mask = _detect_lot_classification(brgy_gdf)
+        if state == LOT_STATE_FOUND:
+            return {
+                "mode": "lot_classification",
+                "skip_mask": mask,
+                "excluded_road_types": [],
+                "lot_column": col_name,
+                "lot_kind": kind,
+            }
+        # Checkbox checked, but THIS particular source doesn't actually
+        # have a usable column -- falls back to no gating for this
+        # source only (per-source evaluation; a mixed batch is expected).
+        return {
+            "mode": "no_gating",
+            "skip_mask": None,
+            "excluded_road_types": [],
+            "lot_column": col_name,
+            "lot_kind": kind,
+        }
+
+    if filter_by_road_type_active:
+        return {
+            "mode": "filter_by_road_type",
+            "skip_mask": None,
+            "excluded_road_types": list(excluded_road_types or []),
+            "lot_column": None,
+            "lot_kind": None,
+        }
+
+    # Neither checkbox active -- today's original, unmodified default:
+    # all roads used, no parcels skipped.
+    return {
+        "mode": "no_gating",
+        "skip_mask": None,
+        "excluded_road_types": [],
+        "lot_column": None,
+        "lot_kind": None,
+    }
+
+
+# ----------------- FRONTAGE-FIRST WIDTH MEASUREMENT UTILITIES -----------------
+# split_boundary_to_segments(): ported verbatim from road_frontage.py.
+# No behavioral changes.
+def split_boundary_to_segments(boundary):
+    segments = []
+    if boundary.geom_type == 'LineString':
+        coords = list(boundary.coords)
+        segments.extend([LineString([coords[i], coords[i + 1]]) for i in range(len(coords) - 1)])
+    elif boundary.geom_type == 'MultiLineString':
+        for line in boundary.geoms:
+            coords = list(line.coords)
+            segments.extend([LineString([coords[i], coords[i + 1]]) for i in range(len(coords) - 1)])
+    return segments
+
+
+def _edge_covered_portion_and_road(seg, road_union, tol=10):
+    """
+    road_width.py-specific variant of road_frontage.py's
+    _edge_covered_portion(). Deliberately kept as its OWN, separate
+    function rather than modifying the reference implementation --
+    _edge_covered_portion() has one responsibility ("how much of this
+    edge is valid frontage") and this tool needs one additional piece of
+    information road_frontage.py never needed: WHICH local road geometry
+    produced that frontage, so ROAD_WIDTH can be measured against that
+    same local road specifically -- not the road network as a whole,
+    which risks matching the wrong nearby road on curves,
+    Y-intersections, or divided highways.
+
+    Uses the IDENTICAL geometric technique as _edge_covered_portion() --
+    same tol, same flat-capped buffer confined to this segment's own
+    footprint (cap_style=2, never extended past the segment's own two
+    endpoints) -- so the two functions will always agree on WHETHER a
+    segment has valid frontage. This function only additionally surfaces
+    the `road_in_zone` geometry that _edge_covered_portion() computes
+    internally and discards.
+
+    For one elementary boundary segment (vertex-to-vertex), returns
+    (covered_piece, road_in_zone):
+      covered_piece : LineString spanning the covered sub-portion of
+                       `seg`, or None if no part of it is within `tol`
+                       of any road geometry.
+      road_in_zone  : the portion of `road_union` that produced that
+                       coverage -- confined to `seg`'s own tol-buffer
+                       footprint, so it is always geometrically local to
+                       THIS segment, never a stray piece of a different,
+                       merely-nearby road. None if covered_piece is None.
+    """
+    zone = seg.buffer(tol, cap_style=2)
+    road_in_zone = road_union.intersection(zone)
+    if road_in_zone.is_empty:
+        return None, None
+
+    gt = road_in_zone.geom_type
+    if gt == "LineString":
+        pts = list(road_in_zone.coords)
+    elif gt == "MultiLineString":
+        pts = [c for g in road_in_zone.geoms for c in g.coords]
+    elif gt == "Point":
+        pts = [(road_in_zone.x, road_in_zone.y)]
+    elif gt == "MultiPoint":
+        pts = [(p.x, p.y) for p in road_in_zone.geoms]
     else:
-        return 3125
+        return None, None
+
+    fracs = [seg.project(Point(p)) for p in pts]
+    lo, hi = min(fracs), max(fracs)
+    if hi - lo < 1e-9:
+        return None, None
+
+    covered_piece = LineString([seg.interpolate(lo), seg.interpolate(hi)])
+    return covered_piece, road_in_zone
+
 
 # ----------------- MAIN PROCESS -----------------
-def process(barangay_gdf, road_gdf, source_name="", progress_cb=None):
-    original_crs = barangay_gdf.crs
-    barangay_gdf["geometry"] = barangay_gdf["geometry"].apply(fix_geometry)
-    barangay_gdf = barangay_gdf[barangay_gdf["geometry"].notnull()]
-    if barangay_gdf.empty:
-        raise ValueError(f"All geometries invalid in {source_name}")
+def process(barangay_gdf, road_gdf, source_name="", progress_cb=None, classification=None, output_column_name="ROAD_WIDTH"):
+    # classification: dict produced by resolve_classification() -- see
+    # its docstring for the exact shape. Defaults to "no gating at all"
+    # (identical to this tool's original, pre-feature behavior) so any
+    # existing caller that doesn't pass this argument keeps working
+    # exactly as before.
+    if classification is None:
+        classification = {
+            "mode": "no_gating",
+            "skip_mask": None,
+            "excluded_road_types": [],
+            "lot_column": None,
+            "lot_kind": None,
+        }
 
-    zone_epsg = get_prs92_zone(barangay_gdf)
+    # output_column_name: the column name the computed width is written
+    # into on barangay_gdf (default "ROAD_WIDTH"). Callers pass an
+    # override here when the selected parcel source already has an
+    # existing column matching "road_width" (case-insensitive, any
+    # casing) and the user confirmed proceeding -- see
+    # parcel_road_width_column_overrides above and the combined
+    # confirmation dialog in on_run(). Writing back into the EXACT
+    # existing name (preserving its casing) avoids silently creating a
+    # duplicate column (e.g. "road_width" alongside a new "ROAD_WIDTH"),
+    # since pandas column names are case-sensitive. The QA layer's own
+    # "ROAD_WIDTH" field is unaffected by this -- it's a brand-new output
+    # layer with no pre-existing column to collide with.
+
+    original_crs = barangay_gdf.crs
+
+    # Row-count check happens BEFORE any geometry validity handling --
+    # deliberately independent of it, since a parcel source with zero
+    # rows to begin with is a different situation from one where every
+    # row's geometry happens to be invalid (the latter no longer drops
+    # rows at all -- see the per-parcel loop below).
+    if len(barangay_gdf) == 0:
+        raise ValueError(f"No parcels found in {source_name}")
+
+    zone_epsg = detect_prs92_zone([barangay_gdf, road_gdf])
     print(f"🌍 [{source_name}] Reprojecting to EPSG:{zone_epsg}...")
     barangay_gdf = barangay_gdf.to_crs(epsg=zone_epsg)
     road_gdf = road_gdf.to_crs(epsg=zone_epsg)
 
-    # ── Build road segments + midpoint index ──────────────────────
-    segment_geoms, segment_midpoints = [], []
-    for geom in road_gdf.geometry:
-        if geom is None or geom.is_empty:
-            continue
-        parts = geom.geoms if geom.geom_type in ['MultiLineString', 'GeometryCollection'] else [geom]
-        for ls in parts:
-            if ls.geom_type != "LineString":
-                continue
-            coords = list(ls.coords)
-            for i in range(len(coords) - 1):
-                seg = LineString([coords[i], coords[i + 1]])
-                segment_geoms.append(seg)
-                midpoint = seg.interpolate(0.5, normalized=True)
-                segment_midpoints.append((midpoint.x, midpoint.y))
+    # ------------------------------------------------------------------
+    # Optional, user-driven Road Type filter (Road Classification ->
+    # "Filter by Road Type" mode only -- classification["excluded_road_types"]
+    # is always [] for both Automatic modes, by construction in
+    # resolve_classification(), so Automatic mode never reaches the
+    # filtering branch below even if the checklist has stale unchecked
+    # values from a previous "Filter by Road Type" session).
+    #
+    # Mirrors road_frontage.py's / lot_location.py's road-type filter --
+    # column detection, .isin() exclusion, and the "all excluded -> fall
+    # back to unfiltered" safety net -- so all three tools behave
+    # identically given the same road layer and the same excluded
+    # values.
+    # ------------------------------------------------------------------
+    excluded_road_types = classification.get("excluded_road_types") or []
+    road_type_col = _detect_road_type_column(road_gdf)
+    if road_type_col and excluded_road_types:
+        original_count = len(road_gdf)
+        filtered_gdf = road_gdf[~road_gdf[road_type_col].isin(excluded_road_types)].copy()
+        if len(filtered_gdf) == 0:
+            print(f"⚠️ [{source_name}] All road types excluded by filter -- "
+                  f"falling back to full road layer.")
+        else:
+            road_gdf = filtered_gdf
+            print(f"ℹ️ [{source_name}] Road type filter: {len(filtered_gdf)}/{original_count} "
+                  f"roads retained after excluding {len(excluded_road_types)} type(s) "
+                  f"(column: '{road_type_col}').")
 
-    if not segment_midpoints:
+    # ── Build road union for frontage detection ────────────────────
+    # road_union: single, computed-once geometry combining every
+    # PARTICIPATING road feature (already filtered by the Road Type
+    # filter above, if that mode is active -- Step 1, Classification,
+    # has already run by this point). Replaces the old segment_geoms /
+    # segment_midpoints / seg_tree infrastructure: the frontage-first
+    # algorithm below no longer does an approximate nearest-segment
+    # search across the whole boundary -- it directly tests each parcel
+    # boundary segment's own local footprint against this union (see
+    # _edge_covered_portion_and_road() above).
+    #
+    # NOTE: road_union has no attribute table of its own (it's a single
+    # unioned geometry blob) -- ROAD_TYPE/ROAD_NAME attribution for the
+    # QA layer below is looked up separately, from the original road_gdf
+    # rows, confined to each winning segment's own local zone.
+    road_geoms = [g for g in road_gdf.geometry if g is not None and not g.is_empty]
+
+    # QA layer column list, decided ONCE per process() call based on
+    # what's actually available -- not hardcoded to a fixed 5/6 fields.
+    # id_col: see _detect_pin_column() for the full priority order (PIN/
+    # ARP_NO/TD_NO/PARCEL_ID, then FID as a last resort) -- never a
+    # synthetic row index, since an index has no meaning outside this
+    # one processing run and can't be used to look the parcel back up in
+    # QGIS or the source data. If nothing is found, the PIN field is
+    # dropped entirely rather than emitted as all-None.
+    id_col = _detect_pin_column(barangay_gdf)
+    road_type_col = _detect_road_type_column(road_gdf)
+    road_name_col = _detect_road_name_column(road_gdf)
+
+    qa_columns = ["ROAD_WIDTH", "FRONT_SEGMENT"]
+    if id_col:
+        qa_columns.insert(0, "PIN")
+    if road_type_col:
+        qa_columns.append("ROAD_TYPE")
+    if road_name_col:
+        qa_columns.append("ROAD_NAME")
+    qa_columns.append("geometry")
+
+    if not road_geoms:
         if progress_cb:
             for _ in range(len(barangay_gdf)):
                 progress_cb(1)
-        barangay_gdf["ROAD_WIDTH"] = None
+        barangay_gdf[output_column_name] = None
+        qa_gdf = gpd.GeoDataFrame(columns=qa_columns, geometry="geometry", crs=barangay_gdf.crs)
         if original_crs:
             barangay_gdf = barangay_gdf.to_crs(original_crs)
-        return barangay_gdf
+            qa_gdf = qa_gdf.to_crs(original_crs)
+        return barangay_gdf, qa_gdf
 
-    seg_tree = cKDTree(segment_midpoints)
+    road_union = unary_union(road_geoms)
 
     def _measure_width(poly, boundary):
         """
-        Core measurement for ANY parcel (road lot or inner lot):
+        Frontage-first measurement. Architecture (see project design
+        notes for the full discussion):
 
-        1. Split the parcel boundary into individual segments.
-        2. For each parcel boundary segment, find the nearest road segment
-           using its midpoint.
-        3. Among all parcel boundary segments, pick the one whose midpoint
-           is closest to any road segment midpoint.
-        4. On that chosen parcel boundary segment, find the point on it
-           that is closest to the nearest road segment.
-        5. Find the closest point on the road segment to that boundary point.
-        6. Measure the distance between the two points.
-        7. Multiply by 2 (centerline → edge = half width).
+          Step 1 -- Classification (already applied before this function
+                    runs: Road Type filter on road_gdf above, and the
+                    Inner-Lot skip_mask check in the parcel loop below)
+                    determines WHICH parcels and roads participate. It
+                    does not affect how width is measured.
 
-        Returns float width in CRS units (metres after PRS92 reproject),
-        or None if boundary has no usable segments.
+          Step 2 -- Frontage detection: split the parcel boundary into
+                    individual segments; for each, test whether it is
+                    genuinely road-adjacent within ROAD_FRONT_TOLERANCE,
+                    using the SAME geometric technique as
+                    road_frontage.py's _edge_covered_portion() (a
+                    flat-capped buffer confined to that segment's own
+                    footprint -- never "bleeds" onto an unrelated nearby
+                    road on curves, Y-intersections, or divided
+                    highways). Each valid segment is paired with the
+                    LOCAL road geometry that produced it, not the road
+                    network as a whole.
+
+          Step 3 -- Width measurement: for every valid frontage segment,
+                    the width candidate is the distance from its covered
+                    portion to its OWN corresponding local road geometry
+                    (not to road_union as a whole -- preserves the
+                    frontage <-> corresponding-road relationship instead
+                    of "frontage <-> any nearby road"), doubled
+                    (centerline -> edge = half width). A candidate is
+                    discarded (excluded from the pool, not fabricated as
+                    None-worthy) if it exceeds MAX_ROAD_DISTANCE -- kept
+                    as a defensive safeguard even though it should not be
+                    structurally reachable, since every candidate is
+                    already confined to ROAD_FRONT_TOLERANCE.
+
+          Final   -- ROAD_WIDTH = the MINIMUM among all valid width
+                    candidates for this parcel -- not a "dominant" /
+                    longest-frontage pick. For a corner lot facing two
+                    genuine road frontages of different widths, the
+                    smaller of the two is the more conservative value.
+                    (road_frontage.py's own "pick the longest covered
+                    piece" precedent is a DEPTH-direction heuristic, not
+                    a general "primary road" rule, and is not carried
+                    over here -- different business metric.)
+
+        Returns a 5-tuple:
+          (width, front_segment_index, qa_line, road_type_value, road_name_value)
+        or (None, None, None, None, None) if the parcel has no boundary
+        segments at all, or no segment qualifies as valid frontage.
+
+        qa_line is a QA/validation geometry for the WINNING (minimum)
+        candidate ONLY -- not a new or approximate measurement. It's
+        built from the exact two points shapely's nearest_points() finds
+        between that winning candidate's covered_piece and road_in_zone
+        (the same pair whose .distance() produced the winning
+        raw_distance), then extended once more in the same direction so
+        the line's own length in QGIS equals the FULL, doubled
+        ROAD_WIDTH value -- not just the undoubled half-width. This
+        matches the "centerline is the midpoint, both edges are the
+        endpoints" reading of the existing doubling convention: the
+        point on the road is the line's midpoint, and both ends sit the
+        same distance away from it.
         """
-        # Split parcel boundary into individual segments
-        boundary_segs = []
-        lines = (
-            [boundary] if boundary.geom_type == "LineString"
-            else [g for g in boundary.geoms if g.geom_type == "LineString"]
-        )
-        for line in lines:
-            coords = list(line.coords)
-            for i in range(len(coords) - 1):
-                seg = LineString([coords[i], coords[i + 1]])
-                if seg.length > 0:
-                    boundary_segs.append(seg)
+        segs = split_boundary_to_segments(boundary)
+        if not segs:
+            return None, None, None, None, None
 
-        if not boundary_segs:
-            return None
+        best = None  # (width, seg_idx, covered_piece, road_in_zone)
+        for seg_idx, seg in enumerate(segs):
+            covered_piece, road_in_zone = _edge_covered_portion_and_road(
+                seg, road_union, tol=ROAD_FRONT_TOLERANCE
+            )
+            if covered_piece is None:
+                continue
 
-        # Build midpoints for all parcel boundary segments
-        bseg_mids = [(s.interpolate(0.5, normalized=True).x,
-                      s.interpolate(0.5, normalized=True).y)
-                     for s in boundary_segs]
+            raw_distance = covered_piece.distance(road_in_zone)
 
-        # For each parcel boundary segment, find nearest road segment
-        # Pick the parcel boundary segment whose midpoint is closest to
-        # any road segment midpoint
-        best_dist = float("inf")
-        best_bseg = None
-        best_rseg = None
+            # Defensive safeguard -- see docstring Step 3 above.
+            if raw_distance > MAX_ROAD_DISTANCE:
+                continue
 
-        for i, (bseg, bmid) in enumerate(zip(boundary_segs, bseg_mids)):
-            # Query nearest road segment to this boundary segment midpoint
-            dist_to_rseg, ridx = seg_tree.query(bmid)
-            if dist_to_rseg < best_dist:
-                best_dist = dist_to_rseg
-                best_bseg = bseg
-                best_rseg = segment_geoms[int(ridx)]
+            width = raw_distance * 2
+            if best is None or width < best[0]:
+                best = (width, seg_idx, covered_piece, road_in_zone)
 
-        if best_bseg is None or best_rseg is None:
-            return None
+        if best is None:
+            return None, None, None, None, None
 
-        # Find the point on the parcel boundary segment closest to the
-        # road segment, and vice versa
-        # nearest_points(a, b) → (point on a closest to b, point on b closest to a)
-        pt_on_bseg, pt_on_rseg = nearest_points(best_bseg, best_rseg)
+        width, seg_idx, covered_piece, road_in_zone = best
+        width = round(width, 4)
 
-        half_width = pt_on_bseg.distance(pt_on_rseg)
-        return round(half_width * 2, 4)
+        # Build the QA line from the EXACT geometry that produced the
+        # winning measurement -- see docstring above.
+        pt_on_edge, pt_on_road = nearest_points(covered_piece, road_in_zone)
+        dx = pt_on_road.x - pt_on_edge.x
+        dy = pt_on_road.y - pt_on_edge.y
+        qa_line = LineString([
+            pt_on_edge,
+            Point(pt_on_edge.x + 2 * dx, pt_on_edge.y + 2 * dy),
+        ])
+
+        # ROAD_TYPE / ROAD_NAME attribution: road_union has no attribute
+        # table (see note above process()'s road_union comment), so
+        # these are looked up from the ORIGINAL road_gdf rows -- confined
+        # to the SAME zone used to detect this winning segment's
+        # frontage, so the attribution stays local to the actual road
+        # that produced the measurement. Only done once, for the winning
+        # segment -- not for every candidate.
+        road_type_val = None
+        road_name_val = None
+        if road_type_col or road_name_col:
+            zone = segs[seg_idx].buffer(ROAD_FRONT_TOLERANCE, cap_style=2)
+            matching = road_gdf[road_gdf.geometry.intersects(zone)]
+            if not matching.empty:
+                if len(matching) > 1:
+                    dists = matching.geometry.distance(covered_piece)
+                    nearest_row = matching.loc[dists.idxmin()]
+                else:
+                    nearest_row = matching.iloc[0]
+                if road_type_col:
+                    road_type_val = nearest_row[road_type_col]
+                if road_name_col:
+                    road_name_val = nearest_row[road_name_col]
+
+        return width, seg_idx, qa_line, road_type_val, road_name_val
+
+    # ------------------------------------------------------------------
+    # Inner-Lot skip (Road Classification -> "Use LOT_LOCATION"
+    # mode only -- see resolve_classification()). Reindexed onto
+    # barangay_gdf's own index, then converted to a plain positional
+    # boolean array so it can be checked by row position inside the
+    # geometry loop below, same convention as skip_arr in
+    # road_frontage.py's process_frontage_single().
+    #
+    # Rows flagged True have their width measurement bypassed entirely
+    # and receive ROAD_WIDTH = None. This deliberately follows
+    # road_width.py's OWN existing convention for "not computed" --
+    # every other bail-out in this function (null/empty geometry,
+    # invalid geometry that buffers to empty, no usable boundary
+    # segments, no roads at all in the layer) already appends None, not
+    # 0.0. ROAD_WIDTH is a distance-in-metres metric, not a
+    # frontage-length -- unlike road_frontage.py's ROAD_FRONTAGE, a
+    # value of 0.0 here would misleadingly claim "this parcel measured a
+    # 0m-wide road," which is not what a skip means. None is the
+    # correct, consistent choice for this tool specifically.
+    # ------------------------------------------------------------------
+    skip_mask = classification.get("skip_mask")
+    if skip_mask is not None:
+        skip_arr = skip_mask.reindex(barangay_gdf.index).fillna(False).to_numpy()
+    else:
+        skip_arr = None
 
     # ── Measure every parcel ──────────────────────────────────────
     road_widths = []
+    qa_records = []
     for idx, poly in enumerate(barangay_gdf.geometry):
         if progress_cb:
             progress_cb(1)
+
+        if skip_arr is not None and skip_arr[idx]:
+            road_widths.append(None)
+            continue
 
         if poly is None or poly.is_empty:
             road_widths.append(None)
             continue
 
         if not poly.is_valid:
+            # Local-scope repair only -- reassigning `poly` here never
+            # writes back into barangay_gdf's own geometry column, so
+            # the exported output always keeps the parcel's original
+            # shape regardless of what happens here. Two-step repair
+            # (buffer(0), then make_valid() if that alone wasn't
+            # enough), matching lot_location.py's fix_geometry() --
+            # buffer(0) alone doesn't always fully repair severely
+            # broken geometry.
             poly = poly.buffer(0)
-            if poly.is_empty:
+            if not poly.is_valid:
+                poly = make_valid(poly)
+            if poly is None or poly.is_empty:
                 road_widths.append(None)
                 continue
 
-        width = _measure_width(poly, poly.boundary)
+        width, front_seg_idx, qa_line, road_type_val, road_name_val = _measure_width(poly, poly.boundary)
         road_widths.append(width)
 
-    barangay_gdf["ROAD_WIDTH"] = road_widths
+        if width is not None:
+            record = {"ROAD_WIDTH": width, "FRONT_SEGMENT": front_seg_idx, "geometry": qa_line}
+            if id_col:
+                record["PIN"] = barangay_gdf.iloc[idx][id_col]
+            if road_type_col:
+                record["ROAD_TYPE"] = road_type_val
+            if road_name_col:
+                record["ROAD_NAME"] = road_name_val
+            qa_records.append(record)
+
+    barangay_gdf[output_column_name] = road_widths
+
+    # ------------------------------------------------------------------
+    # QA / validation layer. NOT another computation -- a visualization
+    # of the exact geometry the production algorithm already selected as
+    # the winning measurement for each parcel (see _measure_width()'s
+    # docstring). Each QA line's own length in QGIS equals that parcel's
+    # ROAD_WIDTH value exactly. Separate output layer -- written by
+    # run_processing() alongside, never merged into, the main parcel
+    # output, so it can be toggled on/off independently in QGIS while
+    # validating results.
+    # ------------------------------------------------------------------
+    if qa_records:
+        qa_gdf = gpd.GeoDataFrame(qa_records, geometry="geometry", crs=barangay_gdf.crs)
+        qa_gdf = qa_gdf[qa_columns]
+    else:
+        qa_gdf = gpd.GeoDataFrame(columns=qa_columns, geometry="geometry", crs=barangay_gdf.crs)
+
     if original_crs:
         barangay_gdf = barangay_gdf.to_crs(original_crs)
-    return barangay_gdf
+        qa_gdf = qa_gdf.to_crs(original_crs)
 
-    tree = cKDTree(segment_midpoints)
-
-    # Classifier: road buffer union (10m — same tolerance as lot_location.py)
-    from shapely.ops import unary_union
-    road_buffer_union = unary_union(road_gdf.geometry).buffer(10)
-
-    # ------------------------------------------------------------------
-    # PASS 1 — compute raw width + classify each parcel
-    # Road lots  → raw width is valid (parcel boundary IS the road edge)
-    # Inner lots → raw width is wrong (gap measurement); flagged for Pass 3
-    # ------------------------------------------------------------------
-    pass1 = []  # list of dicts: {raw_width, seg_idx, is_road_lot}
-
-    for idx, poly in enumerate(barangay_gdf.geometry):
-        if progress_cb:
-            progress_cb(1)
-
-        if poly is None or poly.is_empty:
-            pass1.append({"raw_width": None, "seg_idx": None, "is_road_lot": False})
-            continue
-
-        if not poly.is_valid:
-            poly = poly.buffer(0)
-            if poly.is_empty:
-                pass1.append({"raw_width": None, "seg_idx": None, "is_road_lot": False})
-                continue
-
-        boundary = poly.boundary
-        coords = list(boundary.coords) if boundary.geom_type == "LineString" \
-            else [c for g in boundary.geoms for c in g.coords]
-        if not coords:
-            pass1.append({"raw_width": None, "seg_idx": None, "is_road_lot": False})
-            continue
-
-        dists, indices = tree.query(coords)
-        best = dists.argmin()
-        seg_idx = int(indices[best])
-        nearest_segment = segment_geoms[seg_idx]
-        nearest_point = Point(coords[best])
-        nearest_on_road = nearest_segment.interpolate(nearest_segment.project(nearest_point))
-        nearest_on_feature = nearest_points(nearest_on_road, boundary)[1]
-        raw_width = nearest_on_road.distance(nearest_on_feature) * 2
-
-        is_road_lot = bool(poly.intersects(road_buffer_union))
-
-        pass1.append({
-            "raw_width": raw_width,
-            "seg_idx": seg_idx,
-            "is_road_lot": is_road_lot,
-        })
-
-    # ------------------------------------------------------------------
-    # PASS 2 — build segment_id → median road width from road lots only
-    # ------------------------------------------------------------------
-    seg_widths: dict = {}  # seg_idx -> list of raw widths from road lots
-    for record in pass1:
-        if record["is_road_lot"] and record["raw_width"] is not None and record["seg_idx"] is not None:
-            seg_widths.setdefault(record["seg_idx"], []).append(record["raw_width"])
-
-    segment_width_map: dict = {
-        seg_idx: statistics.median(widths)
-        for seg_idx, widths in seg_widths.items()
-    }
-
-    # ------------------------------------------------------------------
-    # PASS 3 — assemble final ROAD_WIDTH values
-    # Road lots  → use their own raw_width (unchanged from existing logic)
-    # Inner lots → inherit median width of road lots on the same segment;
-    #              None if that segment has no road-touching parcels
-    # ------------------------------------------------------------------
-    road_widths = []
-    for record in pass1:
-        if record["raw_width"] is None:
-            road_widths.append(None)
-        elif record["is_road_lot"]:
-            road_widths.append(record["raw_width"])
-        else:
-            # Inner lot: look up the width associated with its nearest segment
-            road_widths.append(segment_width_map.get(record["seg_idx"], None))
-
-    barangay_gdf["ROAD_WIDTH"] = road_widths
-    if original_crs:
-        barangay_gdf = barangay_gdf.to_crs(original_crs)
-    return barangay_gdf
+    return barangay_gdf, qa_gdf
 
 # ----------------- SINGLE MAIN WINDOW -----------------
 # Drop-in replacement for the entire open_main_window function in road_width.py
@@ -420,6 +1116,18 @@ def open_main_window(root):
     parcel_local_paths = []
     parcel_db_tables   = []
     road_local_path    = tk.StringVar(master=win)
+    # road_db_table: DEDICATED var for the DB-mode road selection.
+    # road_width.py originally reused road_local_path for both local
+    # file path AND db table name -- this looked like a harmless
+    # "least structural change" at first, but it's an actual bug: when
+    # switching Local -> Database, the stale local path stays in
+    # road_local_path, gets misread as "a table is already selected",
+    # and a background read tries to query that path string as a table
+    # name -- which fails and silently wipes the Filter by Road Type
+    # checklist. Splitting this into two vars (matching
+    # road_frontage.py's actual, bug-free road_local_path +
+    # road_db_table design) fixes it at the source.
+    road_db_table       = tk.StringVar(master=win)
     output_local_dir   = tk.StringVar(master=win)
 
     parcel_files_var = tk.StringVar(master=win, value="No file(s) selected")
@@ -431,6 +1139,62 @@ def open_main_window(root):
 
     PAD = dict(padx=8, pady=4)
 
+    # ── Road Classification state (new) ─────────────────────────
+    #   - parcel_classification_vars: {path_or_table: tk.BooleanVar} --
+    #     one checkbox PER selected Land Parcel source that has a usable
+    #     LOT_LOCATION column. Lives under Land Parcel Source.
+    #     Sources without a usable column get no checkbox at all.
+    #   - filter_road_type_var: "Filter by Road Type" -- lives under Road
+    #     Network Source, since it depends entirely on the ROAD layer's
+    #     columns.
+    # Mutual exclusion (wired via trace_add() below, once per-source
+    # checkbox is created, plus once for filter_road_type_var): checking
+    # Filter by Road Type unchecks every per-source classification
+    # checkbox; checking any per-source classification checkbox unchecks
+    # Filter by Road Type. Multiple per-source classification checkboxes
+    # CAN be checked together -- they don't conflict with each other,
+    # only with Filter by Road Type.
+    parcel_classification_vars = {}
+    filter_road_type_var = tk.BooleanVar(master=win, value=False)
+
+    # road_type_value_vars: {display_text: (real_value, tk.BooleanVar)}
+    # for the Filter by Road Type checklist (checked = keep, unchecked =
+    # exclude). No Select All / Unselect All controls -- matches the
+    # canonical reference implementation exactly.
+    road_type_value_vars = {}
+
+    # run_status_var: drives the always-visible "Ready to run." / "Reading
+    # ..." / "Please select ..." label below the Run button, and gates
+    # whether the Run button itself is enabled (_update_run_button_state()
+    # below).
+    run_status_var = tk.StringVar(master=win, value="Preparing…")
+
+    # Background-read state for the two new inspection reads (parcel ->
+    # LOT_LOCATION detection + ROAD_WIDTH column conflict detection,
+    # merged into one read -- see _refresh_parcel_classification() --,
+    # and road -> ROAD_TYPE detection).
+    # Plain closure locals, mutated via `nonlocal` from the nested
+    # functions below -- never touched from a worker thread, only from
+    # win.after() polling on the main thread.
+    road_is_reading = False
+    parcel_is_reading = False
+    # parcel_read_details: per-source breakdown from the most recent
+    # background read -- list of (path_or_table, state, col_name, kind,
+    # road_width_existing_col) tuples, one per selected parcel source.
+    parcel_read_details = []
+    # parcel_road_width_conflicts: derived from parcel_read_details (see
+    # _derive_road_width_conflicts() below) -- list of (path_or_table,
+    # existing_col_name) tuples, one per source with an existing
+    # ROAD_WIDTH-like column. Consumed by the single combined
+    # confirmation dialog in on_run().
+    parcel_road_width_conflicts = []
+
+    # _suppress_mutual_exclusion: guards against the circular cascade
+    # between the two mutual-exclusion trace callbacks below. See
+    # _on_parcel_classification_checkbox_changed() / _on_filter_road_type_changed()
+    # docstrings for the exact bug this prevents.
+    _suppress_mutual_exclusion = False
+
     # ── section label helper ─────────────────────────────────────
     def section_label(parent, text):
         frm = tk.Frame(parent)
@@ -438,6 +1202,708 @@ def open_main_window(root):
         tk.Label(frm, text=text, font=("Segoe UI", 9, "bold")).pack(side="left")
         ttk.Separator(frm, orient="horizontal").pack(
             side="left", fill="x", expand=True, padx=(6, 0), pady=4)
+
+    def _read_gdf_worker(source_type, path_or_table):
+        """
+        Runs on a background thread. Generic reader used by BOTH new
+        Road Classification background reads (parcel -> LOT_LOCATION/
+        LOT_LABEL detection, road -> ROAD_TYPE detection). Returns
+        (gdf, error) and never touches any Tkinter widget or variable.
+        """
+        try:
+            if source_type == "local":
+                gdf = gpd.read_file(path_or_table)
+            else:
+                creds = load_db_credentials()
+                if not creds:
+                    return None, "Could not load DB credentials."
+                engine = create_engine(
+                    f"postgresql://{creds['username']}:{creds['password']}@"
+                    f"{creds['host']}:{creds['port']}/{creds['database']}"
+                )
+                gdf = read_postgis_clean(path_or_table, engine, creds["schema"])
+            return gdf, None
+        except Exception as e:
+            return None, str(e)
+
+    def _reflow_window():
+        """
+        Safety net for dynamic-width/height content -- the per-source
+        classification checklist growing/shrinking, and the road-type
+        checklist growing/shrinking -- combined with
+        win.resizable(False, False) above.
+
+        resizable() itself is never re-toggled: directly measuring
+        winfo_reqwidth()/reqheight() (after update_idletasks()) and
+        setting minsize/maxsize/geometry to that exact value avoids both
+        the "window gets stuck too small" bug and the "window decoration
+        flicker" that toggling resizable() causes on Windows.
+        """
+        win.update_idletasks()
+        req_w = win.winfo_reqwidth()
+        req_h = win.winfo_reqheight()
+        win.minsize(req_w, req_h)
+        win.maxsize(req_w, req_h)
+        win.geometry(f"{req_w}x{req_h}")
+
+    # NOTE: a _freeze_window_size() helper previously existed here,
+    # pinning the window's min/max size to its current displayed size
+    # immediately before a checklist was cleared, so the automatic
+    # pack-geometry shrink (from clearing) wouldn't be visible before the
+    # new content arrived. It has been REMOVED: the swap-based checklist
+    # lifecycle below (see _rebuild_lot_classification_checklist() and
+    # _rebuild_road_type_checklist()) never clears/destroys the OLD
+    # checklist until the NEW one is already built and ready to take its
+    # place in a single swap -- there is no longer an empty intermediate
+    # state to freeze against. If a future need for it reappears, it
+    # was: win.update_idletasks(); w,h = win.winfo_width(),
+    # win.winfo_height(); win.minsize(w,h); win.maxsize(w,h).
+
+    def _rebuild_road_type_checklist():
+        """
+        Swap-based rebuild: builds the new Road Type checklist in a
+        fresh, off-screen Frame first, then swaps road_type_checklist_
+        container's reference to it and destroys the old one -- the old
+        checklist is never cleared/destroyed before the new one is fully
+        built, so the GUI never passes through an empty intermediate
+        state. Deliberately does NOT pack the new container or call
+        _reflow_window() here -- every caller of this function calls
+        _update_road_classification_visibility() immediately afterward,
+        which owns all packing/positioning decisions for whichever
+        container is current at that moment.
+        """
+        nonlocal road_type_checklist_container
+        new_container = tk.Frame(road_frame)
+        for display_text in sorted(road_type_value_vars.keys()):
+            real_value, var = road_type_value_vars[display_text]
+            tk.Checkbutton(new_container, text=display_text,
+                           variable=var).pack(anchor="w")
+        old_container = road_type_checklist_container
+        road_type_checklist_container = new_container
+        old_container.destroy()
+
+    def _on_parcel_classification_checkbox_changed(*_args):
+        """
+        Mutual exclusion: checking ANY per-source "Use LOT_LOCATION/
+        LOT_LABEL" checkbox un-checks "Filter by Road Type" if it was on.
+        Multiple per-source checkboxes CAN be checked together -- this
+        only fires the OTHER direction (toward Filter by Road Type), so
+        checking a second per-source box while a first is already
+        checked does not affect either of them.
+
+        Operation order (kept identical to _on_filter_road_type_changed()
+        below on purpose):
+          1. Guarded mutual-exclusion mutation
+          2. Cache synchronization (no-op here -- parcel_classification_vars
+             and _parcel_classification_cache[...]["vars"] already share
+             the same BooleanVar objects by reference)
+          3. Visibility refresh
+          4. Run button update
+
+        _suppress_mutual_exclusion guards ONLY step 1 -- NOT the whole
+        callback. Steps 2-4 must always run even when this callback was
+        re-entered (nested) while already suppressed, or a genuine
+        needed UI refresh gets silently skipped.
+        """
+        nonlocal _suppress_mutual_exclusion
+        if not _suppress_mutual_exclusion:
+            _suppress_mutual_exclusion = True
+            try:
+                if filter_road_type_var.get():
+                    filter_road_type_var.set(False)
+            finally:
+                _suppress_mutual_exclusion = False
+        # Step 2: cache sync -- nothing to do, see docstring.
+        # Step 3: visibility refresh.
+        _update_road_classification_visibility()
+        # Step 4: run button update.
+        _update_run_button_state()
+
+    def _rebuild_lot_classification_checklist(reuse_vars=None):
+        """
+        Rebuilds the per-source classification checklist from
+        parcel_read_details: one checkbox per selected parcel source
+        that has a usable LOT_LOCATION column (state ==
+        LOT_STATE_FOUND). Sources without a usable column are omitted
+        entirely -- not shown with a "not found" line. If no source
+        qualifies at all, the box is simply left empty -- its own
+        visibility/height is decided separately by
+        _update_parcel_classification_visibility(), not by whether it
+        happens to have children.
+
+        Checkbox label is "Use <col_name> in <filename/table>" (e.g.
+        "Use LOT_LABEL in Barangay_123.gpkg") -- filename/table name
+        only, not the full path. Sufficient to disambiguate between
+        multiple sources at a glance: a single Browse action always
+        selects files from exactly one folder and REPLACES the previous
+        selection, and no filesystem allows duplicate filenames within
+        one folder (nor duplicate table names within one schema), so
+        this name is always guaranteed unique among the currently
+        selected sources.
+
+        reuse_vars: optional {path_or_table: tk.BooleanVar} to reuse
+        instead of creating fresh ones -- used by the cache-hit path in
+        _refresh_parcel_classification() so toggling Local <-> Database
+        back to an unchanged selection restores each checkbox's
+        checked/unchecked state exactly as the user left it.
+
+        Plain destroy-and-repopulate, called directly by the CALLER
+        before _update_parcel_classification_visibility() (never by that
+        function itself, which only handles the "Reading..." placeholder
+        content -- see its own docstring for why the split is this way).
+        Simpler than the previous "build off-screen, swap, destroy old"
+        approach -- that complexity existed only to avoid a brief empty-
+        content moment affecting the WINDOW's own size; now that
+        lot_classification_list_container lives inside a fixed-height
+        Canvas (see its construction above), clearing and repopulating
+        its children in place can never change the window's size at all,
+        so there's nothing left to protect against.
+        """
+        for child in lot_classification_list_container.winfo_children():
+            child.destroy()
+        new_vars = {}
+
+        for path_or_table, state, col_name, kind, _rw_existing_col in parcel_read_details:
+            if state != LOT_STATE_FOUND:
+                continue
+            if reuse_vars is not None and path_or_table in reuse_vars:
+                var = reuse_vars[path_or_table]
+            else:
+                var = tk.BooleanVar(master=win, value=False)
+                var.trace_add("write", _on_parcel_classification_checkbox_changed)
+            new_vars[path_or_table] = var
+
+            # os.path.basename() is safe to call unconditionally here
+            # even for database table names (which have no path
+            # separators) -- it just returns the string unchanged in
+            # that case.
+            display_name = os.path.basename(path_or_table)
+            tk.Checkbutton(
+                lot_classification_list_container,
+                text=f"Use {col_name} in {display_name}", variable=var
+            ).pack(anchor="w")
+
+        parcel_classification_vars.clear()
+        parcel_classification_vars.update(new_vars)
+
+    def _update_parcel_classification_visibility():
+        """
+        Decides whether the classification box (lot_classification_outer,
+        a content-adaptive scrollable Canvas -- see its construction
+        above) is shown at all, and if so, resizes it to fit its current
+        content (capped -- see _resize_lot_classification_box()). Hidden
+        entirely both when no Land Parcel source is selected, AND when
+        one is selected but yields nothing to show (no source has a
+        usable classification column) -- an empty, pointlessly-
+        scrollable box was worse than just not showing it.
+
+        Deliberately NEVER called while parcel_is_reading -- the "Reading
+        parcel..." indicator lives elsewhere now (see
+        _set_parcel_reading_state()'s docstring), and this box is left
+        completely UNTOUCHED for the entire duration of a background
+        read: if it was already showing a previous file's checklist, it
+        stays exactly as it was until the new read's actual result is
+        known. This function is only ever invoked once that result is
+        ready (or immediately, for the synchronous no-sources/cache-hit
+        paths), so it triggers at most ONE resize per call -- never a
+        second one layered close in time on top of an earlier "entering
+        reading" resize, which is what made the previously reported
+        distortion worse rather than better.
+
+        Assumes the caller already populated
+        lot_classification_list_container via
+        _rebuild_lot_classification_checklist() (with the correct
+        reuse_vars, if applicable) before calling this function -- kept
+        as the caller's responsibility rather than threaded through here,
+        so the cache-hit "restore checked state" behavior keeps working
+        without extra parameters.
+        """
+        has_any_parcel_source = (
+            bool(parcel_local_paths) if parcel_source_type.get() == "local"
+            else bool(parcel_db_tables)
+        )
+
+        if not has_any_parcel_source:
+            if lot_classification_outer.winfo_ismapped():
+                lot_classification_outer.pack_forget()
+                _reflow_window()
+            return
+
+        has_content = bool(lot_classification_list_container.winfo_children())
+        if not has_content:
+            if lot_classification_outer.winfo_ismapped():
+                lot_classification_outer.pack_forget()
+                _reflow_window()
+            return
+
+        _resize_lot_classification_box()
+        if not lot_classification_outer.winfo_ismapped():
+            lot_classification_outer.pack(
+                fill="x", pady=(2, 0), after=parcel_action_row)
+        _reflow_window()
+
+    def _update_road_classification_visibility():
+        """
+        Shows the "Filter by Road Type" checkbox plus (if checked) its
+        per-value checklist, and, ADDITIVELY, a "⏳ Reading road
+        network…" indicator while a background read is in flight -- the
+        indicator appears alongside whatever was already on screen (old
+        data, about to be replaced) without ever hiding or clearing it.
+        No usable ROAD_TYPE-like column found shows neither.
+
+        Invariant this preserves: the GUI never passes through an empty
+        intermediate state just because a background refresh is in
+        progress. The checkbox/checklist's own pack state/position is
+        entirely decided HERE (not by _rebuild_road_type_checklist(),
+        which only swaps which Frame object is current) -- while
+        reading, this function does not touch road_filter_checkbox's or
+        road_type_checklist_container's pack state at all, so both stay
+        exactly as they were.
+
+        Deliberately does NOT call _reflow_window() when entering the
+        reading state -- see _update_parcel_classification_visibility()'s
+        docstring for the full rationale (two win.geometry() calls in
+        quick succession -- entering reading, then the completed swap --
+        was found to cause real, reproducible visual ghosting on
+        Windows). Resize happens exactly once per read cycle, at the
+        point the new checklist actually replaces the old one.
+        """
+        if road_is_reading:
+            road_reading_lbl.pack(anchor="w", pady=(2, 0))
+            return
+        road_reading_lbl.pack_forget()
+        if road_type_value_vars:
+            road_filter_checkbox.pack(anchor="w", pady=(2, 0))
+            if filter_road_type_var.get():
+                road_type_checklist_container.pack(
+                    fill="x", padx=(20, 0), pady=(2, 0), after=road_filter_checkbox)
+            else:
+                road_type_checklist_container.pack_forget()
+        else:
+            road_filter_checkbox.pack_forget()
+            road_type_checklist_container.pack_forget()
+        _reflow_window()
+
+    def _on_filter_road_type_changed(*_args):
+        """
+        Mutual exclusion, mirror of _on_parcel_classification_checkbox_changed
+        above: checking "Filter by Road Type" un-checks EVERY per-source
+        classification checkbox currently on the Land Parcel side.
+
+        Operation order identical to
+        _on_parcel_classification_checkbox_changed() above, deliberately:
+          1. Guarded mutual-exclusion mutation
+          2. Cache synchronization -- mirrors the live checked-state into
+             the currently active Road Network mode's cache slot
+             (_road_gdf_cache), if that slot already has cached data.
+          3. Visibility refresh
+          4. Run button update
+
+        _suppress_mutual_exclusion guards ONLY step 1 -- NOT the whole
+        callback (same reasoning as the sibling callback above).
+        """
+        nonlocal _suppress_mutual_exclusion
+        if not _suppress_mutual_exclusion:
+            _suppress_mutual_exclusion = True
+            try:
+                if filter_road_type_var.get():
+                    for var in parcel_classification_vars.values():
+                        var.set(False)
+            finally:
+                _suppress_mutual_exclusion = False
+        # Step 2: cache sync.
+        current_type = road_source_type.get()
+        if _road_gdf_cache[current_type]["gdf"] is not None:
+            _road_gdf_cache[current_type]["filter_active"] = filter_road_type_var.get()
+        # Step 3: visibility refresh.
+        _update_road_classification_visibility()
+        # Step 4: run button update.
+        _update_run_button_state()
+
+    filter_road_type_var.trace_add("write", _on_filter_road_type_changed)
+
+    def _set_parcel_reading_state(reading):
+        """
+        Disables Land Parcel Browse/radio controls while its background
+        classification read is in progress -- prevents starting a
+        second, overlapping read of the same source.
+
+        Also drives the "Reading..." indicator itself -- but NOT via a
+        separate widget or any pack()/pack_forget() call. It reuses the
+        EXISTING "N file(s) selected" / "N table(s) selected" label
+        (parcel_lbl_widget, bound to parcel_files_var / parcel_db_var)
+        that's already permanently present in parcel_action_row,
+        temporarily overwriting its text via the StringVar and restoring
+        it once done. Since this label's own row never changes shape
+        because of a text-length change (no fill/expand on it, nothing
+        below it repositions), this transition needs -- and gets -- ZERO
+        _reflow_window() calls. This replaces an earlier design where
+        entering/leaving the reading state showed/hid the classification
+        checklist box itself, which meant an extra window resize per
+        read cycle; that resize, so close in time to the one at the end
+        of the same cycle, was found to make the reported visual
+        distortion WORSE, not better. The classification checklist box
+        itself is now left completely untouched during reading -- see
+        _refresh_parcel_classification() and
+        _poll_parcel_classification_queue() -- so it only ever resizes
+        once, when the read's final result is actually known.
+        """
+        state = "disabled" if reading else "normal"
+        parcel_btn.config(state=state)
+        parcel_radio_local.config(state=state)
+        parcel_radio_db.config(state=state)
+
+        if reading:
+            # Singular vs plural depends on how many sources are
+            # actually selected for the CURRENT mode -- "Reading Land
+            # Parcel..." for exactly one, "Reading Land Parcels..." for
+            # two or more. Color matches the Road Network side's own
+            # "Reading..." indicator (#b36b00, amber) for visual
+            # consistency between the two sections.
+            n_selected = len(parcel_local_paths) if parcel_source_type.get() == "local" else len(parcel_db_tables)
+            reading_text = "⏳ Reading Land Parcel..." if n_selected == 1 else "⏳ Reading Land Parcels..."
+            parcel_files_var.set(reading_text)
+            parcel_db_var.set(reading_text)
+            parcel_lbl_widget.config(fg="#b36b00")
+        else:
+            n_local = len(parcel_local_paths)
+            parcel_files_var.set(f"{n_local} file(s) selected" if n_local else "No file(s) selected")
+            n_db = len(parcel_db_tables)
+            parcel_db_var.set(f"{n_db} table(s) selected" if n_db else "No table(s) selected")
+            parcel_lbl_widget.config(fg="gray")
+
+    def _set_road_reading_state(reading):
+        """Disable Road Network Browse/radio controls while its
+        background classification read is in progress -- prevents
+        starting a second, overlapping read of the same source."""
+        state = "disabled" if reading else "normal"
+        road_btn.config(state=state)
+        road_radio_local.config(state=state)
+        road_radio_db.config(state=state)
+
+    def _update_run_button_state():
+        """
+        Single source of truth for whether the Run button may be
+        pressed. While a background read (parcel OR road) is still in
+        progress, the checkboxes above haven't yet caught up to the true
+        effective state, so Run stays disabled until both finish.
+
+        Explicit bg/fg/cursor toggling (not just state=) is required:
+        Tkinter does NOT automatically gray out a classic tk.Button's
+        custom bg/fg when state="disabled", and does not suppress a
+        widget's assigned cursor either -- both must be set explicitly
+        for each state.
+        """
+        has_parcel = bool(parcel_local_paths) if parcel_source_type.get() == "local" else bool(parcel_db_tables)
+        has_road = bool(road_local_path.get()) if road_source_type.get() == "local" else bool(road_db_table.get())
+        has_output = bool(output_local_dir.get()) if output_dest_type.get() == "local" else True
+
+        if not has_parcel:
+            run_status_var.set("Please select a Land Parcel source.")
+            ready = False
+        elif not has_road:
+            run_status_var.set("Please select a Road Network source.")
+            ready = False
+        elif not has_output:
+            run_status_var.set("Please select an Output destination.")
+            ready = False
+        elif parcel_is_reading:
+            run_status_var.set("Reading parcel source for classification…")
+            ready = False
+        elif road_is_reading:
+            run_status_var.set("Reading road network for classification…")
+            ready = False
+        else:
+            run_status_var.set("Ready to run.")
+            ready = True
+
+        if ready:
+            run_btn.config(state="normal", cursor="hand2",
+                            bg="#2e7d32", fg="white")
+        else:
+            run_btn.config(state="disabled", cursor="no",
+                            bg="#e0e0e0", fg="#888888", disabledforeground="#888888")
+
+    def _derive_road_width_conflicts(details):
+        """
+        Extracts the ROAD_WIDTH-conflict subset out of parcel_read_details
+        (or an equivalent list, e.g. a cache slot's stored details) --
+        one (path_or_table, existing_col_name) tuple per source where the
+        merged background read found an existing column matching
+        "road_width" (case-insensitive). Sources with no conflict, or
+        that failed to read, are simply absent from the result.
+        """
+        return [
+            (path_or_table, rw_col)
+            for path_or_table, _state, _col_name, _kind, rw_col in details
+            if rw_col is not None
+        ]
+
+    def _refresh_parcel_classification(force_refresh=False):
+        """
+        Background-reads EVERY currently selected Land Parcel file/table
+        (not just the first) so the per-source checklist can offer a
+        checkbox for every source that actually has a usable
+        LOT_LOCATION column -- UNLESS the dual-slot
+        _parcel_classification_cache already has a still-valid entry for
+        this exact mode+selection, in which case the checklist --
+        including each checkbox's checked state -- is restored instantly
+        with no read at all. GeoDataFrames are discarded immediately
+        after inspection, not cached -- only the tiny per-source
+        detection tuples and the BooleanVars are kept.
+
+        This SAME read also checks each source for an existing
+        ROAD_WIDTH-like column (case-insensitive) that would collide
+        with the column this tool is about to write -- deliberately
+        merged into this one pass rather than a second, separate
+        background read, since both checks need to open the exact same
+        file/table anyway. parcel_road_width_conflicts (a derived list,
+        recomputed alongside parcel_read_details below) is consumed by
+        the single combined confirmation dialog in on_run() -- unlike
+        the LOT_LOCATION checklist above, this check has no GUI checklist
+        of its own; it is purely a yes/no warning shown once at Run time.
+
+        force_refresh: when True, skips the cache-hit check entirely and
+        always does a fresh read, even if the cache key matches. Must be
+        True whenever this is called because the user just ACTIVELY
+        selected source(s) via Browse -- if they re-select the exact
+        same file(s) (e.g. after editing one externally to add/change
+        LOT_LOCATION values or a ROAD_WIDTH column), a plain key match
+        would otherwise silently serve the old, now-stale cached
+        results. The cache-hit shortcut is only safe to take on the
+        toggle_parcel() path (the user didn't select anything new, just
+        switched which already-made selection is active), which calls
+        this with the default force_refresh=False.
+        """
+        nonlocal parcel_is_reading, parcel_read_details, parcel_road_width_conflicts
+        if parcel_is_reading:
+            return
+
+        if parcel_source_type.get() == "local":
+            source_type = "local"
+            sources = list(parcel_local_paths)
+        else:
+            source_type = "db"
+            sources = list(parcel_db_tables)
+
+        if not sources:
+            parcel_read_details = []
+            parcel_road_width_conflicts = []
+            _rebuild_lot_classification_checklist()
+            _update_parcel_classification_visibility()
+            _update_run_button_state()
+            return
+
+        cache_key = tuple(sources)
+        slot = _parcel_classification_cache[source_type]
+        if not force_refresh and slot["key"] == cache_key and slot["details"] is not None:
+            parcel_read_details = slot["details"]
+            parcel_road_width_conflicts = _derive_road_width_conflicts(parcel_read_details)
+            _rebuild_lot_classification_checklist(reuse_vars=slot["vars"])
+            _update_parcel_classification_visibility()
+            _update_run_button_state()
+            return
+
+        # Cache miss: selection changed for this mode, or first time
+        # selecting these sources -- do the actual background read. Per
+        # the "never pass through an empty intermediate state" invariant,
+        # the EXISTING checklist (if any) is left completely untouched
+        # here -- it stays fully visible throughout the read, and is
+        # only ever replaced in one atomic swap once the new data is
+        # ready (see _poll_parcel_classification_queue()).
+        result_queue = queue.Queue()
+
+        def worker():
+            per_source_results = []
+            for path_or_table in sources:
+                gdf, error = _read_gdf_worker(source_type, path_or_table)
+                if error is not None or gdf is None:
+                    per_source_results.append((path_or_table, None, None, None, None))
+                    continue
+                state, col_name, kind, _mask = _detect_lot_classification(gdf)
+                road_width_existing_col = next(
+                    (c for c in gdf.columns if c.lower() == "road_width"), None
+                )
+                per_source_results.append((path_or_table, state, col_name, kind, road_width_existing_col))
+                del gdf
+            result_queue.put(per_source_results)
+
+        parcel_is_reading = True
+        _set_parcel_reading_state(True)
+        _update_run_button_state()
+        threading.Thread(target=worker, daemon=True).start()
+        win.after(100, lambda: _poll_parcel_classification_queue(result_queue, source_type, cache_key))
+
+    def _poll_parcel_classification_queue(result_queue, source_type, cache_key):
+        nonlocal parcel_is_reading, parcel_read_details, parcel_road_width_conflicts
+        if not win.winfo_exists():
+            return
+        try:
+            per_source_results = result_queue.get_nowait()
+        except queue.Empty:
+            win.after(100, lambda: _poll_parcel_classification_queue(result_queue, source_type, cache_key))
+            return
+
+        parcel_is_reading = False
+        _set_parcel_reading_state(False)
+        parcel_read_details = per_source_results
+        parcel_road_width_conflicts = _derive_road_width_conflicts(per_source_results)
+
+        failed = [src for (src, state, _c, _k, _rw) in per_source_results if state is None]
+        for src in failed:
+            print(f"⚠️ Could not read parcel layer for classification check: {src}")
+
+        _rebuild_lot_classification_checklist()
+
+        _parcel_classification_cache[source_type] = {
+            "key": cache_key,
+            "details": per_source_results,
+            "vars": dict(parcel_classification_vars),
+        }
+
+        _update_parcel_classification_visibility()
+        _update_run_button_state()
+
+    def _refresh_road_classification(force_refresh=False):
+        """
+        Background-reads the currently selected Road Network source (a
+        single file/table -- Road Network only ever supports one
+        selection) -- UNLESS the dual-slot cache already has a still-
+        valid entry for this exact mode+selection, in which case the
+        checklist is restored instantly from cache with no read and no
+        background thread at all. Populates road_type_value_vars for the
+        Filter by Road Type checklist and caches the read gdf in
+        _road_gdf_cache.
+
+        force_refresh: same semantics as _refresh_parcel_classification()
+        above -- True whenever called from an active Browse selection,
+        False on the toggle_road() path.
+        """
+        nonlocal road_is_reading
+        if road_is_reading:
+            return
+
+        source_type = road_source_type.get()
+        path_or_table = road_local_path.get() if source_type == "local" else road_db_table.get()
+
+        if not path_or_table:
+            # Nothing selected for this mode -- nothing to show, nothing
+            # to read. No background read is involved, so this is an
+            # immediate, synchronous swap to an empty checklist -- not
+            # the "reading" transient state at all.
+            road_type_value_vars.clear()
+            _rebuild_road_type_checklist()
+            filter_road_type_var.set(False)
+            _update_road_classification_visibility()
+            _update_run_button_state()
+            return
+
+        slot = _road_gdf_cache[source_type]
+        if not force_refresh and slot["key"] == path_or_table and slot["gdf"] is not None:
+            # True cache hit: same mode, same selection, already read --
+            # restore the checklist (including each value's checked
+            # state) with no I/O at all. Immediate, synchronous swap --
+            # not the "reading" transient state.
+            road_type_value_vars.clear()
+            road_type_value_vars.update(slot["value_vars"])
+            _rebuild_road_type_checklist()
+            filter_road_type_var.set(slot.get("filter_active", False))
+            _update_road_classification_visibility()
+            _update_run_button_state()
+            return
+
+        # Cache miss: new file/table for this mode, or first time
+        # selecting it -- do the actual background read. Per the "never
+        # pass through an empty intermediate state" invariant, the
+        # EXISTING checkbox/checklist (if any) is left completely
+        # untouched here -- it stays fully visible throughout the read,
+        # and is only ever replaced in one atomic swap once the new data
+        # is ready (see _poll_road_classification_queue()). This
+        # includes filter_road_type_var itself -- its reset to False for
+        # the new file happens there too, not here, so the OLD file's
+        # checked state doesn't visibly flicker off mid-read.
+        source_key = (source_type, path_or_table)
+        result_queue = queue.Queue()
+
+        def worker():
+            gdf, error = _read_gdf_worker(source_type, path_or_table)
+            result_queue.put((gdf, error))
+
+        road_is_reading = True
+        _set_road_reading_state(True)
+        _update_road_classification_visibility()
+        _update_run_button_state()
+        threading.Thread(target=worker, daemon=True).start()
+        win.after(100, lambda: _poll_road_classification_queue(result_queue, source_key))
+
+    def _poll_road_classification_queue(result_queue, source_key):
+        nonlocal road_is_reading
+        if not win.winfo_exists():
+            return
+        try:
+            gdf, error = result_queue.get_nowait()
+        except queue.Empty:
+            win.after(100, lambda: _poll_road_classification_queue(result_queue, source_key))
+            return
+
+        source_type, path_or_table = source_key
+        road_is_reading = False
+        _set_road_reading_state(False)
+        if error is not None or gdf is None:
+            print(f"⚠️ Could not read road layer for classification check: {error}")
+            _road_gdf_cache[source_type] = {
+                "key": None, "gdf": None, "value_vars": {}, "filter_active": False
+            }
+            road_type_value_vars.clear()
+            _rebuild_road_type_checklist()
+            filter_road_type_var.set(False)
+            _update_road_classification_visibility()
+            _update_run_button_state()
+            return
+
+        col = _detect_road_type_column(gdf)
+        new_value_vars = {}
+        if col:
+            # Three distinct data states, never merged into one bucket.
+            counts = {}
+            for v in gdf[col]:
+                if pd.isna(v):
+                    real_value, label = np.nan, "(NULL / No Road Type)"
+                elif str(v) == "":
+                    real_value, label = "", "(Empty String)"
+                else:
+                    real_value, label = str(v), str(v)
+                if label not in counts:
+                    counts[label] = [real_value, 0]
+                counts[label][1] += 1
+
+            if len(counts) > 1:
+                for label in sorted(counts.keys()):
+                    real_value, count = counts[label]
+                    display_text = f"{label} ({count})"
+                    new_value_vars[display_text] = (
+                        real_value, tk.BooleanVar(master=win, value=True)
+                    )
+            # else: only one distinct value (or entirely NULL/empty) --
+            # nothing meaningful to filter on; checkbox stays hidden.
+        # else: no ROAD_TYPE-like column found -- checkbox stays hidden.
+
+        _road_gdf_cache[source_type] = {
+            "key": path_or_table, "gdf": gdf, "value_vars": new_value_vars,
+            "filter_active": False
+        }
+        road_type_value_vars.clear()
+        road_type_value_vars.update(new_value_vars)
+        _rebuild_road_type_checklist()
+        # Reset here (not in _refresh_road_classification(), before the
+        # read started) -- committing this atomically alongside the new
+        # checklist swap means the OLD file's checked state stays fully
+        # intact and visible for the entire duration of the read, only
+        # changing at the exact moment the new checklist replaces it.
+        filter_road_type_var.set(False)
+
+        _update_road_classification_visibility()
+        _update_run_button_state()
 
     # ════════════════════════════════════════════════════════════
     #  SECTION 1 — LAND PARCEL
@@ -458,8 +1924,94 @@ def open_main_window(root):
         fg="gray", anchor="w", width=42)
     parcel_lbl_widget.pack(side="left")
 
-    parcel_btn = tk.Button(parcel_action_row, text="Browse…", width=10)
+    parcel_btn = tk.Button(parcel_action_row, text="Browse…", width=10, cursor="hand2")
     parcel_btn.pack(side="left", **PAD)
+
+    # Per-source classification checklist -- one Checkbutton per selected
+    # Land Parcel source that has a usable LOT_LOCATION column, built
+    # fresh by _rebuild_lot_classification_checklist() after each
+    # background read.
+    #
+    # Content-adaptive height, capped, scrollable when needed (Canvas +
+    # Scrollbar): the box sizes itself to fit however many checkboxes
+    # are actually present, up to LOT_CLASSIFICATION_MAX_HEIGHT -- past
+    # that cap, it stops growing and scrolls internally instead. This is
+    # a deliberate middle ground: an earlier version used a permanently
+    # FIXED height regardless of content, which avoided all resizing but
+    # left an empty, pointlessly-scrollable box visible even when there
+    # was nothing to show (0 checkboxes) -- clearly wrong looking. This
+    # version instead hides the box ENTIRELY when there's nothing to
+    # show, and resizes it (once, cleanly -- see
+    # _resize_lot_classification_box()) whenever its content actually
+    # changes. That reintroduces occasional, deliberate resizes, but NOT
+    # the repeated, rapid-fire resize CASCADE that caused the original
+    # visual distortion bug -- this box's own height is recomputed and
+    # applied in one shot per state transition, not many times in quick
+    # succession.
+    LOT_CLASSIFICATION_MAX_HEIGHT = 90  # pixels -- cap; box grows to fit content up to this, then scrolls
+
+    lot_classification_outer = tk.Frame(parcel_frame)
+    lot_classification_canvas = tk.Canvas(
+        lot_classification_outer, highlightthickness=0, bd=0)
+    lot_classification_scrollbar = tk.Scrollbar(
+        lot_classification_outer, orient="vertical",
+        command=lot_classification_canvas.yview)
+    lot_classification_canvas.configure(yscrollcommand=lot_classification_scrollbar.set)
+    lot_classification_canvas.pack(side="left", fill="both", expand=True)
+    # lot_classification_scrollbar is packed/unpacked dynamically by
+    # _resize_lot_classification_box() below -- only shown when content
+    # actually exceeds the cap and scrolling is genuinely needed.
+
+    # lot_classification_list_container: the actual content frame drawn
+    # INSIDE the canvas -- this is what _rebuild_lot_classification_checklist()
+    # (and the "Reading..." branch of _update_parcel_classification_visibility())
+    # clears and repopulates.
+    lot_classification_list_container = tk.Frame(lot_classification_canvas)
+    _lot_classification_canvas_window = lot_classification_canvas.create_window(
+        (0, 0), window=lot_classification_list_container, anchor="nw")
+
+    def _on_lot_classification_content_configure(_event=None):
+        lot_classification_canvas.configure(
+            scrollregion=lot_classification_canvas.bbox("all"))
+    lot_classification_list_container.bind(
+        "<Configure>", _on_lot_classification_content_configure)
+
+    def _on_lot_classification_canvas_resize(event):
+        # Keep the inner frame's width matched to the canvas's own width
+        # so checkboxes wrap/align correctly and only VERTICAL scrolling
+        # is ever needed.
+        lot_classification_canvas.itemconfig(_lot_classification_canvas_window, width=event.width)
+    lot_classification_canvas.bind("<Configure>", _on_lot_classification_canvas_resize)
+
+    def _on_lot_classification_mousewheel(event):
+        lot_classification_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+    lot_classification_canvas.bind(
+        "<Enter>", lambda e: lot_classification_canvas.bind_all(
+            "<MouseWheel>", _on_lot_classification_mousewheel))
+    lot_classification_canvas.bind(
+        "<Leave>", lambda e: lot_classification_canvas.unbind_all("<MouseWheel>"))
+
+    def _resize_lot_classification_box():
+        """
+        Recomputes lot_classification_canvas's own height to fit
+        lot_classification_list_container's CURRENT content, capped at
+        LOT_CLASSIFICATION_MAX_HEIGHT. Shows the scrollbar only when the
+        content genuinely exceeds the cap (nothing to scroll -> no
+        scrollbar shown at all, avoiding a pointless, always-visible
+        scrollbar next to a box that never needs it). Called once per
+        content change (a state transition -- reading started, reading
+        finished, checklist rebuilt) -- never in a tight loop.
+        """
+        lot_classification_list_container.update_idletasks()
+        content_height = lot_classification_list_container.winfo_reqheight()
+        if content_height <= LOT_CLASSIFICATION_MAX_HEIGHT:
+            lot_classification_canvas.configure(height=content_height)
+            lot_classification_scrollbar.pack_forget()
+        else:
+            lot_classification_canvas.configure(height=LOT_CLASSIFICATION_MAX_HEIGHT)
+            lot_classification_scrollbar.pack(side="right", fill="y")
+    # Both start unpacked; _update_parcel_classification_visibility() (via
+    # _refresh_parcel_classification()) decides what to show.
 
     # ── parcel browse callbacks ───────────────────────────────────
     def browse_parcel_files():
@@ -471,6 +2023,21 @@ def open_main_window(root):
             parcel_local_paths.clear()
             parcel_local_paths.extend(files)
             parcel_files_var.set(f"{len(files)} file(s) selected")
+            # A new Land Parcel selection invalidates any prior
+            # LOT_LOCATION detection -- re-inspect it.
+            # Deliberately NOT calling _reflow_window() here: doing so
+            # BEFORE the old checklist is cleared would freeze the
+            # window (inside _refresh_parcel_classification() below) at
+            # a "hybrid" size -- new label text + stale checklist widget
+            # count -- which then visibly jumps/distorts once the real
+            # read finishes and the checklist changes count. Resizing
+            # happens exactly once, only after the read is confirmed
+            # complete and the final checkbox set is known (see
+            # _update_parcel_classification_visibility()).
+            # force_refresh=True: the user actively chose this selection
+            # just now via Browse -- must be read fresh, never served
+            # from cache.
+            _refresh_parcel_classification(force_refresh=True)
 
     def browse_parcel_db():
         creds = load_db_credentials()
@@ -481,11 +2048,19 @@ def open_main_window(root):
         if not tables:
             messagebox.showwarning("No Tables", "No tables found in the database schema.")
             return
-        _pick_db_tables(win, tables, multi=True,
-            on_select=lambda sel: (
-                parcel_db_tables.__setitem__(slice(None), sel)
-                or parcel_db_var.set(f"{len(sel)} table(s) selected")
-            ))
+
+        def _on_parcel_tables_selected(sel):
+            parcel_db_tables.clear()
+            parcel_db_tables.extend(sel)
+            parcel_db_var.set(f"{len(sel)} table(s) selected")
+            # See browse_parcel_files() above for why _reflow_window()
+            # is deliberately NOT called here.
+            # force_refresh=True: actively chosen just now via the table
+            # picker -- never served from cache, same reasoning as
+            # browse_parcel_files() above.
+            _refresh_parcel_classification(force_refresh=True)
+
+        _pick_db_tables(win, tables, multi=True, on_select=_on_parcel_tables_selected)
 
     # ── parcel toggle ─────────────────────────────────────────────
     def toggle_parcel(*_):
@@ -498,14 +2073,23 @@ def open_main_window(root):
             parcel_lbl_widget.config(textvariable=parcel_db_var,
                                      font=("Segoe UI", 9))
             parcel_btn.config(text="Select…", command=browse_parcel_db)
+        # Switching Local <-> Database does NOT clear the other mode's
+        # remembered selection or cached checklist state -- that's the
+        # whole point of the dual-slot _parcel_classification_cache. This
+        # call shows whichever of the three states actually applies to
+        # the newly active mode: instantly restored from cache, freshly
+        # read, or hidden (nothing selected for this mode yet).
+        _refresh_parcel_classification()
 
     # ── parcel radio buttons (command wired AFTER toggle defined) ─
-    tk.Radiobutton(parcel_radio_row, text="Local File(s)",
+    parcel_radio_local = tk.Radiobutton(parcel_radio_row, text="Local File(s)",
                    variable=parcel_source_type, value="local",
-                   command=toggle_parcel).pack(side="left")
-    tk.Radiobutton(parcel_radio_row, text="Database Table(s)",
+                   command=toggle_parcel)
+    parcel_radio_local.pack(side="left")
+    parcel_radio_db = tk.Radiobutton(parcel_radio_row, text="Database Table(s)",
                    variable=parcel_source_type, value="db",
-                   command=toggle_parcel).pack(side="left", padx=(12, 0))
+                   command=toggle_parcel)
+    parcel_radio_db.pack(side="left", padx=(12, 0))
 
     # ════════════════════════════════════════════════════════════
     #  SECTION 2 — ROAD NETWORK
@@ -526,8 +2110,22 @@ def open_main_window(root):
         fg="gray", anchor="w", width=42)
     road_lbl_widget.pack(side="left")
 
-    road_btn = tk.Button(road_action_row, text="Browse…", width=10)
+    road_btn = tk.Button(road_action_row, text="Browse…", width=10, cursor="hand2")
     road_btn.pack(side="left", **PAD)
+
+    # "Filter by Road Type" checkbox -- created once, only packed/unpacked
+    # (never destroyed) by _update_road_classification_visibility().
+    road_filter_checkbox = tk.Checkbutton(
+        road_frame, text="Filter by Road Type", variable=filter_road_type_var)
+    # Holds one Checkbutton per unique ROAD_TYPE value found in the
+    # currently selected road layer. Only packed while the checkbox above
+    # is checked AND a usable ROAD_TYPE-like column was found.
+    road_type_checklist_container = tk.Frame(road_frame)
+    road_reading_lbl = tk.Label(
+        road_frame, text="⏳ Reading road network…",
+        fg="#b36b00", font=("Segoe UI", 8, "italic"), anchor="w")
+    # All three start unpacked; _update_road_classification_visibility()
+    # (via _refresh_road_classification()) decides what to show.
 
     # ── road browse callbacks ─────────────────────────────────────
     def browse_road_file():
@@ -538,6 +2136,10 @@ def open_main_window(root):
         if f:
             road_local_path.set(f)
             road_file_var.set(os.path.basename(f))
+            # See browse_parcel_files() above for why _reflow_window()
+            # is deliberately NOT called here -- same reasoning applies
+            # to the Road Type checklist.
+            _refresh_road_classification(force_refresh=True)
 
     def browse_road_db():
         creds = load_db_credentials()
@@ -548,11 +2150,15 @@ def open_main_window(root):
         if not tables:
             messagebox.showwarning("No Tables", "No tables found in the database schema.")
             return
-        _pick_db_tables(win, tables, multi=False,
-            on_select=lambda sel: (
-                road_local_path.set(sel[0]) if sel else None,
-                road_db_var.set(sel[0] if sel else "No table selected")
-            ))
+
+        def _on_road_table_selected(sel):
+            road_db_table.set(sel[0])
+            road_db_var.set(sel[0])
+            # See browse_parcel_files() above for why _reflow_window()
+            # is deliberately NOT called here.
+            _refresh_road_classification(force_refresh=True)
+
+        _pick_db_tables(win, tables, multi=False, on_select=_on_road_table_selected)
 
     # ── road toggle ───────────────────────────────────────────────
     def toggle_road(*_):
@@ -565,14 +2171,20 @@ def open_main_window(root):
             road_lbl_widget.config(textvariable=road_db_var,
                                    font=("Segoe UI", 9))
             road_btn.config(text="Select…", command=browse_road_db)
+        # Switching Local <-> Database does NOT clear the other mode's
+        # remembered selection or cached checklist state -- that's the
+        # whole point of the dual-slot _road_gdf_cache.
+        _refresh_road_classification()
 
     # ── road radio buttons ────────────────────────────────────────
-    tk.Radiobutton(road_radio_row, text="Local File",
+    road_radio_local = tk.Radiobutton(road_radio_row, text="Local File",
                    variable=road_source_type, value="local",
-                   command=toggle_road).pack(side="left")
-    tk.Radiobutton(road_radio_row, text="Database Table",
+                   command=toggle_road)
+    road_radio_local.pack(side="left")
+    road_radio_db = tk.Radiobutton(road_radio_row, text="Database Table",
                    variable=road_source_type, value="db",
-                   command=toggle_road).pack(side="left", padx=(12, 0))
+                   command=toggle_road)
+    road_radio_db.pack(side="left", padx=(12, 0))
 
     # ════════════════════════════════════════════════════════════
     #  SECTION 3 — OUTPUT
@@ -593,7 +2205,7 @@ def open_main_window(root):
         fg="gray", anchor="w", width=42)
     out_lbl_widget.pack(side="left")
 
-    out_btn = tk.Button(out_action_row, text="Browse…", width=10)
+    out_btn = tk.Button(out_action_row, text="Browse…", width=10, cursor="hand2")
     out_btn.pack(side="left", **PAD)
 
     # ── output browse callback ────────────────────────────────────
@@ -602,6 +2214,7 @@ def open_main_window(root):
         if d:
             output_local_dir.set(d)
             output_dir_var.set(d)
+            _update_run_button_state()
 
     # ── output toggle ─────────────────────────────────────────────
     def toggle_output(*_):
@@ -615,6 +2228,7 @@ def open_main_window(root):
             out_lbl_widget.config(textvariable=output_db_var,
                                   font=("Segoe UI", 8, "italic"), fg="gray")
             out_btn.pack_forget()
+        _update_run_button_state()
 
     # ── output radio buttons ──────────────────────────────────────
     tk.Radiobutton(out_radio_row, text="Save to Local Folder",
@@ -631,6 +2245,8 @@ def open_main_window(root):
 
     def on_run():
         global barangay_source, road_source, output_mode
+        global parcel_classification_selection, filter_by_road_type_active, road_type_excluded_values
+        global parcel_road_width_column_overrides
 
         # validate parcel
         if parcel_source_type.get() == "local":
@@ -654,11 +2270,11 @@ def open_main_window(root):
                 return
             road_source = ("local", [road_local_path.get()])
         else:
-            if not road_local_path.get():   # road_local_path reused for db table name
+            if not road_db_table.get():
                 messagebox.showerror("Missing Input",
                     "Please select a Road Network table.")
                 return
-            road_source = ("db", [road_local_path.get()])
+            road_source = ("db", [road_db_table.get()])
 
         # validate output
         if output_dest_type.get() == "local":
@@ -670,17 +2286,92 @@ def open_main_window(root):
         else:
             output_mode = ("db", None)
 
+        # Road Classification: resolved mode + excluded values are read
+        # here and stored as module globals, same pattern as
+        # barangay_source / road_source / output_mode above --
+        # run_processing() (and, per source, resolve_classification())
+        # consumes them from there.
+        #
+        # Belt-and-suspenders: the Run button is disabled while either
+        # background read is in progress (_update_run_button_state()),
+        # so this branch should be unreachable in normal use -- kept as
+        # a hard stop in case on_run() is ever invoked some other way
+        # while a read is still running.
+        if parcel_is_reading or road_is_reading:
+            messagebox.showwarning(
+                "Please Wait",
+                "Still reading the selected source(s) for Road Classification. "
+                "Please wait for the status line to finish updating before running."
+            )
+            return
+
+        parcel_classification_selection = {
+            path_or_table: var.get() for path_or_table, var in parcel_classification_vars.items()
+        }
+        filter_by_road_type_active = filter_road_type_var.get()
+        if filter_by_road_type_active:
+            road_type_excluded_values = [
+                real_value for display_text, (real_value, var) in road_type_value_vars.items()
+                if not var.get()
+            ]
+        else:
+            road_type_excluded_values = []
+
+        # Warn about any Land Parcel source(s) that already have a
+        # column matching "road_width" (case-insensitive) -- this tool
+        # is about to write its computed ROAD_WIDTH into that column.
+        # Shown once, combined across every affected source (not one
+        # dialog per file mid-processing), only here at Run time -- never
+        # at Browse time, and never as a console-only message, since a
+        # user running the compiled EXE without a terminal open would
+        # never see one. Declining cancels the run entirely rather than
+        # skipping just the affected source(s), so the user always knows
+        # exactly what did or didn't happen instead of a partial batch
+        # silently going through.
+        if parcel_road_width_conflicts:
+            lines = "\n".join(
+                f"- '{os.path.basename(path_or_table)}' already has a '{existing_col}' column"
+                for path_or_table, existing_col in parcel_road_width_conflicts
+            )
+            proceed = messagebox.askyesno(
+                "Existing ROAD_WIDTH column found",
+                f"{lines}\n\n"
+                "Processing will overwrite the existing column(s) with the "
+                "newly computed values.\n\nProceed?"
+            )
+            if not proceed:
+                return
+            # Preserve each source's existing column name/casing exactly
+            # -- e.g. a detected "road_width" (lowercase) is written back
+            # to "road_width", not a hardcoded "ROAD_WIDTH" -- so no
+            # duplicate column is ever created regardless of the existing
+            # casing. A source with no entry here (no conflict was found)
+            # simply uses the default name in process() below.
+            parcel_road_width_column_overrides = dict(parcel_road_width_conflicts)
+        else:
+            parcel_road_width_column_overrides = {}
+
         win.destroy()
         run_processing()
 
-    tk.Button(win, text="▶  Run Processing", command=on_run,
+    run_btn = tk.Button(win, text="▶  Run Processing", command=on_run,
               bg="#2e7d32", fg="white", font=("Segoe UI", 10, "bold"),
-              relief="flat", padx=16, pady=6).pack(pady=(4, 14))
+              relief="flat", padx=16, pady=6)
+    run_btn.pack(pady=(4, 4))
+
+    # Permanent status line UNDER the Run button -- always visible, no
+    # hover required.
+    run_status_lbl = tk.Label(win, textvariable=run_status_var,
+                              font=("Segoe UI", 8), fg="gray")
+    run_status_lbl.pack(pady=(0, 12))
 
     # ── apply initial toggle state so buttons have correct commands ──
     toggle_parcel()
     toggle_road()
     toggle_output()
+    _update_parcel_classification_visibility()
+    _update_road_classification_visibility()
+    _update_run_button_state()
 
 
 # ── shared DB table picker (used by both parcel and road) ────────
@@ -760,6 +2451,316 @@ def select_output_window(root):
         width=18
     ).pack(side=tk.LEFT, padx=5)
 
+# ----------------- SUCCESS DIALOG -----------------
+def show_success_dialog(parent, saved_files):
+    """
+    Minimal custom "processing complete" dialog, replacing
+    messagebox.showinfo() for this specific message. Not a general-
+    purpose replacement for messagebox elsewhere in this file -- just
+    for this one summary, which needed something messagebox structurally
+    can't do:
+
+    messagebox has no scrolling and no height/width cap of its own -- it
+    just grows to fit whatever text it's given. With a batch of many
+    processed files, or long output paths, the content could grow tall
+    or wide enough to push the OK button (and even the dialog's own
+    titlebar close button) off the visible screen, or truncate long
+    paths with no way to see the rest, with no way to scroll or resize
+    to recover either problem.
+
+    This dialog fixes that with:
+      1. The OK button packed FIRST, side="bottom" -- guaranteed to stay
+         visible/reachable regardless of how tall the content above it
+         wants to be, since pack() reserves its space before laying out
+         anything else.
+      2. The file list lives in a height-CAPPED (in text lines, not
+         pixels), scrollable Text widget -- BOTH vertically (many
+         entries) and horizontally (long paths) -- wrap="none" so long
+         paths stay on one line and scroll into view rather than
+         wrapping awkwardly and losing readability.
+      3. The dialog's own size is left to its natural required size
+         AFTER the Text widget's height is already capped -- no separate
+         pixel-height clamp needed.
+
+    Deliberately NOT a file manager -- no Open Folder button, no per-
+    path actions (open/copy/reveal), no resizing. Just a summary: what
+    was written, and how many.
+
+    saved_files: list of {"main": str, "main_status": "New"|"Overwritten"|None,
+    "vm": str or None} -- one entry per parcel source PROCESSED (not per
+    file), in PROCESSING ORDER (never grouped/sorted by status -- users
+    cross-check against their own source list, which is also in that
+    order). "main" is always a real path or "Database table: X" string,
+    never blank. "main_status" drives the marker shown next to it --
+    absent entirely (not even an empty string) when there was no
+    conflict, since a brand-new write needing no marker is the common
+    case and shouldn't imply something happened when it didn't. "vm" is
+    the paired visual-measurement output for THIS SAME source, if one
+    was written -- shown as an indented sub-line with NO marker of its
+    own (it's a consequence of the main output's decision, not an
+    independent choice -- see with_qa_suffix()'s docstring) -- and
+    simply omitted (no sub-line at all) when this particular source had
+    no VM output (e.g. no parcel in it got a valid measurement).
+    """
+    MAX_LIST_LINES = 15
+
+    if not saved_files:
+        # Distinct message rather than showing an empty bulleted list
+        # with "0 file(s) written." -- that would read like something
+        # went wrong (or like a bug) rather than plainly stating nothing
+        # was written this run.
+        dialog = tk.Toplevel(parent)
+        dialog.title("Processing Complete")
+        dialog.resizable(False, False)
+        # Deliberately NOT calling dialog.transient(parent) here. This
+        # app's root is permanently withdrawn (see main()), and
+        # transient() on a withdrawn parent is a known source of
+        # window-manager-dependent "dialog never becomes viewable, no
+        # exception raised" behavior -- confirmed reproducible on
+        # Linux/X11 during testing, and NOT reliably verifiable here
+        # against the actual Windows/DWM deployment target. Rather than
+        # depend on a specific transient()+update_idletasks()+deiconify()
+        # ordering that might not behave identically across platforms,
+        # this simply avoids transient() altogether for any dialog
+        # parented to the withdrawn root -- the safer, more portable
+        # choice, even though it gives up transient()'s normal UX
+        # benefits (no separate taskbar entry, staying above its
+        # logical parent) for this one case.
+        dialog.grab_set()
+        dialog.deiconify()
+        dialog.lift()
+        dialog.focus_force()
+        dialog.attributes("-topmost", True)
+        dialog.after(100, lambda: dialog.attributes("-topmost", False))
+        btn_frame = tk.Frame(dialog)
+        btn_frame.pack(side="bottom", fill="x", pady=(4, 12))
+        tk.Button(btn_frame, text="OK", command=dialog.destroy,
+                  width=12, cursor="hand2").pack()
+        tk.Label(dialog, text="Processing finished, but no files were saved.",
+                 font=("Segoe UI", 10, "bold"), anchor="w"
+                 ).pack(fill="x", padx=16, pady=(16, 16))
+        dialog.update_idletasks()
+        req_w = max(dialog.winfo_reqwidth(), 360)
+        req_h = dialog.winfo_reqheight()
+        x = parent.winfo_x() + (parent.winfo_width() - req_w) // 2
+        y = parent.winfo_y() + (parent.winfo_height() - req_h) // 2
+        dialog.geometry(f"{req_w}x{req_h}+{max(x,0)}+{max(y,0)}")
+        dialog.wait_window()
+        return
+
+    dialog = tk.Toplevel(parent)
+    dialog.title("Processing Complete")
+    dialog.resizable(False, False)
+    # Deliberately NOT calling dialog.transient(parent) here. This app's
+    # root is permanently withdrawn (see main()), and transient() on a
+    # withdrawn parent is a known source of window-manager-dependent
+    # "dialog never becomes viewable, no exception raised" behavior --
+    # confirmed reproducible on Linux/X11 during testing, and NOT
+    # reliably verifiable here against the actual Windows/DWM deployment
+    # target. Rather than depend on a specific
+    # transient()+update_idletasks()+deiconify() ordering that might not
+    # behave identically across platforms, this simply avoids
+    # transient() altogether for any dialog parented to the withdrawn
+    # root -- the safer, more portable choice, even though it gives up
+    # transient()'s normal UX benefits (no separate taskbar entry,
+    # staying above its logical parent) for this one case.
+    dialog.grab_set()
+    dialog.deiconify()
+    dialog.lift()
+    dialog.focus_force()
+    dialog.attributes("-topmost", True)
+    dialog.after(100, lambda: dialog.attributes("-topmost", False))
+
+    # OK button first, at the bottom -- see docstring point 1.
+    btn_frame = tk.Frame(dialog)
+    btn_frame.pack(side="bottom", fill="x", pady=(4, 12))
+    tk.Button(btn_frame, text="OK", command=dialog.destroy,
+              width=12, cursor="hand2").pack()
+
+    tk.Label(dialog, text="Processing completed successfully.",
+             font=("Segoe UI", 10, "bold"), anchor="w"
+             ).pack(fill="x", padx=16, pady=(16, 4))
+
+    tk.Label(dialog, text="Saved files:", anchor="w"
+             ).pack(fill="x", padx=16, pady=(4, 4))
+
+    # Precompute the actual line content FIRST (before creating the Text
+    # widget) so both the vertical line-count AND whether any line is
+    # wide enough to need horizontal scrolling can be determined ahead
+    # of time -- scrollbars are only shown when actually needed, same
+    # principle as the classification checklist box elsewhere in this
+    # file (an always-visible scrollbar next to a box with nothing to
+    # scroll -- e.g. just one short entry -- is pointless clutter).
+    lines = []
+    total_written = 0
+    for entry in saved_files:
+        main = entry["main"]
+        status = entry.get("main_status")
+        marker = f" ({status})" if status else ""
+        lines.append(f"• {main}{marker}")
+        total_written += 1
+        vm = entry.get("vm")
+        if vm:
+            lines.append(f"    └── {vm}")
+            total_written += 1
+
+    TEXT_WIDTH_CHARS = 60
+
+    list_frame = tk.Frame(dialog)
+    list_frame.pack(fill="both", expand=True, padx=16, pady=(0, 4))
+
+    vscroll = tk.Scrollbar(list_frame, orient="vertical")
+    hscroll = tk.Scrollbar(list_frame, orient="horizontal")
+    text = tk.Text(
+        list_frame, wrap="none",
+        height=min(len(lines), MAX_LIST_LINES) if lines else 1,
+        width=TEXT_WIDTH_CHARS, yscrollcommand=vscroll.set, xscrollcommand=hscroll.set,
+        relief="flat", bg=dialog.cget("bg"), font=("Segoe UI", 9))
+    vscroll.config(command=text.yview)
+    hscroll.config(command=text.xview)
+    if len(lines) > MAX_LIST_LINES:
+        vscroll.pack(side="right", fill="y")
+    if any(len(line) > TEXT_WIDTH_CHARS for line in lines):
+        hscroll.pack(side="bottom", fill="x")
+    text.pack(side="left", fill="both", expand=True)
+
+    for line in lines:
+        text.insert("end", line + "\n")
+    text.config(state="disabled")
+
+    tk.Label(dialog, text=f"{total_written} file(s) written.", anchor="w"
+             ).pack(fill="x", padx=16, pady=(4, 16))
+
+    dialog.update_idletasks()
+    req_w = max(dialog.winfo_reqwidth(), 420)
+    req_h = dialog.winfo_reqheight()
+    x = parent.winfo_x() + (parent.winfo_width() - req_w) // 2
+    y = parent.winfo_y() + (parent.winfo_height() - req_h) // 2
+    dialog.geometry(f"{req_w}x{req_h}+{max(x,0)}+{max(y,0)}")
+
+    dialog.wait_window()
+
+def ask_overwrite_dialog(parent, conflicting_names):
+    """
+    Combined dialog shown ONCE, before any processing starts, when one
+    or more Land Parcel sources' desired local output filename already
+    exists in the chosen output folder. Not a per-file prompt -- every
+    conflicting name in the batch is listed together, and the chosen
+    action applies to ALL of them:
+
+      - "Overwrite": every conflicting file is replaced in place, using
+        its plain desired name (no numbering).
+      - "Create New File": every conflicting file is instead saved under
+        a new, non-colliding name via resolve_output_base_name()'s
+        auto-numbering -- the existing files are left untouched.
+      - "Cancel": aborts the ENTIRE run. Nothing is written, including
+        sources that had no conflict at all.
+
+    If the user wants a MIXED outcome (overwrite some, rename others),
+    the expected workflow is to run the tool twice -- once selecting
+    only the sources to overwrite, once for the rest -- rather than
+    choosing per-file in a single dialog. This keeps the dialog itself
+    simple (three buttons, one decision) instead of turning it into a
+    per-row selection UI.
+
+    Returns "overwrite", "new", or "cancel" (also returned if the
+    dialog's own titlebar close button is used, treated the same as an
+    explicit Cancel -- never silently defaults to a destructive choice).
+    """
+    result = {"choice": "cancel"}
+
+    dialog = tk.Toplevel(parent)
+    dialog.title("File(s) Already Exist")
+    dialog.resizable(False, False)
+    # Deliberately NOT calling dialog.transient(parent) here. This app's
+    # root is permanently withdrawn (see main()), and transient() on a
+    # withdrawn parent is a known source of window-manager-dependent
+    # "dialog never becomes viewable, no exception raised" behavior --
+    # confirmed reproducible on Linux/X11 during testing, and NOT
+    # reliably verifiable here against the actual Windows/DWM deployment
+    # target. Rather than depend on a specific
+    # transient()+update_idletasks()+deiconify() ordering that might not
+    # behave identically across platforms, this simply avoids
+    # transient() altogether for any dialog parented to the withdrawn
+    # root -- the safer, more portable choice, even though it gives up
+    # transient()'s normal UX benefits (no separate taskbar entry,
+    # staying above its logical parent) for this one case.
+    dialog.grab_set()
+    dialog.deiconify()
+    dialog.lift()
+    dialog.focus_force()
+    dialog.attributes("-topmost", True)
+    dialog.after(100, lambda: dialog.attributes("-topmost", False))
+
+    def choose(value):
+        result["choice"] = value
+        dialog.destroy()
+
+    dialog.protocol("WM_DELETE_WINDOW", lambda: choose("cancel"))
+
+    # Buttons packed first, at the bottom -- same reasoning as
+    # show_success_dialog(): guaranteed visible/reachable regardless of
+    # how long the scrollable list above them ends up being.
+    btn_frame = tk.Frame(dialog)
+    btn_frame.pack(side="bottom", fill="x", pady=(4, 12))
+    tk.Button(btn_frame, text="Overwrite", width=14, cursor="hand2",
+              command=lambda: choose("overwrite")).pack(side="left", padx=(16, 4))
+    tk.Button(btn_frame, text="Create New File", width=16, cursor="hand2",
+              command=lambda: choose("new")).pack(side="left", padx=4)
+    tk.Button(btn_frame, text="Cancel", width=10, cursor="hand2",
+              command=lambda: choose("cancel")).pack(side="left", padx=(4, 16))
+
+    tk.Label(dialog, text="The following output file(s) already exist:",
+             font=("Segoe UI", 10, "bold"), anchor="w"
+             ).pack(fill="x", padx=16, pady=(16, 4))
+
+    # Scrollable BOTH ways -- vertical for many conflicting names,
+    # horizontal for long filenames -- wrap="none" so long names stay on
+    # one line and scroll into view rather than wrapping awkwardly.
+    # Scrollbars are only shown when actually needed -- an always-visible
+    # scrollbar next to a box with nothing to scroll (e.g. just one short
+    # filename) is pointless clutter, same principle already applied to
+    # the classification checklist box elsewhere in this file.
+    MAX_LIST_LINES = 10
+    TEXT_WIDTH_CHARS = 55
+
+    list_frame = tk.Frame(dialog)
+    list_frame.pack(fill="both", expand=True, padx=16, pady=(0, 4))
+    vscroll = tk.Scrollbar(list_frame, orient="vertical")
+    hscroll = tk.Scrollbar(list_frame, orient="horizontal")
+    text = tk.Text(
+        list_frame, wrap="none", height=min(len(conflicting_names), MAX_LIST_LINES),
+        width=TEXT_WIDTH_CHARS, yscrollcommand=vscroll.set, xscrollcommand=hscroll.set,
+        relief="flat", bg=dialog.cget("bg"), font=("Segoe UI", 9))
+    vscroll.config(command=text.yview)
+    hscroll.config(command=text.xview)
+    if len(conflicting_names) > MAX_LIST_LINES:
+        vscroll.pack(side="right", fill="y")
+    needs_hscroll = any(len(f"• {name}") > TEXT_WIDTH_CHARS for name in conflicting_names)
+    if needs_hscroll:
+        hscroll.pack(side="bottom", fill="x")
+    text.pack(side="left", fill="both", expand=True)
+    for name in conflicting_names:
+        text.insert("end", f"• {name}\n")
+    text.config(state="disabled")
+
+    tk.Label(dialog, text=(
+        "Overwrite will replace these files. Create New File will save "
+        "them under a new name instead, leaving the existing files "
+        "untouched. This choice applies to all files listed above."
+    ), anchor="w", justify="left", wraplength=420
+             ).pack(fill="x", padx=16, pady=(4, 16))
+
+    dialog.update_idletasks()
+    req_w = max(dialog.winfo_reqwidth(), 460)
+    req_h = dialog.winfo_reqheight()
+    x = parent.winfo_x() + (parent.winfo_width() - req_w) // 2
+    y = parent.winfo_y() + (parent.winfo_height() - req_h) // 2
+    dialog.geometry(f"{req_w}x{req_h}+{max(x,0)}+{max(y,0)}")
+
+    dialog.wait_window()
+    return result["choice"]
+
 # ----------------- PROGRESS WINDOW -----------------
 def create_progress_window(root, total):
     win = tk.Toplevel(root)
@@ -794,9 +2795,34 @@ def update_progress(win, lbl, bar, count_lbl, step, total, msg):
 # ----------------- PROCESSING -----------------
 def run_processing():
     global barangay_source, road_source, output_mode
+    global parcel_classification_selection, filter_by_road_type_active, road_type_excluded_values
     if not barangay_source or not road_source or not output_mode:
         messagebox.showerror("Error","Selections incomplete (Barangay, Road, Output required).")
         return
+
+    # overwrite_mode: "overwrite" | "new" | None (no conflicts found, or
+    # not applicable -- output_mode isn't local). Resolved ONCE, up
+    # front, before any file is read or written, via
+    # ask_overwrite_dialog() -- see that function's docstring for why
+    # this is a single combined decision for the whole batch rather than
+    # a per-file prompt. Desired names only need each source's own
+    # filename/table name (no need to actually read/measure anything
+    # yet), so this check is cheap and happens before the more expensive
+    # DB connection / road reading below.
+    overwrite_mode = None
+    if output_mode[0] == "local":
+        desired_names = [
+            os.path.splitext(os.path.basename(p))[0] for p in barangay_source[1]
+        ] if barangay_source[0] == "local" else list(barangay_source[1])
+        conflicting_names = [
+            f"{name}.gpkg" for name in desired_names
+            if os.path.exists(os.path.join(output_mode[1], f"{name}.gpkg"))
+        ]
+        if conflicting_names:
+            overwrite_mode = ask_overwrite_dialog(root, conflicting_names)
+            if overwrite_mode == "cancel":
+                print("Run cancelled by user (existing output file(s) found).")
+                return
 
     creds = load_db_credentials()
     if not creds:
@@ -836,6 +2862,12 @@ def run_processing():
 
     current_step = 0
 
+    # saved_files: human-readable entries for every output actually
+    # written this run (local file paths, or "Database table: X" for db
+    # output mode) -- collected as each write succeeds, shown together
+    # in show_success_dialog() at the end instead of a generic message.
+    saved_files = []
+
     def progress_cb(_):
         nonlocal current_step
         current_step += 1
@@ -855,20 +2887,107 @@ def run_processing():
     if barangay_source[0] == "local":
         for path in barangay_source[1]:
             b_gdf = gpd.read_file(path)
-            b_gdf = process(b_gdf, road_gdf, os.path.basename(path), progress_cb)
+
+            # output_column_name: preserves the exact existing ROAD_WIDTH-
+            # like column name/casing for this source if a conflict was
+            # detected and confirmed in on_run() (see
+            # parcel_road_width_column_overrides above); defaults to
+            # "ROAD_WIDTH" when no conflict was found for this source.
+            output_column_name = parcel_road_width_column_overrides.get(path, "ROAD_WIDTH")
+
+            # Road Classification: resolved independently for THIS
+            # parcel source. use_classification_for_source comes from
+            # the per-source checkbox the user checked (or didn't) for
+            # exactly this file/table in the GUI -- mixed batches (some
+            # sources checked, some not, or some lacking a usable column
+            # entirely) are intentionally supported.
+            use_classification_for_source = parcel_classification_selection.get(path, False)
+            classification = resolve_classification(
+                b_gdf, use_classification_for_source, filter_by_road_type_active,
+                road_type_excluded_values
+            )
+            b_gdf, qa_gdf = process(b_gdf, road_gdf, os.path.basename(path), progress_cb, classification=classification, output_column_name=output_column_name)
             if output_mode[0] == "local":
-                base_name = os.path.splitext(os.path.basename(path))[0]
+                desired_base_name = os.path.splitext(os.path.basename(path))[0]
+                candidate_path = os.path.join(output_mode[1], f"{desired_base_name}.gpkg")
+                had_conflict = os.path.exists(candidate_path)
+                # overwrite_mode was already resolved ONCE, up front, for
+                # the whole batch (see the pre-scan + ask_overwrite_dialog()
+                # near the top of this function) -- no per-file prompt here.
+                if had_conflict and overwrite_mode == "new":
+                    base_name = resolve_output_base_name(output_mode[1], desired_base_name)
+                    main_status = "New"
+                elif had_conflict and overwrite_mode == "overwrite":
+                    base_name = desired_base_name
+                    main_status = "Overwritten"
+                else:
+                    base_name = desired_base_name
+                    main_status = None
                 out = os.path.join(output_mode[1], f"{base_name}.gpkg")
                 b_gdf.to_file(out, driver="GPKG")
                 print(f"✅ Saved {out}")
                 load_in_global_mapper(out)
+
+                # QA / validation layer -- separate file, not merged into
+                # the main output, so it can be toggled independently in
+                # QGIS. Only written if at least one parcel actually got
+                # a measurement (an all-empty file would just be visual
+                # clutter with nothing to show). Base name is derived
+                # from the ALREADY-FINALIZED main output name above --
+                # never a separate numbering scan -- so the two always
+                # stay paired (e.g. "landparcel_1.gpkg" +
+                # "landparcel_1_VM.gpkg"). No New/Overwritten marker of
+                # its own -- it's a consequence of the main output's
+                # decision, not an independent one (see
+                # show_success_dialog()'s docstring).
+                vm_out = None
+                if not qa_gdf.empty:
+                    qa_base_name = with_qa_suffix(base_name)
+                    qa_out = os.path.join(output_mode[1], f"{qa_base_name}.gpkg")
+                    qa_gdf.to_file(qa_out, driver="GPKG")
+                    print(f"✅ Saved QA layer {qa_out}")
+                    load_in_global_mapper(qa_out)
+                    vm_out = qa_out
+
+                saved_files.append({"main": out, "main_status": main_status, "vm": vm_out})
             else:
-                local_name = os.path.splitext(os.path.basename(path))[0]
-                match = find_matching_table(local_name, schema)
-                table_action = "replaced" if match else "new"
-                table = match if match else local_name.lower()
+                # Exact match only -- previously used find_matching_table(),
+                # a SUBSTRING match (normalize_name() strips non-letters,
+                # then checks "a in b or b in a"). That's a real bug: a
+                # desired name like "landparcel" would match an unrelated
+                # existing table like "landparcel_backup_2023" (which
+                # normalizes to "landparcelbackup", containing
+                # "landparcel" as a substring) and silently overwrite it.
+                # Exact match -- same pattern as the db-source ->
+                # db-output branch elsewhere in this function -- never
+                # touches a table unless its name is precisely the one
+                # this run intends to write to.
+                desired_table = os.path.splitext(os.path.basename(path))[0].lower()
+                all_tables = fetch_tables(schema)
+                table_action = "replaced" if desired_table in all_tables else "new"
+                table = desired_table
                 b_gdf.to_postgis(table, engine, schema=schema, if_exists="replace", index=False)
                 print(f"🔄 Saved to DB: {table} ({table_action})")
+                # DB is always automatic -- no dialog, no user choice.
+                # "Overwritten" only for a genuine exact-match conflict;
+                # a brand-new table is normal, expected behavior, not a
+                # conflict, so it gets no marker at all.
+                main_status = "Overwritten" if table_action == "replaced" else None
+
+                # QA / validation layer -- separate table, mirroring the
+                # local-output branch above.
+                vm_table = None
+                if not qa_gdf.empty:
+                    qa_table = f"{table}_VM"
+                    qa_gdf.to_postgis(qa_table, engine, schema=schema, if_exists="replace", index=False)
+                    print(f"🔄 Saved QA layer to DB: {qa_table}")
+                    vm_table = f"Database table: {qa_table}"
+
+                saved_files.append({
+                    "main": f"Database table: {table}",
+                    "main_status": main_status,
+                    "vm": vm_table,
+                })
 
                 # ---------------- 🟢 CAMA Table + Transaction Log ----------------
                 with engine.begin() as conn:
@@ -896,7 +3015,7 @@ def run_processing():
                     """))
 
                     # Update or insert per PIN
-                    pin_field = next((c for c in b_gdf.columns if c.lower() == "pin"), None)
+                    pin_field = _detect_pin_column(b_gdf)
                     if pin_field:
                         for _, row in b_gdf.iterrows():
                             sql = f"""
@@ -907,7 +3026,7 @@ def run_processing():
                             """
                             params = {
                                 "pin": str(row[pin_field]),
-                                "rw": float(row["ROAD_WIDTH"]) if row["ROAD_WIDTH"] is not None else None,
+                                "rw": float(row[output_column_name]) if row[output_column_name] is not None else None,
                             }
                             conn.execute(text(sql), params)
 
@@ -930,25 +3049,81 @@ def run_processing():
                     """), {
                         "tbl": f"{table} ({table_action})",
                         "type": "road_width",
-                        "details": "ROAD_WIDTH"
+                        "details": output_column_name
                     })
 
     else:  # --- barangay_source == "db" ---
         for table in barangay_source[1]:
             b_gdf = read_postgis_clean(table, engine, schema)
-            b_gdf = process(b_gdf, road_gdf, table, progress_cb)
+
+            # output_column_name: see comment in the "local"
+            # barangay_source branch above for the full rationale.
+            output_column_name = parcel_road_width_column_overrides.get(table, "ROAD_WIDTH")
+
+            # Road Classification: resolved independently for THIS
+            # parcel source (see comment in the "local" branch above).
+            use_classification_for_source = parcel_classification_selection.get(table, False)
+            classification = resolve_classification(
+                b_gdf, use_classification_for_source, filter_by_road_type_active,
+                road_type_excluded_values
+            )
+            b_gdf, qa_gdf = process(b_gdf, road_gdf, table, progress_cb, classification=classification, output_column_name=output_column_name)
             if output_mode[0] == "local":
-                out = os.path.join(output_mode[1], f"{table}.gpkg")
+                candidate_path = os.path.join(output_mode[1], f"{table}.gpkg")
+                had_conflict = os.path.exists(candidate_path)
+                if had_conflict and overwrite_mode == "new":
+                    out_base = resolve_output_base_name(output_mode[1], table)
+                    main_status = "New"
+                elif had_conflict and overwrite_mode == "overwrite":
+                    out_base = table
+                    main_status = "Overwritten"
+                else:
+                    out_base = table
+                    main_status = None
+                out = os.path.join(output_mode[1], f"{out_base}.gpkg")
                 b_gdf.to_file(out, driver="GPKG")
                 print(f"✅ Saved {out}")
                 load_in_global_mapper(out)
+
+                # QA / validation layer -- see comment in the "local"
+                # barangay_source branch above for the full rationale.
+                vm_out = None
+                if not qa_gdf.empty:
+                    qa_out_base = with_qa_suffix(out_base)
+                    qa_out = os.path.join(output_mode[1], f"{qa_out_base}.gpkg")
+                    qa_gdf.to_file(qa_out, driver="GPKG")
+                    print(f"✅ Saved QA layer {qa_out}")
+                    load_in_global_mapper(qa_out)
+                    vm_out = qa_out
+
+                saved_files.append({"main": out, "main_status": main_status, "vm": vm_out})
             else:
-                # Check if table already exists before overwrite
+                # Check if table already exists before overwrite. Output
+                # deliberately writes back to the SAME table name it read
+                # from in this branch (db source -> db output) -- this is
+                # pre-existing, intentional behavior; confirmed fine to
+                # overwrite in place, unrelated to the local-output
+                # filename-suffix fix above.
                 all_tables = fetch_tables(schema)
                 table_action = "replaced" if table in all_tables else "new"
+                main_status = "Overwritten" if table_action == "replaced" else None
 
                 b_gdf.to_postgis(table, engine, schema=schema, if_exists="replace", index=False)
                 print(f"🔄 Updated DB table: {table} ({table_action})")
+
+                # QA / validation layer -- separate table.
+                vm_table = None
+                if not qa_gdf.empty:
+                    qa_table = f"{table}_VM"
+                    qa_gdf.to_postgis(qa_table, engine, schema=schema, if_exists="replace", index=False)
+                    print(f"🔄 Saved QA layer to DB: {qa_table}")
+                    vm_table = f"Database table: {qa_table}"
+
+                saved_files.append({
+                    "main": f"Database table: {table}",
+                    "main_status": main_status,
+                    "vm": vm_table,
+                })
 
                 # ---------------- 🟢 CAMA Table + Transaction Log ----------------
                 with engine.begin() as conn:
@@ -971,7 +3146,7 @@ def run_processing():
                             END IF;
                         END $$;
                     """))
-                    pin_field = next((c for c in b_gdf.columns if c.lower() == "pin"), None)
+                    pin_field = _detect_pin_column(b_gdf)
                     if pin_field:
                         for _, row in b_gdf.iterrows():
                             sql = f"""
@@ -982,7 +3157,7 @@ def run_processing():
                             """
                             params = {
                                 "pin": str(row[pin_field]),
-                                "rw": float(row["ROAD_WIDTH"]) if row["ROAD_WIDTH"] is not None else None,
+                                "rw": float(row[output_column_name]) if row[output_column_name] is not None else None,
                             }
                             conn.execute(text(sql), params)
 
@@ -1002,10 +3177,15 @@ def run_processing():
                     """), {
                         "tbl": f"{table} ({table_action})",
                         "type": "road_width",
-                        "details": "ROAD_WIDTH"
+                        "details": output_column_name
                     })
     progress_win.destroy()
 
+    # Reverted to the original simple message for now, per explicit
+    # request -- the custom show_success_dialog() (bulleted file list,
+    # New/Overwritten markers, scrollable) is still defined above and
+    # still fed by saved_files throughout this function, so switching
+    # back is just a matter of changing this one call again later.
     messagebox.showinfo("Success", "✅ Processing done and logged to CAMA!")
 
 
