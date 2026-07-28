@@ -19,7 +19,7 @@ import threading
 import queue
 
 # ----------------- CONFIG -----------------
-GM_EXE_PATH = r"C:\\Program Files\\GlobalMapper26.1_64bit\\global_mapper.exe"
+GM_EXE_PATH = r"C:\Program Files\GlobalMapper26.1_64bit\global_mapper.exe"
 import sys as _sys
 
 def _get_credentials_path():
@@ -101,17 +101,17 @@ filter_by_road_type_active = False
 road_type_excluded_values = []
 
 # parcel_road_width_column_overrides: {path_or_table: existing_col_name}
-# -- for any Land Parcel source where a pre-existing "ROAD_WIDTH"-like
+# -- for any Land Parcel source where a pre-existing "CAMA_ROAD_WIDTH"-like
 # column was detected (see the merged Land Parcel background read below
 # -- the SAME read that already checks for LOT_LOCATION classification
 # columns, extended to also check for this) and the user confirmed
 # proceeding via the single combined dialog in on_run(). Threaded into
 # process() as output_column_name, so the tool writes back into the
 # EXACT existing column (preserving its original casing) instead of
-# always writing a hardcoded "ROAD_WIDTH" -- the latter would silently
+# always writing a hardcoded "CAMA_ROAD_WIDTH" -- the latter would silently
 # create a confusing duplicate column whenever the existing one used
-# different casing (e.g. "road_width" alongside a new "ROAD_WIDTH"). A
-# source with no entry here uses the default "ROAD_WIDTH" name.
+# different casing (e.g. "cama_road_width" alongside a new "CAMA_ROAD_WIDTH"). A
+# source with no entry here uses the default "CAMA_ROAD_WIDTH" name.
 parcel_road_width_column_overrides = {}
 
 # _road_gdf_cache: dual-slot cache -- one independent slot for "local"
@@ -242,7 +242,7 @@ def resolve_output_base_name(folder: str, desired_base_name: str, ext: str = "gp
 
 def with_qa_suffix(main_base_name: str) -> str:
     """
-    Derives the QA/visual-measurement layer's base name from the
+    Derives the Visual Measurement layer's base name from the
     ALREADY-FINALIZED main output base name (see
     resolve_output_base_name()) -- never scans the folder independently
     for its own numbering, so the two stay paired: "landparcel.gpkg" +
@@ -252,7 +252,7 @@ def with_qa_suffix(main_base_name: str) -> str:
 
     Suffix is "_VM" (Visual Measurement) -- kept as the function/variable
     name "qa" internally throughout this file (qa_gdf, qa_out, qa_table,
-    etc.) since that still describes this layer's role (a validation/QA
+    etc.) since that still describes this layer's role (a validation
     aid), even though the actual file/table name it produces uses the
     "_VM" suffix instead of "_QA_lines".
     """
@@ -306,6 +306,33 @@ def read_postgis_clean(table, engine, schema):
 # principle lot_location.py's fix_geometry() + brgy_fixed_geom pattern
 # already established: repair for internal spatial-operation use only,
 # keep the original shape in the exported output.
+
+def _write_gpkg(gdf, path):
+    """
+    Writes a GeoDataFrame to a .gpkg file, deleting any pre-existing file
+    at that exact path FIRST.
+
+    Why this is necessary: GeoPackage is a SQLite-based container that
+    can hold multiple named layers. Calling gdf.to_file(path,
+    driver="GPKG") when `path` already exists does NOT simply replace
+    its contents -- pyogrio/GDAL tries to create a new layer inside the
+    existing file, and fails with "Layer <name> already exists,
+    CreateLayer failed" if a layer of that name is already there. This
+    is exactly what happened when a user chose "Overwrite" in
+    ask_overwrite_dialog() -- the write raised an uncaught exception,
+    crashing the whole run with no success dialog and no clear message
+    to the user (just a traceback in the console, invisible in the
+    compiled EXE).
+
+    Explicitly removing any existing file before writing guarantees a
+    genuinely clean, single-layer GPKG every time -- matching what
+    "Overwrite" is actually supposed to mean -- rather than depending on
+    pyogrio/GDAL's own in-place layer-replacement behavior, which isn't
+    triggered by a plain to_file() call.
+    """
+    if os.path.exists(path):
+        os.remove(path)
+    gdf.to_file(path, driver="GPKG")
 
 def load_in_global_mapper(filepath):
     """Open or load a file into Global Mapper if it is already running,
@@ -468,7 +495,7 @@ _PIN_CANDIDATES = ["PIN", "pin", "Pin", "ARP_NO", "TD_NO", "PARCEL_ID"]
 def _detect_pin_column(gdf):
     """
     Identifier-column lookup for a parcel GeoDataFrame, shared by every
-    place road_width.py needs to label a row (the QA layer's PIN field,
+    place road_width.py needs to label a row (the Visual Measurement layer's PIN field,
     and the CAMA_Table PIN write in run_processing()). Tries, in order:
 
       1. _PIN_CANDIDATES, exact case match first (PIN, pin, Pin, ARP_NO,
@@ -476,7 +503,7 @@ def _detect_pin_column(gdf):
       2. Any of those same names, case-insensitive (catches e.g. "Arp_No").
       3. "FID" (case-insensitive) -- road_width.py-specific: lot_location.py
          has no equivalent need for this fallback since it doesn't
-         produce a QA layer that has to label individual rows; road_width.py
+         produce a Visual Measurement layer that has to label individual rows; road_width.py
          does, so a last-resort identifier is worth having even if it's
          not a real cadastral PIN.
 
@@ -745,7 +772,7 @@ def _edge_covered_portion_and_road(seg, road_union, tol=10):
 
 
 # ----------------- MAIN PROCESS -----------------
-def process(barangay_gdf, road_gdf, source_name="", progress_cb=None, classification=None, output_column_name="ROAD_WIDTH"):
+def process(barangay_gdf, road_gdf, source_name="", progress_cb=None, classification=None, output_column_name="CAMA_ROAD_WIDTH"):
     # classification: dict produced by resolve_classification() -- see
     # its docstring for the exact shape. Defaults to "no gating at all"
     # (identical to this tool's original, pre-feature behavior) so any
@@ -761,16 +788,16 @@ def process(barangay_gdf, road_gdf, source_name="", progress_cb=None, classifica
         }
 
     # output_column_name: the column name the computed width is written
-    # into on barangay_gdf (default "ROAD_WIDTH"). Callers pass an
+    # into on barangay_gdf (default "CAMA_ROAD_WIDTH"). Callers pass an
     # override here when the selected parcel source already has an
-    # existing column matching "road_width" (case-insensitive, any
+    # existing column matching "cama_road_width" (case-insensitive, any
     # casing) and the user confirmed proceeding -- see
     # parcel_road_width_column_overrides above and the combined
     # confirmation dialog in on_run(). Writing back into the EXACT
     # existing name (preserving its casing) avoids silently creating a
-    # duplicate column (e.g. "road_width" alongside a new "ROAD_WIDTH"),
-    # since pandas column names are case-sensitive. The QA layer's own
-    # "ROAD_WIDTH" field is unaffected by this -- it's a brand-new output
+    # duplicate column (e.g. "cama_road_width" alongside a new "CAMA_ROAD_WIDTH"),
+    # since pandas column names are case-sensitive. The Visual Measurement layer's own
+    # "CAMA_ROAD_WIDTH" field is unaffected by this -- it's a brand-new output
     # layer with no pre-existing column to collide with.
 
     original_crs = barangay_gdf.crs
@@ -829,11 +856,11 @@ def process(barangay_gdf, road_gdf, source_name="", progress_cb=None, classifica
     #
     # NOTE: road_union has no attribute table of its own (it's a single
     # unioned geometry blob) -- ROAD_TYPE/ROAD_NAME attribution for the
-    # QA layer below is looked up separately, from the original road_gdf
+    # Visual Measurement layer below is looked up separately, from the original road_gdf
     # rows, confined to each winning segment's own local zone.
     road_geoms = [g for g in road_gdf.geometry if g is not None and not g.is_empty]
 
-    # QA layer column list, decided ONCE per process() call based on
+    # Visual Measurement layer column list, decided ONCE per process() call based on
     # what's actually available -- not hardcoded to a fixed 5/6 fields.
     # id_col: see _detect_pin_column() for the full priority order (PIN/
     # ARP_NO/TD_NO/PARCEL_ID, then FID as a last resort) -- never a
@@ -845,7 +872,7 @@ def process(barangay_gdf, road_gdf, source_name="", progress_cb=None, classifica
     road_type_col = _detect_road_type_column(road_gdf)
     road_name_col = _detect_road_name_column(road_gdf)
 
-    qa_columns = ["ROAD_WIDTH", "FRONT_SEGMENT"]
+    qa_columns = ["CAMA_ROAD_WIDTH", "FRONT_SEGMENT"]
     if id_col:
         qa_columns.insert(0, "PIN")
     if road_type_col:
@@ -918,7 +945,7 @@ def process(barangay_gdf, road_gdf, source_name="", progress_cb=None, classifica
         or (None, None, None, None, None) if the parcel has no boundary
         segments at all, or no segment qualifies as valid frontage.
 
-        qa_line is a QA/validation geometry for the WINNING (minimum)
+        qa_line is a Visual Measurement geometry for the WINNING (minimum)
         candidate ONLY -- not a new or approximate measurement. It's
         built from the exact two points shapely's nearest_points() finds
         between that winning candidate's covered_piece and road_in_zone
@@ -959,7 +986,7 @@ def process(barangay_gdf, road_gdf, source_name="", progress_cb=None, classifica
         width, seg_idx, covered_piece, road_in_zone = best
         width = round(width, 4)
 
-        # Build the QA line from the EXACT geometry that produced the
+        # Build the Visual Measurement line from the EXACT geometry that produced the
         # winning measurement -- see docstring above.
         pt_on_edge, pt_on_road = nearest_points(covered_piece, road_in_zone)
         dx = pt_on_road.x - pt_on_edge.x
@@ -1055,7 +1082,7 @@ def process(barangay_gdf, road_gdf, source_name="", progress_cb=None, classifica
         road_widths.append(width)
 
         if width is not None:
-            record = {"ROAD_WIDTH": width, "FRONT_SEGMENT": front_seg_idx, "geometry": qa_line}
+            record = {"CAMA_ROAD_WIDTH": width, "FRONT_SEGMENT": front_seg_idx, "geometry": qa_line}
             if id_col:
                 record["PIN"] = barangay_gdf.iloc[idx][id_col]
             if road_type_col:
@@ -1067,10 +1094,10 @@ def process(barangay_gdf, road_gdf, source_name="", progress_cb=None, classifica
     barangay_gdf[output_column_name] = road_widths
 
     # ------------------------------------------------------------------
-    # QA / validation layer. NOT another computation -- a visualization
+    # Visual Measurement layer. NOT another computation -- a visualization
     # of the exact geometry the production algorithm already selected as
     # the winning measurement for each parcel (see _measure_width()'s
-    # docstring). Each QA line's own length in QGIS equals that parcel's
+    # docstring). Each Visual Measurement line's own length in QGIS equals that parcel's
     # ROAD_WIDTH value exactly. Separate output layer -- written by
     # run_processing() alongside, never merged into, the main parcel
     # output, so it can be toggled on/off independently in QGIS while
@@ -1261,26 +1288,27 @@ def open_main_window(root):
 
     def _rebuild_road_type_checklist():
         """
-        Swap-based rebuild: builds the new Road Type checklist in a
-        fresh, off-screen Frame first, then swaps road_type_checklist_
-        container's reference to it and destroys the old one -- the old
-        checklist is never cleared/destroyed before the new one is fully
-        built, so the GUI never passes through an empty intermediate
-        state. Deliberately does NOT pack the new container or call
-        _reflow_window() here -- every caller of this function calls
-        _update_road_classification_visibility() immediately afterward,
-        which owns all packing/positioning decisions for whichever
-        container is current at that moment.
+        Rebuilds the Filter by Road Type checklist from
+        road_type_value_vars: one Checkbutton per distinct ROAD_TYPE
+        value found in the selected road layer.
+
+        Plain destroy-and-repopulate, called directly by the CALLER
+        before _update_road_classification_visibility() (never by that
+        function itself -- see its own docstring for why). Simpler than
+        the previous "build off-screen, swap, destroy old" approach --
+        that complexity existed only to avoid a brief empty-content
+        moment affecting the WINDOW's own size; now that
+        road_type_checklist_container lives inside a fixed/capped Canvas
+        (see its construction above), clearing and repopulating its
+        children in place can never change the window's size at all, so
+        there's nothing left to protect against.
         """
-        nonlocal road_type_checklist_container
-        new_container = tk.Frame(road_frame)
+        for child in road_type_checklist_container.winfo_children():
+            child.destroy()
         for display_text in sorted(road_type_value_vars.keys()):
             real_value, var = road_type_value_vars[display_text]
-            tk.Checkbutton(new_container, text=display_text,
+            tk.Checkbutton(road_type_checklist_container, text=display_text,
                            variable=var).pack(anchor="w")
-        old_container = road_type_checklist_container
-        road_type_checklist_container = new_container
-        old_container.destroy()
 
     def _on_parcel_classification_checkbox_changed(*_args):
         """
@@ -1436,52 +1464,60 @@ def open_main_window(root):
                 _reflow_window()
             return
 
-        _resize_lot_classification_box()
+        # Pack BEFORE resizing -- _resize_lot_classification_box() reads
+        # lot_classification_canvas.winfo_width() to decide whether
+        # horizontal scrolling is needed, and that value is meaningless
+        # (returns 1, not the real layout-derived width) until the
+        # canvas is actually packed into the window at least once.
+        # Packing first, then resizing, guarantees a valid width to
+        # compare against.
         if not lot_classification_outer.winfo_ismapped():
             lot_classification_outer.pack(
                 fill="x", pady=(2, 0), after=parcel_action_row)
+        _resize_lot_classification_box()
         _reflow_window()
 
     def _update_road_classification_visibility():
         """
         Shows the "Filter by Road Type" checkbox plus (if checked) its
-        per-value checklist, and, ADDITIVELY, a "⏳ Reading road
-        network…" indicator while a background read is in flight -- the
-        indicator appears alongside whatever was already on screen (old
-        data, about to be replaced) without ever hiding or clearing it.
-        No usable ROAD_TYPE-like column found shows neither.
+        per-value checklist. No usable ROAD_TYPE-like column found shows
+        neither.
 
-        Invariant this preserves: the GUI never passes through an empty
-        intermediate state just because a background refresh is in
-        progress. The checkbox/checklist's own pack state/position is
-        entirely decided HERE (not by _rebuild_road_type_checklist(),
-        which only swaps which Frame object is current) -- while
-        reading, this function does not touch road_filter_checkbox's or
-        road_type_checklist_container's pack state at all, so both stay
-        exactly as they were.
-
-        Deliberately does NOT call _reflow_window() when entering the
-        reading state -- see _update_parcel_classification_visibility()'s
-        docstring for the full rationale (two win.geometry() calls in
-        quick succession -- entering reading, then the completed swap --
-        was found to cause real, reproducible visual ghosting on
-        Windows). Resize happens exactly once per read cycle, at the
-        point the new checklist actually replaces the old one.
+        Deliberately a no-op while road_is_reading -- the "Reading Road
+        Network..." indicator lives elsewhere now (see
+        _set_road_reading_state()'s docstring: it reuses the existing
+        "No file selected"/filename label via text swap, needing zero
+        _reflow_window() calls of its own), and this function's own
+        checkbox/checklist state is left completely UNTOUCHED for the
+        entire duration of a background read -- if it was already
+        showing a previous file's Filter by Road Type checklist, it
+        stays exactly as it was until the new read's actual result is
+        known (see _refresh_road_classification()'s cache-miss branch,
+        which deliberately does not clear road_type_value_vars before
+        starting the thread). This function is only ever invoked once
+        that result is ready (or immediately, for the synchronous
+        no-selection/cache-hit paths), so it triggers at most ONE resize
+        per call -- matching the same "one resize per cycle" principle
+        established on the Land Parcel side.
         """
         if road_is_reading:
-            road_reading_lbl.pack(anchor="w", pady=(2, 0))
             return
-        road_reading_lbl.pack_forget()
         if road_type_value_vars:
             road_filter_checkbox.pack(anchor="w", pady=(2, 0))
             if filter_road_type_var.get():
-                road_type_checklist_container.pack(
-                    fill="x", padx=(20, 0), pady=(2, 0), after=road_filter_checkbox)
+                # Pack BEFORE resizing -- see the matching comment in
+                # _update_parcel_classification_visibility() for why:
+                # winfo_width() is meaningless until the canvas has
+                # actually been packed into the window at least once.
+                if not road_type_checklist_outer.winfo_ismapped():
+                    road_type_checklist_outer.pack(
+                        fill="x", padx=(20, 0), pady=(2, 0), after=road_filter_checkbox)
+                _resize_road_type_checklist_box()
             else:
-                road_type_checklist_container.pack_forget()
+                road_type_checklist_outer.pack_forget()
         else:
             road_filter_checkbox.pack_forget()
-            road_type_checklist_container.pack_forget()
+            road_type_checklist_outer.pack_forget()
         _reflow_window()
 
     def _on_filter_road_type_changed(*_args):
@@ -1573,13 +1609,37 @@ def open_main_window(root):
             parcel_lbl_widget.config(fg="gray")
 
     def _set_road_reading_state(reading):
-        """Disable Road Network Browse/radio controls while its
-        background classification read is in progress -- prevents
-        starting a second, overlapping read of the same source."""
+        """
+        Disables Road Network Browse/radio controls while its background
+        classification read is in progress -- prevents starting a
+        second, overlapping read of the same source.
+
+        Also drives the "Reading Road Network..." indicator itself --
+        but NOT via a separate widget or any pack()/pack_forget() call.
+        Reuses the EXISTING "No file selected" / filename / "No table
+        selected" label (road_lbl_widget, bound to road_file_var /
+        road_db_var) that's already permanently present in
+        road_action_row, temporarily overwriting its text via the
+        StringVar and restoring it once done -- exact same principle as
+        _set_parcel_reading_state() on the Land Parcel side. Since this
+        label's own row never changes shape from a text-length change,
+        this transition needs -- and gets -- ZERO _reflow_window() calls.
+        """
         state = "disabled" if reading else "normal"
         road_btn.config(state=state)
         road_radio_local.config(state=state)
         road_radio_db.config(state=state)
+
+        if reading:
+            road_file_var.set("Reading Road Network...")
+            road_db_var.set("Reading Road Network...")
+            road_lbl_widget.config(fg="#b36b00")
+        else:
+            road_path = road_local_path.get()
+            road_file_var.set(os.path.basename(road_path) if road_path else "No file selected")
+            road_table = road_db_table.get()
+            road_db_var.set(road_table if road_table else "No table selected")
+            road_lbl_widget.config(fg="gray")
 
     def _update_run_button_state():
         """
@@ -1630,7 +1690,7 @@ def open_main_window(root):
         (or an equivalent list, e.g. a cache slot's stored details) --
         one (path_or_table, existing_col_name) tuple per source where the
         merged background read found an existing column matching
-        "road_width" (case-insensitive). Sources with no conflict, or
+        "cama_road_width" (case-insensitive). Sources with no conflict, or
         that failed to read, are simply absent from the result.
         """
         return [
@@ -1722,7 +1782,7 @@ def open_main_window(root):
                     continue
                 state, col_name, kind, _mask = _detect_lot_classification(gdf)
                 road_width_existing_col = next(
-                    (c for c in gdf.columns if c.lower() == "road_width"), None
+                    (c for c in gdf.columns if c.lower() == "cama_road_width"), None
                 )
                 per_source_results.append((path_or_table, state, col_name, kind, road_width_existing_col))
                 del gdf
@@ -1831,7 +1891,6 @@ def open_main_window(root):
 
         road_is_reading = True
         _set_road_reading_state(True)
-        _update_road_classification_visibility()
         _update_run_button_state()
         threading.Thread(target=worker, daemon=True).start()
         win.after(100, lambda: _poll_road_classification_queue(result_queue, source_key))
@@ -1956,11 +2015,21 @@ def open_main_window(root):
     lot_classification_scrollbar = tk.Scrollbar(
         lot_classification_outer, orient="vertical",
         command=lot_classification_canvas.yview)
-    lot_classification_canvas.configure(yscrollcommand=lot_classification_scrollbar.set)
+    lot_classification_hscroll = tk.Scrollbar(
+        lot_classification_outer, orient="horizontal",
+        command=lot_classification_canvas.xview)
+    lot_classification_canvas.configure(
+        yscrollcommand=lot_classification_scrollbar.set,
+        xscrollcommand=lot_classification_hscroll.set)
     lot_classification_canvas.pack(side="left", fill="both", expand=True)
-    # lot_classification_scrollbar is packed/unpacked dynamically by
+    # lot_classification_scrollbar (vertical) and lot_classification_hscroll
+    # (horizontal) are both packed/unpacked dynamically by
     # _resize_lot_classification_box() below -- only shown when content
-    # actually exceeds the cap and scrolling is genuinely needed.
+    # actually exceeds the box in that direction and scrolling is
+    # genuinely needed (e.g. a very long "Use LOT_LOCATION in
+    # <filename>.gpkg" label -- never truncated, never wrapped, scrolls
+    # into view instead, same principle already used for long file paths
+    # in ask_overwrite_dialog()/show_success_dialog()).
 
     # lot_classification_list_container: the actual content frame drawn
     # INSIDE the canvas -- this is what _rebuild_lot_classification_checklist()
@@ -1976,13 +2045,6 @@ def open_main_window(root):
     lot_classification_list_container.bind(
         "<Configure>", _on_lot_classification_content_configure)
 
-    def _on_lot_classification_canvas_resize(event):
-        # Keep the inner frame's width matched to the canvas's own width
-        # so checkboxes wrap/align correctly and only VERTICAL scrolling
-        # is ever needed.
-        lot_classification_canvas.itemconfig(_lot_classification_canvas_window, width=event.width)
-    lot_classification_canvas.bind("<Configure>", _on_lot_classification_canvas_resize)
-
     def _on_lot_classification_mousewheel(event):
         lot_classification_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
     lot_classification_canvas.bind(
@@ -1993,23 +2055,43 @@ def open_main_window(root):
 
     def _resize_lot_classification_box():
         """
-        Recomputes lot_classification_canvas's own height to fit
-        lot_classification_list_container's CURRENT content, capped at
-        LOT_CLASSIFICATION_MAX_HEIGHT. Shows the scrollbar only when the
-        content genuinely exceeds the cap (nothing to scroll -> no
-        scrollbar shown at all, avoiding a pointless, always-visible
-        scrollbar next to a box that never needs it). Called once per
-        content change (a state transition -- reading started, reading
-        finished, checklist rebuilt) -- never in a tight loop.
+        Recomputes lot_classification_canvas's own height AND width
+        handling to fit lot_classification_list_container's CURRENT
+        content:
+
+        - Vertical: capped at LOT_CLASSIFICATION_MAX_HEIGHT -- past that
+          cap, stops growing and scrolls internally instead.
+        - Horizontal: the inner content frame is matched to the canvas's
+          own displayed width UNLESS its natural required width (the
+          widest checkbox label, e.g. a long filename) exceeds that --
+          in which case the frame is left at its full natural width and
+          a horizontal scrollbar appears, rather than ever truncating or
+          wrapping the text.
+
+        Either scrollbar is shown ONLY when genuinely needed in that
+        direction (nothing to scroll -> no scrollbar at all, avoiding
+        pointless, always-visible scrollbars). Called once per content
+        change (a state transition -- reading started, reading finished,
+        checklist rebuilt) -- never in a tight loop.
         """
         lot_classification_list_container.update_idletasks()
         content_height = lot_classification_list_container.winfo_reqheight()
+        content_width = lot_classification_list_container.winfo_reqwidth()
+        canvas_width = lot_classification_canvas.winfo_width()
+
         if content_height <= LOT_CLASSIFICATION_MAX_HEIGHT:
             lot_classification_canvas.configure(height=content_height)
             lot_classification_scrollbar.pack_forget()
         else:
             lot_classification_canvas.configure(height=LOT_CLASSIFICATION_MAX_HEIGHT)
             lot_classification_scrollbar.pack(side="right", fill="y")
+
+        if content_width > canvas_width:
+            lot_classification_canvas.itemconfig(_lot_classification_canvas_window, width=content_width)
+            lot_classification_hscroll.pack(side="bottom", fill="x")
+        else:
+            lot_classification_canvas.itemconfig(_lot_classification_canvas_window, width=canvas_width)
+            lot_classification_hscroll.pack_forget()
     # Both start unpacked; _update_parcel_classification_visibility() (via
     # _refresh_parcel_classification()) decides what to show.
 
@@ -2117,14 +2199,87 @@ def open_main_window(root):
     # (never destroyed) by _update_road_classification_visibility().
     road_filter_checkbox = tk.Checkbutton(
         road_frame, text="Filter by Road Type", variable=filter_road_type_var)
+
     # Holds one Checkbutton per unique ROAD_TYPE value found in the
     # currently selected road layer. Only packed while the checkbox above
     # is checked AND a usable ROAD_TYPE-like column was found.
-    road_type_checklist_container = tk.Frame(road_frame)
-    road_reading_lbl = tk.Label(
-        road_frame, text="⏳ Reading road network…",
-        fg="#b36b00", font=("Segoe UI", 8, "italic"), anchor="w")
-    # All three start unpacked; _update_road_classification_visibility()
+    #
+    # Content-adaptive height, capped, dual-scroll (vertical + horizontal)
+    # when needed -- identical construction/rationale to the Land Parcel
+    # classification checklist above (see LOT_CLASSIFICATION_MAX_HEIGHT's
+    # comment for the full "why a cap, why hide when empty, why this
+    # avoids the resize-cascade distortion bug" explanation -- same
+    # principle applies here). Horizontal scroll specifically matters
+    # here since some ROAD_TYPE values in real cadastral data can be
+    # long descriptive strings, not just short codes -- never truncated
+    # or wrapped, only ever scrolled into view.
+    ROAD_TYPE_CHECKLIST_MAX_HEIGHT = 90  # pixels -- same cap as the Land Parcel checklist
+
+    road_type_checklist_outer = tk.Frame(road_frame)
+    road_type_checklist_canvas = tk.Canvas(
+        road_type_checklist_outer, highlightthickness=0, bd=0)
+    road_type_checklist_vscroll = tk.Scrollbar(
+        road_type_checklist_outer, orient="vertical",
+        command=road_type_checklist_canvas.yview)
+    road_type_checklist_hscroll = tk.Scrollbar(
+        road_type_checklist_outer, orient="horizontal",
+        command=road_type_checklist_canvas.xview)
+    road_type_checklist_canvas.configure(
+        yscrollcommand=road_type_checklist_vscroll.set,
+        xscrollcommand=road_type_checklist_hscroll.set)
+    road_type_checklist_canvas.pack(side="left", fill="both", expand=True)
+    # Both scrollbars are packed/unpacked dynamically by
+    # _resize_road_type_checklist_box() below -- only shown when content
+    # actually exceeds the box in that direction.
+
+    # road_type_checklist_container: the actual content frame drawn
+    # INSIDE the canvas -- this is what _rebuild_road_type_checklist()
+    # clears and repopulates.
+    road_type_checklist_container = tk.Frame(road_type_checklist_canvas)
+    _road_type_checklist_canvas_window = road_type_checklist_canvas.create_window(
+        (0, 0), window=road_type_checklist_container, anchor="nw")
+
+    def _on_road_type_checklist_content_configure(_event=None):
+        road_type_checklist_canvas.configure(
+            scrollregion=road_type_checklist_canvas.bbox("all"))
+    road_type_checklist_container.bind(
+        "<Configure>", _on_road_type_checklist_content_configure)
+
+    def _on_road_type_checklist_mousewheel(event):
+        road_type_checklist_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+    road_type_checklist_canvas.bind(
+        "<Enter>", lambda e: road_type_checklist_canvas.bind_all(
+            "<MouseWheel>", _on_road_type_checklist_mousewheel))
+    road_type_checklist_canvas.bind(
+        "<Leave>", lambda e: road_type_checklist_canvas.unbind_all("<MouseWheel>"))
+
+    def _resize_road_type_checklist_box():
+        """
+        Recomputes road_type_checklist_canvas's own height and width
+        handling to fit road_type_checklist_container's CURRENT content
+        -- identical logic to _resize_lot_classification_box() (see its
+        docstring for the full rationale). Called once per content
+        change, never in a tight loop.
+        """
+        road_type_checklist_container.update_idletasks()
+        content_height = road_type_checklist_container.winfo_reqheight()
+        content_width = road_type_checklist_container.winfo_reqwidth()
+        canvas_width = road_type_checklist_canvas.winfo_width()
+
+        if content_height <= ROAD_TYPE_CHECKLIST_MAX_HEIGHT:
+            road_type_checklist_canvas.configure(height=content_height)
+            road_type_checklist_vscroll.pack_forget()
+        else:
+            road_type_checklist_canvas.configure(height=ROAD_TYPE_CHECKLIST_MAX_HEIGHT)
+            road_type_checklist_vscroll.pack(side="right", fill="y")
+
+        if content_width > canvas_width:
+            road_type_checklist_canvas.itemconfig(_road_type_checklist_canvas_window, width=content_width)
+            road_type_checklist_hscroll.pack(side="bottom", fill="x")
+        else:
+            road_type_checklist_canvas.itemconfig(_road_type_checklist_canvas_window, width=canvas_width)
+            road_type_checklist_hscroll.pack_forget()
+    # Both start unpacked; _update_road_classification_visibility()
     # (via _refresh_road_classification()) decides what to show.
 
     # ── road browse callbacks ─────────────────────────────────────
@@ -2318,7 +2473,7 @@ def open_main_window(root):
             road_type_excluded_values = []
 
         # Warn about any Land Parcel source(s) that already have a
-        # column matching "road_width" (case-insensitive) -- this tool
+        # column matching "cama_road_width" (case-insensitive) -- this tool
         # is about to write its computed ROAD_WIDTH into that column.
         # Shown once, combined across every affected source (not one
         # dialog per file mid-processing), only here at Run time -- never
@@ -2342,8 +2497,8 @@ def open_main_window(root):
             if not proceed:
                 return
             # Preserve each source's existing column name/casing exactly
-            # -- e.g. a detected "road_width" (lowercase) is written back
-            # to "road_width", not a hardcoded "ROAD_WIDTH" -- so no
+            # -- e.g. a detected "cama_road_width" (lowercase) is written back
+            # to "cama_road_width", not a hardcoded "CAMA_ROAD_WIDTH" -- so no
             # duplicate column is ever created regardless of the existing
             # casing. A source with no entry here (no conflict was found)
             # simply uses the default name in process() below.
@@ -2892,8 +3047,8 @@ def run_processing():
             # like column name/casing for this source if a conflict was
             # detected and confirmed in on_run() (see
             # parcel_road_width_column_overrides above); defaults to
-            # "ROAD_WIDTH" when no conflict was found for this source.
-            output_column_name = parcel_road_width_column_overrides.get(path, "ROAD_WIDTH")
+            # "CAMA_ROAD_WIDTH" when no conflict was found for this source.
+            output_column_name = parcel_road_width_column_overrides.get(path, "CAMA_ROAD_WIDTH")
 
             # Road Classification: resolved independently for THIS
             # parcel source. use_classification_for_source comes from
@@ -2924,11 +3079,11 @@ def run_processing():
                     base_name = desired_base_name
                     main_status = None
                 out = os.path.join(output_mode[1], f"{base_name}.gpkg")
-                b_gdf.to_file(out, driver="GPKG")
+                _write_gpkg(b_gdf, out)
                 print(f"✅ Saved {out}")
                 load_in_global_mapper(out)
 
-                # QA / validation layer -- separate file, not merged into
+                # Visual Measurement layer -- separate file, not merged into
                 # the main output, so it can be toggled independently in
                 # QGIS. Only written if at least one parcel actually got
                 # a measurement (an all-empty file would just be visual
@@ -2944,8 +3099,8 @@ def run_processing():
                 if not qa_gdf.empty:
                     qa_base_name = with_qa_suffix(base_name)
                     qa_out = os.path.join(output_mode[1], f"{qa_base_name}.gpkg")
-                    qa_gdf.to_file(qa_out, driver="GPKG")
-                    print(f"✅ Saved QA layer {qa_out}")
+                    _write_gpkg(qa_gdf, qa_out)
+                    print(f"✅ Saved Visual Measurement layer {qa_out}")
                     load_in_global_mapper(qa_out)
                     vm_out = qa_out
 
@@ -2974,13 +3129,13 @@ def run_processing():
                 # conflict, so it gets no marker at all.
                 main_status = "Overwritten" if table_action == "replaced" else None
 
-                # QA / validation layer -- separate table, mirroring the
+                # Visual Measurement layer -- separate table, mirroring the
                 # local-output branch above.
                 vm_table = None
                 if not qa_gdf.empty:
                     qa_table = f"{table}_VM"
                     qa_gdf.to_postgis(qa_table, engine, schema=schema, if_exists="replace", index=False)
-                    print(f"🔄 Saved QA layer to DB: {qa_table}")
+                    print(f"🔄 Saved Visual Measurement layer to DB: {qa_table}")
                     vm_table = f"Database table: {qa_table}"
 
                 saved_files.append({
@@ -3007,9 +3162,9 @@ def run_processing():
                                 SELECT 1 FROM information_schema.columns
                                 WHERE table_schema='{schema}'
                                   AND table_name='CAMA_Table'
-                                  AND column_name='road_width'
+                                  AND column_name='cama_road_width'
                             ) THEN
-                                EXECUTE 'ALTER TABLE "{schema}"."CAMA_Table" ADD COLUMN "road_width" NUMERIC';
+                                EXECUTE 'ALTER TABLE "{schema}"."CAMA_Table" ADD COLUMN "cama_road_width" NUMERIC';
                             END IF;
                         END $$;
                     """))
@@ -3019,10 +3174,10 @@ def run_processing():
                     if pin_field:
                         for _, row in b_gdf.iterrows():
                             sql = f"""
-                                INSERT INTO "{schema}"."CAMA_Table" (PIN, road_width)
+                                INSERT INTO "{schema}"."CAMA_Table" (PIN, cama_road_width)
                                 VALUES (:pin, :rw)
                                 ON CONFLICT (PIN) DO UPDATE
-                                SET road_width = EXCLUDED.road_width;
+                                SET cama_road_width = EXCLUDED.cama_road_width;
                             """
                             params = {
                                 "pin": str(row[pin_field]),
@@ -3048,7 +3203,7 @@ def run_processing():
                         VALUES (:tbl, :type, :details);
                     """), {
                         "tbl": f"{table} ({table_action})",
-                        "type": "road_width",
+                        "type": "cama_road_width",
                         "details": output_column_name
                     })
 
@@ -3058,7 +3213,7 @@ def run_processing():
 
             # output_column_name: see comment in the "local"
             # barangay_source branch above for the full rationale.
-            output_column_name = parcel_road_width_column_overrides.get(table, "ROAD_WIDTH")
+            output_column_name = parcel_road_width_column_overrides.get(table, "CAMA_ROAD_WIDTH")
 
             # Road Classification: resolved independently for THIS
             # parcel source (see comment in the "local" branch above).
@@ -3081,18 +3236,18 @@ def run_processing():
                     out_base = table
                     main_status = None
                 out = os.path.join(output_mode[1], f"{out_base}.gpkg")
-                b_gdf.to_file(out, driver="GPKG")
+                _write_gpkg(b_gdf, out)
                 print(f"✅ Saved {out}")
                 load_in_global_mapper(out)
 
-                # QA / validation layer -- see comment in the "local"
+                # Visual Measurement layer -- see comment in the "local"
                 # barangay_source branch above for the full rationale.
                 vm_out = None
                 if not qa_gdf.empty:
                     qa_out_base = with_qa_suffix(out_base)
                     qa_out = os.path.join(output_mode[1], f"{qa_out_base}.gpkg")
-                    qa_gdf.to_file(qa_out, driver="GPKG")
-                    print(f"✅ Saved QA layer {qa_out}")
+                    _write_gpkg(qa_gdf, qa_out)
+                    print(f"✅ Saved Visual Measurement layer {qa_out}")
                     load_in_global_mapper(qa_out)
                     vm_out = qa_out
 
@@ -3111,12 +3266,12 @@ def run_processing():
                 b_gdf.to_postgis(table, engine, schema=schema, if_exists="replace", index=False)
                 print(f"🔄 Updated DB table: {table} ({table_action})")
 
-                # QA / validation layer -- separate table.
+                # Visual Measurement layer -- separate table.
                 vm_table = None
                 if not qa_gdf.empty:
                     qa_table = f"{table}_VM"
                     qa_gdf.to_postgis(qa_table, engine, schema=schema, if_exists="replace", index=False)
-                    print(f"🔄 Saved QA layer to DB: {qa_table}")
+                    print(f"🔄 Saved Visual Measurement layer to DB: {qa_table}")
                     vm_table = f"Database table: {qa_table}"
 
                 saved_files.append({
@@ -3140,9 +3295,9 @@ def run_processing():
                                 SELECT 1 FROM information_schema.columns
                                 WHERE table_schema='{schema}'
                                   AND table_name='CAMA_Table'
-                                  AND column_name='road_width'
+                                  AND column_name='cama_road_width'
                             ) THEN
-                                EXECUTE 'ALTER TABLE "{schema}"."CAMA_Table" ADD COLUMN "road_width" NUMERIC';
+                                EXECUTE 'ALTER TABLE "{schema}"."CAMA_Table" ADD COLUMN "cama_road_width" NUMERIC';
                             END IF;
                         END $$;
                     """))
@@ -3150,10 +3305,10 @@ def run_processing():
                     if pin_field:
                         for _, row in b_gdf.iterrows():
                             sql = f"""
-                                INSERT INTO "{schema}"."CAMA_Table" (PIN, road_width)
+                                INSERT INTO "{schema}"."CAMA_Table" (PIN, cama_road_width)
                                 VALUES (:pin, :rw)
                                 ON CONFLICT (PIN) DO UPDATE
-                                SET road_width = EXCLUDED.road_width;
+                                SET cama_road_width = EXCLUDED.cama_road_width;
                             """
                             params = {
                                 "pin": str(row[pin_field]),
@@ -3176,7 +3331,7 @@ def run_processing():
                         VALUES (:tbl, :type, :details);
                     """), {
                         "tbl": f"{table} ({table_action})",
-                        "type": "road_width",
+                        "type": "cama_road_width",
                         "details": output_column_name
                     })
     progress_win.destroy()
