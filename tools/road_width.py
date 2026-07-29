@@ -385,44 +385,68 @@ PRS92_ZONE_BOUNDS = [
 ]
 
 
-def detect_prs92_zone(gdfs):
+def detect_prs92_zone(labeled_gdfs):
     """
-    Auto-detect the PRS92 zone EPSG code from the COMBINED bounding-box
-    midpoint longitude of one or more input GeoDataFrames.
+    Detect the appropriate PRS92 zone from the combined geographic
+    extent of one or more GeoDataFrames.
 
-    Ported from lot_location.py (itself standardized from
-    road_frontage.py, the original canonical reference) -- replaces
-    road_width.py's own former get_prs92_zone(), which had two real
-    correctness gaps this version fixes:
+    Parameters
+    ----------
+    labeled_gdfs
+        List of (label, GeoDataFrame) tuples, e.g.
+        [("Land Parcel", barangay_gdf), ("Road Network", road_gdf)].
+        The label is used only for diagnostics -- it has no effect on
+        CRS detection.
 
-    1. Used gdf.unary_union.centroid.x -- a real source of GEOS
-       TopologyExceptions (crashes) on real-world cadastral data with
-       invalid geometries. total_bounds (plain numeric min/max of each
-       feature's bounding box) needs no geometric operation at all, so
-       it can't fail this way.
-    2. Read .centroid.x directly with no check or reprojection first --
-       if the input CRS was already projected (e.g. already in meters,
-       not degrees), the lon < 118 / < 120 / etc. thresholds (which are
-       degree-based) would silently produce a WRONG zone. This version
-       explicitly reprojects to EPSG:4326 first when the CRS isn't
-       already WGS84.
+    Returns
+    -------
+    int
+        The EPSG code of the detected PRS92 zone.
 
-    Also takes the COMBINED extent of every GeoDataFrame passed in
-    (road_width.py's process() passes both the parcel and road layers)
-    rather than deciding from the parcel layer alone -- avoids picking a
-    zone based on one layer that doesn't reflect where the other layer
-    actually is.
+    Notes
+    -----
+    Uses bounding-box midpoint (total_bounds) instead of
+    unary_union.centroid to avoid GEOS TopologyExceptions caused by
+    invalid geometries. Reprojects each input to EPSG:4326 first when
+    its CRS isn't already WGS84, since the zone thresholds are
+    degree-based. Uses the COMBINED extent of every GeoDataFrame
+    passed in rather than deciding from a single layer alone.
+
+    Auxiliary layers without usable geometry are ignored for CRS zone
+    determination -- zone detection proceeds as long as at least one
+    valid layer remains. A layer with no usable geometry at all
+    (all-null, or all-empty-but-non-null shapes) raises a ValueError
+    naming that specific layer, rather than silently corrupting the
+    computed longitude.
     """
+    valid = [
+        (label, g) for label, g in labeled_gdfs
+        if g is not None and not g.empty and g.geometry.notna().any()
+    ]
+    if not valid:
+        raise ValueError("No valid (non-empty) GeoDataFrames provided for PRS92 zone detection.")
+
     all_bounds = []
-    for gdf in gdfs:
+    for label, gdf in valid:
         g = gdf
         if g.crs is None:
             g = g.set_crs(epsg=4326)
-            print("⚠️ No CRS found in one of the input datasets -- assuming "
+            print(f"⚠️ No CRS found in the '{label}' layer -- assuming "
                   "WGS84. Measurements may be incorrect if the actual CRS "
                   "is different.")
-        g_wgs84 = g.to_crs(epsg=4326) if g.crs.to_epsg() != 4326 else g
-        all_bounds.append(g_wgs84.total_bounds)
+        epsg = g.crs.to_epsg()
+        if epsg != 4326:
+            g_wgs84 = g.to_crs(epsg=4326)
+        else:
+            g_wgs84 = g
+
+        bounds = g_wgs84.total_bounds
+        if np.isnan(bounds).any():
+            raise ValueError(
+                f"Cannot determine PRS92 zone because the '{label}' layer "
+                f"contains no valid geometry."
+            )
+        all_bounds.append(bounds)
 
     minx = min(b[0] for b in all_bounds)
     maxx = max(b[2] for b in all_bounds)
@@ -810,7 +834,7 @@ def process(barangay_gdf, road_gdf, source_name="", progress_cb=None, classifica
     if len(barangay_gdf) == 0:
         raise ValueError(f"No parcels found in {source_name}")
 
-    zone_epsg = detect_prs92_zone([barangay_gdf, road_gdf])
+    zone_epsg = detect_prs92_zone([("Land Parcel", barangay_gdf), ("Road Network", road_gdf)])
     print(f"🌍 [{source_name}] Reprojecting to EPSG:{zone_epsg}...")
     barangay_gdf = barangay_gdf.to_crs(epsg=zone_epsg)
     road_gdf = road_gdf.to_crs(epsg=zone_epsg)
