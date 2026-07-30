@@ -1,4 +1,5 @@
 import os
+import math
 import pyproj
 os.environ["PROJ_LIB"] = pyproj.datadir.get_data_dir()
 
@@ -146,12 +147,60 @@ def read_postgis_clean(table, engine, schema):
 
 
 # ---------------- CRS Helpers ----------------
-def detect_prs92_zone(centroid):
-    lon = centroid.x
-    if 118 <= lon < 120: return 3121
-    elif 120 <= lon < 122: return 3122
-    elif 122 <= lon < 124: return 3123
-    elif 124 <= lon < 126: return 3124
+def detect_prs92_zone(labeled_gdfs):
+    """
+    Choose PRS92 zone EPSG from the combined bbox-midpoint longitude of
+    one or more input GeoDataFrames.
+
+    labeled_gdfs: list of (label, gdf) tuples, e.g.
+        [("Land Parcel", parcels), ("Road Network", roads)]
+    The label is used only for diagnostics. It has no effect on CRS
+    detection.
+
+    Auxiliary layers without usable geometry are ignored for CRS zone
+    determination. Downstream processing may still validate required
+    layers independently.
+
+    Replaces the previous single-centroid, first-parcel-only version,
+    which had a real off-by-one bug in its zone-boundary mapping (every
+    threshold shifted one zone from the correct PRS92 EPSG codes) and
+    used only feature 0's centroid rather than the dataset's extent.
+    Uses total_bounds, not a unioned-geometry centroid -- unary_union.centroid
+    is a known source of GEOS TopologyExceptions on real-world cadastral
+    data with invalid geometries.
+    """
+    valid = [
+        (label, g) for label, g in labeled_gdfs
+        if g is not None and not g.empty and g.geometry.notna().any()
+    ]
+    if not valid:
+        raise ValueError("No valid (non-empty) GeoDataFrames provided for PRS92 zone detection.")
+
+    all_bounds = []
+    for label, g in valid:
+        if g.crs is None:
+            g = g.set_crs(epsg=4326)
+        epsg = g.crs.to_epsg()
+        if epsg != 4326:
+            g_wgs84 = g.to_crs(epsg=4326)
+        else:
+            g_wgs84 = g
+
+        bounds = g_wgs84.total_bounds
+        if any(math.isnan(v) for v in bounds):
+            raise ValueError(
+                f"Cannot determine PRS92 zone because the '{label}' layer "
+                f"contains no valid geometry."
+            )
+        all_bounds.append(bounds)
+
+    minx = min(b[0] for b in all_bounds)
+    maxx = max(b[2] for b in all_bounds)
+    lon = (minx + maxx) / 2
+    if lon < 118: return 3121
+    elif lon < 120: return 3122
+    elif lon < 122: return 3123
+    elif lon < 124: return 3124
     else: return 3125
 
 
@@ -198,6 +247,15 @@ def get_raster_values_batch(raster, points):
 
 
 def process_parcels_fast(parcels, roads, dtm, parcels_crs):
+    # NOTE (Part A3 investigation, resolved as NOT needed): like
+    # road_density.py, this function only reads parcels.geometry.centroid
+    # from each parcel (line below) -- never buffers/intersects/unions
+    # the parcel polygon itself. Road geometry is split into raw
+    # LineString segments via direct coordinate-list slicing (no
+    # buffer/union either) purely for STRtree nearest-neighbor lookup.
+    # Centroid computation is already confirmed safe on invalid geometry
+    # elsewhere in this project (no crash, unlike unary_union). No
+    # fix_geometry() added.
     update_progress("Building road spatial index...")
     # Split roads into segments and index them
     segments = []
@@ -278,73 +336,18 @@ def process_parcels_fast(parcels, roads, dtm, parcels_crs):
     return parcels.to_crs(parcels_crs)
 
 
-# ---------------- Run ----------------
-def run_processing():
-    open_progress_window()
-    try:
-        global barangay_source, road_source, dtm_source, output_mode
-        creds = load_db_credentials()
-        if not creds:
-            close_progress_window()
-            return
-        schema = creds["schema"]
-        engine = create_engine(
-            f"postgresql://{creds['username']}:{creds['password']}@{creds['host']}:{creds['port']}/{creds['database']}"
-        )
-
-        update_progress("Loading road data...")
-        road_gdf = gpd.read_file(road_source[1][0]) if road_source[0] == "local" else read_postgis_clean(road_source[1][0], engine, schema)
-
-        barangay_list = barangay_source[1]
-        for idx, src in enumerate(barangay_list, 1):
-            update_progress(f"Loading barangay {idx}/{len(barangay_list)}...")
-            if barangay_source[0] == "local":
-                parcels = gpd.read_file(src)
-                name = os.path.splitext(os.path.basename(src))[0]
-            else:
-                parcels = read_postgis_clean(src, engine, schema)
-                name = src
-
-            centroid_ll = parcels.to_crs(4326).geometry.centroid.iloc[0]
-            target_epsg = detect_prs92_zone(centroid_ll)
-            parcels_crs = parcels.crs
-            parcels = parcels.to_crs(epsg=target_epsg)
-            roads = road_gdf.to_crs(epsg=target_epsg)
-
-            update_progress("Loading DTM...")
-            if dtm_source[0] == "local":
-                dtm_raw = rasterio.open(dtm_source[1])
-                dtm = reproject_raster_to_prs92(dtm_raw, target_epsg)
-            else:
-                dtm_table = dtm_source[1]
-                dtm_raw = rasterio.open(
-                    f"PG:dbname={creds['database']} host={creds['host']} user={creds['username']} password={creds['password']} schema={schema} table={dtm_table} column=rast"
-                )
-                srid = get_raster_srid(engine, schema, dtm_table)
-                dtm = reproject_raster_to_prs92(dtm_raw, target_epsg) if srid != target_epsg else dtm_raw
-
-            result = process_parcels_fast(parcels, roads, dtm, parcels_crs)
-
-            update_progress("Saving output...")
-            if output_mode[0] == "local":
-                out = os.path.join(output_mode[1], f"{name}_terrain.shp")
-                result.to_file(out)
-            else:
-                existing = [t for t in inspect(engine).get_table_names(schema=schema) if name.lower() in t.lower()]
-                out_table = existing[0] if existing else name + "_terrain"
-                result.to_postgis(out_table, engine, schema=schema, if_exists="replace", index=False)
-
-            update_progress(f"✅ Completed {name}")
-
-        close_progress_window()
-        messagebox.showinfo("Success", "✅ Terrain processing complete!")
-
-    except Exception as e:
-        close_progress_window()
-        messagebox.showerror("Error", f"❌ Processing failed:\n{str(e)}")
-
-
-# REPLACE WITH
+# NOTE: An earlier, unreachable run_processing() (no-argument signature)
+# used to live here. It was permanently shadowed by the run_processing(app_root)
+# definition further below (Python keeps only the last function bound to a
+# given name at module level) and was never callable -- open_main_window()'s
+# on_run() always called run_processing(root), which only matches the
+# surviving definition's signature. Verified unreachable via: (1) no
+# external references anywhere in the project (tools are dispatched as
+# isolated subprocesses via importlib, never imported directly by name),
+# (2) the only call site in this file passes one positional argument,
+# matching only the surviving definition. Removed rather than left in
+# place to avoid a future fix being silently applied to the dead copy
+# instead of the live one.
 
 # ========================= GLOBAL MAPPER =========================
 def load_in_global_mapper(filepath):
@@ -430,6 +433,16 @@ def open_main_window(root):
     dtm_db_table       = tk.StringVar(master=win)
     output_local_dir   = tk.StringVar(master=win)
 
+    # run_status_var: drives the always-visible status label under the
+    # Run button ("Please select ..." / "Ready to run.") and mirrors
+    # whether the Run button itself is enabled. Updated by
+    # _update_run_button_state() below. Its validation-order cascade
+    # intentionally mirrors on_run()'s own validation order below --
+    # conscious duplication for a minimal-risk, additive gating layer,
+    # not a refactor of on_run() itself; keep the two in sync if this
+    # tool's required inputs ever change.
+    run_status_var = tk.StringVar(master=win, value="Preparing…")
+
     PAD = dict(padx=8, pady=4)
 
     def section_label(parent, text):
@@ -475,6 +488,13 @@ def open_main_window(root):
             parcel_local_paths.clear()
             parcel_local_paths.extend(files)
             parcel_files_var.set(f"{len(files)} file(s) selected")
+            _update_run_button_state()
+
+    def _on_parcel_db_selected(sel):
+        parcel_db_tables.clear()
+        parcel_db_tables.extend(sel)
+        parcel_db_label.set(f"{len(sel)} table(s) selected")
+        _update_run_button_state()
 
     def browse_parcel_db():
         creds = load_db_credentials()
@@ -486,11 +506,7 @@ def open_main_window(root):
         if not tables:
             messagebox.showwarning("No Tables", "No tables found in the database schema.")
             return
-        _pick_db_tables(win, tables, multi=True,
-            on_select=lambda sel: (
-                parcel_db_tables.__setitem__(slice(None), sel)
-                or parcel_db_label.set(f"{len(sel)} table(s) selected")
-            ))
+        _pick_db_tables(win, tables, multi=True, on_select=_on_parcel_db_selected)
 
     def _toggle_parcel():
         if parcel_source_type.get() == "local":
@@ -499,6 +515,7 @@ def open_main_window(root):
         else:
             parcel_lbl.config(textvariable=parcel_db_label)
             parcel_btn.config(text="Select…", command=browse_parcel_db)
+        _update_run_button_state()
 
     # ── SECTION 2: ROAD NETWORK ──────────────────────────────────
     section_label(win, "Road Network Source")
@@ -534,6 +551,17 @@ def open_main_window(root):
         if f:
             road_local_path.set(f)
             road_file_var.set(os.path.basename(f))
+            _update_run_button_state()
+
+    def _on_road_db_selected(sel):
+        # _pick_db_tables() only invokes on_select after a confirmed
+        # selection, so sel is never empty here -- the original
+        # lambda's "if sel else None" branch was a redundant
+        # conditional. Switching to a named callback is a readability
+        # change only; no behavior change.
+        road_db_table.set(sel[0])
+        road_db_var.set(sel[0])
+        _update_run_button_state()
 
     def browse_road_db():
         creds = load_db_credentials()
@@ -545,11 +573,7 @@ def open_main_window(root):
         if not tables:
             messagebox.showwarning("No Tables", "No tables found in the database schema.")
             return
-        _pick_db_tables(win, tables, multi=False,
-            on_select=lambda sel: (
-                road_db_table.set(sel[0]) if sel else None,
-                road_db_var.set(sel[0] if sel else "No table selected")
-            ))
+        _pick_db_tables(win, tables, multi=False, on_select=_on_road_db_selected)
 
     def _toggle_road():
         if road_source_type.get() == "local":
@@ -558,6 +582,7 @@ def open_main_window(root):
         else:
             road_lbl.config(textvariable=road_db_var)
             road_btn.config(text="Select…", command=browse_road_db)
+        _update_run_button_state()
 
     # ── SECTION 3: DTM ───────────────────────────────────────────
     section_label(win, "DTM Source")
@@ -593,6 +618,14 @@ def open_main_window(root):
         if f:
             dtm_local_path.set(f)
             dtm_file_var.set(os.path.basename(f))
+            _update_run_button_state()
+
+    def _on_dtm_db_selected(sel):
+        # Same note as _on_road_db_selected() above: _pick_db_tables()
+        # only calls on_select with a confirmed, non-empty selection.
+        dtm_db_table.set(sel[0])
+        dtm_db_var.set(sel[0])
+        _update_run_button_state()
 
     def browse_dtm_db():
         creds = load_db_credentials()
@@ -604,11 +637,7 @@ def open_main_window(root):
         if not tables:
             messagebox.showwarning("No Tables", "No tables found in the database schema.")
             return
-        _pick_db_tables(win, tables, multi=False,
-            on_select=lambda sel: (
-                dtm_db_table.set(sel[0]) if sel else None,
-                dtm_db_var.set(sel[0] if sel else "No table selected")
-            ))
+        _pick_db_tables(win, tables, multi=False, on_select=_on_dtm_db_selected)
 
     def _toggle_dtm():
         if dtm_source_type.get() == "local":
@@ -617,6 +646,7 @@ def open_main_window(root):
         else:
             dtm_lbl.config(textvariable=dtm_db_var)
             dtm_btn.config(text="Select…", command=browse_dtm_db)
+        _update_run_button_state()
 
     # ── SECTION 4: OUTPUT ────────────────────────────────────────
     section_label(win, "Output Destination")
@@ -652,6 +682,7 @@ def open_main_window(root):
         if d:
             output_local_dir.set(d)
             output_dir_var.set(d)
+            _update_run_button_state()
 
     def _toggle_output():
         if output_dest_type.get() == "local":
@@ -663,6 +694,7 @@ def open_main_window(root):
             out_lbl.config(textvariable=output_db_var,
                            font=("Segoe UI", 8, "italic"), fg="gray")
             out_btn.pack_forget()
+        _update_run_button_state()
 
     # ── RUN BUTTON ───────────────────────────────────────────────
     ttk.Separator(win, orient="horizontal").pack(
@@ -726,15 +758,80 @@ def open_main_window(root):
         win.destroy()
         run_processing(root)
 
-    tk.Button(win, text="▶  Run Processing", command=on_run,
-              bg="#2e7d32", fg="white",
+    # Single source of truth for the Run button's enabled/disabled
+    # colors -- used both at button creation and inside
+    # _update_run_button_state() below, so there's only one place to
+    # change if the theme changes later.
+    RUN_BTN_BG_ENABLED  = "#2e7d32"
+    RUN_BTN_FG_ENABLED  = "white"
+    RUN_BTN_BG_DISABLED = "#e0e0e0"
+    RUN_BTN_FG_DISABLED = "#888888"
+
+    def _update_run_button_state():
+        """
+        Single source of truth for whether the Run button may be
+        pressed. Disabled (with an explanatory status message) until a
+        Land Parcel source, a Road Network source, a DTM source, and an
+        Output destination are all present.
+
+        The has_parcel / has_road / has_dtm / has_output cascade below
+        intentionally mirrors on_run()'s own validation order further
+        down -- this is a conscious duplication for a minimal-risk,
+        additive gating layer, not a refactor of on_run() itself. Keep
+        the two in sync if this tool's required inputs ever change.
+
+        Explicit bg/fg/cursor toggling (not just state=) is required:
+        Tkinter does NOT automatically gray out a classic tk.Button's
+        custom bg/fg when state="disabled", and does not suppress a
+        widget's assigned cursor either -- both must be set explicitly
+        for each state.
+        """
+        has_parcel = bool(parcel_local_paths) if parcel_source_type.get() == "local" else bool(parcel_db_tables)
+        has_road = bool(road_local_path.get()) if road_source_type.get() == "local" else bool(road_db_table.get())
+        has_dtm = bool(dtm_local_path.get()) if dtm_source_type.get() == "local" else bool(dtm_db_table.get())
+        has_output = bool(output_local_dir.get()) if output_dest_type.get() == "local" else True
+
+        if not has_parcel:
+            run_status_var.set("Please select a Land Parcel source.")
+            ready = False
+        elif not has_road:
+            run_status_var.set("Please select a Road Network source.")
+            ready = False
+        elif not has_dtm:
+            run_status_var.set("Please select a DTM source.")
+            ready = False
+        elif not has_output:
+            run_status_var.set("Please select an Output destination.")
+            ready = False
+        else:
+            run_status_var.set("Ready to run.")
+            ready = True
+
+        if ready:
+            run_btn.config(state="normal", cursor="hand2",
+                            bg=RUN_BTN_BG_ENABLED, fg=RUN_BTN_FG_ENABLED)
+        else:
+            run_btn.config(state="disabled", cursor="no",
+                            bg=RUN_BTN_BG_DISABLED, fg=RUN_BTN_FG_DISABLED,
+                            disabledforeground=RUN_BTN_FG_DISABLED)
+
+    run_btn = tk.Button(win, text="▶  Run Processing", command=on_run,
+              bg=RUN_BTN_BG_ENABLED, fg=RUN_BTN_FG_ENABLED,
               font=("Segoe UI", 10, "bold"),
-              relief="flat", padx=16, pady=6).pack(pady=(4, 14))
+              relief="flat", padx=16, pady=6)
+    run_btn.pack(pady=(4, 4))
+
+    # Permanent status line UNDER the Run button -- always visible, no
+    # hover required.
+    run_status_lbl = tk.Label(win, textvariable=run_status_var,
+                              font=("Segoe UI", 8), fg="gray")
+    run_status_lbl.pack(pady=(0, 12))
 
     _toggle_parcel()
     _toggle_road()
     _toggle_dtm()
     _toggle_output()
+    _update_run_button_state()
 
 
 # ========================= RUN =========================
@@ -767,8 +864,7 @@ def run_processing(app_root):
                 parcels = read_postgis_clean(src, engine, schema)
                 name = src
 
-            centroid_ll = parcels.to_crs(4326).geometry.centroid.iloc[0]
-            target_epsg = detect_prs92_zone(centroid_ll)
+            target_epsg = detect_prs92_zone([("Land Parcel", parcels), ("Road Network", road_gdf)])
             parcels_crs = parcels.crs
             parcels = parcels.to_crs(epsg=target_epsg)
             roads = road_gdf.to_crs(epsg=target_epsg)

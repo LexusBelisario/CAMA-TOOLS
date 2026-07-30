@@ -203,40 +203,80 @@ PRS92_ZONE_BOUNDS = [
 ]
 
 
-def detect_prs92_zone(gdf):
+def detect_prs92_zone(labeled_gdfs):
     """
-    Auto-detect the correct PRS92 zone EPSG code from the bounding-box
-    midpoint longitude of the input GeoDataFrame.
+    Auto-detect the correct PRS92 zone EPSG code from the COMBINED
+    bounding-box midpoint longitude of one or more input GeoDataFrames.
 
-    If the layer has no CRS defined, WGS84 (EPSG:4326) is assumed and a
-    warning string is returned alongside the zone so the caller can
-    surface it to the operator — processing continues rather than
-    aborting, but the resulting measurements may be wrong if the actual
-    source CRS was something other than WGS84.
+    labeled_gdfs: list of (label, gdf) tuples, e.g.
+        [("Land Parcel", brgy_gdf), ("Road Network", road_gdf)]
+    The label is used only for diagnostics. It has no effect on CRS
+    detection.
+
+    If a layer has no CRS defined, WGS84 (EPSG:4326) is assumed and a
+    warning string naming that layer is included in the returned
+    warning so the caller can surface it to the operator — processing
+    continues rather than aborting, but the resulting measurements may
+    be wrong if the actual source CRS was something other than WGS84.
+    Multiple such warnings (one per affected layer) are joined into a
+    single multi-line string rather than the last one silently
+    overwriting the others.
 
     Uses total_bounds (min/max coordinates) rather than a unioned-geometry
     centroid. A union across an entire large parcel layer is a known
     source of GEOS TopologyExceptions on real-world cadastral data —
     confirmed by reproducing the exact failure this tool hit in
     production. total_bounds is pure min/max arithmetic and carries no
-    such risk, at the cost of being slightly less representative of the
-    dataset's true center for a layer with very unevenly distributed
-    parcels near a zone boundary — a much smaller and purely theoretical
-    concern next to a confirmed production crash.
+    such risk.
+
+    Auxiliary layers (e.g. Road Network) without usable geometry are
+    ignored for CRS zone determination -- zone detection proceeds as
+    long as at least one valid layer remains. Downstream processing
+    (the "if road_gdf.empty:" check further down) already has its own,
+    more specific error for a missing/unusable road layer, so failing
+    zone detection over it here would only produce a less helpful
+    message for the same situation.
+
+    A layer with no usable geometry at all (all-null, or
+    all-empty-but-non-null shapes) raises a ValueError naming that
+    specific layer, rather than silently corrupting the computed
+    longitude into NaN.
 
     Returns (epsg, warning) where warning is None when no CRS issue was
-    found, or a string describing the issue otherwise.
+    found, or a string describing the issue(s) otherwise.
     """
-    warning = None
-    if gdf.crs is None:
-        gdf = gdf.set_crs(epsg=4326)
-        warning = (
-            "No CRS found in the dataset -- assuming WGS84. "
-            "Measurements may be incorrect if the actual CRS is different."
-        )
+    valid = [
+        (label, g) for label, g in labeled_gdfs
+        if g is not None and not g.empty and g.geometry.notna().any()
+    ]
+    if not valid:
+        raise ValueError("No valid (non-empty) GeoDataFrames provided for PRS92 zone detection.")
 
-    gdf_wgs84 = gdf.to_crs(epsg=4326) if gdf.crs.to_epsg() != 4326 else gdf
-    minx, miny, maxx, maxy = gdf_wgs84.total_bounds
+    warnings = []
+    all_bounds = []
+    for label, gdf in valid:
+        g = gdf
+        if g.crs is None:
+            g = g.set_crs(epsg=4326)
+            warnings.append(
+                f"No CRS found in the '{label}' layer -- assuming WGS84. "
+                "Measurements may be incorrect if the actual CRS is different."
+            )
+        epsg = g.crs.to_epsg()
+        g_wgs84 = g.to_crs(epsg=4326) if epsg != 4326 else g
+
+        bounds = g_wgs84.total_bounds
+        if np.isnan(bounds).any():
+            raise ValueError(
+                f"Cannot determine PRS92 zone because the '{label}' layer "
+                f"contains no valid geometry."
+            )
+        all_bounds.append(bounds)
+
+    warning = "\n".join(warnings) if warnings else None
+
+    minx = min(b[0] for b in all_bounds)
+    maxx = max(b[2] for b in all_bounds)
     center_lon = (minx + maxx) / 2
 
     for lon_min, lon_max, epsg, zone_label in PRS92_ZONE_BOUNDS:
@@ -260,9 +300,17 @@ def fix_geometry(geom):
         return None
     try:
         if not geom.is_valid:
-            geom = geom.buffer(0)
-        if not geom.is_valid:
-            geom = make_valid(geom)
+            # buffer(0) is a polygon-repair technique. Applied to
+            # LineString/MultiLineString it can collapse the geometry
+            # into POLYGON EMPTY (confirmed empirically, including on
+            # already-valid LineStrings), silently destroying that
+            # feature and changing its geometry type. Line geometries
+            # are repaired directly with make_valid() instead, which
+            # handles both geometry families correctly.
+            if geom.geom_type in {"Polygon", "MultiPolygon"}:
+                geom = geom.buffer(0)
+            if not geom.is_valid:
+                geom = make_valid(geom)
         if geom.is_empty:
             return None
         return geom
@@ -1291,7 +1339,7 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
         }
 
     original_crs = brgy_gdf.crs
-    zone_epsg, crs_warning = detect_prs92_zone(brgy_gdf)
+    zone_epsg, crs_warning = detect_prs92_zone([("Land Parcel", brgy_gdf), ("Road Network", road_gdf)])
 
     if crs_warning and progress:
         progress(f"Warning: {source_name}: {crs_warning}")

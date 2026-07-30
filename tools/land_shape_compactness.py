@@ -131,12 +131,36 @@ def largest_polygon(geom):
     return None
 
 def auto_utm_epsg_from_gdf(gdf):
-    if gdf.crs is None: gdf_tmp=gdf.set_crs(epsg=4326,allow_override=True)
-    else: gdf_tmp=gdf.to_crs(epsg=4326)
-    centroid=gdf_tmp.unary_union.centroid
-    lon=centroid.x
-    zone=int((lon+180)//6)+1
-    return 32600+zone
+    """
+    Choose the UTM zone EPSG from the bbox-midpoint longitude of the
+    input GeoDataFrame. UTM (not PRS92) is intentionally kept here --
+    the Polsby-Popper ratio computed downstream is largely invariant
+    under the locally uniform scale distortions expected for ordinary
+    cadastral parcels (both UTM and PRS92 are Transverse Mercator
+    family, locally conformal projections -- area and perimeter scale
+    by k^2 and k respectively under a locally uniform scale factor k,
+    which cancels out in the area/perimeter^2 ratio), so switching CRS
+    systems has no established accuracy benefit for this computation
+    and was not pursued.
+
+    Uses total_bounds, not a unioned-geometry centroid -- unary_union.centroid
+    is a known source of GEOS TopologyExceptions on real-world cadastral
+    data with invalid geometries.
+    """
+    if gdf is None or gdf.empty or not gdf.geometry.notna().any():
+        raise ValueError("No valid (non-empty) GeoDataFrame provided for UTM zone detection.")
+
+    g = gdf if gdf.crs is not None else gdf.set_crs(epsg=4326, allow_override=True)
+    epsg = g.crs.to_epsg()
+    g_wgs84 = g.to_crs(epsg=4326) if epsg != 4326 else g
+
+    bounds = g_wgs84.total_bounds
+    if np.isnan(bounds).any():
+        raise ValueError("Cannot determine UTM zone because the Land Parcel layer contains no valid geometry.")
+
+    lon = (bounds[0] + bounds[2]) / 2
+    zone = int((lon + 180) // 6) + 1
+    return 32600 + zone
 
 # ---------------- Core ----------------
 def compute_ppr_and_lot_shape_gdf(gdf):
@@ -150,9 +174,22 @@ def compute_ppr_and_lot_shape_gdf(gdf):
         epsg = auto_utm_epsg_from_gdf(gdf)
         gdf = gdf.to_crs(epsg=epsg)
 
-    # ---- Do calculations in projected CRS ----
-    area = gdf.geometry.area
-    perimeter = gdf.geometry.length
+    # Geometry repair is scoped to this local Series only -- used below
+    # for area/perimeter/vertex-angle computation, never written back
+    # into gdf's own geometry column. The exported output keeps each
+    # parcel's original, untouched shape, even if invalid.
+    #
+    # Repair is genuinely needed here (unlike, say, a centroid-only
+    # computation elsewhere in this project) -- confirmed empirically:
+    # a self-intersecting rectangle-with-digitizing-fold test case
+    # classified as OTHERS with PP_RATIO 0.27 on the raw geometry, vs
+    # RECTANGLE with PP_RATIO 0.96 after repair, because vertex_angles()
+    # reads the exterior ring's raw coordinate sequence directly.
+    fixed_geoms = gdf.geometry.apply(fix_geometry)
+
+    # ---- Do calculations in projected CRS, using the repaired geometry ----
+    area = fixed_geoms.area
+    perimeter = fixed_geoms.length
     gdf["PP_RATIO"] = ((4 * np.pi * area) / (perimeter ** 2)).round(2)
 
     gdf["VTX_COUNT"] = 0
@@ -163,9 +200,31 @@ def compute_ppr_and_lot_shape_gdf(gdf):
             gdf[col] = 0
     gdf["LOT_SHAPE"] = ""
 
-    for idx, geom in enumerate(gdf.geometry):
+    # .items() yields gdf's actual index LABELS (not positions), which
+    # gdf.at[] requires. enumerate() gives positional 0..N-1 instead --
+    # if gdf's index has any gaps (e.g. from upstream row filtering),
+    # gdf.at[label, ...] with a positional number that isn't an actual
+    # label silently creates a brand-new row full of NaNs rather than
+    # raising an error. Confirmed empirically. Independent of the
+    # geometry-repair change above -- this indexing correctness issue
+    # applies regardless of what fixed_geoms contains.
+    for idx, geom in fixed_geoms.items():
         poly = largest_polygon(geom)
         if poly is None:
+            # Temporary behavior: parcels whose geometry cannot be
+            # repaired are retained in the output (never dropped --
+            # every input row must appear exactly once in the output)
+            # with LOT_SHAPE="OTHERS" and PP_RATIO=NaN (area/perimeter
+            # above are NaN for a None entry in fixed_geoms, so
+            # PP_RATIO is already NaN for this row without extra code
+            # here) until the business rule for a dedicated
+            # "INVALID_GEOMETRY" classification is finalized with the
+            # team lead. The parcel's OWN geometry in the output stays
+            # exactly as originally read -- only this repaired local
+            # `poly` failed, not gdf's own geometry column.
+            gdf.at[idx, "TRIANGLE"] = 0
+            gdf.at[idx, "RECTANGLE"] = 0
+            gdf.at[idx, "L_SHAPED"] = 0
             gdf.at[idx, "OTHERS"] = 1
             gdf.at[idx, "LOT_SHAPE"] = "OTHERS"
             continue
@@ -312,6 +371,12 @@ def open_main_window(root):
     parcel_db_tables   = []
     output_local_dir   = tk.StringVar(master=win)
 
+    # run_status_var: drives the always-visible status label under the
+    # Run button ("Please select ..." / "Ready to run.") and mirrors
+    # whether the Run button itself is enabled. Updated by
+    # _update_run_button_state() below.
+    run_status_var = tk.StringVar(master=win, value="Preparing…")
+
     PAD = dict(padx=8, pady=4)
 
     def section_label(parent, text):
@@ -357,6 +422,13 @@ def open_main_window(root):
             parcel_local_paths.clear()
             parcel_local_paths.extend(files)
             parcel_files_var.set(f"{len(files)} file(s) selected")
+            _update_run_button_state()
+
+    def _on_parcel_db_selected(sel):
+        parcel_db_tables.clear()
+        parcel_db_tables.extend(sel)
+        parcel_db_label.set(f"{len(sel)} table(s) selected")
+        _update_run_button_state()
 
     def browse_parcel_db():
         creds = load_db_credentials()
@@ -367,11 +439,7 @@ def open_main_window(root):
         if not tables:
             messagebox.showwarning("No Tables", "No tables found in the database schema.")
             return
-        _pick_db_tables(win, tables, multi=True,
-            on_select=lambda sel: (
-                parcel_db_tables.__setitem__(slice(None), sel)
-                or parcel_db_label.set(f"{len(sel)} table(s) selected")
-            ))
+        _pick_db_tables(win, tables, multi=True, on_select=_on_parcel_db_selected)
 
     def _toggle_parcel():
         if parcel_source_type.get() == "local":
@@ -380,6 +448,7 @@ def open_main_window(root):
         else:
             parcel_lbl.config(textvariable=parcel_db_label)
             parcel_btn.config(text="Select…", command=browse_parcel_db)
+        _update_run_button_state()
 
     # ── SECTION 2: OUTPUT ────────────────────────────────────────
     section_label(win, "Output Destination")
@@ -415,6 +484,7 @@ def open_main_window(root):
         if d:
             output_local_dir.set(d)
             output_dir_var.set(d)
+            _update_run_button_state()
 
     def _toggle_output():
         if output_dest_type.get() == "local":
@@ -426,6 +496,7 @@ def open_main_window(root):
             out_lbl.config(textvariable=output_db_var,
                            font=("Segoe UI", 8, "italic"), fg="gray")
             out_btn.pack_forget()
+        _update_run_button_state()
 
     # ── RUN BUTTON ───────────────────────────────────────────────
     ttk.Separator(win, orient="horizontal").pack(
@@ -459,13 +530,63 @@ def open_main_window(root):
         win.destroy()
         run_processing()
 
-    tk.Button(win, text="▶  Run Processing", command=on_run,
-              bg="#2e7d32", fg="white",
+    # Single source of truth for the Run button's enabled/disabled
+    # colors -- used both at button creation and inside
+    # _update_run_button_state() below, so there's only one place to
+    # change if the theme changes later.
+    RUN_BTN_BG_ENABLED  = "#2e7d32"
+    RUN_BTN_FG_ENABLED  = "white"
+    RUN_BTN_BG_DISABLED = "#e0e0e0"
+    RUN_BTN_FG_DISABLED = "#888888"
+
+    def _update_run_button_state():
+        """
+        Single source of truth for whether the Run button may be
+        pressed. Disabled (with an explanatory status message) until a
+        Land Parcel source and an Output destination are both selected.
+
+        Explicit bg/fg/cursor toggling (not just state=) is required:
+        Tkinter does NOT automatically gray out a classic tk.Button's
+        custom bg/fg when state="disabled", and does not suppress a
+        widget's assigned cursor either -- both must be set explicitly
+        for each state.
+        """
+        has_parcel = bool(parcel_local_paths) if parcel_source_type.get() == "local" else bool(parcel_db_tables)
+        has_output = bool(output_local_dir.get()) if output_dest_type.get() == "local" else True
+
+        if not has_parcel:
+            run_status_var.set("Please select a Land Parcel source.")
+            ready = False
+        elif not has_output:
+            run_status_var.set("Please select an Output destination.")
+            ready = False
+        else:
+            run_status_var.set("Ready to run.")
+            ready = True
+
+        if ready:
+            run_btn.config(state="normal", cursor="hand2",
+                            bg=RUN_BTN_BG_ENABLED, fg=RUN_BTN_FG_ENABLED)
+        else:
+            run_btn.config(state="disabled", cursor="no",
+                            bg=RUN_BTN_BG_DISABLED, fg=RUN_BTN_FG_DISABLED,
+                            disabledforeground=RUN_BTN_FG_DISABLED)
+
+    run_btn = tk.Button(win, text="▶  Run Processing", command=on_run,
+              bg=RUN_BTN_BG_ENABLED, fg=RUN_BTN_FG_ENABLED,
               font=("Segoe UI", 10, "bold"),
-              relief="flat", padx=16, pady=6).pack(pady=(4, 14))
+              relief="flat", padx=16, pady=6)
+    run_btn.pack(pady=(4, 4))
+
+    # Permanent status line UNDER the Run button -- always visible, no
+    # hover required.
+    run_status_lbl = tk.Label(win, textvariable=run_status_var,
+                              font=("Segoe UI", 8), fg="gray")
+    run_status_lbl.pack(pady=(0, 12))
 
     _toggle_parcel()
     _toggle_output()
+    _update_run_button_state()
 
 
 # ---------------- Processing ----------------
@@ -484,8 +605,14 @@ def run_processing():
     if barangay_source[0] == "local":
         for path in barangay_source[1]:
             gdf = gpd.read_file(path)
-            gdf["geometry"] = gdf["geometry"].apply(fix_geometry)
-            gdf = gdf[gdf["geometry"].notnull()]
+            # Row-dropping REMOVED (Phase 1B decision, approved): every
+            # input parcel must appear exactly once in the output. A
+            # parcel whose geometry can't be repaired is no longer
+            # dropped -- compute_ppr_and_lot_shape_gdf() below keeps it
+            # in the output with its ORIGINAL geometry, PP_RATIO=NaN,
+            # and LOT_SHAPE="OTHERS" as a temporary placeholder pending
+            # a dedicated "INVALID_GEOMETRY" classification once that
+            # business rule is finalized with the team lead.
             result = compute_ppr_and_lot_shape_gdf(gdf)
             if output_mode[0] == "local":
                 base = os.path.splitext(os.path.basename(path))[0]
@@ -502,8 +629,8 @@ def run_processing():
     else:
         for table in barangay_source[1]:
             gdf = read_postgis_clean(table, engine, schema)
-            gdf["geometry"] = gdf["geometry"].apply(fix_geometry)
-            gdf = gdf[gdf["geometry"].notnull()]
+            # Row-dropping REMOVED -- same reasoning as the local-source
+            # branch above.
             result = compute_ppr_and_lot_shape_gdf(gdf)
             if output_mode[0] == "local":
                 out = os.path.join(output_mode[1], f"{table}_lotshape.gpkg")
