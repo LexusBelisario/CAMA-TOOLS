@@ -337,13 +337,21 @@ def run_processing():
     for src in sources:
         if barangay_source[0] == "local":
             local_name = get_local_name(src)
-            b_gdf = read_vector_file(src).to_crs(epsg=3857)
+            b_gdf_raw = read_vector_file(src)
         else:
             local_name = src
             geom_col = get_geom_column(engine, schema, src)
-            b_gdf = gpd.read_postgis(
+            b_gdf_raw = gpd.read_postgis(
                 f'SELECT * FROM "{schema}"."{src}"', engine, geom_col=geom_col
-            ).to_crs(epsg=3857)
+            )
+
+        # Preserve the parcel layer's original CRS so the final output
+        # can be reprojected back to it before saving. 3857 (below) is
+        # only the working CRS used for the spatial join against the
+        # influence/thematic layers -- not the intended CRS of the
+        # saved output. Captured now, before b_gdf gets reprojected.
+        original_crs = b_gdf_raw.crs
+        b_gdf = b_gdf_raw.to_crs(epsg=3857)
 
         b_gdf = ensure_geometry_column(b_gdf)
         b_gdf = transfer_attributes(b_gdf, influence_gdfs)
@@ -357,8 +365,14 @@ def run_processing():
             if b_gdf.crs is None:
                 raise RuntimeError("❌ Cannot write file: CRS is None")
 
-            # 2️⃣ Reproject to WGS84
-            b_gdf = b_gdf.to_crs(epsg=4326)
+            # 2️⃣ Restore the parcel layer's original CRS (captured
+            # above, before the 3857 working-CRS reprojection). Falls
+            # back to WGS84 only if the source itself had no CRS to
+            # begin with -- there's nothing to "restore" in that case.
+            if original_crs is not None:
+                b_gdf = b_gdf.to_crs(original_crs)
+            else:
+                b_gdf = b_gdf.to_crs(epsg=4326)
             print("🧭 CRS before save:", b_gdf.crs)
 
             # 3️⃣ Fix invalid geometries
@@ -384,6 +398,13 @@ def run_processing():
                 table_action = "new"
 
             print(f"🗂️ Saving to DB: {target_table} ({table_action})")
+
+            # Same restoration as the local-file save path above --
+            # b_gdf is still in the 3857 working CRS at this point.
+            if original_crs is not None:
+                b_gdf = b_gdf.to_crs(original_crs)
+            else:
+                b_gdf = b_gdf.to_crs(epsg=4326)
 
             b_gdf.to_postgis(
                 target_table,
@@ -574,6 +595,12 @@ def open_main_window(root):
     influence_db_tables   = []
     output_local_dir      = tk.StringVar(master=win)
 
+    # run_status_var: drives the always-visible status label under the
+    # Run button ("Please select ..." / "Ready to run.") and mirrors
+    # whether the Run button itself is enabled. Updated by
+    # _update_run_button_state() below.
+    run_status_var = tk.StringVar(master=win, value="Preparing…")
+
     PAD = dict(padx=8, pady=4)
 
     def section_label(parent, text):
@@ -620,6 +647,13 @@ def open_main_window(root):
             parcel_local_paths.clear()
             parcel_local_paths.extend(files)
             parcel_files_var.set(f"{len(files)} file(s) selected")
+            _update_run_button_state()
+
+    def _on_parcel_db_selected(sel):
+        parcel_db_tables.clear()
+        parcel_db_tables.extend(sel)
+        parcel_db_label.set(f"{len(sel)} table(s) selected")
+        _update_run_button_state()
 
     def browse_parcel_db():
         creds = load_db_credentials()
@@ -629,11 +663,7 @@ def open_main_window(root):
         if not tables:
             messagebox.showwarning("No Tables", "No tables found in the database schema.")
             return
-        _pick_db_tables(win, tables, multi=True,
-            on_select=lambda sel: (
-                parcel_db_tables.__setitem__(slice(None), sel)
-                or parcel_db_label.set(f"{len(sel)} table(s) selected")
-            ))
+        _pick_db_tables(win, tables, multi=True, on_select=_on_parcel_db_selected)
 
     def _toggle_parcel():
         if parcel_source_type.get() == "local":
@@ -642,6 +672,7 @@ def open_main_window(root):
         else:
             parcel_lbl.config(textvariable=parcel_db_label)
             parcel_btn.config(text="Select…", command=browse_parcel_db)
+        _update_run_button_state()
 
     # ── SECTION 2: INFLUENCE MAP ─────────────────────────────────
     section_label(win, "Influence Map Source")
@@ -679,6 +710,13 @@ def open_main_window(root):
             influence_local_paths.clear()
             influence_local_paths.extend(files)
             infl_files_var.set(f"{len(files)} file(s) selected")
+            _update_run_button_state()
+
+    def _on_influence_db_selected(sel):
+        influence_db_tables.clear()
+        influence_db_tables.extend(sel)
+        infl_db_label.set(f"{len(sel)} table(s) selected")
+        _update_run_button_state()
 
     def browse_influence_db():
         creds = load_db_credentials()
@@ -688,11 +726,7 @@ def open_main_window(root):
         if not tables:
             messagebox.showwarning("No Tables", "No tables found in the database schema.")
             return
-        _pick_db_tables(win, tables, multi=True,
-            on_select=lambda sel: (
-                influence_db_tables.__setitem__(slice(None), sel)
-                or infl_db_label.set(f"{len(sel)} table(s) selected")
-            ))
+        _pick_db_tables(win, tables, multi=True, on_select=_on_influence_db_selected)
 
     def _toggle_influence():
         if influence_source_type.get() == "local":
@@ -701,6 +735,7 @@ def open_main_window(root):
         else:
             infl_lbl.config(textvariable=infl_db_label)
             infl_btn.config(text="Select…", command=browse_influence_db)
+        _update_run_button_state()
 
     # ── SECTION 3: OUTPUT ────────────────────────────────────────
     section_label(win, "Output Destination")
@@ -736,6 +771,7 @@ def open_main_window(root):
         if d:
             output_local_dir.set(d)
             output_dir_var.set(d)
+            _update_run_button_state()
 
     def _toggle_output():
         if output_dest_type.get() == "local":
@@ -747,6 +783,7 @@ def open_main_window(root):
             out_lbl.config(textvariable=output_db_var,
                            font=("Segoe UI", 8, "italic"), fg="gray")
             out_btn.pack_forget()
+        _update_run_button_state()
 
     # ── RUN BUTTON ───────────────────────────────────────────────
     ttk.Separator(win, orient="horizontal").pack(
@@ -796,14 +833,69 @@ def open_main_window(root):
         win.destroy()
         run_processing()
 
-    tk.Button(win, text="▶  Run Processing", command=on_run,
-              bg="#2e7d32", fg="white",
+    # Single source of truth for the Run button's enabled/disabled
+    # colors -- used both at button creation and inside
+    # _update_run_button_state() below, so there's only one place to
+    # change if the theme changes later.
+    RUN_BTN_BG_ENABLED  = "#2e7d32"
+    RUN_BTN_FG_ENABLED  = "white"
+    RUN_BTN_BG_DISABLED = "#e0e0e0"
+    RUN_BTN_FG_DISABLED = "#888888"
+
+    def _update_run_button_state():
+        """
+        Single source of truth for whether the Run button may be
+        pressed. Disabled (with an explanatory status message) until a
+        Land Parcel source, an Influence Map source, and an Output
+        destination are all selected.
+
+        Explicit bg/fg/cursor toggling (not just state=) is required:
+        Tkinter does NOT automatically gray out a classic tk.Button's
+        custom bg/fg when state="disabled", and does not suppress a
+        widget's assigned cursor either -- both must be set explicitly
+        for each state.
+        """
+        has_parcel = bool(parcel_local_paths) if parcel_source_type.get() == "local" else bool(parcel_db_tables)
+        has_influence = bool(influence_local_paths) if influence_source_type.get() == "local" else bool(influence_db_tables)
+        has_output = bool(output_local_dir.get()) if output_dest_type.get() == "local" else True
+
+        if not has_parcel:
+            run_status_var.set("Please select a Land Parcel source.")
+            ready = False
+        elif not has_influence:
+            run_status_var.set("Please select an Influence Map source.")
+            ready = False
+        elif not has_output:
+            run_status_var.set("Please select an Output destination.")
+            ready = False
+        else:
+            run_status_var.set("Ready to run.")
+            ready = True
+
+        if ready:
+            run_btn.config(state="normal", cursor="hand2",
+                            bg=RUN_BTN_BG_ENABLED, fg=RUN_BTN_FG_ENABLED)
+        else:
+            run_btn.config(state="disabled", cursor="no",
+                            bg=RUN_BTN_BG_DISABLED, fg=RUN_BTN_FG_DISABLED,
+                            disabledforeground=RUN_BTN_FG_DISABLED)
+
+    run_btn = tk.Button(win, text="▶  Run Processing", command=on_run,
+              bg=RUN_BTN_BG_ENABLED, fg=RUN_BTN_FG_ENABLED,
               font=("Segoe UI", 10, "bold"),
-              relief="flat", padx=16, pady=6).pack(pady=(4, 14))
+              relief="flat", padx=16, pady=6)
+    run_btn.pack(pady=(4, 4))
+
+    # Permanent status line UNDER the Run button -- always visible, no
+    # hover required.
+    run_status_lbl = tk.Label(win, textvariable=run_status_var,
+                              font=("Segoe UI", 8), fg="gray")
+    run_status_lbl.pack(pady=(0, 12))
 
     _toggle_parcel()
     _toggle_influence()
     _toggle_output()
+    _update_run_button_state()
 
 
 # -------------------- MAIN --------------------

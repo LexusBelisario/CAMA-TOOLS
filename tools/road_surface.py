@@ -1,4 +1,5 @@
 import os
+import math
 import tkinter as tk
 from tkinter import filedialog, messagebox, Listbox
 import geopandas as gpd
@@ -69,12 +70,53 @@ road_source = None
 output_mode = None
 
 # ---------------- CRS Helper ----------------
-def get_prs92_zone(gdf):
-    """Determine PRS92 zone based on centroid longitude."""
-    if gdf.crs is None:
-        gdf = gdf.set_crs(epsg=4326)  
-    gdf_wgs84 = gdf.to_crs(epsg=4326)
-    lon = gdf_wgs84.unary_union.centroid.x
+def get_prs92_zone(labeled_gdfs):
+    """
+    Choose PRS92 zone EPSG from the combined bbox-midpoint longitude of
+    one or more input GeoDataFrames.
+
+    labeled_gdfs: list of (label, gdf) tuples, e.g.
+        [("Land Parcel", brgy_gdf), ("Road Network", road_gdf)]
+    The label is used only for diagnostics. It has no effect on CRS
+    detection.
+
+    Auxiliary layers without usable geometry are ignored for CRS zone
+    determination. Downstream processing may still validate required
+    layers independently.
+
+    Uses total_bounds, not a unioned-geometry centroid -- unary_union.centroid
+    is a known source of GEOS TopologyExceptions on real-world cadastral
+    data with invalid geometries. Same zone-boundary thresholds as
+    before; only the longitude used to evaluate them has changed.
+    """
+    valid = [
+        (label, g) for label, g in labeled_gdfs
+        if g is not None and not g.empty and g.geometry.notna().any()
+    ]
+    if not valid:
+        raise ValueError("No valid (non-empty) GeoDataFrames provided for PRS92 zone detection.")
+
+    all_bounds = []
+    for label, g in valid:
+        if g.crs is None:
+            g = g.set_crs(epsg=4326)
+        epsg = g.crs.to_epsg()
+        if epsg != 4326:
+            g_wgs84 = g.to_crs(epsg=4326)
+        else:
+            g_wgs84 = g
+
+        bounds = g_wgs84.total_bounds
+        if any(math.isnan(v) for v in bounds):
+            raise ValueError(
+                f"Cannot determine PRS92 zone because the '{label}' layer "
+                f"contains no valid geometry."
+            )
+        all_bounds.append(bounds)
+
+    minx = min(b[0] for b in all_bounds)
+    maxx = max(b[2] for b in all_bounds)
+    lon = (minx + maxx) / 2
     if lon < 118: return 3121
     elif lon < 120: return 3122
     elif lon < 122: return 3123
@@ -119,12 +161,23 @@ def open_in_global_mapper(path):
         subprocess.Popen([GM_EXE_PATH, path], shell=True)
 
 # ---------------- Processing ----------------
+# NOTE (Part A3 investigation, resolved as NOT needed): unlike
+# land_shape_compactness.py, this tool has no fix_geometry() helper at
+# all. Investigated whether it should -- the operations below are
+# geometry.intersects() (against a positive-distance road buffer, not
+# buffer(0)), geometry.distance() from a parcel centroid, and .centroid
+# itself. None of these require a full boolean set operation (union,
+# intersection) across a whole collection -- the operation class
+# responsible for the confirmed unary_union.centroid crash risk found
+# elsewhere in this project. Empirically confirmed .intersects() and
+# .distance() both return without crashing on a self-intersecting test
+# polygon, including at GeoSeries batch level. No fix_geometry() added.
 def process_surface(brgy_gdf, road_gdf):
     # Save original CRS
     orig_crs = brgy_gdf.crs
 
-    # Temporary reproject to PRS92
-    zone_epsg = get_prs92_zone(brgy_gdf)
+    # Temporary reproject to PRS92 (combined parcel + road extent)
+    zone_epsg = get_prs92_zone([("Land Parcel", brgy_gdf), ("Road Network", road_gdf)])
     print(f"🌍 Reprojecting layers to EPSG:{zone_epsg} for processing...")
     brgy_gdf = brgy_gdf.to_crs(epsg=zone_epsg)
     road_gdf = road_gdf.to_crs(epsg=zone_epsg)
@@ -262,6 +315,16 @@ def open_main_window(root):
     road_db_table      = tk.StringVar(master=win)
     output_local_dir   = tk.StringVar(master=win)
 
+    # run_status_var: drives the always-visible status label under the
+    # Run button ("Please select ..." / "Ready to run.") and mirrors
+    # whether the Run button itself is enabled. Updated by
+    # _update_run_button_state() below. Its validation-order cascade
+    # intentionally mirrors on_run()'s own validation order below --
+    # conscious duplication for a minimal-risk, additive gating layer,
+    # not a refactor of on_run() itself; keep the two in sync if this
+    # tool's required inputs ever change.
+    run_status_var = tk.StringVar(master=win, value="Preparing…")
+
     PAD = dict(padx=8, pady=4)
 
     def section_label(parent, text):
@@ -307,6 +370,13 @@ def open_main_window(root):
             parcel_local_paths.clear()
             parcel_local_paths.extend(files)
             parcel_files_var.set(f"{len(files)} file(s) selected")
+            _update_run_button_state()
+
+    def _on_parcel_db_selected(sel):
+        parcel_db_tables.clear()
+        parcel_db_tables.extend(sel)
+        parcel_db_label.set(f"{len(sel)} table(s) selected")
+        _update_run_button_state()
 
     def browse_parcel_db():
         creds = load_db_credentials()
@@ -319,11 +389,7 @@ def open_main_window(root):
         if not tables:
             messagebox.showwarning("No Tables", "No tables found in the database schema.")
             return
-        _pick_db_tables(win, tables, multi=True,
-            on_select=lambda sel: (
-                parcel_db_tables.__setitem__(slice(None), sel)
-                or parcel_db_label.set(f"{len(sel)} table(s) selected")
-            ))
+        _pick_db_tables(win, tables, multi=True, on_select=_on_parcel_db_selected)
 
     def _toggle_parcel():
         if parcel_source_type.get() == "local":
@@ -332,6 +398,7 @@ def open_main_window(root):
         else:
             parcel_lbl.config(textvariable=parcel_db_label)
             parcel_btn.config(text="Select…", command=browse_parcel_db)
+        _update_run_button_state()
 
     # ── SECTION 2: ROAD NETWORK ──────────────────────────────────
     section_label(win, "Road Network Source")
@@ -367,6 +434,17 @@ def open_main_window(root):
         if f:
             road_local_path.set(f)
             road_file_var.set(os.path.basename(f))
+            _update_run_button_state()
+
+    def _on_road_db_selected(sel):
+        # _pick_db_tables() only invokes on_select after a confirmed
+        # selection, so sel is never empty here -- the original
+        # lambda's "if sel else None" branch was a redundant
+        # conditional. Switching to a named callback is a readability
+        # change only; no behavior change.
+        road_db_table.set(sel[0])
+        road_db_var.set(sel[0])
+        _update_run_button_state()
 
     def browse_road_db():
         creds = load_db_credentials()
@@ -379,11 +457,7 @@ def open_main_window(root):
         if not tables:
             messagebox.showwarning("No Tables", "No tables found in the database schema.")
             return
-        _pick_db_tables(win, tables, multi=False,
-            on_select=lambda sel: (
-                road_db_table.set(sel[0]) if sel else None,
-                road_db_var.set(sel[0] if sel else "No table selected")
-            ))
+        _pick_db_tables(win, tables, multi=False, on_select=_on_road_db_selected)
 
     def _toggle_road():
         if road_source_type.get() == "local":
@@ -392,6 +466,7 @@ def open_main_window(root):
         else:
             road_lbl.config(textvariable=road_db_var)
             road_btn.config(text="Select…", command=browse_road_db)
+        _update_run_button_state()
 
     # ── SECTION 3: OUTPUT ────────────────────────────────────────
     section_label(win, "Output Destination")
@@ -427,6 +502,7 @@ def open_main_window(root):
         if d:
             output_local_dir.set(d)
             output_dir_var.set(d)
+            _update_run_button_state()
 
     def _toggle_output():
         if output_dest_type.get() == "local":
@@ -438,6 +514,7 @@ def open_main_window(root):
             out_lbl.config(textvariable=output_db_var,
                            font=("Segoe UI", 8, "italic"), fg="gray")
             out_btn.pack_forget()
+        _update_run_button_state()
 
     # ── RUN BUTTON ───────────────────────────────────────────────
     ttk.Separator(win, orient="horizontal").pack(
@@ -487,14 +564,75 @@ def open_main_window(root):
         win.destroy()
         run_processing()
 
-    tk.Button(win, text="▶  Run Processing", command=on_run,
-              bg="#2e7d32", fg="white",
+    # Single source of truth for the Run button's enabled/disabled
+    # colors -- used both at button creation and inside
+    # _update_run_button_state() below, so there's only one place to
+    # change if the theme changes later.
+    RUN_BTN_BG_ENABLED  = "#2e7d32"
+    RUN_BTN_FG_ENABLED  = "white"
+    RUN_BTN_BG_DISABLED = "#e0e0e0"
+    RUN_BTN_FG_DISABLED = "#888888"
+
+    def _update_run_button_state():
+        """
+        Single source of truth for whether the Run button may be
+        pressed. Disabled (with an explanatory status message) until a
+        Land Parcel source, a Road Network source, and an Output
+        destination are all present.
+
+        The cascade below intentionally mirrors on_run()'s own
+        validation order further down -- conscious duplication for a
+        minimal-risk, additive gating layer, not a refactor of on_run()
+        itself. Keep the two in sync if this tool's required inputs
+        ever change.
+
+        Explicit bg/fg/cursor toggling (not just state=) is required:
+        Tkinter does NOT automatically gray out a classic tk.Button's
+        custom bg/fg when state="disabled", and does not suppress a
+        widget's assigned cursor either -- both must be set explicitly
+        for each state.
+        """
+        has_parcel = bool(parcel_local_paths) if parcel_source_type.get() == "local" else bool(parcel_db_tables)
+        has_road = bool(road_local_path.get()) if road_source_type.get() == "local" else bool(road_db_table.get())
+        has_output = bool(output_local_dir.get()) if output_dest_type.get() == "local" else True
+
+        if not has_parcel:
+            run_status_var.set("Please select a Land Parcel source.")
+            ready = False
+        elif not has_road:
+            run_status_var.set("Please select a Road Network source.")
+            ready = False
+        elif not has_output:
+            run_status_var.set("Please select an Output destination.")
+            ready = False
+        else:
+            run_status_var.set("Ready to run.")
+            ready = True
+
+        if ready:
+            run_btn.config(state="normal", cursor="hand2",
+                            bg=RUN_BTN_BG_ENABLED, fg=RUN_BTN_FG_ENABLED)
+        else:
+            run_btn.config(state="disabled", cursor="no",
+                            bg=RUN_BTN_BG_DISABLED, fg=RUN_BTN_FG_DISABLED,
+                            disabledforeground=RUN_BTN_FG_DISABLED)
+
+    run_btn = tk.Button(win, text="▶  Run Processing", command=on_run,
+              bg=RUN_BTN_BG_ENABLED, fg=RUN_BTN_FG_ENABLED,
               font=("Segoe UI", 10, "bold"),
-              relief="flat", padx=16, pady=6).pack(pady=(4, 14))
+              relief="flat", padx=16, pady=6)
+    run_btn.pack(pady=(4, 4))
+
+    # Permanent status line UNDER the Run button -- always visible, no
+    # hover required.
+    run_status_lbl = tk.Label(win, textvariable=run_status_var,
+                              font=("Segoe UI", 8), fg="gray")
+    run_status_lbl.pack(pady=(0, 12))
 
     _toggle_parcel()
     _toggle_road()
     _toggle_output()
+    _update_run_button_state()
 
 
 # ---------------- Run ----------------

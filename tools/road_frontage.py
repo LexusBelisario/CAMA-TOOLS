@@ -203,40 +203,80 @@ PRS92_ZONE_BOUNDS = [
 ]
 
 
-def detect_prs92_zone(gdf):
+def detect_prs92_zone(labeled_gdfs):
     """
-    Auto-detect the correct PRS92 zone EPSG code from the bounding-box
-    midpoint longitude of the input GeoDataFrame.
+    Auto-detect the correct PRS92 zone EPSG code from the COMBINED
+    bounding-box midpoint longitude of one or more input GeoDataFrames.
 
-    If the layer has no CRS defined, WGS84 (EPSG:4326) is assumed and a
-    warning string is returned alongside the zone so the caller can
-    surface it to the operator — processing continues rather than
-    aborting, but the resulting measurements may be wrong if the actual
-    source CRS was something other than WGS84.
+    labeled_gdfs: list of (label, gdf) tuples, e.g.
+        [("Land Parcel", brgy_gdf), ("Road Network", road_gdf)]
+    The label is used only for diagnostics. It has no effect on CRS
+    detection.
+
+    If a layer has no CRS defined, WGS84 (EPSG:4326) is assumed and a
+    warning string naming that layer is included in the returned
+    warning so the caller can surface it to the operator — processing
+    continues rather than aborting, but the resulting measurements may
+    be wrong if the actual source CRS was something other than WGS84.
+    Multiple such warnings (one per affected layer) are joined into a
+    single multi-line string rather than the last one silently
+    overwriting the others.
 
     Uses total_bounds (min/max coordinates) rather than a unioned-geometry
     centroid. A union across an entire large parcel layer is a known
     source of GEOS TopologyExceptions on real-world cadastral data —
     confirmed by reproducing the exact failure this tool hit in
     production. total_bounds is pure min/max arithmetic and carries no
-    such risk, at the cost of being slightly less representative of the
-    dataset's true center for a layer with very unevenly distributed
-    parcels near a zone boundary — a much smaller and purely theoretical
-    concern next to a confirmed production crash.
+    such risk.
+
+    Auxiliary layers (e.g. Road Network) without usable geometry are
+    ignored for CRS zone determination -- zone detection proceeds as
+    long as at least one valid layer remains. Downstream processing
+    (the "if road_gdf.empty:" check further down) already has its own,
+    more specific error for a missing/unusable road layer, so failing
+    zone detection over it here would only produce a less helpful
+    message for the same situation.
+
+    A layer with no usable geometry at all (all-null, or
+    all-empty-but-non-null shapes) raises a ValueError naming that
+    specific layer, rather than silently corrupting the computed
+    longitude into NaN.
 
     Returns (epsg, warning) where warning is None when no CRS issue was
-    found, or a string describing the issue otherwise.
+    found, or a string describing the issue(s) otherwise.
     """
-    warning = None
-    if gdf.crs is None:
-        gdf = gdf.set_crs(epsg=4326)
-        warning = (
-            "No CRS found in the dataset -- assuming WGS84. "
-            "Measurements may be incorrect if the actual CRS is different."
-        )
+    valid = [
+        (label, g) for label, g in labeled_gdfs
+        if g is not None and not g.empty and g.geometry.notna().any()
+    ]
+    if not valid:
+        raise ValueError("No valid (non-empty) GeoDataFrames provided for PRS92 zone detection.")
 
-    gdf_wgs84 = gdf.to_crs(epsg=4326) if gdf.crs.to_epsg() != 4326 else gdf
-    minx, miny, maxx, maxy = gdf_wgs84.total_bounds
+    warnings = []
+    all_bounds = []
+    for label, gdf in valid:
+        g = gdf
+        if g.crs is None:
+            g = g.set_crs(epsg=4326)
+            warnings.append(
+                f"No CRS found in the '{label}' layer -- assuming WGS84. "
+                "Measurements may be incorrect if the actual CRS is different."
+            )
+        epsg = g.crs.to_epsg()
+        g_wgs84 = g.to_crs(epsg=4326) if epsg != 4326 else g
+
+        bounds = g_wgs84.total_bounds
+        if np.isnan(bounds).any():
+            raise ValueError(
+                f"Cannot determine PRS92 zone because the '{label}' layer "
+                f"contains no valid geometry."
+            )
+        all_bounds.append(bounds)
+
+    warning = "\n".join(warnings) if warnings else None
+
+    minx = min(b[0] for b in all_bounds)
+    maxx = max(b[2] for b in all_bounds)
     center_lon = (minx + maxx) / 2
 
     for lon_min, lon_max, epsg, zone_label in PRS92_ZONE_BOUNDS:
@@ -260,9 +300,17 @@ def fix_geometry(geom):
         return None
     try:
         if not geom.is_valid:
-            geom = geom.buffer(0)
-        if not geom.is_valid:
-            geom = make_valid(geom)
+            # buffer(0) is a polygon-repair technique. Applied to
+            # LineString/MultiLineString it can collapse the geometry
+            # into POLYGON EMPTY (confirmed empirically, including on
+            # already-valid LineStrings), silently destroying that
+            # feature and changing its geometry type. Line geometries
+            # are repaired directly with make_valid() instead, which
+            # handles both geometry families correctly.
+            if geom.geom_type in {"Polygon", "MultiPolygon"}:
+                geom = geom.buffer(0)
+            if not geom.is_valid:
+                geom = make_valid(geom)
         if geom.is_empty:
             return None
         return geom
@@ -329,6 +377,43 @@ MIN_FRONTAGE_THRESHOLD = 0.9
 # "Generate buffer diagnostic layer (Visual Measurement)" checkbox) to
 # visually inspect the effect of this change on real parcel data.
 FRONTAGE_BUFFER_TOLERANCE = 9
+
+
+# ========================= PARALLEL-VALIDATION ALGORITHM =========================
+# This replaces the earlier proximity-only frontage detection
+# (_edge_covered_portion(), now removed) with a three-stage pipeline:
+# candidate detection (buffer, unchanged) -> parallel validation (NEW) ->
+# measurement. See _edge_covered_pieces() below for the full
+# implementation and rationale.
+#
+# PARALLEL_ANGLE_THRESHOLD: maximum angle (degrees) between a boundary
+# segment's own direction and a road piece's local direction for that
+# road piece to be considered "running alongside" the segment (genuine
+# frontage) rather than merely crossing near it. A road piece whose
+# local angle exceeds this is rejected outright, regardless of
+# proximity -- this is what fixes the crossing-road sliver problem
+# (a road crossing near-perpendicular through a segment's buffer zone
+# used to register a small, spurious "covered" length purely from a
+# shallow angle of approach; it now contributes nothing). Deliberately
+# NOT yet tuned against real cadastral data -- treat this value as a
+# starting point for the first round of real-data validation, not a
+# final constant.
+PARALLEL_ANGLE_THRESHOLD = 25  # degrees
+
+# ROAD_DENSIFY_INTERVAL: before running the parallel-angle test, the
+# candidate road geometry is resampled into consecutive pieces of
+# approximately this length (meters), rather than testing angle between
+# the road's own ORIGINAL vertices. This exists specifically so the
+# algorithm's behavior does not depend on how densely or sparsely the
+# source road layer happened to be digitized -- a road digitized with
+# few, widely-spaced vertices and the same road digitized with many
+# closely-spaced vertices now produce the same validation result, since
+# both are resampled to this same fixed interval before any angle is
+# measured. Also used as the basis for measurement (every resampled
+# point of a validated run is projected onto the segment's axis, not
+# just the road's original vertices) so a curved road's true covered
+# range is not underestimated by relying on sparse original vertices.
+ROAD_DENSIFY_INTERVAL = 1.0  # meters
 
 
 # ========================= TWO-STAGE GATE+MEASURE (EXPERIMENT, NOT VALIDATED) =========================
@@ -876,47 +961,158 @@ def split_boundary_to_segments(boundary):
     return segments
 
 
-def _edge_covered_portion(seg, road_union, tol=10):
-    """For one elementary boundary segment (vertex-to-vertex), find which
-    portion of it — if any — is genuinely road-adjacent, using a buffer
-    confined to this segment's OWN footprint (flat-capped at cap_style=2,
-    never extended past the segment's own two endpoints).
+def _direction_vector(p0, p1):
+    """Unit direction vector from point p0 to point p1. Returns (0.0, 0.0)
+    for a degenerate (zero-length) pair -- callers must check for this
+    before using the result, since it has no meaningful angle."""
+    dx, dy = p1[0] - p0[0], p1[1] - p0[1]
+    length = math.hypot(dx, dy)
+    if length == 0:
+        return (0.0, 0.0)
+    return (dx / length, dy / length)
 
-    This replaces buffering the road network as a whole, which is
-    isotropic and was confirmed (via reproducible test) to "bleed" onto a
-    perpendicular boundary segment near a corner even when no road
-    actually runs alongside that segment. Confining the buffer to each
-    segment's own footprint eliminates that spillover by construction —
-    a corner's two meeting segments each only "see" road within their own
-    rectangle, with a small uncovered gap exactly at the corner itself.
 
-    Returns a LineString spanning only the covered sub-portion of `seg`
-    (which may be the full segment, a partial/truncated portion matching
-    where the road genuinely reaches, or None if no part of it is within
-    `tol` of any road geometry).
-    """
-    zone = seg.buffer(tol, cap_style=2)
-    road_in_zone = road_union.intersection(zone)
-    if road_in_zone.is_empty:
-        return None
+def _angle_between_deg(d1, d2):
+    """Angle between two unit direction vectors, in degrees, folded into
+    the 0-90 range (absolute value of the dot product) -- direction
+    SIGN doesn't matter for parallelism (a road running "backwards"
+    relative to the segment's own vertex ordering is still parallel)."""
+    dot = d1[0] * d2[0] + d1[1] * d2[1]
+    dot = max(-1.0, min(1.0, abs(dot)))  # clamp against float rounding past +/-1
+    return math.degrees(math.acos(dot))
 
-    gt = road_in_zone.geom_type
-    if gt == "LineString":
-        pts = list(road_in_zone.coords)
-    elif gt == "MultiLineString":
-        pts = [c for g in road_in_zone.geoms for c in g.coords]
-    elif gt == "Point":
-        pts = [(road_in_zone.x, road_in_zone.y)]
-    elif gt == "MultiPoint":
-        pts = [(p.x, p.y) for p in road_in_zone.geoms]
-    else:
-        return None
 
-    fracs = [seg.project(Point(p)) for p in pts]
+def _densify_linestring(line, interval):
+    """Resamples `line` into a list of points spaced approximately
+    `interval` apart (including both endpoints), regardless of the
+    line's own original vertex spacing. This is the mechanism that
+    makes parallel validation and measurement independent of source
+    digitizing density -- see ROAD_DENSIFY_INTERVAL's module-level
+    docstring."""
+    length = line.length
+    if length == 0:
+        return [line.coords[0]]
+    n_steps = max(1, int(length / interval))
+    return [line.interpolate(i * length / n_steps).coords[0] for i in range(n_steps + 1)]
+
+
+def _project_run_to_segment(run_pts, seg):
+    """Projects every point of one validated, contiguous run onto seg's
+    own axis, returning the LineString spanning the resulting lo/hi
+    range -- or None if the run collapses to a single point on that
+    axis (e.g. a run running exactly perpendicular to seg, which
+    shouldn't normally survive the angle test but is guarded against
+    here regardless)."""
+    fracs = [seg.project(Point(p)) for p in run_pts]
     lo, hi = min(fracs), max(fracs)
     if hi - lo < 1e-9:
         return None
     return LineString([seg.interpolate(lo), seg.interpolate(hi)])
+
+
+def _edge_covered_pieces(seg, road_union, tol=FRONTAGE_BUFFER_TOLERANCE,
+                          angle_threshold=PARALLEL_ANGLE_THRESHOLD,
+                          densify_interval=ROAD_DENSIFY_INTERVAL):
+    """For one elementary boundary segment (vertex-to-vertex), finds
+    every genuinely road-adjacent portion of it via a three-stage
+    pipeline, replacing the earlier proximity-only _edge_covered_portion().
+
+    Stage 1 -- Candidate detection (unchanged from the earlier
+    implementation): a buffer confined to this segment's OWN footprint
+    (flat-capped at cap_style=2, never extended past the segment's own
+    two endpoints) isolates nearby road geometry. This is what prevents
+    a corner's two meeting segments from "seeing" road that only runs
+    alongside the OTHER segment -- a confirmed, reproducible defect of
+    buffering the road network as a whole.
+
+    Stage 2 -- Parallel validation (NEW): the candidate road geometry is
+    densified into fixed-length pieces (ROAD_DENSIFY_INTERVAL), and EACH
+    piece is independently tested for whether its own local direction is
+    within PARALLEL_ANGLE_THRESHOLD degrees of seg's direction. A road
+    piece that merely crosses through the buffer zone at a steep angle
+    -- previously counted as a small, spurious "covered" sliver purely
+    from proximity -- is now rejected outright, regardless of how close
+    it is. Consecutive validated pieces are grouped into "runs"; a
+    SINGLE rejected piece breaks a run immediately (no gap tolerance --
+    deliberately strict for this first implementation, so the
+    algorithm's behavior stays fully deterministic and easy to validate
+    against real data before any smoothing heuristic is considered).
+
+    Stage 3 -- Measurement: each validated run is projected onto seg's
+    own axis using EVERY one of its densified points (not just the
+    road's original vertices), so a curved road's true covered range
+    isn't underestimated by relying on sparse source vertices.
+
+    Returns a LIST of covered LineString pieces along `seg` -- possibly
+    empty, possibly more than one (e.g. two separate parallel runs with
+    a rejected crossing piece between them). Deliberately NEVER merges
+    these into a single min-to-max range across the whole candidate
+    geometry -- doing so would silently re-include geometry the
+    parallel-validation stage specifically rejected. Merging validated
+    pieces that happen to be very close together is a separate,
+    deliberately deferred concern (see linemerge() at the call site,
+    which only welds pieces that already share an endpoint).
+    """
+    zone = seg.buffer(tol, cap_style=2)
+    road_in_zone = road_union.intersection(zone)
+    if road_in_zone.is_empty:
+        return []
+
+    seg_p0, seg_p1 = seg.coords[0], seg.coords[-1]
+    d_S = _direction_vector(seg_p0, seg_p1)
+    if d_S == (0.0, 0.0):
+        return []
+
+    gt = road_in_zone.geom_type
+    if gt == "LineString":
+        road_lines = [road_in_zone]
+    elif gt == "MultiLineString":
+        road_lines = list(road_in_zone.geoms)
+    elif gt == "GeometryCollection":
+        road_lines = []
+        for g in road_in_zone.geoms:
+            if g.geom_type == "LineString":
+                road_lines.append(g)
+            elif g.geom_type == "MultiLineString":
+                road_lines.extend(g.geoms)
+        # Point/MultiPoint members of the collection are skipped -- a
+        # road that only grazes the zone at an isolated point has no
+        # local direction to validate against.
+    else:
+        # Point / MultiPoint -- road only touches the zone at isolated
+        # points, no line direction to test. Correctly contributes
+        # nothing (a single touching point can't be "parallel").
+        return []
+
+    covered_pieces = []
+    for line in road_lines:
+        densified_pts = _densify_linestring(line, densify_interval)
+        if len(densified_pts) < 2:
+            continue
+
+        current_run = []
+        for i in range(len(densified_pts) - 1):
+            a, b = densified_pts[i], densified_pts[i + 1]
+            d_R = _direction_vector(a, b)
+            valid = d_R != (0.0, 0.0) and _angle_between_deg(d_S, d_R) <= angle_threshold
+
+            if valid:
+                if not current_run:
+                    current_run.append(a)
+                current_run.append(b)
+            else:
+                if len(current_run) >= 2:
+                    piece = _project_run_to_segment(current_run, seg)
+                    if piece is not None:
+                        covered_pieces.append(piece)
+                current_run = []
+
+        if len(current_run) >= 2:
+            piece = _project_run_to_segment(current_run, seg)
+            if piece is not None:
+                covered_pieces.append(piece)
+
+    return covered_pieces
 
 
 def calculate_centroid_to_road_depth(parcel_geom, road_gdf):
@@ -1143,7 +1339,7 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
         }
 
     original_crs = brgy_gdf.crs
-    zone_epsg, crs_warning = detect_prs92_zone(brgy_gdf)
+    zone_epsg, crs_warning = detect_prs92_zone([("Land Parcel", brgy_gdf), ("Road Network", road_gdf)])
 
     if crs_warning and progress:
         progress(f"Warning: {source_name}: {crs_warning}")
@@ -1324,7 +1520,7 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
                 # ends up 0.0 in Pass 3, Stage 2 never runs for this parcel.
                 gate_hit = False
                 for seg in segments:
-                    if _edge_covered_portion(seg, road_union, tol=TWO_STAGE_GATE_TOLERANCE) is not None:
+                    if _edge_covered_pieces(seg, road_union, tol=TWO_STAGE_GATE_TOLERANCE):
                         gate_hit = True
                         break
 
@@ -1335,9 +1531,9 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
                     # combined with anything from Stage 1 -- Stage 1 is
                     # purely a pass/fail gate, never a measurement.
                     for _seg_idx, seg in enumerate(segments):
-                        piece = _edge_covered_portion(seg, road_union, tol=TWO_STAGE_MEASURE_TOLERANCE)
-                        if piece is not None:
-                            covered_pieces.append(piece)
+                        pieces = _edge_covered_pieces(seg, road_union, tol=TWO_STAGE_MEASURE_TOLERANCE)
+                        if pieces:
+                            covered_pieces.extend(pieces)
                             if emit_buffer_qa:
                                 # Stage 2's buffer only -- Stage 1 is a
                                 # pass/fail gate with nothing meaningful
@@ -1350,23 +1546,25 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
                 # empty, frontage_total will be 0.0 in Pass 3.
             else:
                 for _seg_idx, seg in enumerate(segments):
-                    piece = _edge_covered_portion(seg, road_union, tol=FRONTAGE_BUFFER_TOLERANCE)
-                    if piece is not None:
-                        covered_pieces.append(piece)
+                    pieces = _edge_covered_pieces(seg, road_union, tol=FRONTAGE_BUFFER_TOLERANCE)
+                    if pieces:
+                        covered_pieces.extend(pieces)
                         if emit_buffer_qa:
                             # Explicitly passed FRONTAGE_BUFFER_TOLERANCE
-                            # above (not _edge_covered_portion()'s own
-                            # tol=10 default) -- this re-derives the
-                            # identical buffer zone actually used for
-                            # this call, it does not introduce a second,
-                            # independent tolerance value.
+                            # above (not _edge_covered_pieces()'s own
+                            # default) -- this re-derives the identical
+                            # buffer zone actually used for this call, it
+                            # does not introduce a second, independent
+                            # tolerance value.
                             seg_buffer_records.append(
                                 (_seg_idx, seg.buffer(FRONTAGE_BUFFER_TOLERANCE, cap_style=2))
                             )
             # Weld consecutive covered pieces back into continuous lines.
-            # _edge_covered_portion() works per elementary (vertex-to-vertex)
-            # segment, so a long run of adjacent covered segments would
-            # otherwise stay fragmented into many tiny pieces instead of
+            # _edge_covered_pieces() can already return MULTIPLE pieces per
+            # elementary (vertex-to-vertex) segment (e.g. two separate
+            # parallel-validated runs with a rejected crossing piece
+            # between them), and a long run of adjacent covered segments
+            # would otherwise stay fragmented into many tiny pieces instead of
             # one continuous edge — confirmed reproducible via a jagged
             # boundary test. linemerge() only welds pieces that genuinely
             # share an endpoint; two disjoint edges (e.g. both sides of a

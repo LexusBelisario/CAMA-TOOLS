@@ -72,12 +72,78 @@ output_mode = None
 buffer_size = None  # 🔹 global buffer size (meters)
 
 # ---------------- CRS Utility ----------------
-def get_prs92_zone(gdf):
-    """Choose PRS92 zone EPSG by centroid longitude."""
-    if gdf.crs is None:
-        gdf = gdf.set_crs(epsg=4326)
-    gdf_wgs84 = gdf.to_crs(epsg=4326)
-    lon = gdf_wgs84.unary_union.centroid.x
+def get_prs92_zone(labeled_gdfs):
+    """
+    Choose PRS92 zone EPSG from the combined bbox-midpoint longitude of
+    one or more input GeoDataFrames.
+
+    labeled_gdfs: list of (label, gdf) tuples, e.g.
+        [("Land Parcel", brgy_gdf), ("Road Network", road_gdf)]
+    The label is used only for diagnostics. It has no effect on CRS
+    detection.
+
+    Uses total_bounds, not a unioned-geometry centroid -- unary_union.centroid
+    is a known source of GEOS TopologyExceptions on real-world cadastral
+    data with invalid geometries (confirmed empirically: total_bounds
+    stays fine on a mix of valid + self-intersecting polygons, while
+    unary_union.centroid raises GEOSException/TopologyException on the
+    exact same input). Same zone-boundary thresholds as before; only
+    the longitude used to evaluate them has changed.
+
+    total_bounds itself does not invoke GEOS topology operations, so it
+    is not expected to raise the same TopologyException produced by
+    unary_union.centroid -- but it is NOT immune to bad input in
+    general: a GeoDataFrame with no usable geometry (all None, or all
+    empty-but-non-null Polygon() shapes) still yields NaN bounds
+    instead of crashing, which would otherwise silently fall through
+    every "lon < ..." comparison below (NaN comparisons are always
+    False) into the final "else" branch -- an incorrect zone returned
+    with no warning at all.
+
+    Two layers of defense against that:
+      1. Pre-filter: skip any gdf that's None, has zero rows, or has
+         no non-null geometry at all (geometry.notna().any()). Note
+         notna() alone does NOT catch empty-but-non-null geometries
+         (confirmed empirically -- Shapely's empty Polygon() passes
+         notna() but still produces NaN bounds), so this filter is a
+         cheap first pass, not a complete guarantee.
+      2. Per-gdf post-check: after computing each gdf's total_bounds,
+         explicitly verify it's not NaN and raise immediately, naming
+         the specific layer -- BEFORE appending to all_bounds. This has
+         to happen here and not after combining: the combination step
+         below uses Python's built-in min()/max(), not a NaN-aware
+         aggregation, so a single NaN slipping into all_bounds would
+         silently propagate or vanish depending on its position in the
+         list (confirmed empirically) rather than raising anything.
+    """
+    valid = [
+        (label, g) for label, g in labeled_gdfs
+        if g is not None and not g.empty and g.geometry.notna().any()
+    ]
+    if not valid:
+        raise ValueError("No valid (non-empty) GeoDataFrames provided for PRS92 zone detection.")
+
+    all_bounds = []
+    for label, g in valid:
+        if g.crs is None:
+            g = g.set_crs(epsg=4326)
+        epsg = g.crs.to_epsg()
+        if epsg != 4326:
+            g_wgs84 = g.to_crs(epsg=4326)
+        else:
+            g_wgs84 = g
+
+        bounds = g_wgs84.total_bounds
+        if any(math.isnan(v) for v in bounds):
+            raise ValueError(
+                f"Cannot determine PRS92 zone because the '{label}' layer "
+                f"contains no valid geometry."
+            )
+        all_bounds.append(bounds)
+
+    minx = min(b[0] for b in all_bounds)
+    maxx = max(b[2] for b in all_bounds)
+    lon = (minx + maxx) / 2
     if lon < 118: return 3121
     elif lon < 120: return 3122
     elif lon < 122: return 3123
@@ -85,6 +151,28 @@ def get_prs92_zone(gdf):
     else: return 3125
 
 # ---------------- Geometry Fix ----------------
+# NOTE (Part A3 investigation, resolved as NOT a confirmed bug): the two
+# call sites below overwrite brgy_gdf["geometry"] directly with this
+# function's repaired output, before process_density() runs -- the same
+# "writes the fix into the output column" pattern flagged as a bug in
+# other tools. Investigated specifically for THIS tool and found to be
+# architecturally different:
+#   1. process_density() only reads row.geometry.centroid from each
+#      parcel -- never buffers/intersects the parcel polygon itself.
+#   2. Empirically confirmed .centroid is safe on invalid geometry (no
+#      crash, unlike unary_union) and the resulting centroid shift after
+#      repair is negligible (~0.09m in a stress test, vs. a typical
+#      1000m search radius) -- i.e. no evidence of a materially wrong
+#      DENS_ROAD result.
+#   3. This function does NOT have the historical "keep only the
+#      largest MultiPolygon piece" defect that the older road_width.py
+#      version had (confirmed by reading its body -- it returns
+#      whatever buffer(0)/make_valid() produces, dropping nothing).
+# What remains is a genuine but different question: should this tool
+# persist repaired parcel geometry to its output at all, vs. keeping
+# the original shape (matching the convention used elsewhere in this
+# project)? That's a data-management POLICY decision, not a computation
+# bug -- left as-is pending that decision, not modified here.
 def fix_geometry(geom):
     if geom is None or geom.is_empty: 
         return None
@@ -156,8 +244,8 @@ def process_density(brgy_gdf, road_gdf, source_name=""):
     global buffer_size
     orig_crs = brgy_gdf.crs
 
-    # ✅ Project both to correct PRS92 zone
-    zone_epsg = get_prs92_zone(brgy_gdf)
+    # ✅ Project both to correct PRS92 zone (combined parcel + road extent)
+    zone_epsg = get_prs92_zone([("Land Parcel", brgy_gdf), ("Road Network", road_gdf)])
     print(f"🌍 [{source_name}] Using PRS92 EPSG:{zone_epsg}")
     brgy_proj = brgy_gdf.to_crs(epsg=zone_epsg)
     road_proj = road_gdf.to_crs(epsg=zone_epsg)
@@ -273,6 +361,16 @@ def open_main_window(root):
     output_local_dir   = tk.StringVar(master=win)
     buffer_var         = tk.StringVar(master=win, value="1000")
 
+    # run_status_var: drives the always-visible status label under the
+    # Run button ("Please select ..." / "Ready to run.") and mirrors
+    # whether the Run button itself is enabled. Updated by
+    # _update_run_button_state() below. Its validation-order cascade
+    # intentionally mirrors on_run()'s own validation order below --
+    # conscious duplication for a minimal-risk, additive gating layer,
+    # not a refactor of on_run() itself; keep the two in sync if this
+    # tool's required inputs ever change.
+    run_status_var = tk.StringVar(master=win, value="Preparing…")
+
     PAD = dict(padx=8, pady=4)
 
     def section_label(parent, text):
@@ -318,6 +416,13 @@ def open_main_window(root):
             parcel_local_paths.clear()
             parcel_local_paths.extend(files)
             parcel_files_var.set(f"{len(files)} file(s) selected")
+            _update_run_button_state()
+
+    def _on_parcel_db_selected(sel):
+        parcel_db_tables.clear()
+        parcel_db_tables.extend(sel)
+        parcel_db_label.set(f"{len(sel)} table(s) selected")
+        _update_run_button_state()
 
     def browse_parcel_db():
         creds = load_db_credentials()
@@ -328,11 +433,7 @@ def open_main_window(root):
         if not tables:
             messagebox.showwarning("No Tables", "No tables found in the database schema.")
             return
-        _pick_db_tables(win, tables, multi=True,
-            on_select=lambda sel: (
-                parcel_db_tables.__setitem__(slice(None), sel)
-                or parcel_db_label.set(f"{len(sel)} table(s) selected")
-            ))
+        _pick_db_tables(win, tables, multi=True, on_select=_on_parcel_db_selected)
 
     def _toggle_parcel():
         if parcel_source_type.get() == "local":
@@ -341,6 +442,7 @@ def open_main_window(root):
         else:
             parcel_lbl.config(textvariable=parcel_db_label)
             parcel_btn.config(text="Select…", command=browse_parcel_db)
+        _update_run_button_state()
 
     # ── SECTION 2: ROAD NETWORK ──────────────────────────────────
     section_label(win, "Road Network Source")
@@ -376,6 +478,17 @@ def open_main_window(root):
         if f:
             road_local_path.set(f)
             road_file_var.set(os.path.basename(f))
+            _update_run_button_state()
+
+    def _on_road_db_selected(sel):
+        # _pick_db_tables() only invokes on_select after a confirmed
+        # selection, so sel is never empty here -- the original
+        # lambda's "if sel else None" branch was a redundant
+        # conditional. Switching to a named callback is a readability
+        # change only; no behavior change.
+        road_db_table.set(sel[0])
+        road_db_var.set(sel[0])
+        _update_run_button_state()
 
     def browse_road_db():
         creds = load_db_credentials()
@@ -386,11 +499,7 @@ def open_main_window(root):
         if not tables:
             messagebox.showwarning("No Tables", "No tables found in the database schema.")
             return
-        _pick_db_tables(win, tables, multi=False,
-            on_select=lambda sel: (
-                road_db_table.set(sel[0]) if sel else None,
-                road_db_var.set(sel[0] if sel else "No table selected")
-            ))
+        _pick_db_tables(win, tables, multi=False, on_select=_on_road_db_selected)
 
     def _toggle_road():
         if road_source_type.get() == "local":
@@ -399,6 +508,7 @@ def open_main_window(root):
         else:
             road_lbl.config(textvariable=road_db_var)
             road_btn.config(text="Select…", command=browse_road_db)
+        _update_run_button_state()
 
     # ── SECTION 3: BUFFER RADIUS ─────────────────────────────────
     section_label(win, "Buffer Radius")
@@ -444,6 +554,7 @@ def open_main_window(root):
         if d:
             output_local_dir.set(d)
             output_dir_var.set(d)
+            _update_run_button_state()
 
     def _toggle_output():
         if output_dest_type.get() == "local":
@@ -455,6 +566,7 @@ def open_main_window(root):
             out_lbl.config(textvariable=output_db_var,
                            font=("Segoe UI", 8, "italic"), fg="gray")
             out_btn.pack_forget()
+        _update_run_button_state()
 
     # ── RUN BUTTON ───────────────────────────────────────────────
     ttk.Separator(win, orient="horizontal").pack(
@@ -514,14 +626,95 @@ def open_main_window(root):
         win.destroy()
         run_processing()
 
-    tk.Button(win, text="▶  Run Processing", command=on_run,
-              bg="#2e7d32", fg="white",
+    # Single source of truth for the Run button's enabled/disabled
+    # colors -- used both at button creation and inside
+    # _update_run_button_state() below, so there's only one place to
+    # change if the theme changes later.
+    RUN_BTN_BG_ENABLED  = "#2e7d32"
+    RUN_BTN_FG_ENABLED  = "white"
+    RUN_BTN_BG_DISABLED = "#e0e0e0"
+    RUN_BTN_FG_DISABLED = "#888888"
+
+    def _is_valid_buffer(value):
+        """
+        Same acceptance rule on_run() already applies (float, > 0) --
+        used here only to gate the Run button, not to clamp or
+        auto-correct buffer_var itself.
+        """
+        try:
+            r = float(value)
+        except (TypeError, ValueError):
+            return False
+        return r > 0
+
+    def _update_run_button_state():
+        """
+        Single source of truth for whether the Run button may be
+        pressed. Disabled (with an explanatory status message) until a
+        Land Parcel source, a Road Network source, a valid positive
+        buffer radius, and an Output destination are all present.
+
+        The cascade below intentionally mirrors on_run()'s own
+        validation order further down -- conscious duplication for a
+        minimal-risk, additive gating layer, not a refactor of on_run()
+        itself. Keep the two in sync if this tool's required inputs
+        ever change.
+
+        Explicit bg/fg/cursor toggling (not just state=) is required:
+        Tkinter does NOT automatically gray out a classic tk.Button's
+        custom bg/fg when state="disabled", and does not suppress a
+        widget's assigned cursor either -- both must be set explicitly
+        for each state.
+        """
+        has_parcel = bool(parcel_local_paths) if parcel_source_type.get() == "local" else bool(parcel_db_tables)
+        has_road = bool(road_local_path.get()) if road_source_type.get() == "local" else bool(road_db_table.get())
+        has_output = bool(output_local_dir.get()) if output_dest_type.get() == "local" else True
+        buffer_ok = _is_valid_buffer(buffer_var.get())
+
+        if not has_parcel:
+            run_status_var.set("Please select a Land Parcel source.")
+            ready = False
+        elif not has_road:
+            run_status_var.set("Please select a Road Network source.")
+            ready = False
+        elif not buffer_ok:
+            run_status_var.set("Please enter a valid buffer radius.")
+            ready = False
+        elif not has_output:
+            run_status_var.set("Please select an Output destination.")
+            ready = False
+        else:
+            run_status_var.set("Ready to run.")
+            ready = True
+
+        if ready:
+            run_btn.config(state="normal", cursor="hand2",
+                            bg=RUN_BTN_BG_ENABLED, fg=RUN_BTN_FG_ENABLED)
+        else:
+            run_btn.config(state="disabled", cursor="no",
+                            bg=RUN_BTN_BG_DISABLED, fg=RUN_BTN_FG_DISABLED,
+                            disabledforeground=RUN_BTN_FG_DISABLED)
+
+    run_btn = tk.Button(win, text="▶  Run Processing", command=on_run,
+              bg=RUN_BTN_BG_ENABLED, fg=RUN_BTN_FG_ENABLED,
               font=("Segoe UI", 10, "bold"),
-              relief="flat", padx=16, pady=6).pack(pady=(4, 14))
+              relief="flat", padx=16, pady=6)
+    run_btn.pack(pady=(4, 4))
+
+    # Permanent status line UNDER the Run button -- always visible, no
+    # hover required.
+    run_status_lbl = tk.Label(win, textvariable=run_status_var,
+                              font=("Segoe UI", 8), fg="gray")
+    run_status_lbl.pack(pady=(0, 12))
+
+    # Live-updates the Run button as the user types in the buffer
+    # radius field, without requiring focus-out or Enter.
+    buffer_var.trace_add("write", lambda *_: _update_run_button_state())
 
     _toggle_parcel()
     _toggle_road()
     _toggle_output()
+    _update_run_button_state()
 
 
 # ---------------- Main Processing ----------------

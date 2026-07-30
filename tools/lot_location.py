@@ -112,6 +112,19 @@ output_mode = None
 # list => no filtering (default / backward-compatible behavior).
 road_type_excluded_values = []
 
+# lot_location_column_overrides: {path_or_table: existing_col_name} — for
+# any Land Parcel source where a pre-existing "lot_location"-like column
+# was detected (see the GUI's _check_parcel_lot_location_worker()) and
+# the user confirmed proceeding. Set by on_run(), read by
+# run_processing() and threaded into process_lot_location() as
+# output_column_name, so the tool writes back into the EXACT existing
+# column (preserving its original casing) instead of always writing a
+# hardcoded "LOT_LOCATION" — the latter would silently create a
+# confusing duplicate column whenever the existing one used different
+# casing (e.g. "lot_location" alongside a new "LOT_LOCATION"). A source
+# with no entry here uses the default "LOT_LOCATION" name.
+lot_location_column_overrides = {}
+
 # _road_gdf_cache: holds the most recently, successfully read road layer
 # so run_processing() can reuse it instead of re-reading the same file/DB
 # table that was already read to populate the Section 2 checklist.
@@ -136,35 +149,68 @@ PRS92_ZONE_BOUNDS = [
 ]
 
 
-def detect_prs92_zone(gdfs):
+def detect_prs92_zone(labeled_gdfs):
     """
-    Auto-detect the PRS92 zone EPSG code from the COMBINED bounding-box
-    midpoint longitude of one or more input GeoDataFrames.
+    Detect the appropriate PRS92 zone from the combined geographic
+    extent of one or more GeoDataFrames.
 
-    Canonical CRS-detection logic, standardized across CAMA GIS tools
-    (see road_frontage.py, the reference implementation): total_bounds
-    (not a unioned-geometry centroid — a known source of GEOS
-    TopologyExceptions on real-world cadastral data with invalid
-    geometries), the same PRS92_ZONE_BOUNDS table, and the same
-    missing-CRS fallback/warning behavior.
+    Parameters
+    ----------
+    labeled_gdfs
+        List of (label, GeoDataFrame) tuples, e.g.
+        [("Land Parcel", barangay_gdf), ("Road Network", road_gdf)].
+        The label is used only for diagnostics -- it has no effect on
+        CRS detection.
+
+    Returns
+    -------
+    int
+        The EPSG code of the detected PRS92 zone.
+
+    Notes
+    -----
+    Uses bounding-box midpoint (total_bounds) instead of
+    unary_union.centroid to avoid GEOS TopologyExceptions caused by
+    invalid geometries. Reprojects each input to EPSG:4326 first when
+    its CRS isn't already WGS84. Uses the COMBINED extent of every
+    GeoDataFrame passed in (this tool reprojects both the parcel and
+    road layers together).
+
+    Optional layers that are absent (None) or contain no usable
+    features are skipped. Layers that survive that initial validation
+    but still produce invalid geographic bounds (NaN) raise a
+    ValueError identifying the offending layer.
 
     Integration note (lot_location-specific): this tool has no progress
-    callback, so unlike road_frontage.py's (epsg, warning) tuple return,
-    this returns only the EPSG code — any warning is printed directly.
-    Also, since process_lot_location() reprojects both the parcel and
-    road layers together, this accepts a list of GeoDataFrames and uses
-    their COMBINED extent, rather than a single GeoDataFrame.
+    callback, so unlike road_frontage.py's (epsg, warning) tuple
+    return, this returns only the EPSG code -- any warning is printed
+    directly.
     """
+    valid = [
+        (label, g) for label, g in labeled_gdfs
+        if g is not None and not g.empty and g.geometry.notna().any()
+    ]
+    if not valid:
+        raise ValueError("No valid (non-empty) GeoDataFrames provided for PRS92 zone detection.")
+
     all_bounds = []
-    for gdf in gdfs:
+    for label, gdf in valid:
         g = gdf
         if g.crs is None:
             g = g.set_crs(epsg=4326)
-            print("⚠️ No CRS found in one of the input datasets -- assuming "
+            print(f"⚠️ No CRS found in the '{label}' layer -- assuming "
                   "WGS84. Measurements may be incorrect if the actual CRS "
                   "is different.")
-        g_wgs84 = g.to_crs(epsg=4326) if g.crs.to_epsg() != 4326 else g
-        all_bounds.append(g_wgs84.total_bounds)
+        epsg = g.crs.to_epsg()
+        g_wgs84 = g.to_crs(epsg=4326) if epsg != 4326 else g
+
+        bounds = g_wgs84.total_bounds
+        if np.isnan(bounds).any():
+            raise ValueError(
+                f"Cannot determine PRS92 zone because the '{label}' layer "
+                f"contains no valid geometry."
+            )
+        all_bounds.append(bounds)
 
     minx = min(b[0] for b in all_bounds)
     maxx = max(b[2] for b in all_bounds)
@@ -173,9 +219,9 @@ def detect_prs92_zone(gdfs):
     for lon_min, lon_max, epsg, zone_label in PRS92_ZONE_BOUNDS:
         if lon_min <= center_lon < lon_max:
             if not (lon_min <= minx and maxx < lon_max):
-                print(f"⚠️ Dataset longitude range ({minx:.4f}° to {maxx:.4f}°E) "
+                print(f"⚠️ Dataset longitude range ({minx:.4f}°E to {maxx:.4f}°E) "
                       f"extends outside the detected {zone_label} bounds "
-                      f"({lon_min}°E–{lon_max}°E). Features near the dataset "
+                      f"({lon_min}°E-{lon_max}°E). Features near the dataset "
                       f"edge may be very slightly less accurate.")
             print(f"ℹ️ Auto-detected PRS92 {zone_label} (EPSG:{epsg}) "
                   f"from combined bbox-midpoint longitude {center_lon:.4f}°E")
@@ -326,7 +372,7 @@ def label_lot_location(val):
     return {0: "Inner Lot", 1: "Road Lot", 2: "Corner Lot"}.get(val, "Unknown")
 
 
-def process_lot_location(barangay_gdf, road_gdf, source_name="", excluded_road_types=None, progress=None):
+def process_lot_location(barangay_gdf, road_gdf, source_name="", excluded_road_types=None, progress=None, output_column_name="LOT_LOCATION"):
     """
     Core classification engine. Unchanged from the prior "Double Frontage"
     fix (Intersection Buffer Test / road-name deduplication below) except
@@ -346,9 +392,16 @@ def process_lot_location(barangay_gdf, road_gdf, source_name="", excluded_road_t
         classification loop. None (default) disables progress reporting
         entirely — every call site below is guarded, so this remains
         backward-compatible with any existing caller that doesn't pass it.
+    output_column_name : str — the column name the classification is
+        written to. Defaults to "LOT_LOCATION" (this tool's normal
+        output). The GUI overrides this per-source when the selected
+        parcel layer already has an existing "lot_location"-like column
+        (any casing) — the exact existing name/casing is passed here so
+        processing writes back into that same column instead of creating
+        a hardcoded "LOT_LOCATION" alongside it as a confusing duplicate.
     """
     orig_crs = barangay_gdf.crs
-    zone_epsg = detect_prs92_zone([barangay_gdf, road_gdf])
+    zone_epsg = detect_prs92_zone([("Land Parcel", barangay_gdf), ("Road Network", road_gdf)])
     print(f"🌍 [{source_name}] Using EPSG:{zone_epsg}")
     if progress:
         progress(f"Reprojecting {source_name} to EPSG:{zone_epsg}")
@@ -480,29 +533,41 @@ def process_lot_location(barangay_gdf, road_gdf, source_name="", excluded_road_t
     })
 
     result = brgy_proj.copy()   # ORIGINAL geometry — never overwritten
-    result["ROAD_ID"] = result.index.map(grouped["ROAD_ID"].to_dict()).fillna("")
+
+    # ROAD_ID (comma-separated touched-road-feature-index string per
+    # parcel) is working data for the classification loop immediately
+    # below ONLY -- it drives the Inner/Road/Corner Lot decision (how
+    # many distinct roads a parcel touches, and which ones, for the
+    # Intersection Buffer Test), but has no use once classification is
+    # done: neither road_frontage.py nor road_width.py ever reads it,
+    # and a raw internal road-feature-index string has little diagnostic
+    # value to a human reading the attribute table either. Kept as a
+    # plain dict (index label -> ROAD_ID string), never written as a
+    # column on `result` -- it is never saved to the exported GPKG/DB
+    # table.
+    road_id_by_idx = grouped["ROAD_ID"].to_dict()
 
     # ------------------------------------------------------------------
     # Classification — replaces the old compute_lot_location() string check
     # ------------------------------------------------------------------
-    lot_locations = []
+    lot_location_codes = []
     total = len(result)
     for i, (idx, row) in enumerate(result.iterrows(), start=1):
         if progress and (i % 200 == 0 or i == 1 or i == total):
             progress(f"Classifying {source_name}: {i}/{total}", i, total)
 
-        road_id_str = row["ROAD_ID"]
+        road_id_str = road_id_by_idx.get(idx, "")
 
         # --- Inner Lot: no road contact ---
         if not road_id_str or not road_id_str.strip():
-            lot_locations.append(0)
+            lot_location_codes.append(0)
             continue
 
         id_list = [int(x) for x in road_id_str.split(",") if x.strip()]
 
         # --- Road Lot: only one road feature touched ---
         if len(id_list) == 1:
-            lot_locations.append(1)
+            lot_location_codes.append(1)
             continue
 
         # --- 2+ road features touched: need to determine Corner vs Road ---
@@ -513,7 +578,7 @@ def process_lot_location(barangay_gdf, road_gdf, source_name="", excluded_road_t
 
         # After deduplication, if only one unique road remains → Road Lot
         if len(deduped_ids) == 1:
-            lot_locations.append(1)
+            lot_location_codes.append(1)
             continue
 
         # Step 2: Intersection Buffer Test (Option C)
@@ -528,16 +593,23 @@ def process_lot_location(barangay_gdf, road_gdf, source_name="", excluded_road_t
         # a future change — better to fail loudly than silently fall back.
         parcel_geom = brgy_fixed_geom.loc[idx]
         if parcel_geom is None or parcel_geom.is_empty:
-            lot_locations.append(1)  # Can't test → default Road Lot (conservative)
+            lot_location_codes.append(1)  # Can't test → default Road Lot (conservative)
             continue
 
         if _is_corner_lot(parcel_geom, road_geoms, tolerance=CORNER_TOLERANCE_METERS):
-            lot_locations.append(2)  # Corner Lot
+            lot_location_codes.append(2)  # Corner Lot
         else:
-            lot_locations.append(1)  # Road Lot (through-lot / double frontage)
+            lot_location_codes.append(1)  # Road Lot (through-lot / double frontage)
 
-    result["LOT_LOCATION"] = lot_locations
-    result["LOT_LABEL"] = result["LOT_LOCATION"].apply(label_lot_location)
+    # output_column_name (default "LOT_LOCATION") holds the
+    # human-readable classification directly ("Inner Lot" / "Road Lot" /
+    # "Corner Lot") -- per project lead decision, this column should
+    # contain the actual classification, not an internal numeric code,
+    # and an end user has no reason to see a code column in the
+    # attribute table. lot_location_codes (0/1/2) stays purely internal
+    # to this function; label_lot_location() is applied here, once, to
+    # produce the only classification column that ends up in the output.
+    result[output_column_name] = [label_lot_location(v) for v in lot_location_codes]
 
     if progress:
         progress(f"Finished {source_name}", total, total)
@@ -652,6 +724,20 @@ def open_main_window(root):
     road_is_reading = False     # True while the background read thread is active
     road_read_ok = False        # True once the current road source has been read successfully
 
+    # Land Parcel existing-LOT_LOCATION-column check (Section 1). Mirrors
+    # the Road Network background-read shape above, and the dual-slot
+    # cache shape already proven in road_frontage.py/road_width.py's own
+    # _parcel_classification_cache -- adapted here for much lighter data
+    # (just a conflict list, not full GeoDataFrames or checklist
+    # BooleanVars, since this check's only job is a yes/no warning before
+    # Run, not building a UI checklist).
+    parcel_is_reading = False
+    parcel_existing_lot_location = []   # [(source_label, existing_col_name), ...]
+    _parcel_lot_location_cache = {
+        "local": {"key": None, "conflicts": None},
+        "db": {"key": None, "conflicts": None},
+    }
+
     PAD = dict(padx=8, pady=4)
 
     def section_label(parent, text):
@@ -673,15 +759,17 @@ def open_main_window(root):
           1. Land Parcel not selected
           2. Road Network not selected
           3. Output Destination not selected
-          4. Road Network currently being read (background thread)
-          5. Road Network selected but not yet successfully read
+          4. Land Parcel currently being checked for an existing
+             LOT_LOCATION column (background thread)
+          5. Road Network currently being read (background thread)
+          6. Road Network selected but not yet successfully read
              (covers: read failed, or hasn't completed for any other
              reason) — same corrective action as case 2, since a
              working road source isn't actually available yet either
              way, so it reuses that message rather than introducing a
              separate "something went wrong" message here.
-          6. Ready.
-        Selection-completeness (1-3) is checked before road-read status
+          7. Ready.
+        Selection-completeness (1-3) is checked before either read status
         (4-5) so the more actionable "please select X" messages take
         priority over the passive "reading..." status — the user can go
         pick an output folder while the road is still loading, for
@@ -706,6 +794,8 @@ def open_main_window(root):
             return "Please select a Road Network source."
         if not output_ok:
             return "Please select an Output Destination."
+        if parcel_is_reading:
+            return "Reading Land Parcel..."
         if road_is_reading:
             return "Reading Road Network..."
         if not road_read_ok:
@@ -751,12 +841,14 @@ def open_main_window(root):
 
     radio_row = tk.Frame(parcel_frame)
     radio_row.pack(fill="x")
-    tk.Radiobutton(radio_row, text="Local File(s)",
+    parcel_radio_local = tk.Radiobutton(radio_row, text="Local File(s)",
                    variable=parcel_source_type, value="local",
-                   command=lambda: _toggle_parcel()).pack(side="left")
-    tk.Radiobutton(radio_row, text="Database Table(s)",
+                   command=lambda: _toggle_parcel())
+    parcel_radio_local.pack(side="left")
+    parcel_radio_db = tk.Radiobutton(radio_row, text="Database Table(s)",
                    variable=parcel_source_type, value="db",
-                   command=lambda: _toggle_parcel()).pack(side="left", padx=(12, 0))
+                   command=lambda: _toggle_parcel())
+    parcel_radio_db.pack(side="left", padx=(12, 0))
 
     parcel_files_var = tk.StringVar(master=win, value="No file(s) selected")
     parcel_db_label  = tk.StringVar(master=win, value="No table(s) selected")
@@ -771,6 +863,151 @@ def open_main_window(root):
     parcel_btn = tk.Button(parcel_action_row, text="Browse…", width=10, cursor="hand2")
     parcel_btn.pack(side="left", **PAD)
 
+    parcel_read_status_var = tk.StringVar(master=win, value="")
+    parcel_read_status_lbl = tk.Label(
+        parcel_frame, textvariable=parcel_read_status_var,
+        fg="#b36b00", font=("Segoe UI", 8, "italic"), anchor="w")
+    # packed/unpacked by _set_parcel_reading_state()
+
+    def _check_parcel_lot_location_worker(sources_list, source_type):
+        """
+        Runs on a background thread. Reads each currently selected Land
+        Parcel source and checks for an existing column matching
+        "lot_location" (case-insensitive) — this tool is about to write
+        its own Inner/Road/Corner Lot classification into that column,
+        and the on_run() confirmation dialog below lets the user
+        confirm before it does. Reuses _read_road_layer_worker (defined
+        below) — despite the name, it's a generic file/DB reader, not
+        road-specific, and never touches any Tkinter widget/variable.
+
+        Returns a list of (path_or_table, existing_col_name) tuples — one
+        entry only for sources where a conflicting column was actually
+        found. The raw path/table (not a display-friendly basename) is
+        returned here so it can be used directly as a lookup key by
+        run_processing() later — the basename is derived separately,
+        only where actually needed for display (see on_run() below).
+        Sources with no conflict, or that fail to read, are simply
+        omitted — a read failure here is reported via a console warning
+        only and never blocks Run for a reason unrelated to this check's
+        own purpose; the real read, at Run time, will surface any
+        genuine failure on its own.
+        """
+        conflicts = []
+        for path_or_table in sources_list:
+            gdf, error = _read_road_layer_worker(source_type, path_or_table)
+            if error is not None or gdf is None:
+                print(f"⚠️ Could not read parcel layer to check for an "
+                      f"existing LOT_LOCATION column: {path_or_table}: {error}")
+                continue
+            existing_col = next(
+                (c for c in gdf.columns if c.lower() == "lot_location"), None
+            )
+            if existing_col:
+                conflicts.append((path_or_table, existing_col))
+        return conflicts
+
+    def _set_parcel_reading_state(is_reading):
+        """
+        Toggle GUI responsiveness while the Land Parcel existing-
+        LOT_LOCATION-column check is in progress. Mirrors
+        _set_road_reading_state() below exactly — disables the parcel
+        Browse/Select button and the Local/Database radio buttons for
+        the duration of the read, preventing a second, concurrent read
+        of the same selection.
+        """
+        nonlocal parcel_is_reading
+        parcel_is_reading = is_reading
+        if is_reading:
+            parcel_read_status_var.set("⏳ Reading Land Parcel…")
+            parcel_read_status_lbl.pack(fill="x", pady=(2, 0))
+            parcel_btn.config(state="disabled")
+            parcel_radio_local.config(state="disabled")
+            parcel_radio_db.config(state="disabled")
+        else:
+            parcel_read_status_lbl.pack_forget()
+            parcel_btn.config(state="normal")
+            parcel_radio_local.config(state="normal")
+            parcel_radio_db.config(state="normal")
+        _update_run_button_state()
+
+    def _poll_parcel_lot_location_queue(result_queue, source_type, cache_key):
+        """
+        Runs on the main thread via win.after() polling. Picks up the
+        conflict list placed on the queue by the background worker.
+        Mirrors _poll_road_read_queue() below.
+        """
+        nonlocal parcel_existing_lot_location
+        if not win.winfo_exists():
+            return
+        try:
+            conflicts = result_queue.get_nowait()
+        except queue.Empty:
+            win.after(100, lambda: _poll_parcel_lot_location_queue(
+                result_queue, source_type, cache_key))
+            return
+
+        _parcel_lot_location_cache[source_type] = {
+            "key": cache_key, "conflicts": conflicts
+        }
+        parcel_existing_lot_location = conflicts
+        _set_parcel_reading_state(False)
+
+    def _refresh_parcel_lot_location_check(force_refresh=False):
+        """
+        Background-checks every currently selected Land Parcel
+        file/table for an existing column that would collide with the
+        LOT_LOCATION column this tool is about to write — UNLESS the
+        dual-slot cache already has a still-valid entry for this exact
+        mode+selection (e.g. toggling Local <-> Database back to a
+        selection that hasn't changed), in which case the result is
+        restored instantly with no read at all.
+
+        force_refresh: when True, skips the cache-hit check entirely and
+        always re-reads, even if the cache key matches. Must be True
+        whenever this is called because the user just ACTIVELY selected
+        source(s) via Browse/Select — if they re-select the exact same
+        file(s) (e.g. after externally adding/removing a LOT_LOCATION
+        column), a plain key match would otherwise silently serve a
+        stale result. Only safe to leave at the default False on the
+        _toggle_parcel() path, where the user didn't select anything new.
+        """
+        nonlocal parcel_existing_lot_location
+        if parcel_is_reading:
+            # A check is already in flight — do not start a second,
+            # overlapping one (controls are disabled while reading, but
+            # this guard is the actual enforcement).
+            return
+
+        source_type = parcel_source_type.get()
+        sources = (list(parcel_local_paths) if source_type == "local"
+                   else list(parcel_db_tables))
+
+        if not sources:
+            # Nothing selected for this mode — nothing to check.
+            parcel_existing_lot_location = []
+            _update_run_button_state()
+            return
+
+        cache_key = tuple(sources)
+        slot = _parcel_lot_location_cache[source_type]
+        if not force_refresh and slot["key"] == cache_key and slot["conflicts"] is not None:
+            # True cache hit: same mode, exact same set of selected
+            # sources, already checked — restore with no I/O.
+            parcel_existing_lot_location = slot["conflicts"]
+            _update_run_button_state()
+            return
+
+        result_queue = queue.Queue()
+
+        def worker():
+            conflicts = _check_parcel_lot_location_worker(sources, source_type)
+            result_queue.put(conflicts)
+
+        _set_parcel_reading_state(True)
+        threading.Thread(target=worker, daemon=True).start()
+        win.after(100, lambda: _poll_parcel_lot_location_queue(
+            result_queue, source_type, cache_key))
+
     def browse_parcel_files():
         files = filedialog.askopenfilenames(filetypes=[
             ("Shapefiles", "*.shp"), ("GeoPackage", "*.gpkg"), ("All", "*.*")])
@@ -778,6 +1015,11 @@ def open_main_window(root):
             parcel_local_paths.clear()
             parcel_local_paths.extend(files)
             parcel_files_var.set(f"{len(files)} file(s) selected")
+            # A new Land Parcel selection invalidates any prior
+            # LOT_LOCATION-conflict check — force_refresh=True: the user
+            # actively chose this selection just now, so it must be
+            # checked fresh, never served from a stale cache entry.
+            _refresh_parcel_lot_location_check(force_refresh=True)
         _update_run_button_state()
 
     def browse_parcel_db():
@@ -794,6 +1036,7 @@ def open_main_window(root):
             if sel:
                 parcel_db_tables[:] = sel
                 parcel_db_label.set(f"{len(sel)} table(s) selected")
+                _refresh_parcel_lot_location_check(force_refresh=True)
             _update_run_button_state()
 
         _pick_db_tables(win, tables, multi=True, on_select=_on_parcel_tables_selected)
@@ -805,6 +1048,11 @@ def open_main_window(root):
         else:
             parcel_lbl.config(textvariable=parcel_db_label)
             parcel_btn.config(text="Select…", command=browse_parcel_db)
+        # Switching Local <-> Database does NOT clear the other mode's
+        # remembered selection — that's pre-existing behavior, left
+        # untouched. Re-check (or instantly restore from cache) whichever
+        # of the three states applies to the newly active mode.
+        _refresh_parcel_lot_location_check()
         _update_run_button_state()
 
     # ── SECTION 2: ROAD NETWORK ──────────────────────────────────
@@ -1164,7 +1412,7 @@ def open_main_window(root):
         fill="x", padx=10, pady=(12, 4))
 
     def on_run():
-        global barangay_source, road_source, output_mode, road_type_excluded_values
+        global barangay_source, road_source, output_mode, road_type_excluded_values, lot_location_column_overrides
 
         if parcel_source_type.get() == "local":
             if not parcel_local_paths:
@@ -1178,6 +1426,15 @@ def open_main_window(root):
                     "Please select at least one Land Parcel table.")
                 return
             barangay_source = ("db", parcel_db_tables)
+
+        # Defensive fallback: the Run button is normally disabled while
+        # parcel_is_reading (see _update_run_button_state), but this
+        # check is kept in case that state is ever reached inconsistently.
+        if parcel_is_reading:
+            messagebox.showerror("Missing Input",
+                "Still checking the selected Land Parcel source(s). "
+                "Please wait for the status line to finish before running.")
+            return
 
         if road_source_type.get() == "local":
             if not road_local_path.get():
@@ -1209,6 +1466,41 @@ def open_main_window(root):
             output_mode = ("local", output_local_dir.get())
         else:
             output_mode = ("db", None)
+
+        # Warn about any Land Parcel source(s) that already have a
+        # column matching "lot_location" (case-insensitive) — this tool
+        # is about to write its Inner/Road/Corner Lot classification
+        # into that column. Shown once, combined across every affected
+        # source, only here at Run time — never at Browse time, and
+        # never as a console-only message, since a user running the
+        # compiled EXE without a terminal open would never see one.
+        # Declining cancels the run entirely rather than skipping just
+        # the affected source(s), so the user always knows exactly what
+        # did or didn't happen instead of a partial batch silently going
+        # through.
+        if parcel_existing_lot_location:
+            lines = "\n".join(
+                f"• '{os.path.basename(path_or_table)}' already has a '{existing_col}' column"
+                for path_or_table, existing_col in parcel_existing_lot_location
+            )
+            proceed = messagebox.askyesno(
+                "Existing LOT_LOCATION column found",
+                f"{lines}\n\n"
+                "Processing will overwrite the existing column(s) with the "
+                "newly computed classification.\n\nProceed?"
+            )
+            if not proceed:
+                return
+            # Preserve each source's existing column name/casing exactly
+            # -- e.g. a detected "lot_location" (lowercase) is written
+            # back to "lot_location", not a hardcoded "LOT_LOCATION" --
+            # so no duplicate column is ever created regardless of the
+            # existing casing. A source with no entry here (no conflict
+            # was found) simply uses the default name in
+            # process_lot_location() below.
+            lot_location_column_overrides = dict(parcel_existing_lot_location)
+        else:
+            lot_location_column_overrides = {}
 
         road_type_excluded_values = (
             [real_value for display_text, (real_value, var) in road_type_value_vars.items()
@@ -1306,7 +1598,7 @@ def run_processing(app_root):
     any skipped sources is shown at the end instead of a raw crash
     aborting the whole batch.
     """
-    global barangay_source, road_source, output_mode, road_type_excluded_values, _road_gdf_cache
+    global barangay_source, road_source, output_mode, road_type_excluded_values, lot_location_column_overrides, _road_gdf_cache
     if not barangay_source or not road_source or not output_mode:
         messagebox.showerror("Error", "Selections incomplete (Barangay, Road, Output required).")
         return
@@ -1361,9 +1653,20 @@ def run_processing(app_root):
                     # operations, never mutating brgy_gdf's geometry
                     # column, so the exported output stays faithful to
                     # the original source shapes.
-                    result = process_lot_location(brgy_gdf, road_gdf, name,
-                                                   excluded_road_types=excluded_road_types,
-                                                   progress=progress_cb)
+                    # output_column_name: preserves the exact existing
+                    # column name/casing this source's parcel layer
+                    # already had (if the user confirmed overwriting one
+                    # at Run time — see on_run()'s confirmation dialog),
+                    # keyed by the same raw path/table string used to
+                    # iterate `sources` above. A source with no entry
+                    # here falls back to process_lot_location()'s own
+                    # default ("LOT_LOCATION").
+                    result = process_lot_location(
+                        brgy_gdf, road_gdf, name,
+                        excluded_road_types=excluded_road_types,
+                        progress=progress_cb,
+                        output_column_name=lot_location_column_overrides.get(src, "LOT_LOCATION")
+                    )
 
                     if output_mode[0] == "local":
                         out = os.path.join(output_mode[1], f"{out_base}_lot_location.gpkg")
