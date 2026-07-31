@@ -18,6 +18,37 @@ import psycopg2
 ICON_PATH = r"D:/2025_PROJECTS/BLGF-GM_TEST/FOR TESTING/DCS_CODES/BLGF.ico"
 GM_EXE_PATH = r"C:\Program Files\GlobalMapper26.1_64bit\global_mapper.exe"
 
+
+def resource_path(relative_path):
+    """PyInstaller-safe resource path -- same as all other tools."""
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
+
+def apply_icon(win):
+    """Apply BLGF icon to a Tk window -- same as all other tools."""
+    ico = resource_path("BLGF.ico")
+    png = resource_path("BLGF.png")
+
+    # Taskbar / Alt-Tab icon
+    if os.path.exists(ico):
+        try:
+            win.iconbitmap(ico)
+        except Exception:
+            pass
+
+    # Tk titlebar fallback (important)
+    if os.path.exists(png):
+        try:
+            img = tk.PhotoImage(file=png)
+            win.iconphoto(True, img)
+            win._icon_ref = img  # prevent garbage collection
+        except Exception:
+            pass
+
 def _get_credentials_path():
     if getattr(sys, "frozen", False):
         return os.path.join(os.path.dirname(sys.executable), "pg_credentials.json")
