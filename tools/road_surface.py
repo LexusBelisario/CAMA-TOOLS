@@ -1,4 +1,5 @@
 import os
+import re
 import math
 import tkinter as tk
 from tkinter import filedialog, messagebox, Listbox
@@ -68,6 +69,20 @@ CREDENTIALS_FILE = _get_credentials_path()
 barangay_source = None
 road_source = None
 output_mode = None
+
+# surface_column_overrides: {path: existing_col_name} -- for any LOCAL
+# Land Parcel source where a pre-existing "cama_rd_surface"-like column
+# was detected (see _check_parcel_surface_conflicts() below) and the
+# user confirmed proceeding at Run time. Read by run_processing() and
+# passed into process_surface() as output_column_name, so the tool
+# writes back into the EXACT existing column (preserving its original
+# casing) instead of always writing a hardcoded "CAMA_RD_SURFACE" --
+# the latter would silently create a confusing duplicate column
+# whenever the existing one used different casing. A source with no
+# entry here uses the default "CAMA_RD_SURFACE" name. Scope: LOCAL
+# sources only -- Database Land Parcel sources are explicitly out of
+# scope for this check (see _check_parcel_surface_conflicts()).
+surface_column_overrides = {}
 
 # ---------------- CRS Helper ----------------
 def get_prs92_zone(labeled_gdfs):
@@ -160,6 +175,52 @@ def open_in_global_mapper(path):
     if os.path.exists(GM_EXE_PATH) and os.path.exists(path):
         subprocess.Popen([GM_EXE_PATH, path], shell=True)
 
+
+# ========================= PARCEL COLUMN-CONFLICT CHECK =========================
+# _check_parcel_surface_conflicts(): checks LOCAL Land Parcel source(s)
+# for an existing column matching "cama_rd_surface" (case-insensitive
+# exact match) -- this tool is about to write its computed road
+# surface(s) into that column, and on_run() below shows a combined
+# confirmation dialog before proceeding.
+#
+# Same pattern as road_density.py's _check_parcel_density_conflicts()
+# and road_width.py's canonical _read_gdf_worker(): runs synchronously
+# on the main thread (this tool has no background worker thread /
+# progress window / queue-polling architecture, and adding one is out
+# of scope for this task), reads via plain gpd.read_file(path) (no
+# partial/schema-only read trick), and a read failure here is NEVER
+# treated as a column-conflict failure -- it only skips the conflict
+# check for that one source (logged to console); the real read inside
+# run_processing() further below remains solely responsible for
+# surfacing any genuine read error to the user.
+#
+# Scope: LOCAL sources only. Database Land Parcel sources are
+# explicitly out of scope for this check per the project task
+# definition -- callers must not invoke this for "db"-mode sources.
+def _check_parcel_surface_conflicts(local_paths):
+    """
+    Returns a list of (path, existing_col_name) tuples -- one entry
+    only for local sources where a column matching "cama_rd_surface"
+    (case-insensitive) was actually found. existing_col_name preserves
+    the exact casing found in the source, so the confirmation dialog
+    and the eventual write-back both show/use the real casing.
+    """
+    conflicts = []
+    for path in local_paths:
+        try:
+            gdf = gpd.read_file(path)
+        except Exception as e:
+            print(f"⚠️ Could not read parcel layer to check for an "
+                  f"existing CAMA_RD_SURFACE column: {path}: {e}")
+            continue
+        existing_col = next(
+            (c for c in gdf.columns if c.lower() == "cama_rd_surface"), None
+        )
+        if existing_col:
+            conflicts.append((path, existing_col))
+    return conflicts
+
+
 # ---------------- Processing ----------------
 # NOTE (Part A3 investigation, resolved as NOT needed): unlike
 # land_shape_compactness.py, this tool has no fix_geometry() helper at
@@ -172,7 +233,19 @@ def open_in_global_mapper(path):
 # elsewhere in this project. Empirically confirmed .intersects() and
 # .distance() both return without crashing on a self-intersecting test
 # polygon, including at GeoSeries batch level. No fix_geometry() added.
-def process_surface(brgy_gdf, road_gdf):
+def process_surface(brgy_gdf, road_gdf, output_column_name="CAMA_RD_SURFACE"):
+    """
+    output_column_name : str -- the column name the computed road
+        surface(s) are written to. Defaults to "CAMA_RD_SURFACE" (this
+        tool's normal output, CAMA_-prefixed per project-wide column
+        naming convention -- see road_width.py's own ROAD_WIDTH ->
+        CAMA_ROAD_WIDTH). The GUI overrides this per-source when the
+        selected LOCAL parcel layer already has an existing
+        "cama_rd_surface"-like column (any casing) -- the exact
+        existing name/casing is passed here so processing writes back
+        into that same column instead of creating a hardcoded
+        "CAMA_RD_SURFACE" alongside it as a confusing duplicate.
+    """
     # Save original CRS
     orig_crs = brgy_gdf.crs
 
@@ -201,7 +274,7 @@ def process_surface(brgy_gdf, road_gdf):
     road_buffer = road_gdf.copy()
     road_buffer["geometry"] = road_gdf.buffer(10)
 
-    brgy_gdf["RD_SURFACE"] = [[] for _ in range(len(brgy_gdf))]
+    brgy_gdf[output_column_name] = [[] for _ in range(len(brgy_gdf))]
 
     # Assign surfaces from intersecting roads
     for _, road in road_buffer.iterrows():
@@ -210,21 +283,21 @@ def process_surface(brgy_gdf, road_gdf):
             continue
         intersect_mask = brgy_gdf.geometry.intersects(road.geometry)
         for idx in brgy_gdf[intersect_mask].index:
-            if surface_val not in brgy_gdf.at[idx, "RD_SURFACE"]:
-                brgy_gdf.at[idx, "RD_SURFACE"].append(surface_val)
+            if surface_val not in brgy_gdf.at[idx, output_column_name]:
+                brgy_gdf.at[idx, output_column_name].append(surface_val)
 
     # Nearest road for those with no intersections
-    no_surface_mask = brgy_gdf["RD_SURFACE"].apply(lambda x: len(x) == 0)
+    no_surface_mask = brgy_gdf[output_column_name].apply(lambda x: len(x) == 0)
     for idx, row in brgy_gdf[no_surface_mask].iterrows():
         centroid: Point = row.geometry.centroid
         distances = road_gdf.distance(centroid)
         nearest_idx = distances.idxmin()
         nearest_surface = str(road_gdf.at[nearest_idx, surface_col]).strip()
         if nearest_surface:
-            brgy_gdf.at[idx, "RD_SURFACE"] = [nearest_surface]
+            brgy_gdf.at[idx, output_column_name] = [nearest_surface]
 
     # Convert list → slash-separated string
-    brgy_gdf["RD_SURFACE"] = brgy_gdf["RD_SURFACE"].apply(
+    brgy_gdf[output_column_name] = brgy_gdf[output_column_name].apply(
         lambda surfaces: "/".join(sorted(set(surfaces))) if surfaces else None
     )
 
@@ -234,7 +307,162 @@ def process_surface(brgy_gdf, road_gdf):
 
     return brgy_gdf
 
-# REPLACE WITH
+# ---------------- Output filename helpers ----------------
+# Ported from road_width.py's validated pattern, already successfully
+# adapted in road_frontage.py, lot_location.py, and road_density.py.
+
+def _split_trailing_number(base_name: str):
+    """
+    Splits a base name into (root, existing_number) if it ends with
+    "_<digits>" (e.g. "landparcel_1" -> ("landparcel", 1)), else returns
+    (base_name, None) unchanged.
+    """
+    m = re.match(r'^(.*)_(\d+)$', base_name)
+    if m:
+        return m.group(1), int(m.group(2))
+    return base_name, None
+
+
+def resolve_output_base_name(folder: str, desired_base_name: str, ext: str = "gpkg") -> str:
+    """
+    Determines the actual output base name (no extension) to use for a
+    NEW file in `folder`, given the DESIRED name -- normally the Land
+    Parcel source's own filename, unchanged, with no tool-name suffix
+    appended.
+
+    Rule: reuse the desired name exactly if nothing of that name exists
+    yet in `folder`. If it already exists, strip any existing trailing
+    "_<N>" from the desired name to get a root, scan `folder` for every
+    file matching "<root>_<N>.<ext>", and use "<root>_<max(N)+1>" --
+    the highest N found ANYWHERE in the folder, not just "the source
+    file's own N + 1".
+
+    This tool has no companion/QA outputs, so there is no
+    with_output_suffix call needed here.
+    """
+    candidate_path = os.path.join(folder, f"{desired_base_name}.{ext}")
+    if not os.path.exists(candidate_path):
+        return desired_base_name
+
+    root, _existing_number = _split_trailing_number(desired_base_name)
+
+    pattern = re.compile(rf'^{re.escape(root)}_(\d+)\.{re.escape(ext)}$', re.IGNORECASE)
+    max_n = 0
+    try:
+        for fname in os.listdir(folder):
+            m = pattern.match(fname)
+            if m:
+                max_n = max(max_n, int(m.group(1)))
+    except OSError:
+        pass  # folder unreadable -- fall through with max_n=0, worst case uses N=1
+
+    return f"{root}_{max_n + 1}"
+
+
+def ask_overwrite_dialog(parent, conflicting_names):
+    """
+    Combined dialog shown ONCE, before any processing starts, when one or
+    more Land Parcel sources' desired local output filename already
+    exists in the chosen output folder. Not a per-file prompt -- every
+    conflicting name in the batch is listed together, and the chosen
+    action applies to ALL of them:
+
+      - "Overwrite": every conflicting file is replaced in place, using
+        its plain desired name (no numbering).
+      - "Create New File": every conflicting file is instead saved under
+        a new, non-colliding name via resolve_output_base_name()'s
+        auto-numbering -- the existing files are left untouched.
+      - "Cancel": aborts the ENTIRE run. Nothing is written, including
+        sources that had no conflict at all.
+
+    Returns "overwrite", "new", or "cancel" (also returned if the
+    dialog's own titlebar close button is used).
+
+    Ported from road_width.py's validated implementation, already
+    adapted in road_frontage.py, lot_location.py, and road_density.py.
+    Deliberately does NOT call dialog.transient(parent): this app's root
+    is permanently withdrawn (see main()), and transient() on a withdrawn
+    parent is a known source of window-manager-dependent "dialog never
+    becomes viewable" behavior. grab_set()+deiconify()+lift()+
+    focus_force()+topmost is used instead, matching this file's own
+    existing dialog pattern (see _pick_db_tables()).
+    """
+    result = {"choice": "cancel"}
+
+    dialog = tk.Toplevel(parent)
+    apply_icon(dialog)
+    dialog.title("File(s) Already Exist")
+    dialog.resizable(False, False)
+    dialog.grab_set()
+    dialog.deiconify()
+    dialog.lift()
+    dialog.focus_force()
+    dialog.attributes("-topmost", True)
+    dialog.after(100, lambda: dialog.attributes("-topmost", False))
+
+    def choose(value):
+        result["choice"] = value
+        dialog.destroy()
+
+    dialog.protocol("WM_DELETE_WINDOW", lambda: choose("cancel"))
+
+    # Buttons packed first, at the bottom -- guaranteed visible/reachable
+    # regardless of how long the scrollable list above them ends up being.
+    btn_frame = tk.Frame(dialog)
+    btn_frame.pack(side="bottom", fill="x", pady=(4, 12))
+    tk.Button(btn_frame, text="Overwrite", width=14, cursor="hand2",
+              command=lambda: choose("overwrite")).pack(side="left", padx=(16, 4))
+    tk.Button(btn_frame, text="Create New File", width=16, cursor="hand2",
+              command=lambda: choose("new")).pack(side="left", padx=4)
+    tk.Button(btn_frame, text="Cancel", width=10, cursor="hand2",
+              command=lambda: choose("cancel")).pack(side="left", padx=(4, 16))
+
+    tk.Label(dialog, text="The following output file(s) already exist:",
+             font=("Segoe UI", 10, "bold"), anchor="w"
+             ).pack(fill="x", padx=16, pady=(16, 4))
+
+    MAX_LIST_LINES = 10
+    TEXT_WIDTH_CHARS = 55
+
+    list_frame = tk.Frame(dialog)
+    list_frame.pack(fill="both", expand=True, padx=16, pady=(0, 4))
+    vscroll = tk.Scrollbar(list_frame, orient="vertical")
+    hscroll = tk.Scrollbar(list_frame, orient="horizontal")
+    text = tk.Text(
+        list_frame, wrap="none", height=min(len(conflicting_names), MAX_LIST_LINES),
+        width=TEXT_WIDTH_CHARS, yscrollcommand=vscroll.set, xscrollcommand=hscroll.set,
+        relief="flat", bg=dialog.cget("bg"), font=("Segoe UI", 9))
+    vscroll.config(command=text.yview)
+    hscroll.config(command=text.xview)
+    if len(conflicting_names) > MAX_LIST_LINES:
+        vscroll.pack(side="right", fill="y")
+    needs_hscroll = any(len(f"• {name}") > TEXT_WIDTH_CHARS for name in conflicting_names)
+    if needs_hscroll:
+        hscroll.pack(side="bottom", fill="x")
+    text.pack(side="left", fill="both", expand=True)
+    for name in conflicting_names:
+        text.insert("end", f"• {name}\n")
+    text.config(state="disabled")
+
+    tk.Label(dialog, text=(
+        "Overwrite will replace these files. Create New File will save "
+        "them under a new name instead, leaving the existing files "
+        "untouched. This choice applies to all files listed above."
+    ), wraplength=380, justify="left", anchor="w"
+    ).pack(fill="x", padx=16, pady=(4, 8))
+
+    dialog.update_idletasks()
+    req_w = max(dialog.winfo_reqwidth(), 420)
+    req_h = dialog.winfo_reqheight()
+    sw = dialog.winfo_screenwidth()
+    sh = dialog.winfo_screenheight()
+    x = (sw - req_w) // 2
+    y = (sh - req_h) // 2
+    dialog.geometry(f"{req_w}x{req_h}+{x}+{y}")
+
+    dialog.wait_window()
+    return result["choice"]
+
 
 # ========================= GLOBAL MAPPER =========================
 def load_in_global_mapper(filepath):
@@ -561,8 +789,73 @@ def open_main_window(root):
         else:
             output_mode = ("db", None)
 
+        # Warn about any LOCAL Land Parcel source(s) that already have a
+        # column matching "cama_rd_surface" (case-insensitive exact
+        # match) -- this tool is about to write its computed road
+        # surface(s) into that column. The dialog shows the existing
+        # column exactly as found in the source (original casing
+        # preserved). Shown once, combined across every affected
+        # source, only here at Run time -- never at Browse time.
+        # Declining cancels the run entirely rather than skipping just
+        # the affected source(s), so the user always knows exactly what
+        # did or didn't happen instead of a partial batch silently
+        # going through. Database Land Parcel sources are explicitly
+        # out of scope for this check (see _check_parcel_surface_conflicts()).
+        global surface_column_overrides
+        if parcel_source_type.get() == "local":
+            conflicts = _check_parcel_surface_conflicts(parcel_local_paths)
+            if conflicts:
+                lines = "\n".join(
+                    f"- '{os.path.basename(path)}' already has a '{existing_col}' column"
+                    for path, existing_col in conflicts
+                )
+                proceed = messagebox.askyesno(
+                    "Existing CAMA_RD_SURFACE column found",
+                    f"{lines}\n\n"
+                    "Processing will overwrite the existing column(s) with the "
+                    "newly computed values.\n\nProceed?"
+                )
+                if not proceed:
+                    print("Run cancelled by user (existing CAMA_RD_SURFACE column(s) found).")
+                    return
+                # Preserve each source's existing column name/casing
+                # exactly -- e.g. a detected "caMA_rd_SURFACE" is
+                # written back to "caMA_rd_SURFACE", not a hardcoded
+                # "CAMA_RD_SURFACE" -- so no duplicate column is ever
+                # created regardless of the existing casing. A source
+                # with no entry here (no conflict was found) simply
+                # uses the default name in process_surface() below.
+                surface_column_overrides = dict(conflicts)
+            else:
+                surface_column_overrides = {}
+        else:
+            surface_column_overrides = {}
+        # PRIORITY 2: existing OUTPUT-FILE conflict check (local output only).
+        # Resolved ONCE, up front, on the main thread -- before win.destroy()
+        # so the dialog has a live parent window. The chosen action applies
+        # to ALL conflicting sources in the batch (one combined dialog, not
+        # per-file). Cancel aborts the entire run; nothing is written.
+        # Ported from road_width.py / road_frontage.py's validated pattern.
+        overwrite_mode = None
+        if output_mode[0] == "local":
+            desired_names = (
+                [os.path.splitext(os.path.basename(p))[0] for p in barangay_source[1]]
+                if barangay_source[0] == "local"
+                else list(barangay_source[1])
+            )
+            conflicting_names = [
+                f"{name}.gpkg" for name in desired_names
+                if os.path.exists(os.path.join(output_mode[1], f"{name}.gpkg"))
+            ]
+            if conflicting_names:
+                overwrite_mode = ask_overwrite_dialog(win, conflicting_names)
+                if overwrite_mode == "cancel":
+                    print("Run cancelled by user (existing output file(s) found).")
+                    return
+
+
         win.destroy()
-        run_processing()
+        run_processing(overwrite_mode)
 
     # Single source of truth for the Run button's enabled/disabled
     # colors -- used both at button creation and inside
@@ -636,7 +929,11 @@ def open_main_window(root):
 
 
 # ---------------- Run ----------------
-def run_processing():
+def run_processing(overwrite_mode=None):
+    # overwrite_mode: "overwrite", "new", or None (no conflict existed).
+    # Resolved ONCE, up front, on the main thread in on_run() before
+    # win.destroy() -- passed here as a parameter (not a global).
+    # See ask_overwrite_dialog() for the full behavior contract.
     global barangay_source, road_source, output_mode
     if not barangay_source or not road_source or not output_mode:
         messagebox.showerror("Error", "Selections incomplete.")
@@ -656,10 +953,30 @@ def run_processing():
     if barangay_source[0] == "local":
         for path in barangay_source[1]:
             brgy_gdf = gpd.read_file(path)
-            result = process_surface(brgy_gdf, road_gdf)
+            # output_column_name: preserves the exact existing column
+            # name/casing this LOCAL source's parcel layer already had
+            # (if the user confirmed overwriting one at Run time -- see
+            # on_run()'s confirmation dialog). A source with no entry
+            # here falls back to process_surface()'s own default
+            # ("CAMA_RD_SURFACE").
+            output_column_name = surface_column_overrides.get(path, "CAMA_RD_SURFACE")
+            result = process_surface(brgy_gdf, road_gdf, output_column_name=output_column_name)
             if output_mode[0] == "local":
-                base = os.path.splitext(os.path.basename(path))[0]
-                out = os.path.join(output_mode[1], f"{base}_roadsurface.gpkg")
+                # Desired output filename = the Land Parcel source's own
+                # name, unchanged -- no tool-name suffix appended (matching
+                # road_width.py / road_frontage.py's established convention).
+                # overwrite_mode was resolved ONCE, up front in on_run(),
+                # for the whole batch -- no per-file prompt here.
+                desired_base_name = os.path.splitext(os.path.basename(path))[0]
+                candidate_path = os.path.join(output_mode[1], f"{desired_base_name}.gpkg")
+                had_conflict = os.path.exists(candidate_path)
+                if had_conflict and overwrite_mode == "new":
+                    base_name = resolve_output_base_name(output_mode[1], desired_base_name)
+                else:
+                    # No conflict, or user chose "Overwrite" --
+                    # both cases use the plain desired name.
+                    base_name = desired_base_name
+                out = os.path.join(output_mode[1], f"{base_name}.gpkg")
                 result.to_file(out, driver="GPKG")
                 print(f"✅ Saved {out}")
                 load_in_global_mapper(out)
@@ -672,11 +989,24 @@ def run_processing():
                                   if_exists="replace", index=False)
                 print(f"🔄 Saved to DB: {out_table}")
     else:
+        # Database Land Parcel sources: column-conflict check is out of
+        # scope (see _check_parcel_surface_conflicts()) -- always uses
+        # process_surface()'s default "CAMA_RD_SURFACE" name.
         for table in barangay_source[1]:
             brgy_gdf = read_postgis_clean(table, engine, schema)
             result = process_surface(brgy_gdf, road_gdf)
             if output_mode[0] == "local":
-                out = os.path.join(output_mode[1], f"{table}_roadsurface.gpkg")
+                # DB parcel source: table name used as desired base name
+                # directly (no .splitext() needed). Same overwrite/create-new
+                # logic as the local parcel source branch above.
+                desired_base_name = table
+                candidate_path = os.path.join(output_mode[1], f"{desired_base_name}.gpkg")
+                had_conflict = os.path.exists(candidate_path)
+                if had_conflict and overwrite_mode == "new":
+                    base_name = resolve_output_base_name(output_mode[1], desired_base_name)
+                else:
+                    base_name = desired_base_name
+                out = os.path.join(output_mode[1], f"{base_name}.gpkg")
                 result.to_file(out, driver="GPKG")
                 print(f"✅ Saved {out}")
                 load_in_global_mapper(out)
@@ -688,7 +1018,7 @@ def run_processing():
                                   if_exists="replace", index=False)
                 print(f"🔄 Saved to DB: {out_table}")
 
-    messagebox.showinfo("Success", "✅ Processing complete!")
+    messagebox.showinfo("Success", "Processing complete!")
 
 
 # ---------------- Main ----------------

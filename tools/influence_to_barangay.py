@@ -264,7 +264,131 @@ def detect_attr_name(gdf, name_guess: str):
     raise ValueError(f"No suitable attribute column found for {name_guess}")
 
 
-def transfer_attributes(barangay_gdf, influence_gdfs):
+# parcel_output_column_overrides: {path: {"CAMA_<attr_name>": name, ...}}
+# -- for any LOCAL Land Parcel/Barangay source where one or more
+# pre-existing CAMA_-prefixed output columns were detected (see
+# _check_parcel_influence_conflicts() below) and the user confirmed
+# proceeding at Run time. Read by run_processing() and resolved into
+# transfer_attributes()'s output_column_map, so the tool writes back
+# into the EXACT existing column (preserving original casing) instead
+# of always writing a hardcoded "CAMA_*" name. A source with no entry
+# here (or an attr_name missing from its entry) uses the default
+# CAMA_-prefixed name. Scope: LOCAL sources only -- Database Land
+# Parcel sources are explicitly out of scope for this check.
+parcel_output_column_overrides = {}
+
+
+# ========================= EXISTING OUTPUT-COLUMN CONFLICT DETECTION =========================
+# This tool's output columns are dynamic, not a fixed list -- each
+# selected Influence Map source contributes ONE column, named after
+# whatever attribute detect_attr_name() finds on that specific layer
+# (e.g. a "FloodHazardMap" layer might contribute a column detected as
+# "FloodLevel" -> CAMA_FloodLevel). Unlike road_frontage.py/terrain.py/
+# land_shape_compactness.py's fixed OUTPUT_COLUMN_TARGETS tuples, this
+# tool's target list is built per-run from whichever Influence Map
+# source(s) are actually selected -- see _get_added_fields_for_check()
+# below.
+def _get_added_fields_for_check(influence_source, engine, schema):
+    """
+    Lightweight, standalone read of the selected Influence Map
+    source(s), used ONLY by the Run-time column-conflict pre-check in
+    on_run() -- separate from, and NOT a substitute for, the "real"
+    influence-layer read run_processing() performs later. Mirrors the
+    exact same attr_name detection logic run_processing() uses
+    (read_vector_file()/read_postgis + ensure_geometry_column() +
+    detect_attr_name()) so the target list built here matches what
+    run_processing() will actually use.
+
+    Returns a list of attr_name strings (one per Influence Map source),
+    or an empty list if the read fails for any reason -- a failure here
+    is NEVER treated as a column-conflict failure; it just means the
+    conflict check is skipped entirely for this Run (logged to
+    console). The real read inside run_processing() remains solely
+    responsible for surfacing any genuine read error to the user.
+    """
+    added_fields = []
+    try:
+        if influence_source[0] == "local":
+            for path in influence_source[1]:
+                gdf = read_vector_file(path).to_crs(epsg=3857)
+                gdf = ensure_geometry_column(gdf)
+                name_guess = get_local_name(path)
+                added_fields.append(detect_attr_name(gdf, name_guess))
+        else:
+            for table in influence_source[1]:
+                geom_col = get_geom_column(engine, schema, table)
+                gdf = gpd.read_postgis(
+                    f'SELECT * FROM "{schema}"."{table}"', engine, geom_col=geom_col
+                ).to_crs(epsg=3857)
+                gdf = ensure_geometry_column(gdf)
+                added_fields.append(detect_attr_name(gdf, table))
+    except Exception as e:
+        print(f"⚠️ Could not read Influence Map source to check for "
+              f"existing output column(s): {e}")
+        return []
+    return added_fields
+
+
+def _check_parcel_influence_conflicts(local_paths, targets):
+    """
+    Checks LOCAL Land Parcel/Barangay source(s) for pre-existing
+    columns matching any of `targets` (case-insensitive exact match).
+    Same read approach as every other tool's conflict check
+    (read_vector_file() -- this tool's own canonical reader, handling
+    multi-layer GPKGs the same way run_processing() does -- read
+    failure = skip-only, never a conflict-check failure).
+
+    Returns a list of (path, existing_output_cols) tuples -- one entry
+    only for local sources where at least one target match was found.
+    existing_output_cols is {target_name: actual_existing_column_name},
+    original casing preserved -- shown in the confirmation dialog and
+    used verbatim as the write-back column (canonical road_width.py
+    pattern: exact detected casing, per source, no coalescing needed
+    here since -- unlike POI_All_Distance.py -- this tool saves one
+    output per source, never merges multiple sources together).
+    """
+    conflicts = []
+    for path in local_paths:
+        try:
+            gdf = read_vector_file(path)
+        except Exception as e:
+            print(f"⚠️ Could not read parcel layer to check for existing "
+                  f"output column(s): {path}: {e}")
+            continue
+        found = {}
+        for target in targets:
+            match = next((c for c in gdf.columns if c.lower() == target.lower()), None)
+            if match is not None:
+                found[target] = match
+        if found:
+            conflicts.append((path, found))
+    return conflicts
+
+
+def transfer_attributes(barangay_gdf, influence_gdfs, output_column_map=None):
+    """
+    output_column_map : optional {attr_name: output_col_name} -- for
+        each (infl_gdf, attr_name) pair, the joined value is written
+        into output_column_map.get(attr_name, f"CAMA_{attr_name}")
+        instead of the bare attr_name directly. Defaults to the
+        standard CAMA_-prefixed name (this tool's normal output,
+        matching road_width.py's own ROAD_WIDTH -> CAMA_ROAD_WIDTH
+        convention). The GUI overrides this per barangay/parcel source
+        when that LOCAL source already has an existing matching column
+        (see _check_parcel_influence_conflicts() below) -- the exact
+        existing name/casing is passed here so processing writes back
+        into that same column instead of creating a hardcoded
+        CAMA_-prefixed duplicate.
+
+        NOTE: this only affects the column name written into
+        barangay_gdf (the tool's own local/DB output). It does NOT
+        affect CAMA_Table -- that shared, cross-tool table's own
+        column names/schema are explicitly out of scope for this
+        change (see the CAMA_Table section of run_processing() below,
+        which reads from the resolved column name here but writes
+        into CAMA_Table under the same unprefixed name it always has).
+    """
+    output_column_map = output_column_map or {}
     for infl_gdf, attr_name in influence_gdfs:
         infl_clean = infl_gdf[[attr_name, "geometry"]].copy()
         infl_clean = infl_clean.rename(columns={attr_name: "joined_attr"})
@@ -275,12 +399,17 @@ def transfer_attributes(barangay_gdf, influence_gdfs):
         joined = gpd.sjoin(centroid_gdf, infl_clean, how="left", predicate="within")
         joined = joined.loc[:, ~joined.columns.duplicated(keep="first")]
 
-        barangay_gdf[attr_name] = joined["joined_attr"].reset_index(drop=True)
+        out_col = output_column_map.get(attr_name, f"CAMA_{attr_name}")
+        barangay_gdf[out_col] = joined["joined_attr"].reset_index(drop=True)
     return barangay_gdf
 
 
 # -------------------- PROCESSING --------------------
-def run_processing():
+def run_processing(overwrite_mode=None):
+    # overwrite_mode: "overwrite", "new", or None (no conflict existed).
+    # Resolved ONCE, up front, on the main thread in on_run() before
+    # win.destroy() -- passed here as a parameter (not a global).
+    # See ask_overwrite_dialog() for the full behavior contract.
     global barangay_source, influence_source, output_mode
 
     # 🧠 Debug info (helps verify what's actually set)
@@ -354,12 +483,45 @@ def run_processing():
         b_gdf = b_gdf_raw.to_crs(epsg=3857)
 
         b_gdf = ensure_geometry_column(b_gdf)
-        b_gdf = transfer_attributes(b_gdf, influence_gdfs)
+
+        # output_column_map: preserves this source's existing output
+        # column name(s)/casing exactly, if a conflict was detected and
+        # confirmed in on_run() -- e.g. a detected "caMA_FloodLevel" is
+        # written back to "caMA_FloodLevel", not a hardcoded
+        # "CAMA_FloodLevel". Defaults to the standard CAMA_-prefixed
+        # name for any attr_name this source has no override for.
+        # Always {} for DB-sourced parcels (column-conflict check is
+        # LOCAL-only), so this naturally falls back to every default in
+        # that case.
+        src_col_overrides = (
+            parcel_output_column_overrides.get(src, {})
+            if barangay_source[0] == "local" else {}
+        )
+        output_column_map = {
+            attr_name: src_col_overrides.get(f"CAMA_{attr_name}", f"CAMA_{attr_name}")
+            for attr_name in added_fields
+        }
+        b_gdf = transfer_attributes(b_gdf, influence_gdfs, output_column_map=output_column_map)
 
         # --- Save outputs ---
         if output_mode[0] == "local":
             out_dir = output_mode[1]
-            out_path = os.path.join(out_dir, f"{local_name}.gpkg")
+            # Desired output filename = local_name (= get_local_name(src)
+            # for local sources, src directly for DB sources) -- already
+            # the Land Parcel source's own clean name with no tool-name
+            # suffix, so no suffix removal is needed here unlike other
+            # tools in this project. overwrite_mode was resolved ONCE,
+            # up front in on_run(), for the whole batch.
+            desired_base_name = local_name
+            candidate_path = os.path.join(out_dir, f"{desired_base_name}.gpkg")
+            had_conflict = os.path.exists(candidate_path)
+            if had_conflict and overwrite_mode == "new":
+                base_name = resolve_output_base_name(out_dir, desired_base_name)
+            else:
+                # No conflict, or user chose "Overwrite" --
+                # both cases use the plain desired name.
+                base_name = desired_base_name
+            out_path = os.path.join(out_dir, f"{base_name}.gpkg")
 
             # 1️⃣ Ensure CRS exists
             if b_gdf.crs is None:
@@ -467,10 +629,39 @@ def run_processing():
                         params["pin"] = str(row[pin_field])
                         
                         for c in added_fields:
-                            if c in row:
+                            # Source-side lookup only -- CAMA_Table's
+                            # OWN column names (c.lower(), used for
+                            # insert_cols/update_assignments/params keys
+                            # above and below) are UNCHANGED by this
+                            # fix. This only changes WHERE the value is
+                            # read FROM in b_gdf: prefer the new
+                            # CAMA_-prefixed column (the one
+                            # transfer_attributes() actually wrote this
+                            # run -- output_column_map already resolved
+                            # any per-source override casing), falling
+                            # back to the legacy unprefixed column name
+                            # if the new one somehow isn't present (e.g.
+                            # a barangay/parcel source that still has an
+                            # old, pre-CAMA_-prefix column from before
+                            # this change, and for whatever reason the
+                            # new column wasn't created this run).
+                            # Without this fallback-aware lookup, every
+                            # CAMA_Table value would silently become
+                            # NULL after the CAMA_ prefix rollout, since
+                            # b_gdf no longer has a column literally
+                            # named `c`.
+                            resolved_col = output_column_map.get(c, f"CAMA_{c}")
+                            if resolved_col in row:
+                                source_val = row[resolved_col]
+                            elif c in row:
+                                source_val = row[c]
+                            else:
+                                source_val = None
+
+                            if source_val is not None:
                                 try:
-                                    params[c.lower()] = float(row[c])
-                                    params[f"{c.lower()}_upd"] = float(row[c])
+                                    params[c.lower()] = float(source_val)
+                                    params[f"{c.lower()}_upd"] = float(source_val)
                                 except (ValueError, TypeError):
                                     params[c.lower()] = None
                                     params[f"{c.lower()}_upd"] = None
@@ -514,7 +705,169 @@ def run_processing():
     messagebox.showinfo("Success", "✅ Processing done with CAMA logs!")
 
 
-# REPLACE WITH
+# ---------------- Output filename helpers ----------------
+# Ported from road_width.py's validated pattern, already successfully
+# adapted in road_frontage.py, lot_location.py, road_density.py,
+# road_surface.py, terrain.py, land_shape_compactness.py, and
+# poi_within_200_meters_for_parcellary_church_mall_police_park.py.
+# Implementations are identical across all ports.
+
+def _split_trailing_number(base_name: str):
+    """
+    Splits a base name into (root, existing_number) if it ends with
+    "_<digits>" (e.g. "landparcel_1" -> ("landparcel", 1)), else returns
+    (base_name, None) unchanged.
+    """
+    m = re.match(r'^(.*)_(\d+)$', base_name)
+    if m:
+        return m.group(1), int(m.group(2))
+    return base_name, None
+
+
+def resolve_output_base_name(folder: str, desired_base_name: str, ext: str = "gpkg") -> str:
+    """
+    Determines the actual output base name (no extension) to use for a
+    NEW file in `folder`, given the DESIRED name -- normally the Land
+    Parcel source's own filename/layer name, unchanged, with no
+    tool-name suffix appended.
+
+    Rule: reuse the desired name exactly if nothing of that name exists
+    yet in `folder`. If it already exists, strip any existing trailing
+    "_<N>" from the desired name to get a root, scan `folder` for every
+    file matching "<root>_<N>.<ext>", and use "<root>_<max(N)+1>" --
+    the highest N found ANYWHERE in the folder, not just "the source
+    file's own N + 1".
+
+    This tool already uses local_name (= get_local_name(src)) as its
+    output filename, so there is no tool-name suffix to remove here --
+    unlike other tools in this project. This function is only called
+    when had_conflict is True AND overwrite_mode == "new".
+    """
+    candidate_path = os.path.join(folder, f"{desired_base_name}.{ext}")
+    if not os.path.exists(candidate_path):
+        return desired_base_name
+
+    root, _existing_number = _split_trailing_number(desired_base_name)
+
+    pattern = re.compile(rf'^{re.escape(root)}_(\d+)\.{re.escape(ext)}$', re.IGNORECASE)
+    max_n = 0
+    try:
+        for fname in os.listdir(folder):
+            m = pattern.match(fname)
+            if m:
+                max_n = max(max_n, int(m.group(1)))
+    except OSError:
+        pass  # folder unreadable -- fall through with max_n=0, worst case uses N=1
+
+    return f"{root}_{max_n + 1}"
+
+
+def ask_overwrite_dialog(parent, conflicting_names):
+    """
+    Combined dialog shown ONCE, before any processing starts, when one or
+    more Land Parcel sources' desired local output filename already
+    exists in the chosen output folder. Not a per-file prompt -- every
+    conflicting name in the batch is listed together, and the chosen
+    action applies to ALL of them:
+
+      - "Overwrite": every conflicting file is replaced in place, using
+        its plain desired name (no numbering).
+      - "Create New File": every conflicting file is instead saved under
+        a new, non-colliding name via resolve_output_base_name()'s
+        auto-numbering -- the existing files are left untouched.
+      - "Cancel": aborts the ENTIRE run. Nothing is written, including
+        sources that had no conflict at all.
+
+    Returns "overwrite", "new", or "cancel" (also returned if the
+    dialog's own titlebar close button is used).
+
+    Ported from road_width.py's validated implementation, already
+    adapted in road_frontage.py, lot_location.py, road_density.py,
+    road_surface.py, terrain.py, land_shape_compactness.py, and
+    poi_within_200_meters_for_parcellary_church_mall_police_park.py.
+    Deliberately does NOT call dialog.transient(parent): this app's root
+    is permanently withdrawn (see main()), and transient() on a withdrawn
+    parent is a known source of window-manager-dependent "dialog never
+    becomes viewable" behavior. grab_set()+deiconify()+lift()+
+    focus_force()+topmost is used instead, matching this file's own
+    existing dialog pattern (see _pick_db_tables()).
+    """
+    result = {"choice": "cancel"}
+
+    dialog = tk.Toplevel(parent)
+    apply_icon(dialog)
+    dialog.title("File(s) Already Exist")
+    dialog.resizable(False, False)
+    dialog.grab_set()
+    dialog.deiconify()
+    dialog.lift()
+    dialog.focus_force()
+    dialog.attributes("-topmost", True)
+    dialog.after(100, lambda: dialog.attributes("-topmost", False))
+
+    def choose(value):
+        result["choice"] = value
+        dialog.destroy()
+
+    dialog.protocol("WM_DELETE_WINDOW", lambda: choose("cancel"))
+
+    # Buttons packed first, at the bottom -- guaranteed visible/reachable
+    # regardless of how long the scrollable list above them ends up being.
+    btn_frame = tk.Frame(dialog)
+    btn_frame.pack(side="bottom", fill="x", pady=(4, 12))
+    tk.Button(btn_frame, text="Overwrite", width=14, cursor="hand2",
+              command=lambda: choose("overwrite")).pack(side="left", padx=(16, 4))
+    tk.Button(btn_frame, text="Create New File", width=16, cursor="hand2",
+              command=lambda: choose("new")).pack(side="left", padx=4)
+    tk.Button(btn_frame, text="Cancel", width=10, cursor="hand2",
+              command=lambda: choose("cancel")).pack(side="left", padx=(4, 16))
+
+    tk.Label(dialog, text="The following output file(s) already exist:",
+             font=("Segoe UI", 10, "bold"), anchor="w"
+             ).pack(fill="x", padx=16, pady=(16, 4))
+
+    MAX_LIST_LINES = 10
+    TEXT_WIDTH_CHARS = 55
+
+    list_frame = tk.Frame(dialog)
+    list_frame.pack(fill="both", expand=True, padx=16, pady=(0, 4))
+    vscroll = tk.Scrollbar(list_frame, orient="vertical")
+    hscroll = tk.Scrollbar(list_frame, orient="horizontal")
+    text = tk.Text(
+        list_frame, wrap="none", height=min(len(conflicting_names), MAX_LIST_LINES),
+        width=TEXT_WIDTH_CHARS, yscrollcommand=vscroll.set, xscrollcommand=hscroll.set,
+        relief="flat", bg=dialog.cget("bg"), font=("Segoe UI", 9))
+    vscroll.config(command=text.yview)
+    hscroll.config(command=text.xview)
+    if len(conflicting_names) > MAX_LIST_LINES:
+        vscroll.pack(side="right", fill="y")
+    needs_hscroll = any(len(f"\u2022 {name}") > TEXT_WIDTH_CHARS for name in conflicting_names)
+    if needs_hscroll:
+        hscroll.pack(side="bottom", fill="x")
+    text.pack(side="left", fill="both", expand=True)
+    for name in conflicting_names:
+        text.insert("end", f"\u2022 {name}\n")
+    text.config(state="disabled")
+
+    tk.Label(dialog, text=(
+        "Overwrite will replace these files. Create New File will save "
+        "them under a new name instead, leaving the existing files "
+        "untouched. This choice applies to all files listed above."
+    ), wraplength=380, justify="left", anchor="w"
+    ).pack(fill="x", padx=16, pady=(4, 8))
+
+    dialog.update_idletasks()
+    req_w = max(dialog.winfo_reqwidth(), 420)
+    req_h = dialog.winfo_reqheight()
+    sw = dialog.winfo_screenwidth()
+    sh = dialog.winfo_screenheight()
+    x = (sw - req_w) // 2
+    y = (sh - req_h) // 2
+    dialog.geometry(f"{req_w}x{req_h}+{x}+{y}")
+
+    dialog.wait_window()
+    return result["choice"]
+
 
 # -------------------- GLOBAL MAPPER --------------------
 def load_in_global_mapper(filepath):
@@ -830,8 +1183,112 @@ def open_main_window(root):
         else:
             output_mode = ("db", None)
 
+        # Existing OUTPUT-COLUMN conflict warning. This tool's output
+        # columns are dynamic (see _get_added_fields_for_check()) -- the
+        # target list is built from whichever Influence Map source(s)
+        # are actually selected this run. LOCAL Land Parcel/Barangay
+        # sources only; Database sources are explicitly out of scope.
+        # Shown once, combined across every affected source, only here
+        # at Run time. Declining cancels the run entirely -- nothing is
+        # processed, including sources that had no conflict.
+        #
+        # Unlike POI_All_Distance.py, this tool saves ONE output per
+        # source (never merges), so the standard per-source override
+        # map applies here -- exact detected casing is preserved and
+        # written back into, same canonical road_width.py pattern used
+        # by every other per-source tool in this project.
+        # ------------------------------------------------------------------
+        global parcel_output_column_overrides
+        if parcel_source_type.get() == "local":
+            added_fields_for_check = []
+            try:
+                creds_for_check = load_db_credentials()
+                engine_for_check = None
+                schema_for_check = None
+                if influence_source[0] == "db" and creds_for_check:
+                    schema_for_check = creds_for_check["schema"]
+                    engine_for_check = create_engine(
+                        f"postgresql://{creds_for_check['username']}:{creds_for_check['password']}@"
+                        f"{creds_for_check['host']}:{creds_for_check['port']}/{creds_for_check['database']}"
+                    )
+                added_fields_for_check = _get_added_fields_for_check(
+                    influence_source, engine_for_check, schema_for_check)
+            except Exception as e:
+                print(f"⚠️ Could not prepare Influence Map attribute check "
+                      f"for column conflicts: {e}")
+                added_fields_for_check = []
+
+            if added_fields_for_check:
+                targets_for_check = [f"CAMA_{a}" for a in added_fields_for_check]
+                conflicts = _check_parcel_influence_conflicts(
+                    parcel_local_paths, targets_for_check)
+                if conflicts:
+                    lines = "\n".join(
+                        f"- '{os.path.basename(path)}': found "
+                        + ", ".join(
+                            f"'{existing_name}' column (for {target})"
+                            for target, existing_name in existing_output_cols.items()
+                        )
+                        for path, existing_output_cols in conflicts
+                    )
+                    proceed = messagebox.askyesno(
+                        "Existing output column(s) found",
+                        f"{lines}\n\n"
+                        "Processing will overwrite the existing column(s) with the "
+                        "newly computed values. The column name(s) will not change.\n\n"
+                        "Proceed?"
+                    )
+                    if not proceed:
+                        print("Run cancelled by user (existing output column(s) found).")
+                        return
+                    # Preserve each source's existing column name(s)/
+                    # casing exactly -- e.g. a detected "caMA_FloodLevel"
+                    # is written back to "caMA_FloodLevel", not a
+                    # hardcoded "CAMA_FloodLevel" -- so no duplicate
+                    # column is ever created regardless of the existing
+                    # casing. A source with no entry here (no conflict
+                    # was found) simply uses the default names in
+                    # transfer_attributes() below.
+                    parcel_output_column_overrides = dict(conflicts)
+                else:
+                    parcel_output_column_overrides = {}
+            else:
+                parcel_output_column_overrides = {}
+        else:
+            parcel_output_column_overrides = {}
+        # PRIORITY 2: existing OUTPUT-FILE conflict check (local output only).
+        # Resolved ONCE, up front, on the main thread -- before win.destroy()
+        # so the dialog has a live parent window. The chosen action applies
+        # to ALL conflicting sources in the batch (one combined dialog, not
+        # per-file). Cancel aborts the entire run; nothing is written.
+        # Ported from road_width.py / road_frontage.py's validated pattern.
+        #
+        # IMPORTANT: get_local_name(p) is used here -- NOT os.path.splitext()
+        # -- because run_processing() uses get_local_name() to derive
+        # local_name (and therefore out_path). For GPKG files whose internal
+        # layer name differs from the file stem, os.path.splitext() would
+        # check the wrong filename and miss the conflict entirely.
+        overwrite_mode = None
+        if output_mode[0] == "local":
+            desired_names = (
+                [get_local_name(p) for p in barangay_source[1]]
+                if barangay_source[0] == "local"
+                else list(barangay_source[1])
+            )
+            conflicting_names = [
+                f"{name}.gpkg" for name in desired_names
+                if os.path.exists(os.path.join(output_mode[1], f"{name}.gpkg"))
+            ]
+            if conflicting_names:
+                overwrite_mode = ask_overwrite_dialog(win, conflicting_names)
+                if overwrite_mode == "cancel":
+                    print("Run cancelled by user (existing output file(s) found).")
+                    return
+
+        # ------------------------------------------------------------------
+
         win.destroy()
-        run_processing()
+        run_processing(overwrite_mode)
 
     # Single source of truth for the Run button's enabled/disabled
     # colors -- used both at button creation and inside
