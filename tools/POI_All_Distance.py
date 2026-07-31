@@ -213,6 +213,172 @@ def read_postgis_clean(table, engine, schema):
     return gpd.read_postgis(sql, engine, geom_col="geometry")
 
 
+# ========================= EXISTING OUTPUT-COLUMN CONFLICT DETECTION =========================
+# This tool's output columns are dynamic, not a fixed list -- they
+# depend on which POI fclass types (from ALLOWED_FCLASS) actually
+# appear in the selected POI source. Unlike road_frontage.py/terrain.py/
+# land_shape_compactness.py's fixed OUTPUT_COLUMN_TARGETS tuples, this
+# tool builds its target list per-run via _realizable_targets() below.
+#
+# Business decision (confirmed): only check for types that are actually
+# PRESENT in the selected POI source this run -- if there's no
+# "university" POI in the selected POI layer, there's no reason to
+# check for a pre-existing CAMA_UNIVERSITY1 conflict. All three ranks
+# (1-3) are checked for every present type, plus each rank's _METHOD
+# companion column, e.g. present type "school" -> CAMA_SCHOOL1,
+# CAMA_SCHOOL2, CAMA_SCHOOL3, CAMA_SCHOOL1_METHOD, CAMA_SCHOOL2_METHOD,
+# CAMA_SCHOOL3_METHOD.
+#
+# NOTE (flagged, not acted on): the per-row distance-write loop in
+# task() below unconditionally pre-initializes ALL FIVE ALLOWED_FCLASS
+# types' distance columns (CAMA_SCHOOL1..CAMA_UNIVERSITY3) to NaN every
+# run, regardless of which types are actually present in this run's POI
+# source -- this is pre-existing tool behavior, unrelated to and not
+# modified by this change. Scoping the conflict CHECK to only
+# currently-present types (per the confirmed decision above) means a
+# type absent this run won't trigger a warning even though its
+# pre-init step will still silently wipe that column's old values to
+# NaN, same as it always has. This is an accepted, informed tradeoff,
+# not an oversight.
+def _realizable_targets(poi_types):
+    """
+    Builds this run's actual list of CAMA_-prefixed target column names
+    -- only for POI types present in poi_types (already filtered to
+    ALLOWED_FCLASS and normalized/lowercased upstream). Six targets per
+    type: three distance ranks + their three _METHOD companions.
+    """
+    targets = []
+    for t in poi_types:
+        for i in range(1, 4):
+            targets.append(f"CAMA_{t.upper()}{i}")
+            targets.append(f"CAMA_{t.upper()}{i}_METHOD")
+    return targets
+
+
+def _get_poi_types_for_check(poi_source, engine, schema):
+    """
+    Lightweight, standalone read of the selected POI source, used ONLY
+    by the Run-time column-conflict pre-check in on_run() -- separate
+    from, and NOT a substitute for, the "real" POI read task() performs
+    later. Mirrors the same normalize/filter logic task() uses
+    (lowercase + strip 'fclass', filtered to ALLOWED_FCLASS) so the
+    target list built here matches what task() will actually realize.
+
+    Returns a sorted list of present type strings, or an empty list if
+    the read fails for any reason -- a failure here is NEVER treated as
+    a column-conflict failure; it just means the conflict check is
+    skipped entirely for this Run (logged to console). The real read
+    inside task() remains solely responsible for surfacing any genuine
+    read error to the user.
+    """
+    try:
+        poi_gdf = (
+            gpd.read_file(poi_source[1][0]) if poi_source[0] == "local"
+            else read_postgis_clean(poi_source[1][0], engine, schema)
+        )
+        fclass_norm = poi_gdf["fclass"].astype(str).str.lower().str.strip()
+        return sorted(t for t in fclass_norm.unique() if t in ALLOWED_FCLASS)
+    except Exception as e:
+        print(f"⚠️ Could not read POI source to check for existing output "
+              f"column(s): {e}")
+        return []
+
+
+def _check_parcel_poi_distance_conflicts(local_paths, targets):
+    """
+    Checks LOCAL Land Parcel source(s) for pre-existing columns matching
+    any of `targets` (case-insensitive exact match). Same read approach
+    as every other tool's conflict check (plain gpd.read_file(), read
+    failure = skip-only, never a conflict-check failure).
+
+    Returns a list of (path, existing_output_cols) tuples -- one entry
+    only for local sources where at least one target match was found.
+    existing_output_cols is {target_name: actual_existing_column_name},
+    original casing preserved (shown in the confirmation dialog only --
+    see _normalize_conflicting_columns() below for how the ACTUAL
+    write-back always converges to the canonical CAMA_ name instead of
+    preserving this casing, since this tool's output is a single
+    merged dataframe across possibly many sources, not one output per
+    source).
+    """
+    conflicts = []
+    for path in local_paths:
+        try:
+            gdf = gpd.read_file(path)
+        except Exception as e:
+            print(f"⚠️ Could not read parcel layer to check for existing "
+                  f"output column(s): {path}: {e}")
+            continue
+        found = {}
+        for target in targets:
+            match = next((c for c in gdf.columns if c.lower() == target.lower()), None)
+            if match is not None:
+                found[target] = match
+        if found:
+            conflicts.append((path, found))
+    return conflicts
+
+
+def _normalize_conflicting_columns(gdf, targets):
+    """
+    Runs on the MERGED parcel dataframe (after pd.concat of all
+    selected sources), before any distance values are written.
+    Guarantees that, for each canonical target name, there is at most
+    ONE resulting column -- never a leftover, differently-cased
+    duplicate sitting alongside the canonical one.
+
+    Since this tool's output is one merged dataframe (not one output
+    per source), there is no meaningful "which source's casing should
+    win" question to answer -- the canonical CAMA_-prefixed name is
+    always the final name, full stop. This function does not preserve
+    any detected casing; it only prevents duplicate logical columns
+    from surviving the merge.
+
+    For each target:
+      - No matching column (any casing) -> nothing to do.
+      - Exactly one matching column -> renamed to the canonical name if
+        its casing differs (a no-op if it's already exactly canonical).
+      - More than one matching column (can only happen if two DIFFERENT
+        source files each had their own, differently-cased version of
+        the same logical column before merging) -> coalesced row-wise
+        into a single canonical column, preferring the first column's
+        value wherever it's non-null. This is safe and lossless in the
+        normal case: after pd.concat, a row only ever has data in the
+        ONE column that its OWN source file actually had -- every other
+        matching column is NaN for that row (pd.concat fills missing
+        columns with NaN), so there is no real overlap to resolve.
+        The only genuinely "impossible/ambiguous" case -- a single row
+        with non-null values in more than one matching column at once
+        (only possible if a single source file itself already had two
+        differently-cased duplicate columns, which would be corrupt/
+        unusual input) -- is handled by keeping the first column's
+        value and printing a console warning naming the affected target
+        and row count. This is never surfaced as a dialog; it's a
+        silent, deterministic fallback for a case that should not occur
+        with normal input.
+    """
+    for target in targets:
+        matches = [c for c in gdf.columns if c.lower() == target.lower()]
+        if not matches:
+            continue
+        if len(matches) == 1:
+            if matches[0] != target:
+                gdf = gdf.rename(columns={matches[0]: target})
+            continue
+        combined = gdf[matches[0]]
+        for extra in matches[1:]:
+            both_populated = combined.notna() & gdf[extra].notna()
+            if both_populated.any():
+                print(f"⚠️ Ambiguous duplicate values found for '{target}' "
+                      f"across columns {matches}: {int(both_populated.sum())} "
+                      f"row(s) had values in more than one matching column -- "
+                      f"keeping the first column's value for those rows.")
+            combined = combined.combine_first(gdf[extra])
+        gdf = gdf.drop(columns=matches)
+        gdf[target] = combined
+    return gdf
+
+
 # -----------------------------------
 # Build graph from road shapefile
 # -----------------------------------
@@ -315,8 +481,8 @@ def worker_process(args):
 
             network_results = sorted(network_results, key=lambda r: r[0])
             for i, (dist, method, route_geom) in enumerate(network_results[:3], start=1):
-                results[f"{typ.upper()}{i}"] = float(dist)
-                results[f"{typ.upper()}{i}_METHOD"] = method
+                results[f"CAMA_{typ.upper()}{i}"] = float(dist)
+                results[f"CAMA_{typ.upper()}{i}_METHOD"] = method
                 route_records.append({
                     "PARCEL_IDX": row_idx,
                     "CATEGORY": typ.upper(),
@@ -824,6 +990,69 @@ def open_main_window(app_root):
         else:
             output_mode = ("db", None)
 
+        # ------------------------------------------------------------------
+        # Existing OUTPUT-COLUMN conflict warning. This tool's output
+        # columns are dynamic (see _realizable_targets()) -- only POI
+        # types actually present in the selected POI source this run are
+        # checked. LOCAL Land Parcel sources only; Database sources are
+        # explicitly out of scope. Shown once, combined across every
+        # affected source, only here at Run time. Declining cancels the
+        # run entirely -- nothing is processed, including sources that
+        # had no conflict.
+        #
+        # Unlike every other tool's Task A, there is NO override map
+        # threaded through to processing here: this tool's output is a
+        # single merged dataframe (multiple parcel sources are
+        # concatenated together), so there is no per-source casing to
+        # preserve. This dialog is purely a confirmation gate -- the
+        # actual write-back always converges to the canonical CAMA_
+        # name, handled unconditionally and safely inside task() by
+        # _normalize_conflicting_columns() regardless of what happens
+        # here.
+        # ------------------------------------------------------------------
+        if parcel_source_type.get() == "local":
+            poi_types_for_check = []
+            try:
+                creds_for_check = load_db_credentials()
+                engine_for_check = None
+                schema_for_check = None
+                if poi_source[0] == "db" and creds_for_check:
+                    schema_for_check = creds_for_check["schema"]
+                    engine_for_check = create_engine(
+                        f"postgresql://{creds_for_check['username']}:{creds_for_check['password']}@"
+                        f"{creds_for_check['host']}:{creds_for_check['port']}/{creds_for_check['database']}"
+                    )
+                poi_types_for_check = _get_poi_types_for_check(
+                    poi_source, engine_for_check, schema_for_check)
+            except Exception as e:
+                print(f"⚠️ Could not prepare POI-type check for column "
+                      f"conflicts: {e}")
+                poi_types_for_check = []
+
+            if poi_types_for_check:
+                targets_for_check = _realizable_targets(poi_types_for_check)
+                conflicts = _check_parcel_poi_distance_conflicts(
+                    parcel_local_paths, targets_for_check)
+                if conflicts:
+                    lines = "\n".join(
+                        f"- '{os.path.basename(path)}': found "
+                        + ", ".join(
+                            f"'{existing_name}' column (for {target})"
+                            for target, existing_name in existing_output_cols.items()
+                        )
+                        for path, existing_output_cols in conflicts
+                    )
+                    proceed = messagebox.askyesno(
+                        "Existing output column(s) found",
+                        f"{lines}\n\n"
+                        "Processing will overwrite the existing column(s) with the "
+                        "newly computed values. The column name(s) will not change.\n\n"
+                        "Proceed?"
+                    )
+                    if not proceed:
+                        print("Run cancelled by user (existing output column(s) found).")
+                        return
+
         win.destroy()
         run_with_progress(app_root)
 
@@ -1034,9 +1263,21 @@ def run_with_progress(app_root):
                 for t in poi_types
             }
 
+            # Consolidate any pre-existing, differently-cased CAMA_*
+            # column(s) detected in the confirmation step (on_run()
+            # above) into their single canonical name before writing
+            # anything -- see _normalize_conflicting_columns()'s own
+            # docstring for the full reasoning (safe row-wise coalesce,
+            # never a per-source override). Runs unconditionally and
+            # safely even if on_run()'s own pre-check was skipped (e.g.
+            # the lightweight POI pre-read failed) or found nothing --
+            # a no-op when there's nothing to consolidate.
+            realizable_targets = _realizable_targets(poi_types)
+            gdf = _normalize_conflicting_columns(gdf, realizable_targets)
+
             for t in ALLOWED_FCLASS:
                 for i in range(1, 4):
-                    gdf[f"{t.upper()}{i}"] = np.nan
+                    gdf[f"CAMA_{t.upper()}{i}"] = np.nan
 
             output_path = (
                 os.path.join(output_mode[1], "parcels_with_poi_distances.gpkg")

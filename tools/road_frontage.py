@@ -556,7 +556,7 @@ def _detect_road_type_column(gdf):
 # "lot_location" present, so no real dataset depends on a label-only
 # fallback.
 KNOWN_LOT_LABEL_VALUES = {"Inner Lot", "Road Lot", "Corner Lot"}
-LOT_LOCATION_COLUMN_CANDIDATES = ("lot_location",)
+LOT_LOCATION_COLUMN_CANDIDATES = ("cama_lot_location",)
 
 # Tri-state result of inspecting a parcel layer for a usable classification
 # column -- kept as named states rather than a bare has_lot_location bool
@@ -3714,40 +3714,7 @@ def open_main_window(root):
             road_type_excluded_values = []
 
         # ------------------------------------------------------------------
-        # PRIORITY 1: output FILENAME conflict pre-scan. Resolved ONCE, up
-        # front, here on the main thread -- BEFORE the window is destroyed
-        # and BEFORE run_processing()'s background worker starts (Tkinter
-        # dialogs must never be shown from a worker thread). Desired names
-        # only need each source's own filename/table name (no need to
-        # actually read/measure anything yet), so this check is cheap.
-        # Ported from road_width.py's validated pattern -- see
-        # ask_overwrite_dialog()'s docstring for the full behavior.
-        # Matches road_width.py's own convention exactly: the main output
-        # reuses the parcel source's own name directly, no tool-name
-        # suffix appended (confirmed/changed by the project lead -- the
-        # "_road_frontage" suffix that used to be appended here is gone;
-        # only the QA lines layer gets a suffix now, "_VM" for Visual
-        # Measurement -- see with_output_suffix() usage below).
-        # ------------------------------------------------------------------
-        overwrite_mode = None
-        if output_mode[0] == "local":
-            desired_names = (
-                [os.path.splitext(os.path.basename(p))[0] for p in barangay_source[1]]
-                if barangay_source[0] == "local"
-                else list(barangay_source[1])
-            )
-            conflicting_names = [
-                f"{name}.gpkg" for name in desired_names
-                if os.path.exists(os.path.join(output_mode[1], f"{name}.gpkg"))
-            ]
-            if conflicting_names:
-                overwrite_mode = ask_overwrite_dialog(win, conflicting_names)
-                if overwrite_mode == "cancel":
-                    print("Run cancelled by user (existing output file(s) found).")
-                    return
-
-        # ------------------------------------------------------------------
-        # PRIORITY 2: existing OUTPUT-COLUMN conflict warning. Checks all
+        # PRIORITY 1: existing OUTPUT-COLUMN conflict warning. Checks all
         # three output columns (ROAD_FRONTAGE, DEPTH, DEPTH_WIDTH_RATIO) --
         # not just ROAD_FRONTAGE -- per project-lead decision: they are one
         # feature set computed together, so a conflict on ANY of them
@@ -3787,6 +3754,39 @@ def open_main_window(root):
             parcel_output_column_overrides = dict(parcel_output_column_conflicts)
         else:
             parcel_output_column_overrides = {}
+
+        # ------------------------------------------------------------------
+        # PRIORITY 2: output FILENAME conflict pre-scan. Resolved ONCE, up
+        # front, here on the main thread -- BEFORE the window is destroyed
+        # and BEFORE run_processing()'s background worker starts (Tkinter
+        # dialogs must never be shown from a worker thread). Desired names
+        # only need each source's own filename/table name (no need to
+        # actually read/measure anything yet), so this check is cheap.
+        # Ported from road_width.py's validated pattern -- see
+        # ask_overwrite_dialog()'s docstring for the full behavior.
+        # Matches road_width.py's own convention exactly: the main output
+        # reuses the parcel source's own name directly, no tool-name
+        # suffix appended (confirmed/changed by the project lead -- the
+        # "_road_frontage" suffix that used to be appended here is gone;
+        # only the QA lines layer gets a suffix now, "_VM" for Visual
+        # Measurement -- see with_output_suffix() usage below).
+        # ------------------------------------------------------------------
+        overwrite_mode = None
+        if output_mode[0] == "local":
+            desired_names = (
+                [os.path.splitext(os.path.basename(p))[0] for p in barangay_source[1]]
+                if barangay_source[0] == "local"
+                else list(barangay_source[1])
+            )
+            conflicting_names = [
+                f"{name}.gpkg" for name in desired_names
+                if os.path.exists(os.path.join(output_mode[1], f"{name}.gpkg"))
+            ]
+            if conflicting_names:
+                overwrite_mode = ask_overwrite_dialog(win, conflicting_names)
+                if overwrite_mode == "cancel":
+                    print("Run cancelled by user (existing output file(s) found).")
+                    return
 
         win.destroy()
         if _app_root is None:

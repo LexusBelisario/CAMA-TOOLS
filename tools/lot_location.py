@@ -113,16 +113,21 @@ output_mode = None
 road_type_excluded_values = []
 
 # lot_location_column_overrides: {path_or_table: existing_col_name} — for
-# any Land Parcel source where a pre-existing "lot_location"-like column
-# was detected (see the GUI's _check_parcel_lot_location_worker()) and
-# the user confirmed proceeding. Set by on_run(), read by
+# any Land Parcel source where a pre-existing "cama_lot_location"-like
+# column was detected (see the GUI's _check_parcel_lot_location_worker())
+# and the user confirmed proceeding. Set by on_run(), read by
 # run_processing() and threaded into process_lot_location() as
 # output_column_name, so the tool writes back into the EXACT existing
 # column (preserving its original casing) instead of always writing a
-# hardcoded "LOT_LOCATION" — the latter would silently create a
+# hardcoded "CAMA_LOT_LOCATION" — the latter would silently create a
 # confusing duplicate column whenever the existing one used different
-# casing (e.g. "lot_location" alongside a new "LOT_LOCATION"). A source
-# with no entry here uses the default "LOT_LOCATION" name.
+# casing (e.g. "cAMA_lot_location" alongside a new "CAMA_LOT_LOCATION").
+# A source with no entry here uses the default "CAMA_LOT_LOCATION" name.
+# NOTE (CAMA_ prefix rollout): this check only recognizes the NEW
+# "cama_lot_location" name. Pre-rollout files that still have the old,
+# unprefixed "lot_location" column will NOT be flagged as a conflict —
+# accepted tradeoff per project decision, since this tool has not yet
+# been run against any pre-rollout output. Revisit if that changes.
 lot_location_column_overrides = {}
 
 # _road_gdf_cache: holds the most recently, successfully read road layer
@@ -372,7 +377,7 @@ def label_lot_location(val):
     return {0: "Inner Lot", 1: "Road Lot", 2: "Corner Lot"}.get(val, "Unknown")
 
 
-def process_lot_location(barangay_gdf, road_gdf, source_name="", excluded_road_types=None, progress=None, output_column_name="LOT_LOCATION"):
+def process_lot_location(barangay_gdf, road_gdf, source_name="", excluded_road_types=None, progress=None, output_column_name="CAMA_LOT_LOCATION"):
     """
     Core classification engine. Unchanged from the prior "Double Frontage"
     fix (Intersection Buffer Test / road-name deduplication below) except
@@ -393,12 +398,15 @@ def process_lot_location(barangay_gdf, road_gdf, source_name="", excluded_road_t
         entirely — every call site below is guarded, so this remains
         backward-compatible with any existing caller that doesn't pass it.
     output_column_name : str — the column name the classification is
-        written to. Defaults to "LOT_LOCATION" (this tool's normal
-        output). The GUI overrides this per-source when the selected
-        parcel layer already has an existing "lot_location"-like column
-        (any casing) — the exact existing name/casing is passed here so
-        processing writes back into that same column instead of creating
-        a hardcoded "LOT_LOCATION" alongside it as a confusing duplicate.
+        written to. Defaults to "CAMA_LOT_LOCATION" (this tool's normal
+        output, CAMA_-prefixed per project-wide column naming convention
+        — see road_width.py's own ROAD_WIDTH -> CAMA_ROAD_WIDTH). The GUI
+        overrides this per-source when the selected parcel layer already
+        has an existing "cama_lot_location"-like column (any casing) —
+        the exact existing name/casing is passed here so processing
+        writes back into that same column instead of creating a
+        hardcoded "CAMA_LOT_LOCATION" alongside it as a confusing
+        duplicate.
     """
     orig_crs = barangay_gdf.crs
     zone_epsg = detect_prs92_zone([("Land Parcel", barangay_gdf), ("Road Network", road_gdf)])
@@ -601,7 +609,7 @@ def process_lot_location(barangay_gdf, road_gdf, source_name="", excluded_road_t
         else:
             lot_location_codes.append(1)  # Road Lot (through-lot / double frontage)
 
-    # output_column_name (default "LOT_LOCATION") holds the
+    # output_column_name (default "CAMA_LOT_LOCATION") holds the
     # human-readable classification directly ("Inner Lot" / "Road Lot" /
     # "Corner Lot") -- per project lead decision, this column should
     # contain the actual classification, not an internal numeric code,
@@ -665,7 +673,173 @@ def find_matching_table(local_name, schema):
             return t
     return None
 
-# REPLACE WITH
+
+# ----------------- Output filename helpers -----------------
+# Ported from road_width.py's validated pattern, already successfully
+# adapted in road_frontage.py. See those files for the full design
+# rationale; only a brief summary is repeated here.
+
+def _split_trailing_number(base_name: str):
+    """
+    Splits a base name into (root, existing_number) if it ends with
+    "_<digits>" (e.g. "landparcel_1" -> ("landparcel", 1)), else returns
+    (base_name, None) unchanged.
+    """
+    m = re.match(r'^(.*)_(\d+)$', base_name)
+    if m:
+        return m.group(1), int(m.group(2))
+    return base_name, None
+
+
+def resolve_output_base_name(folder: str, desired_base_name: str, ext: str = "gpkg") -> str:
+    """
+    Determines the actual output base name (no extension) to use for a
+    NEW file in `folder`, given the DESIRED name -- normally the Land
+    Parcel source's own filename, unchanged, with no tool-name suffix
+    appended.
+
+    Rule: reuse the desired name exactly if nothing of that name exists
+    yet in `folder`. If it already exists, strip any existing trailing
+    "_<N>" from the desired name to get a root (e.g. "landparcel_1" ->
+    root "landparcel"), scan `folder` for every file matching
+    "<root>_<N>.<ext>", and use "<root>_<max(N)+1>" -- the highest N
+    found ANYWHERE in the folder, not just "the source file's own N + 1".
+
+    This function decides the number ONCE, for the MAIN output only.
+    (This tool has no companion/QA outputs, so there is no with_output_suffix
+    call needed here -- unlike road_frontage.py.)
+    """
+    candidate_path = os.path.join(folder, f"{desired_base_name}.{ext}")
+    if not os.path.exists(candidate_path):
+        return desired_base_name
+
+    root, _existing_number = _split_trailing_number(desired_base_name)
+
+    pattern = re.compile(rf'^{re.escape(root)}_(\d+)\.{re.escape(ext)}$', re.IGNORECASE)
+    max_n = 0
+    try:
+        for fname in os.listdir(folder):
+            m = pattern.match(fname)
+            if m:
+                max_n = max(max_n, int(m.group(1)))
+    except OSError:
+        pass  # folder unreadable -- fall through with max_n=0, worst case uses N=1
+
+    return f"{root}_{max_n + 1}"
+
+
+def ask_overwrite_dialog(parent, conflicting_names):
+    """
+    Combined dialog shown ONCE, before any processing starts, when one or
+    more Land Parcel sources' desired local output filename already
+    exists in the chosen output folder. Not a per-file prompt -- every
+    conflicting name in the batch is listed together, and the chosen
+    action applies to ALL of them:
+
+      - "Overwrite": every conflicting file is replaced in place, using
+        its plain desired name (no numbering).
+      - "Create New File": every conflicting file is instead saved under
+        a new, non-colliding name via resolve_output_base_name()'s
+        auto-numbering -- the existing files are left untouched.
+      - "Cancel": aborts the ENTIRE run. Nothing is written, including
+        sources that had no conflict at all.
+
+    If the user wants a MIXED outcome (overwrite some, rename others),
+    the expected workflow is to run the tool twice -- once selecting
+    only the sources to overwrite, once for the rest -- rather than
+    choosing per-file in a single dialog.
+
+    Returns "overwrite", "new", or "cancel" (also returned if the
+    dialog's own titlebar close button is used, treated the same as an
+    explicit Cancel -- never silently defaults to a destructive choice).
+
+    Ported from road_width.py's validated implementation, already
+    adapted in road_frontage.py. Deliberately does NOT call
+    dialog.transient(parent): this app's root is permanently withdrawn
+    (see main()), and transient() on a withdrawn parent is a known
+    source of window-manager-dependent "dialog never becomes viewable"
+    behavior. grab_set()+deiconify()+lift()+focus_force()+topmost is
+    used instead, matching this file's own existing dialog pattern
+    (see _pick_db_tables()).
+    """
+    result = {"choice": "cancel"}
+
+    dialog = tk.Toplevel(parent)
+    apply_icon(dialog)
+    dialog.title("File(s) Already Exist")
+    dialog.resizable(False, False)
+    dialog.grab_set()
+    dialog.deiconify()
+    dialog.lift()
+    dialog.focus_force()
+    dialog.attributes("-topmost", True)
+    dialog.after(100, lambda: dialog.attributes("-topmost", False))
+
+    def choose(value):
+        result["choice"] = value
+        dialog.destroy()
+
+    dialog.protocol("WM_DELETE_WINDOW", lambda: choose("cancel"))
+
+    # Buttons packed first, at the bottom -- guaranteed visible/reachable
+    # regardless of how long the scrollable list above them ends up being.
+    btn_frame = tk.Frame(dialog)
+    btn_frame.pack(side="bottom", fill="x", pady=(4, 12))
+    tk.Button(btn_frame, text="Overwrite", width=14, cursor="hand2",
+              command=lambda: choose("overwrite")).pack(side="left", padx=(16, 4))
+    tk.Button(btn_frame, text="Create New File", width=16, cursor="hand2",
+              command=lambda: choose("new")).pack(side="left", padx=4)
+    tk.Button(btn_frame, text="Cancel", width=10, cursor="hand2",
+              command=lambda: choose("cancel")).pack(side="left", padx=(4, 16))
+
+    tk.Label(dialog, text="The following output file(s) already exist:",
+             font=("Segoe UI", 10, "bold"), anchor="w"
+             ).pack(fill="x", padx=16, pady=(16, 4))
+
+    # Scrollable both ways -- vertical for many conflicting names,
+    # horizontal for long filenames. Scrollbars only shown when needed.
+    MAX_LIST_LINES = 10
+    TEXT_WIDTH_CHARS = 55
+
+    list_frame = tk.Frame(dialog)
+    list_frame.pack(fill="both", expand=True, padx=16, pady=(0, 4))
+    vscroll = tk.Scrollbar(list_frame, orient="vertical")
+    hscroll = tk.Scrollbar(list_frame, orient="horizontal")
+    text = tk.Text(
+        list_frame, wrap="none", height=min(len(conflicting_names), MAX_LIST_LINES),
+        width=TEXT_WIDTH_CHARS, yscrollcommand=vscroll.set, xscrollcommand=hscroll.set,
+        relief="flat", bg=dialog.cget("bg"), font=("Segoe UI", 9))
+    vscroll.config(command=text.yview)
+    hscroll.config(command=text.xview)
+    if len(conflicting_names) > MAX_LIST_LINES:
+        vscroll.pack(side="right", fill="y")
+    needs_hscroll = any(len(f"• {name}") > TEXT_WIDTH_CHARS for name in conflicting_names)
+    if needs_hscroll:
+        hscroll.pack(side="bottom", fill="x")
+    text.pack(side="left", fill="both", expand=True)
+    for name in conflicting_names:
+        text.insert("end", f"• {name}\n")
+    text.config(state="disabled")
+
+    tk.Label(dialog, text=(
+        "Overwrite will replace these files. Create New File will save "
+        "them under a new name instead, leaving the existing files "
+        "untouched. This choice applies to all files listed above."
+    ), wraplength=380, justify="left", anchor="w"
+    ).pack(fill="x", padx=16, pady=(4, 8))
+
+    dialog.update_idletasks()
+    req_w = max(dialog.winfo_reqwidth(), 420)
+    req_h = dialog.winfo_reqheight()
+    sw = dialog.winfo_screenwidth()
+    sh = dialog.winfo_screenheight()
+    x = (sw - req_w) // 2
+    y = (sh - req_h) // 2
+    dialog.geometry(f"{req_w}x{req_h}+{x}+{y}")
+
+    dialog.wait_window()
+    return result["choice"]
+
 
 # ----------------- Single Main Window -----------------
 def _pick_db_tables(parent, tables, multi, on_select):
@@ -724,7 +898,7 @@ def open_main_window(root):
     road_is_reading = False     # True while the background read thread is active
     road_read_ok = False        # True once the current road source has been read successfully
 
-    # Land Parcel existing-LOT_LOCATION-column check (Section 1). Mirrors
+    # Land Parcel existing-CAMA_LOT_LOCATION-column check (Section 1). Mirrors
     # the Road Network background-read shape above, and the dual-slot
     # cache shape already proven in road_frontage.py/road_width.py's own
     # _parcel_classification_cache -- adapted here for much lighter data
@@ -760,7 +934,7 @@ def open_main_window(root):
           2. Road Network not selected
           3. Output Destination not selected
           4. Land Parcel currently being checked for an existing
-             LOT_LOCATION column (background thread)
+             CAMA_LOT_LOCATION column (background thread)
           5. Road Network currently being read (background thread)
           6. Road Network selected but not yet successfully read
              (covers: read failed, or hasn't completed for any other
@@ -873,34 +1047,45 @@ def open_main_window(root):
         """
         Runs on a background thread. Reads each currently selected Land
         Parcel source and checks for an existing column matching
-        "lot_location" (case-insensitive) — this tool is about to write
-        its own Inner/Road/Corner Lot classification into that column,
-        and the on_run() confirmation dialog below lets the user
-        confirm before it does. Reuses _read_road_layer_worker (defined
-        below) — despite the name, it's a generic file/DB reader, not
-        road-specific, and never touches any Tkinter widget/variable.
+        "cama_lot_location" (case-insensitive exact match) — this tool
+        is about to write its own Inner/Road/Corner Lot classification
+        into that column, and the on_run() confirmation dialog below
+        lets the user confirm before it does. Reuses
+        _read_road_layer_worker (defined below) — despite the name,
+        it's a generic file/DB reader, not road-specific, and never
+        touches any Tkinter widget/variable.
+
+        CAMA_ prefix rollout note: this only matches "cama_lot_location"
+        (case-insensitive), not the old, unprefixed "lot_location". Files
+        produced before the CAMA_ prefix rollout will not be flagged
+        here — accepted per project decision, since this tool has not
+        yet been run against any pre-rollout output.
 
         Returns a list of (path_or_table, existing_col_name) tuples — one
         entry only for sources where a conflicting column was actually
-        found. The raw path/table (not a display-friendly basename) is
-        returned here so it can be used directly as a lookup key by
-        run_processing() later — the basename is derived separately,
-        only where actually needed for display (see on_run() below).
-        Sources with no conflict, or that fail to read, are simply
-        omitted — a read failure here is reported via a console warning
-        only and never blocks Run for a reason unrelated to this check's
-        own purpose; the real read, at Run time, will surface any
-        genuine failure on its own.
+        found. existing_col_name preserves the exact casing found in the
+        source (e.g. a column literally named "caMA_Lot_locaTION" is
+        returned as-is, not normalized), so the confirmation dialog and
+        the eventual write-back both show/use the real casing. The raw
+        path/table (not a display-friendly basename) is returned here so
+        it can be used directly as a lookup key by run_processing()
+        later — the basename is derived separately, only where actually
+        needed for display (see on_run() below). Sources with no
+        conflict, or that fail to read, are simply omitted — a read
+        failure here is reported via a console warning only and never
+        blocks Run for a reason unrelated to this check's own purpose;
+        the real read, at Run time, will surface any genuine failure on
+        its own.
         """
         conflicts = []
         for path_or_table in sources_list:
             gdf, error = _read_road_layer_worker(source_type, path_or_table)
             if error is not None or gdf is None:
                 print(f"⚠️ Could not read parcel layer to check for an "
-                      f"existing LOT_LOCATION column: {path_or_table}: {error}")
+                      f"existing CAMA_LOT_LOCATION column: {path_or_table}: {error}")
                 continue
             existing_col = next(
-                (c for c in gdf.columns if c.lower() == "lot_location"), None
+                (c for c in gdf.columns if c.lower() == "cama_lot_location"), None
             )
             if existing_col:
                 conflicts.append((path_or_table, existing_col))
@@ -909,7 +1094,7 @@ def open_main_window(root):
     def _set_parcel_reading_state(is_reading):
         """
         Toggle GUI responsiveness while the Land Parcel existing-
-        LOT_LOCATION-column check is in progress. Mirrors
+        CAMA_LOT_LOCATION-column check is in progress. Mirrors
         _set_road_reading_state() below exactly — disables the parcel
         Browse/Select button and the Local/Database radio buttons for
         the duration of the read, preventing a second, concurrent read
@@ -956,7 +1141,7 @@ def open_main_window(root):
         """
         Background-checks every currently selected Land Parcel
         file/table for an existing column that would collide with the
-        LOT_LOCATION column this tool is about to write — UNLESS the
+        CAMA_LOT_LOCATION column this tool is about to write — UNLESS the
         dual-slot cache already has a still-valid entry for this exact
         mode+selection (e.g. toggling Local <-> Database back to a
         selection that hasn't changed), in which case the result is
@@ -966,7 +1151,7 @@ def open_main_window(root):
         always re-reads, even if the cache key matches. Must be True
         whenever this is called because the user just ACTIVELY selected
         source(s) via Browse/Select — if they re-select the exact same
-        file(s) (e.g. after externally adding/removing a LOT_LOCATION
+        file(s) (e.g. after externally adding/removing a CAMA_LOT_LOCATION
         column), a plain key match would otherwise silently serve a
         stale result. Only safe to leave at the default False on the
         _toggle_parcel() path, where the user didn't select anything new.
@@ -1016,7 +1201,7 @@ def open_main_window(root):
             parcel_local_paths.extend(files)
             parcel_files_var.set(f"{len(files)} file(s) selected")
             # A new Land Parcel selection invalidates any prior
-            # LOT_LOCATION-conflict check — force_refresh=True: the user
+            # CAMA_LOT_LOCATION-conflict check — force_refresh=True: the user
             # actively chose this selection just now, so it must be
             # checked fresh, never served from a stale cache entry.
             _refresh_parcel_lot_location_check(force_refresh=True)
@@ -1468,11 +1653,15 @@ def open_main_window(root):
             output_mode = ("db", None)
 
         # Warn about any Land Parcel source(s) that already have a
-        # column matching "lot_location" (case-insensitive) — this tool
-        # is about to write its Inner/Road/Corner Lot classification
-        # into that column. Shown once, combined across every affected
-        # source, only here at Run time — never at Browse time, and
-        # never as a console-only message, since a user running the
+        # column matching "cama_lot_location" (case-insensitive exact
+        # match) — this tool is about to write its Inner/Road/Corner Lot
+        # classification into that column. The dialog shows the existing
+        # column exactly as found in the source (original casing
+        # preserved, e.g. a column literally named "caMA_Lot_locaTION"
+        # is shown as "caMA_Lot_locaTION", not normalized to
+        # "CAMA_LOT_LOCATION"). Shown once, combined across every
+        # affected source, only here at Run time — never at Browse time,
+        # and never as a console-only message, since a user running the
         # compiled EXE without a terminal open would never see one.
         # Declining cancels the run entirely rather than skipping just
         # the affected source(s), so the user always knows exactly what
@@ -1484,7 +1673,7 @@ def open_main_window(root):
                 for path_or_table, existing_col in parcel_existing_lot_location
             )
             proceed = messagebox.askyesno(
-                "Existing LOT_LOCATION column found",
+                "Existing CAMA_LOT_LOCATION column found",
                 f"{lines}\n\n"
                 "Processing will overwrite the existing column(s) with the "
                 "newly computed classification.\n\nProceed?"
@@ -1492,8 +1681,8 @@ def open_main_window(root):
             if not proceed:
                 return
             # Preserve each source's existing column name/casing exactly
-            # -- e.g. a detected "lot_location" (lowercase) is written
-            # back to "lot_location", not a hardcoded "LOT_LOCATION" --
+            # -- e.g. a detected "caMA_Lot_locaTION" is written back to
+            # "caMA_Lot_locaTION", not a hardcoded "CAMA_LOT_LOCATION" --
             # so no duplicate column is ever created regardless of the
             # existing casing. A source with no entry here (no conflict
             # was found) simply uses the default name in
@@ -1507,9 +1696,32 @@ def open_main_window(root):
              if not var.get()]
             if road_type_filter_check_var.get() else []
         )
+        # PRIORITY 2: existing OUTPUT-FILE conflict check (local output only).
+        # Resolved ONCE, up front, on the main thread -- before win.destroy()
+        # so the dialog has a live parent window. The chosen action applies
+        # to ALL conflicting sources in the batch (one combined dialog, not
+        # per-file). Cancel aborts the entire run; nothing is written.
+        # Ported from road_width.py / road_frontage.py's validated pattern.
+        overwrite_mode = None
+        if output_mode[0] == "local":
+            desired_names = (
+                [os.path.splitext(os.path.basename(p))[0] for p in barangay_source[1]]
+                if barangay_source[0] == "local"
+                else list(barangay_source[1])
+            )
+            conflicting_names = [
+                f"{name}.gpkg" for name in desired_names
+                if os.path.exists(os.path.join(output_mode[1], f"{name}.gpkg"))
+            ]
+            if conflicting_names:
+                overwrite_mode = ask_overwrite_dialog(win, conflicting_names)
+                if overwrite_mode == "cancel":
+                    print("Run cancelled by user (existing output file(s) found).")
+                    return
+
 
         win.destroy()
-        run_processing(root)
+        run_processing(root, overwrite_mode)
 
     run_btn = tk.Button(win, text="▶  Run Processing", command=on_run,
               font=("Segoe UI", 10, "bold"),
@@ -1576,7 +1788,7 @@ class ProgressWindow:
         self.win.destroy()
 
 
-def run_processing(app_root):
+def run_processing(app_root, overwrite_mode=None):
     """
     Runs the full batch (all selected parcel sources) on a background
     thread, reporting progress via a ProgressWindow.
@@ -1591,6 +1803,13 @@ def run_processing(app_root):
     already has it as open_main_window()'s own `root` parameter) rather
     than a module-level `_app_root` global — smaller diff, no new global
     state, since this tool's architecture already makes it available.
+
+    overwrite_mode: "overwrite", "new", or None (no conflict existed).
+    Resolved ONCE, up front, on the main thread in on_run() before
+    win.destroy() -- passed here as a parameter (not a global) for the
+    same reason app_root is passed as a parameter. worker() captures it
+    via closure automatically. See ask_overwrite_dialog() for the full
+    behavior contract.
 
     Per-source failure isolation: if one parcel source (file or DB
     table) fails, it's skipped and the rest of the batch continues —
@@ -1660,16 +1879,31 @@ def run_processing(app_root):
                     # keyed by the same raw path/table string used to
                     # iterate `sources` above. A source with no entry
                     # here falls back to process_lot_location()'s own
-                    # default ("LOT_LOCATION").
+                    # default ("CAMA_LOT_LOCATION").
                     result = process_lot_location(
                         brgy_gdf, road_gdf, name,
                         excluded_road_types=excluded_road_types,
                         progress=progress_cb,
-                        output_column_name=lot_location_column_overrides.get(src, "LOT_LOCATION")
+                        output_column_name=lot_location_column_overrides.get(src, "CAMA_LOT_LOCATION")
                     )
 
                     if output_mode[0] == "local":
-                        out = os.path.join(output_mode[1], f"{out_base}_lot_location.gpkg")
+                        # Desired output filename = the Land Parcel source's
+                        # own name, unchanged -- no tool-name suffix appended
+                        # (matching road_width.py / road_frontage.py's
+                        # established convention). overwrite_mode was resolved
+                        # ONCE, up front in on_run(), for the whole batch --
+                        # no per-file prompt here.
+                        desired_base_name = out_base
+                        candidate_path = os.path.join(output_mode[1], f"{desired_base_name}.gpkg")
+                        had_conflict = os.path.exists(candidate_path)
+                        if had_conflict and overwrite_mode == "new":
+                            base_name = resolve_output_base_name(output_mode[1], desired_base_name)
+                        else:
+                            # No conflict, or user chose "Overwrite" --
+                            # both cases use the plain desired name.
+                            base_name = desired_base_name
+                        out = os.path.join(output_mode[1], f"{base_name}.gpkg")
                         result.to_file(out, driver="GPKG")
                         print(f"✅ Saved {out}")
                         q.put(("open_gm", out, None, None))

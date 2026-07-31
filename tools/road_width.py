@@ -2,6 +2,7 @@ root = None
 
 import os
 import re
+import time
 import tkinter as tk
 from tkinter import ttk
 from tkinter import filedialog, messagebox, Listbox
@@ -36,6 +37,168 @@ def _get_credentials_path():
         return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "pg_credentials.json")
 
 CREDENTIALS_FILE = _get_credentials_path()
+
+def resource_path(relative_path):
+    """PyInstaller-safe resource path. Ported from road_frontage.py."""
+    try:
+        base_path = _sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
+
+def apply_icon(win):
+    """
+    Sets both the Windows taskbar/Alt-Tab icon (.ico) and the Tk titlebar
+    icon (.png fallback, needed since iconbitmap() alone doesn't reliably
+    set the titlebar icon on every Windows/Tk combination) for a single
+    window. Ported verbatim from road_frontage.py so the new
+    ProgressWindow and show_success_dialog() in this file show the same
+    BLGF logo as every other tool -- previously relied entirely on
+    Toplevel windows inheriting the (permanently withdrawn) root's icon,
+    which happens to work but isn't an explicit guarantee the way calling
+    this directly is.
+    """
+    ico = resource_path("BLGF.ico")
+    png = resource_path("BLGF.png")
+
+    if os.path.exists(ico):
+        try:
+            win.iconbitmap(ico)
+        except Exception:
+            pass
+
+    if os.path.exists(png):
+        try:
+            img = tk.PhotoImage(file=png)
+            win.iconphoto(True, img)
+        except Exception:
+            pass
+
+
+def _get_dialog_center_position(dialog_widget, req_w, req_h):
+    """
+    Returns (x, y) screen coordinates to center a dialog of the given
+    size on.
+
+    Tries the actual Global Mapper window first (found via the same
+    EnumWindows technique as load_in_global_mapper() above) -- Global
+    Mapper is the visible, foreground application the user is actually
+    looking at when these dialogs appear (this tool's own selection
+    windows are already destroyed by the time processing runs -- see
+    on_run()'s win.destroy() before run_processing()).
+
+    Falls back to centering on the physical screen if Global Mapper's
+    window can't be found (not running, or the lookup fails for any
+    reason) -- deliberately NOT on `root`'s own winfo_x()/winfo_y()/
+    winfo_width()/winfo_height(), which was the previous approach and
+    is exactly what caused a dialog to appear in an unexpected,
+    seemingly-random position: `root` is permanently withdrawn (see
+    main()) and its reported geometry is meaningless, not tied to
+    anything visible on screen. winfo_screenwidth()/winfo_screenheight()
+    on the other hand query the actual physical screen and are
+    meaningful even from a withdrawn widget.
+
+    dialog_widget: any already-created Tk widget (used only to query
+    screen dimensions for the fallback case -- does not need to be
+    mapped/visible itself).
+    """
+    try:
+        import ctypes
+        import ctypes.wintypes
+
+        gm_hwnd = None
+
+        def enum_callback(hwnd, _):
+            nonlocal gm_hwnd
+            if not ctypes.windll.user32.IsWindowVisible(hwnd):
+                return True
+            length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+            if length == 0:
+                return True
+            buf = ctypes.create_unicode_buffer(length + 1)
+            ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
+            if "Global Mapper" in buf.value:
+                gm_hwnd = hwnd
+                return False
+            return True
+
+        EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+        ctypes.windll.user32.EnumWindows(EnumWindowsProc(enum_callback), 0)
+
+        if gm_hwnd:
+            rect = ctypes.wintypes.RECT()
+            ctypes.windll.user32.GetWindowRect(gm_hwnd, ctypes.byref(rect))
+            gm_w = rect.right - rect.left
+            gm_h = rect.bottom - rect.top
+            x = rect.left + (gm_w - req_w) // 2
+            y = rect.top + (gm_h - req_h) // 2
+            return max(x, 0), max(y, 0)
+    except Exception:
+        pass
+
+    screen_w = dialog_widget.winfo_screenwidth()
+    screen_h = dialog_widget.winfo_screenheight()
+    x = (screen_w - req_w) // 2
+    y = (screen_h - req_h) // 2
+    return max(x, 0), max(y, 0)
+
+
+def _remove_close_button(win):
+    """
+    Strips the titlebar's close (X) button (and system menu) via the
+    Win32 API directly.
+
+    protocol("WM_DELETE_WINDOW", lambda: None) (used elsewhere for this
+    same window) only prevents the CLICK from doing anything -- the X
+    itself stays fully visible, still highlights on hover, and still
+    looks clickable, since Tkinter/the OS's own window chrome has no
+    idea the close action has been neutralized. Confirmed via direct
+    user report/screenshot: this reads as broken (a button that does
+    nothing when clicked) rather than intentionally absent. This
+    function is a stronger fix -- actually removing the button from the
+    titlebar so there's nothing there to click in the first place.
+
+    Uses GetWindowLongW/SetWindowLongW to clear the WS_SYSMENU bit from
+    the window's style. WS_SYSMENU controls the system menu AND the
+    close button as a single unit in the Win32 API -- there is no
+    separate flag for "close button only". Removing it also removes the
+    right-click system menu and Alt+F4 for this specific window, and
+    (on most Windows versions) the small titlebar icon -- acceptable
+    here since none of those are meaningful for a progress window with
+    no cancel action to offer regardless.
+
+    GetParent(win.winfo_id()) rather than win.winfo_id() directly: a
+    long-standing, widely-documented Tkinter-on-Windows quirk where
+    winfo_id() can return a CHILD window's HWND rather than the actual
+    top-level frame's HWND on some Tcl/Tk builds -- GetParent() walks up
+    to the real top-level window whose style actually controls the
+    titlebar, which winfo_id() does not reliably do on its own.
+
+    Windows-only (ctypes.windll doesn't exist on other platforms) and
+    fully defensive: any failure here (wrong platform, unexpected
+    Win32 API/ABI mismatch) is caught and logged, falling back to the
+    protocol()-based click-does-nothing behavior already in place --
+    a visible-but-inert X is a much smaller problem than crashing the
+    whole tool over what is ultimately a cosmetic fix.
+
+    NOTE: could not be tested against a real Windows/DWM environment
+    from this development environment (Linux-only) -- this is a
+    well-established, commonly-documented Win32 API pattern for this
+    exact "remove system menu + close box" scenario, but the actual
+    visual/behavioral result (in particular, whether it affects the
+    minimize/maximize buttons on this specific window's exact style
+    flags) should be confirmed on the real deployment target.
+    """
+    try:
+        import ctypes
+        GWL_STYLE = -16
+        WS_SYSMENU = 0x00080000
+        hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+        style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_STYLE)
+        ctypes.windll.user32.SetWindowLongW(hwnd, GWL_STYLE, style & ~WS_SYSMENU)
+    except Exception as e:
+        print(f"⚠️ Could not remove the titlebar close button (non-Windows platform, or unexpected Win32 API issue): {e}")
 
 # MAX_ROAD_DISTANCE: sanity cutoff (meters, in the PRS92 projected CRS
 # used internally by process()) applied to every width candidate in the
@@ -240,6 +403,169 @@ def resolve_output_base_name(folder: str, desired_base_name: str, ext: str = "gp
     return f"{root}_{max_n + 1}"
 
 
+def _find_existing_table_case_insensitive(desired_name, all_tables):
+    """
+    Case-insensitive lookup for an existing table matching desired_name
+    among all_tables (as returned by fetch_tables()). Returns the EXACT
+    existing name as stored in the database (never desired_name's own
+    casing) if a case-insensitive match is found, else None.
+
+    Only the COMPARISON is case-insensitive -- the return value never
+    is. This exists specifically so callers can show the user the
+    actual table name that already exists (e.g. "landparcel"), never
+    silently substituting whatever casing the caller happened to be
+    asking about (e.g. an incoming "LanDPARCEL" must never make this
+    function claim the existing table is itself called "LanDPARCEL").
+    """
+    desired_lower = desired_name.lower()
+    for existing in all_tables:
+        if existing.lower() == desired_lower:
+            return existing
+    return None
+
+
+def resolve_db_table_name(schema, desired_base_name):
+    """
+    Determines the actual table name to use for a NEW table, given the
+    DESIRED name -- the same "reuse the desired name if nothing of that
+    name exists yet; otherwise find the true max existing "<root>_<N>"
+    suffix ANYWHERE in the schema and use max(N)+1" rule as
+    resolve_output_base_name() uses for local files (see that
+    function's own docstring for the full rationale -- identical logic,
+    just scanning fetch_tables(schema) instead of a folder's file
+    listing, and with no extension involved).
+
+    Case-insensitive matching throughout (PostgreSQL table names read
+    back from information_schema are compared without regard to case),
+    but the RETURNED name always uses desired_base_name's own casing as
+    its root -- e.g. desired "LandParcel" with existing "landparcel"
+    and "LandParcel_2" (any casing) already present returns
+    "LandParcel_3", preserving the caller's own casing, not whatever
+    casing existing rows happened to use.
+    """
+    all_tables = fetch_tables(schema)
+    if _find_existing_table_case_insensitive(desired_base_name, all_tables) is None:
+        return desired_base_name
+
+    root, _existing_number = _split_trailing_number(desired_base_name)
+
+    pattern = re.compile(rf'^{re.escape(root)}_(\d+)$', re.IGNORECASE)
+    max_n = 0
+    for existing in all_tables:
+        m = pattern.match(existing)
+        if m:
+            max_n = max(max_n, int(m.group(1)))
+
+    return f"{root}_{max_n + 1}"
+
+
+def ask_db_overwrite_dialog(parent, conflicting_pairs):
+    """
+    Combined dialog shown ONCE, before any processing starts, when one
+    or more Land Parcel sources' desired database table name already
+    exists (case-insensitively) in the target schema. Mirrors
+    ask_overwrite_dialog()'s design (same three choices, same
+    single-combined-decision-for-the-whole-batch philosophy, same
+    grab_set()/no-transient() dialog-safety pattern) -- kept as a
+    separate function rather than a shared one because the two operate
+    on genuinely different resources (files in a folder vs. tables in a
+    schema) with different name-matching rules (filesystem paths are
+    typically case-sensitive; this dialog's whole reason to exist is
+    PostgreSQL's case-INsensitive default table-name comparison).
+
+      - "Overwrite": every conflicting table is replaced in place,
+        using the schema's ACTUAL existing casing for each (e.g. an
+        incoming "LandParcel" that matched an existing "landparcel"
+        writes to "landparcel", not "LandParcel") -- never creates a
+        second, differently-cased duplicate table.
+      - "Create New": every conflicting table gets a new, non-colliding
+        name instead (resolve_db_table_name()), using the INCOMING
+        source's own casing as the new name's root, leaving the
+        existing table(s) completely untouched.
+      - "Cancel" (or closing the dialog): aborts the entire run. No
+        source is processed, including ones with no conflict -- same
+        all-or-nothing semantics as ask_overwrite_dialog().
+
+    conflicting_pairs: list of (desired_name, existing_name) tuples --
+    existing_name is the actual casing found in the schema, always
+    shown to the user instead of desired_name, so "Found existing
+    table: 'landparcel'" always names what's REALLY there, not what
+    the incoming source happened to be called.
+
+    Returns "overwrite", "new", or "cancel".
+    """
+    result = {"choice": "cancel"}
+
+    dialog = tk.Toplevel(parent)
+    apply_icon(dialog)
+    dialog.title("ROAD WIDTH TOOL")
+    dialog.resizable(False, False)
+    dialog.grab_set()
+    dialog.deiconify()
+    dialog.lift()
+    dialog.focus_force()
+    dialog.attributes("-topmost", True)
+    dialog.after(100, lambda: dialog.attributes("-topmost", False))
+
+    def choose(choice):
+        result["choice"] = choice
+        dialog.destroy()
+
+    dialog.protocol("WM_DELETE_WINDOW", lambda: choose("cancel"))
+
+    tk.Label(
+        dialog, text="Found existing table(s):",
+        font=("Segoe UI", 10, "bold"), anchor="w"
+    ).pack(fill="x", padx=16, pady=(16, 4))
+
+    MAX_LIST_LINES = 10
+    names = [existing for _desired, existing in conflicting_pairs]
+    list_frame = tk.Frame(dialog)
+    list_frame.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+    vscroll = tk.Scrollbar(list_frame, orient="vertical")
+    text = tk.Text(
+        list_frame, wrap="none",
+        height=min(len(names), MAX_LIST_LINES), width=50,
+        yscrollcommand=vscroll.set, relief="flat",
+        bg=dialog.cget("bg"), font=("Segoe UI", 9))
+    vscroll.config(command=text.yview)
+    if len(names) > MAX_LIST_LINES:
+        vscroll.pack(side="right", fill="y")
+    text.pack(side="left", fill="both", expand=True)
+    for name in names:
+        text.insert("end", f"{name}\n")
+    text.config(state="disabled")
+
+    tk.Label(dialog, text="Do you want to overwrite them?",
+             anchor="w").pack(fill="x", padx=16, pady=(0, 12))
+
+    btn_frame = tk.Frame(dialog)
+    btn_frame.pack(fill="x", padx=16, pady=(0, 8))
+    tk.Button(btn_frame, text="Overwrite", width=14, cursor="hand2",
+              command=lambda: choose("overwrite")).pack(side="left", padx=(0, 8))
+    tk.Button(btn_frame, text="Create New", width=14, cursor="hand2",
+              command=lambda: choose("new")).pack(side="left", padx=(0, 8))
+    tk.Button(btn_frame, text="Cancel", width=14, cursor="hand2",
+              command=lambda: choose("cancel")).pack(side="left")
+
+    tk.Label(dialog, text=(
+        "\"Overwrite\" replaces the existing table(s) shown above with "
+        "the new results. \"Create New\" saves the new results under a "
+        "new table name instead, leaving the existing table(s) "
+        "untouched. This choice applies to all tables listed above."
+    ), anchor="w", justify="left", wraplength=420
+             ).pack(fill="x", padx=16, pady=(4, 16))
+
+    dialog.update_idletasks()
+    req_w = max(dialog.winfo_reqwidth(), 460)
+    req_h = dialog.winfo_reqheight()
+    x, y = _get_dialog_center_position(dialog, req_w, req_h)
+    dialog.geometry(f"{req_w}x{req_h}+{x}+{y}")
+
+    dialog.wait_window()
+    return result["choice"]
+
+
 def with_qa_suffix(main_base_name: str) -> str:
     """
     Derives the Visual Measurement layer's base name from the
@@ -309,30 +635,61 @@ def read_postgis_clean(table, engine, schema):
 
 def _write_gpkg(gdf, path):
     """
-    Writes a GeoDataFrame to a .gpkg file, deleting any pre-existing file
-    at that exact path FIRST.
+    Writes a GeoDataFrame to a .gpkg file, atomically.
 
-    Why this is necessary: GeoPackage is a SQLite-based container that
-    can hold multiple named layers. Calling gdf.to_file(path,
-    driver="GPKG") when `path` already exists does NOT simply replace
-    its contents -- pyogrio/GDAL tries to create a new layer inside the
-    existing file, and fails with "Layer <name> already exists,
-    CreateLayer failed" if a layer of that name is already there. This
-    is exactly what happened when a user chose "Overwrite" in
-    ask_overwrite_dialog() -- the write raised an uncaught exception,
-    crashing the whole run with no success dialog and no clear message
-    to the user (just a traceback in the console, invisible in the
-    compiled EXE).
+    Why atomicity is necessary here specifically: the previous version
+    of this function deleted any pre-existing file at `path` FIRST,
+    then wrote the new content -- necessary because GeoPackage is a
+    SQLite-based container that can hold multiple named layers, and
+    calling gdf.to_file(path, driver="GPKG") when `path` already exists
+    does NOT simply replace its contents; pyogrio/GDAL tries to create
+    a new layer inside the existing file and fails with "Layer <name>
+    already exists, CreateLayer failed" if a layer of that name is
+    already there (confirmed reproduced when a user chose "Overwrite"
+    in ask_overwrite_dialog() -- crashed the whole run with no success
+    dialog and no clear message, just a console traceback invisible in
+    the compiled EXE).
 
-    Explicitly removing any existing file before writing guarantees a
-    genuinely clean, single-layer GPKG every time -- matching what
-    "Overwrite" is actually supposed to mean -- rather than depending on
-    pyogrio/GDAL's own in-place layer-replacement behavior, which isn't
-    triggered by a plain to_file() call.
+    But delete-then-write has its own, worse failure mode: if anything
+    interrupts the process between the delete and the write completing
+    (a crash, the machine losing power, disk full mid-write), the
+    result isn't a corrupted file -- there is NO FILE AT ALL at `path`
+    anymore, having deleted the original with nothing to show for it.
+
+    This version instead writes to a temporary file first, VERIFIES
+    that file is actually readable back (a write that raised no
+    exception but produced something GDAL itself can't re-open is
+    exactly the failure this guards against), and only then atomically
+    replaces the destination via os.replace() -- which is atomic on
+    the same filesystem on both Windows and POSIX, unlike
+    os.remove()+os.rename(): there is no window where `path` doesn't
+    exist. If ANY step before the final os.replace() fails, `path` is
+    left completely untouched, exactly as if this call never happened.
     """
-    if os.path.exists(path):
-        os.remove(path)
-    gdf.to_file(path, driver="GPKG")
+    tmp_path = f"{os.path.splitext(path)[0]}.tmp{os.path.splitext(path)[1]}"
+    if os.path.exists(tmp_path):
+        os.remove(tmp_path)
+
+    gdf.to_file(tmp_path, driver="GPKG")
+
+    try:
+        verify_gdf = gpd.read_file(tmp_path)
+        if len(verify_gdf) != len(gdf):
+            raise ValueError(
+                f"Row count mismatch after write: expected {len(gdf)}, "
+                f"got {len(verify_gdf)}."
+            )
+    except Exception as e:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"Could not verify the written file before replacing the "
+            f"destination -- destination left unchanged. Details: {e}"
+        )
+
+    os.replace(tmp_path, path)
 
 def load_in_global_mapper(filepath):
     """Open or load a file into Global Mapper if it is already running,
@@ -566,7 +923,7 @@ def _detect_pin_column(gdf):
 # "lot_location" present, so no real dataset depends on a label-only
 # fallback.
 KNOWN_LOT_LABEL_VALUES = {"Inner Lot", "Road Lot", "Corner Lot"}
-LOT_LOCATION_COLUMN_CANDIDATES = ("lot_location",)
+LOT_LOCATION_COLUMN_CANDIDATES = ("cama_lot_location",)
 
 # Tri-state result of inspecting a parcel layer for a usable
 # classification column -- kept as named states rather than a bare
@@ -2513,7 +2870,7 @@ def open_main_window(root):
                 for path_or_table, existing_col in parcel_road_width_conflicts
             )
             proceed = messagebox.askyesno(
-                "Existing ROAD_WIDTH column found",
+                "Existing CAMA_ROAD_WIDTH column found",
                 f"{lines}\n\n"
                 "Processing will overwrite the existing column(s) with the "
                 "newly computed values.\n\nProceed?"
@@ -2530,8 +2887,40 @@ def open_main_window(root):
         else:
             parcel_road_width_column_overrides = {}
 
+        # ------------------------------------------------------------------
+        # PRIORITY 2: output FILENAME conflict pre-scan. Resolved ONCE, up
+        # front, here on the main thread -- BEFORE the window is destroyed
+        # and BEFORE run_processing()'s background worker starts (Tkinter
+        # dialogs must never be shown from a worker thread). Desired names
+        # only need each source's own filename/table name (no need to
+        # actually read/measure anything yet), so this check is cheap.
+        # Moved here from run_processing() so that:
+        #   (a) win is still live, giving the dialog a proper parent, and
+        #   (b) the user can cancel without losing the main window --
+        #       consistent with all other tools in this project.
+        # overwrite_mode shadows the module-level global of the same name
+        # (line ~125) -- this is intentional and preferred: the parameter
+        # passed into run_processing() is the per-run resolved value;
+        # the module-level default (None) is only a fallback for
+        # callers that don't pass it.
+        # ------------------------------------------------------------------
+        overwrite_mode = None
+        if output_mode[0] == "local":
+            desired_names = [
+                os.path.splitext(os.path.basename(p))[0] for p in barangay_source[1]
+            ] if barangay_source[0] == "local" else list(barangay_source[1])
+            conflicting_names = [
+                f"{name}.gpkg" for name in desired_names
+                if os.path.exists(os.path.join(output_mode[1], f"{name}.gpkg"))
+            ]
+            if conflicting_names:
+                overwrite_mode = ask_overwrite_dialog(win, conflicting_names)
+                if overwrite_mode == "cancel":
+                    print("Run cancelled by user (existing output file(s) found).")
+                    return
+
         win.destroy()
-        run_processing()
+        run_processing(root, overwrite_mode)
 
     run_btn = tk.Button(win, text="▶  Run Processing", command=on_run,
               bg="#2e7d32", fg="white", font=("Segoe UI", 10, "bold"),
@@ -2600,7 +2989,7 @@ def select_output_window(root):
             output_mode = ("local", out_dir)
             print("✅ Output mode set:", output_mode)
             win.destroy()
-            run_processing()
+            run_processing(root)
 
     def save_db():
         global output_mode, barangay_source, road_source
@@ -2610,7 +2999,7 @@ def select_output_window(root):
         output_mode = ("db", None)
         print("✅ Output mode set:", output_mode)
         win.destroy()
-        run_processing()
+        run_processing(root)
 
     # 🔹 SIDE-BY-SIDE buttons (same layout & size)
     btn_frame = tk.Frame(win)
@@ -2631,104 +3020,90 @@ def select_output_window(root):
     ).pack(side=tk.LEFT, padx=5)
 
 # ----------------- SUCCESS DIALOG -----------------
-def show_success_dialog(parent, saved_files):
+def show_success_dialog(parent, total_sources, failed_sources, single_success_detail=None):
     """
-    Minimal custom "processing complete" dialog, replacing
-    messagebox.showinfo() for this specific message. Not a general-
-    purpose replacement for messagebox elsewhere in this file -- just
-    for this one summary, which needed something messagebox structurally
-    can't do:
+    "Processing complete" summary dialog -- or, for the one specific
+    case of a single-source run that failed, a "Processing failed"
+    dialog instead (see single_failure below). Deliberately does NOT
+    list every successful source individually -- with a batch of many
+    sources, a full list of every filename that simply worked adds
+    length without adding information the user needs to act on; the
+    total count at the top already answers "did it work." Only
+    FAILURES are listed individually, since those are exactly the
+    entries a user needs to identify and act on (fix the source, then
+    re-run just that one).
 
-    messagebox has no scrolling and no height/width cap of its own -- it
-    just grows to fit whatever text it's given. With a batch of many
-    processed files, or long output paths, the content could grow tall
-    or wide enough to push the OK button (and even the dialog's own
-    titlebar close button) off the visible screen, or truncate long
-    paths with no way to see the rest, with no way to scroll or resize
-    to recover either problem.
+    Not a general-purpose replacement for messagebox elsewhere in this
+    file -- just for this one summary, which needs something messagebox
+    structurally can't do: messagebox has no scrolling and no height/
+    width cap of its own -- it just grows to fit whatever text it's
+    given. With many failed sources, or long reason text, the content
+    could grow tall or wide enough to push the OK button off the
+    visible screen, with no way to scroll or resize to recover.
 
     This dialog fixes that with:
       1. The OK button packed FIRST, side="bottom" -- guaranteed to stay
          visible/reachable regardless of how tall the content above it
-         wants to be, since pack() reserves its space before laying out
-         anything else.
-      2. The file list lives in a height-CAPPED (in text lines, not
-         pixels), scrollable Text widget -- BOTH vertically (many
-         entries) and horizontally (long paths) -- wrap="none" so long
-         paths stay on one line and scroll into view rather than
-         wrapping awkwardly and losing readability.
+         wants to be.
+      2. The failed-sources list lives in a height-CAPPED (in text
+         lines, not pixels), scrollable Text widget -- BOTH vertically
+         (many entries) and horizontally (long names) -- but the
+         scrollbar itself is only shown when actually needed (matches
+         ask_overwrite_dialog()'s own convention elsewhere in this
+         file): a short list with short names shows no scrollbar at
+         all, the dialog just sizes itself to fit.
       3. The dialog's own size is left to its natural required size
-         AFTER the Text widget's height is already capped -- no separate
-         pixel-height clamp needed.
+         AFTER the Text widget's height is already capped.
 
-    Deliberately NOT a file manager -- no Open Folder button, no per-
-    path actions (open/copy/reveal), no resizing. Just a summary: what
-    was written, and how many.
+    No decorative icons or emoji beyond a single "❌" per failed source
+    name in the multi-source case -- that one IS meaningful
+    (distinguishes a failed entry at a glance in a list), not
+    decorative.
 
-    saved_files: list of {"main": str, "main_status": "New"|"Overwritten"|None,
-    "vm": str or None} -- one entry per parcel source PROCESSED (not per
-    file), in PROCESSING ORDER (never grouped/sorted by status -- users
-    cross-check against their own source list, which is also in that
-    order). "main" is always a real path or "Database table: X" string,
-    never blank. "main_status" drives the marker shown next to it --
-    absent entirely (not even an empty string) when there was no
-    conflict, since a brand-new write needing no marker is the common
-    case and shouldn't imply something happened when it didn't. "vm" is
-    the paired visual-measurement output for THIS SAME source, if one
-    was written -- shown as an indented sub-line with NO marker of its
-    own (it's a consequence of the main output's decision, not an
-    independent choice -- see with_qa_suffix()'s docstring) -- and
-    simply omitted (no sub-line at all) when this particular source had
-    no VM output (e.g. no parcel in it got a valid measurement).
+    total_sources: int -- how many parcel sources were part of this run
+    (successful + failed). The success count shown is total_sources
+    minus len(failed_sources); no separate success list is passed in.
+
+    failed_sources: list of (source_name, reason) tuples, in the order
+    they failed during processing. Grouped by reason for display (one
+    reason header, one or more "❌ name" lines under it) rather than
+    repeating the same reason text per source -- multiple sources
+    commonly fail for the identical reason (e.g. a shared network drive
+    briefly unavailable), and repeating that same sentence many times
+    over adds length without adding information.
+
+    single_failure (total_sources == 1 and exactly one failure): this
+    isn't really a "batch summary" at all -- there's nothing to
+    summarize across multiple sources, just one source that failed.
+    Showing "0 of 1 source(s)..." or even "None of the 1 source(s)
+    completed successfully." in this case reads like a batch-processing
+    report for something that was never really a batch. Gets its own
+    much simpler layout instead: a "Processing Failed" title (not
+    "Processing Complete"), a direct "'{name}' could not be processed."
+    statement, and the reason -- no source count anywhere, no "Failed
+    (N):" header, no ❌ marker (nothing to distinguish since there's
+    only the one item, already named directly above).
+
+    single_success_detail: optional str, e.g. "'landparcel' overwritten
+    successfully." or "'LandParcel_2' created successfully." -- the
+    single-source SUCCESS counterpart to single_failure above. Only
+    used when total_sources == 1 and that one source succeeded; shown
+    instead of the generic "All 1 source(s) completed successfully."
+    for the same reason single_failure exists -- a specific, precise
+    statement about the one thing that happened is more useful than a
+    batch-shaped summary of a non-batch. Caller-supplied (built in
+    run_processing()'s worker(), which knows the exact outcome --
+    "overwritten" vs. "created" -- and output name/table for that one
+    source) rather than derived here, since this function has no other
+    way to know which of those two words applies.
     """
-    MAX_LIST_LINES = 15
-
-    if not saved_files:
-        # Distinct message rather than showing an empty bulleted list
-        # with "0 file(s) written." -- that would read like something
-        # went wrong (or like a bug) rather than plainly stating nothing
-        # was written this run.
-        dialog = tk.Toplevel(parent)
-        dialog.title("Processing Complete")
-        dialog.resizable(False, False)
-        # Deliberately NOT calling dialog.transient(parent) here. This
-        # app's root is permanently withdrawn (see main()), and
-        # transient() on a withdrawn parent is a known source of
-        # window-manager-dependent "dialog never becomes viewable, no
-        # exception raised" behavior -- confirmed reproducible on
-        # Linux/X11 during testing, and NOT reliably verifiable here
-        # against the actual Windows/DWM deployment target. Rather than
-        # depend on a specific transient()+update_idletasks()+deiconify()
-        # ordering that might not behave identically across platforms,
-        # this simply avoids transient() altogether for any dialog
-        # parented to the withdrawn root -- the safer, more portable
-        # choice, even though it gives up transient()'s normal UX
-        # benefits (no separate taskbar entry, staying above its
-        # logical parent) for this one case.
-        dialog.grab_set()
-        dialog.deiconify()
-        dialog.lift()
-        dialog.focus_force()
-        dialog.attributes("-topmost", True)
-        dialog.after(100, lambda: dialog.attributes("-topmost", False))
-        btn_frame = tk.Frame(dialog)
-        btn_frame.pack(side="bottom", fill="x", pady=(4, 12))
-        tk.Button(btn_frame, text="OK", command=dialog.destroy,
-                  width=12, cursor="hand2").pack()
-        tk.Label(dialog, text="Processing finished, but no files were saved.",
-                 font=("Segoe UI", 10, "bold"), anchor="w"
-                 ).pack(fill="x", padx=16, pady=(16, 16))
-        dialog.update_idletasks()
-        req_w = max(dialog.winfo_reqwidth(), 360)
-        req_h = dialog.winfo_reqheight()
-        x = parent.winfo_x() + (parent.winfo_width() - req_w) // 2
-        y = parent.winfo_y() + (parent.winfo_height() - req_h) // 2
-        dialog.geometry(f"{req_w}x{req_h}+{max(x,0)}+{max(y,0)}")
-        dialog.wait_window()
-        return
+    failed_count = len(failed_sources)
+    success_count = total_sources - failed_count
+    single_failure = (total_sources == 1 and failed_count == 1)
 
     dialog = tk.Toplevel(parent)
-    dialog.title("Processing Complete")
+    apply_icon(dialog)
+    dialog.title("ROAD WIDTH TOOL")
     dialog.resizable(False, False)
     # Deliberately NOT calling dialog.transient(parent) here. This app's
     # root is permanently withdrawn (see main()), and transient() on a
@@ -2756,66 +3131,129 @@ def show_success_dialog(parent, saved_files):
     tk.Button(btn_frame, text="OK", command=dialog.destroy,
               width=12, cursor="hand2").pack()
 
-    tk.Label(dialog, text="Processing completed successfully.",
-             font=("Segoe UI", 10, "bold"), anchor="w"
-             ).pack(fill="x", padx=16, pady=(16, 4))
-
-    tk.Label(dialog, text="Saved files:", anchor="w"
-             ).pack(fill="x", padx=16, pady=(4, 4))
-
-    # Precompute the actual line content FIRST (before creating the Text
-    # widget) so both the vertical line-count AND whether any line is
-    # wide enough to need horizontal scrolling can be determined ahead
-    # of time -- scrollbars are only shown when actually needed, same
-    # principle as the classification checklist box elsewhere in this
-    # file (an always-visible scrollbar next to a box with nothing to
-    # scroll -- e.g. just one short entry -- is pointless clutter).
-    lines = []
-    total_written = 0
-    for entry in saved_files:
-        main = entry["main"]
-        status = entry.get("main_status")
-        marker = f" ({status})" if status else ""
-        lines.append(f"• {main}{marker}")
-        total_written += 1
-        vm = entry.get("vm")
-        if vm:
-            lines.append(f"    └── {vm}")
-            total_written += 1
-
+    MAX_LIST_LINES = 15
     TEXT_WIDTH_CHARS = 60
 
-    list_frame = tk.Frame(dialog)
-    list_frame.pack(fill="both", expand=True, padx=16, pady=(0, 4))
+    if single_failure:
+        source_label, reason = failed_sources[0]
 
-    vscroll = tk.Scrollbar(list_frame, orient="vertical")
-    hscroll = tk.Scrollbar(list_frame, orient="horizontal")
-    text = tk.Text(
-        list_frame, wrap="none",
-        height=min(len(lines), MAX_LIST_LINES) if lines else 1,
-        width=TEXT_WIDTH_CHARS, yscrollcommand=vscroll.set, xscrollcommand=hscroll.set,
-        relief="flat", bg=dialog.cget("bg"), font=("Segoe UI", 9))
-    vscroll.config(command=text.yview)
-    hscroll.config(command=text.xview)
-    if len(lines) > MAX_LIST_LINES:
-        vscroll.pack(side="right", fill="y")
-    if any(len(line) > TEXT_WIDTH_CHARS for line in lines):
-        hscroll.pack(side="bottom", fill="x")
-    text.pack(side="left", fill="both", expand=True)
+        tk.Label(dialog, text="Processing failed.",
+                 font=("Segoe UI", 10, "bold"), anchor="w"
+                 ).pack(fill="x", padx=16, pady=(16, 4))
+        tk.Label(dialog, text=f"'{source_label}' could not be processed.",
+                 anchor="w"
+                 ).pack(fill="x", padx=16, pady=(0, 8))
 
-    for line in lines:
-        text.insert("end", line + "\n")
-    text.config(state="disabled")
+        reason_lines = reason.split("\n")
 
-    tk.Label(dialog, text=f"{total_written} file(s) written.", anchor="w"
-             ).pack(fill="x", padx=16, pady=(4, 16))
+        list_frame = tk.Frame(dialog)
+        list_frame.pack(fill="both", expand=True, padx=16, pady=(0, 4))
+        vscroll = tk.Scrollbar(list_frame, orient="vertical")
+        hscroll = tk.Scrollbar(list_frame, orient="horizontal")
+        text = tk.Text(
+            list_frame, wrap="none",
+            height=min(len(reason_lines), MAX_LIST_LINES),
+            width=TEXT_WIDTH_CHARS, yscrollcommand=vscroll.set, xscrollcommand=hscroll.set,
+            relief="flat", bg=dialog.cget("bg"), font=("Segoe UI", 9))
+        vscroll.config(command=text.yview)
+        hscroll.config(command=text.xview)
+        if len(reason_lines) > MAX_LIST_LINES:
+            vscroll.pack(side="right", fill="y")
+        if any(len(rl) > TEXT_WIDTH_CHARS for rl in reason_lines):
+            hscroll.pack(side="bottom", fill="x")
+        text.pack(side="left", fill="both", expand=True)
+        for rl in reason_lines:
+            text.insert("end", rl + "\n")
+        text.config(state="disabled")
+
+    else:
+        tk.Label(dialog, text="Processing complete.",
+                 font=("Segoe UI", 10, "bold"), anchor="w"
+                 ).pack(fill="x", padx=16, pady=(16, 4))
+
+        if failed_count == 0:
+            tk.Label(
+                dialog,
+                text=(
+                    single_success_detail if (total_sources == 1 and single_success_detail)
+                    else f"All {total_sources} source(s) completed successfully."
+                ),
+                anchor="w"
+            ).pack(fill="x", padx=16, pady=(0, 16))
+        else:
+            if success_count == 0:
+                summary_text = f"None of the {total_sources} source(s) completed successfully."
+            else:
+                summary_text = f"{success_count} of {total_sources} source(s) completed. {failed_count} failed."
+            tk.Label(
+                dialog,
+                text=summary_text,
+                anchor="w"
+            ).pack(fill="x", padx=16, pady=(0, 4))
+
+            tk.Label(dialog, text=f"Failed ({failed_count}):",
+                     font=("Segoe UI", 9, "bold"), anchor="w"
+                     ).pack(fill="x", padx=16, pady=(8, 4))
+
+            # Group by reason, preserving first-seen order (matches
+            # processing order -- not alphabetical) so the display reads
+            # naturally rather than shuffling entries the user just watched
+            # happen in a different order in the progress window.
+            grouped = {}
+            for name, reason in failed_sources:
+                grouped.setdefault(reason, []).append(name)
+
+            # Each reason acts as a group heading with a dash-underline
+            # (matches a plain-text convention rather than needing any
+            # extra font-weight state on a single Text widget), followed by
+            # every source that failed for exactly that reason, then a
+            # blank line before the next group -- reads like short
+            # sub-sections rather than one undifferentiated wall of text
+            # when there are multiple distinct failure reasons in the same
+            # batch.
+            lines = []
+            for i, (reason, names) in enumerate(grouped.items()):
+                if i > 0:
+                    lines.append("")
+                # reason may itself contain explicit \n line breaks (see
+                # _translate_exception()) -- each line is added separately
+                # so the Text widget (wrap="none") displays them as
+                # intended, and the dash-underline is sized to the LONGEST
+                # of those lines, not the raw string length including the
+                # \n characters themselves.
+                reason_lines = reason.split("\n")
+                lines.extend(reason_lines)
+                lines.append("-" * max(len(rl) for rl in reason_lines))
+                for name in names:
+                    lines.append(f"❌ {name}")
+
+            list_frame = tk.Frame(dialog)
+            list_frame.pack(fill="both", expand=True, padx=16, pady=(0, 4))
+
+            vscroll = tk.Scrollbar(list_frame, orient="vertical")
+            hscroll = tk.Scrollbar(list_frame, orient="horizontal")
+            text = tk.Text(
+                list_frame, wrap="none",
+                height=min(len(lines), MAX_LIST_LINES) if lines else 1,
+                width=TEXT_WIDTH_CHARS, yscrollcommand=vscroll.set, xscrollcommand=hscroll.set,
+                relief="flat", bg=dialog.cget("bg"), font=("Segoe UI", 9))
+            vscroll.config(command=text.yview)
+            hscroll.config(command=text.xview)
+            if len(lines) > MAX_LIST_LINES:
+                vscroll.pack(side="right", fill="y")
+            if any(len(line) > TEXT_WIDTH_CHARS for line in lines):
+                hscroll.pack(side="bottom", fill="x")
+            text.pack(side="left", fill="both", expand=True)
+
+            for line in lines:
+                text.insert("end", line + "\n")
+            text.config(state="disabled")
 
     dialog.update_idletasks()
     req_w = max(dialog.winfo_reqwidth(), 420)
     req_h = dialog.winfo_reqheight()
-    x = parent.winfo_x() + (parent.winfo_width() - req_w) // 2
-    y = parent.winfo_y() + (parent.winfo_height() - req_h) // 2
-    dialog.geometry(f"{req_w}x{req_h}+{max(x,0)}+{max(y,0)}")
+    x, y = _get_dialog_center_position(dialog, req_w, req_h)
+    dialog.geometry(f"{req_w}x{req_h}+{x}+{y}")
 
     dialog.wait_window()
 
@@ -2849,7 +3287,7 @@ def ask_overwrite_dialog(parent, conflicting_names):
     result = {"choice": "cancel"}
 
     dialog = tk.Toplevel(parent)
-    dialog.title("File(s) Already Exist")
+    dialog.title("ROAD WIDTH TOOL")
     dialog.resizable(False, False)
     # Deliberately NOT calling dialog.transient(parent) here. This app's
     # root is permanently withdrawn (see main()), and transient() on a
@@ -2933,14 +3371,129 @@ def ask_overwrite_dialog(parent, conflicting_names):
     dialog.update_idletasks()
     req_w = max(dialog.winfo_reqwidth(), 460)
     req_h = dialog.winfo_reqheight()
-    x = parent.winfo_x() + (parent.winfo_width() - req_w) // 2
-    y = parent.winfo_y() + (parent.winfo_height() - req_h) // 2
-    dialog.geometry(f"{req_w}x{req_h}+{max(x,0)}+{max(y,0)}")
+    x, y = _get_dialog_center_position(dialog, req_w, req_h)
+    dialog.geometry(f"{req_w}x{req_h}+{x}+{y}")
 
     dialog.wait_window()
     return result["choice"]
 
-# ----------------- PROGRESS WINDOW -----------------
+# ----------------- PROGRESS WINDOW (thread-safe) -----------------
+class ProgressWindow:
+    """
+    Thread-safe progress display. Ported from road_frontage.py's own
+    ProgressWindow -- this class itself is only ever touched from the
+    main thread (see poll_queue() in run_processing() below); the
+    background worker() thread never calls any method on this class
+    directly, it only puts messages onto a queue.Queue() that the main
+    thread drains and translates into calls here.
+
+    Supports indeterminate mode (a continuously-animating bar with no
+    known total) for the "Counting parcels..." stage, where the total
+    feature count genuinely isn't known yet -- switches to determinate
+    mode once switch_to_determinate() is called with the real total,
+    matching this tool's own "Found N parcels." UX decision.
+    """
+    def __init__(self, root, title="Processing"):
+        self.win = tk.Toplevel(root)
+        self._closed = False
+        apply_icon(self.win)
+        self.win.title(title)
+        self.win.minsize(420, 140)
+        self.win.resizable(False, False)
+        # No cancel function exists for an in-progress run -- the X
+        # button closing this window wouldn't actually stop worker()
+        # (still running on its own thread) or the database transaction
+        # it might be mid-way through. _remove_close_button() below
+        # (called once the window is realized) removes the X visually
+        # via the Win32 API -- this protocol() override is kept as a
+        # defensive fallback in case that Win32-level call doesn't fully
+        # succeed on some Windows version/build, so clicking still does
+        # nothing even if the button is somehow still visible.
+        self.win.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        self.status_var = tk.StringVar(master=self.win)
+        self.status_var.set("Starting...")
+        tk.Label(
+            self.win, textvariable=self.status_var, anchor="center",
+            justify="center", wraplength=380,
+        ).pack(pady=(14, 8), padx=10, fill="x")
+
+        self.progress = ttk.Progressbar(
+            self.win, orient="horizontal", mode="indeterminate", length=360
+        )
+        self.progress.pack(pady=6)
+        self.progress.start(12)
+
+        self.count_var = tk.StringVar(master=self.win)
+        self.count_var.set("")
+        tk.Label(self.win, textvariable=self.count_var).pack(pady=(0, 10))
+
+        self.win.attributes("-topmost", True)
+        self.win.update_idletasks()
+        req_w = max(self.win.winfo_reqwidth(), 420)
+        req_h = self.win.winfo_reqheight()
+        x, y = _get_dialog_center_position(self.win, req_w, req_h)
+        self.win.geometry(f"{req_w}x{req_h}+{x}+{y}")
+        _remove_close_button(self.win)
+        self.win.focus_force()
+        self.win.lift()
+        self.win.after(100, lambda: self.win.attributes("-topmost", False))
+
+    def switch_to_determinate(self, total):
+        """Called once the real parcel count is known -- stops the
+        indeterminate animation and switches to a normal 0..total bar."""
+        if self._closed or not self.win.winfo_exists():
+            return
+        self.progress.stop()
+        self.progress.config(mode="determinate", maximum=total, value=0)
+        self.count_var.set(f"0 / {total}")
+
+    def update(self, message, value=None, total=None):
+        # Defensive: poll_queue() drains the ENTIRE queue in one pass
+        # per call (see run_processing() below), and this window is
+        # only ever destroyed in response to a "done"/"fatal_error"
+        # message -- which is always the LAST message worker() puts.
+        # In normal operation there should be nothing left to process
+        # after that. This guard exists as a safety net regardless: if
+        # this window has already been destroyed (self.win.destroy()
+        # already ran, e.g. via close()) by the time some update
+        # message is processed, silently do nothing instead of raising
+        # _tkinter.TclError: invalid command name "...progressbar" --
+        # confirmed reproduced in production (root cause not fully
+        # pinned down; suspected relation to a duplicate tool launch
+        # observed in the same session, tracked separately as a
+        # dispatcher-level issue in MAIN.py, out of scope for this
+        # file). A silently-dropped stale update is harmless -- the
+        # window is already gone, there's nothing for the user to see
+        # regardless -- whereas an uncaught TclError here surfaces as
+        # a visible, alarming "Exception in Tkinter callback" even on
+        # an otherwise fully successful run.
+        if self._closed or not self.win.winfo_exists():
+            return
+        self.status_var.set(message)
+        if value is not None and total is not None:
+            self.progress["value"] = value
+            self.count_var.set(f"{value} / {total}")
+        self.win.update_idletasks()
+
+    def close(self):
+        self._closed = True
+        try:
+            self.progress.stop()
+        except Exception:
+            pass
+        self.win.destroy()
+
+
+# ----------------- PROGRESS WINDOW (OLD -- kept temporarily, unused) -----------------
+# NOTE: superseded by the ProgressWindow class above as part of moving
+# run_processing() onto a background thread (see that function's own
+# docstring). create_progress_window()/update_progress() below are no
+# longer called anywhere in this file -- left in place deliberately,
+# not deleted yet, as the first phase of a two-phase migration: get the
+# new thread+queue architecture working and validated first, remove
+# this dead code as a separate, later, low-risk cleanup once confirmed
+# stable. Do not call these two functions in any new code.
 def create_progress_window(root, total):
     win = tk.Toplevel(root)
     win.title("Processing...")
@@ -2972,37 +3525,400 @@ def update_progress(win, lbl, bar, count_lbl, step, total, msg):
 
 
 # ----------------- PROCESSING -----------------
-def run_processing():
+def _translate_exception(e, source_label):
+    """
+    Maps a caught exception to a plain-language, non-technical message
+    -- shown to the user in the final show_success_dialog() summary.
+    The exact technical exception (type + message) is still printed to
+    the console separately by the caller for anyone who needs to
+    actually debug it; this function's job is only to produce
+    something a non-technical LGU user can read and act on without
+    seeing a raw Python traceback.
+
+    Matched by exception type name (not a strict isinstance() chain) so
+    this also catches exceptions raised by lower-level libraries
+    (SQLAlchemy, psycopg2, pyogrio) that wrap the same underlying OS or
+    connection error in a library-specific exception class.
+
+    The five CATEGORIZED reasons below deliberately do NOT embed
+    source_label -- show_success_dialog() groups failed sources by
+    their exact reason text, one shared header per group followed by
+    every source that hit it. If the filename were embedded in the
+    reason itself, every source would produce a technically-different
+    reason string (even for the identical underlying cause) and
+    grouping would never actually combine anything -- e.g. a shared
+    network drive going briefly unavailable mid-batch would otherwise
+    show as N separate one-line groups instead of one shared reason
+    with N sources listed under it.
+
+    The UNEXPECTED/fallback case is the one exception to that: kept
+    deliberately generic-but-per-source (embeds source_label, doesn't
+    group), since this catch-all covers whatever wasn't specifically
+    anticipated above -- coincidentally-identical, unrelated failures
+    across different sources are much less likely here than for the
+    four specific, well-understood categories above, so there's little
+    grouping benefit to lose, and naming the source directly in this
+    one case is more useful than a generic "an unexpected error
+    occurred" header with no other information.
+
+    Explicit \\n line breaks (not just wrapping) throughout -- the
+    failed-sources list in show_success_dialog() lives in a Text widget
+    with wrap="none" (deliberately, so long filenames stay on one line
+    and scroll into view rather than wrapping and losing readability --
+    see that function's own docstring), so a long reason with no
+    manual line breaks would just run off horizontally instead of
+    wrapping on its own.
+    """
+    type_name = type(e).__name__
+    # SQLAlchemy wraps the original DB-API (psycopg2) exception in its
+    # own exception class, exposing it via .orig -- e.g. a raw
+    # psycopg2.errors.InvalidSchemaName arrives here wrapped as a
+    # SQLAlchemy ProgrammingError. Checking .orig's type name catches
+    # the specific underlying database error, not just SQLAlchemy's
+    # generic wrapper class (confirmed via a real production log: a
+    # misconfigured pg_credentials.json schema name produced exactly
+    # this ProgrammingError -> InvalidSchemaName chain; also verified
+    # empirically that SQLAlchemy's ProgrammingError.orig is the exact
+    # original psycopg2.errors.InvalidSchemaName instance).
+    orig_type_name = type(getattr(e, "orig", None)).__name__
+
+    if isinstance(e, FileNotFoundError):
+        return (
+            "The file could not be found.\n"
+            "It may have been moved, renamed, or deleted."
+        )
+    if isinstance(e, PermissionError):
+        return (
+            "The output could not be saved.\n"
+            "Make sure it is not open in another program and\n"
+            "that you have permission to write to this folder."
+        )
+    if "InvalidSchemaName" in orig_type_name:
+        return (
+            "The database schema could not be found.\n"
+            "Please check your database configuration and try again."
+        )
+    if "OperationalError" in type_name or "InterfaceError" in type_name:
+        return (
+            "Could not connect to the database.\n"
+            "Please check the database connection and try again."
+        )
+    if isinstance(e, KeyError):
+        return (
+            "The file is missing required data (such as geometry\n"
+            "or required fields). Please verify that you selected\n"
+            "the correct dataset."
+        )
+    return f"An unexpected error occurred while processing '{source_label}'."
+
+
+def _process_one_source(
+    source_id, is_db_source, road_gdf, engine, schema,
+    output_mode, overwrite_mode, db_overwrite_mode,
+    parcel_classification_selection, filter_by_road_type_active,
+    road_type_excluded_values, parcel_road_width_column_overrides,
+    progress_cb, status_cb,
+):
+    """
+    Fully processes ONE parcel source: load, classify, measure, and
+    write (main output + Visual Measurement layer). Returns
+    (source_label, main_output_path_or_table, vm_output_path_or_table_or_None, outcome)
+    on success, where outcome is "overwritten" or "created" -- describes
+    what happened to the MAIN output specifically (never the VM layer),
+    used by the caller to build a precise single-source success
+    message (e.g. "'landparcel' overwritten successfully." vs.
+    "'LandParcel_2' created successfully.").
+
+    Raises on any failure. Deliberately does NOT catch or swallow
+    exceptions itself -- per-source failure isolation is the CALLER's
+    responsibility (see worker() in run_processing()), so a failure
+    partway through this function is always visible to the caller as a
+    genuine failure for this source, never silently treated as success.
+
+    Atomicity guarantees:
+      - Local output: _write_gpkg() itself is atomic (temp file,
+        verified readable, then os.replace()) -- if this function
+        raises at any point, including mid-write, no partial or
+        corrupted file is ever left at the destination path.
+      - Database output: to_postgis() and the CAMA_Table update all run
+        inside ONE transaction (see the inline comment at that call
+        site for why passing the shared `conn`, not `engine`, is what
+        makes this true) -- if anything in that block raises, the
+        ENTIRE per-source database update rolls back together,
+        including the to_postgis() write. (CAMA_Transaction_Log
+        writes, previously also part of this block, were removed --
+        confirmed unused: nothing in this project reads from that
+        table, and the one other tool that also wrote to it,
+        influence_to_barangay.py, does so independently via its own
+        CREATE TABLE IF NOT EXISTS, not dependent on this tool's
+        contribution.)
+      - Visual Measurement layer: intentionally NOT covered by either
+        guarantee above. It's a supplementary QA/visualization layer,
+        not a core appraisal deliverable -- its own write is wrapped in
+        its own try/except, logged to the console on failure, and never
+        raised further, so a VM failure can never undo or block an
+        already-successful main output.
+
+    db_overwrite_mode: "overwrite" | "new" | None -- the batch-wide
+    choice from ask_db_overwrite_dialog() (see run_processing()),
+    parallel to overwrite_mode for local output. Only consulted for a
+    LOCAL parcel source being written to a DATABASE table (is_db_source
+    is False, output_mode[0] == "db") -- a source that was ITSELF read
+    from the database always writes back to that exact same table (see
+    below), which never goes through this dialog at all.
+
+    status_cb(message): called at each stage transition within this
+    function (before classification, before each write) so the
+    progress window's status text reflects what THIS function is
+    actually doing, not an approximation guessed from the caller.
+    """
+    _t_read_start = time.perf_counter()
+    if is_db_source:
+        b_gdf = read_postgis_clean(source_id, engine, schema)
+        source_label = source_id
+    else:
+        b_gdf = gpd.read_file(source_id)
+        source_label = os.path.basename(source_id)
+    print(f"⏱️ [{source_label}] Reading source: {time.perf_counter() - _t_read_start:.2f}s")
+
+    output_column_name = parcel_road_width_column_overrides.get(source_id, "CAMA_ROAD_WIDTH")
+
+    status_cb(f"Resolving road classification: {source_label}...")
+    _t_classify_start = time.perf_counter()
+    use_classification_for_source = parcel_classification_selection.get(source_id, False)
+    classification = resolve_classification(
+        b_gdf, use_classification_for_source, filter_by_road_type_active,
+        road_type_excluded_values
+    )
+    print(f"⏱️ [{source_label}] Resolving classification: {time.perf_counter() - _t_classify_start:.2f}s")
+
+    _t_process_start = time.perf_counter()
+    b_gdf, qa_gdf = process(
+        b_gdf, road_gdf, source_label, progress_cb,
+        classification=classification, output_column_name=output_column_name
+    )
+    print(f"⏱️ [{source_label}] process() (measurement): {time.perf_counter() - _t_process_start:.2f}s")
+
+    if output_mode[0] == "local":
+        desired_base_name = (
+            source_id if is_db_source
+            else os.path.splitext(os.path.basename(source_id))[0]
+        )
+        candidate_path = os.path.join(output_mode[1], f"{desired_base_name}.gpkg")
+        had_conflict = os.path.exists(candidate_path)
+        # overwrite_mode was already resolved ONCE, up front, for the
+        # whole batch (see the pre-scan + ask_overwrite_dialog() in
+        # run_processing()) -- no per-file prompt here.
+        base_name = (
+            resolve_output_base_name(output_mode[1], desired_base_name)
+            if had_conflict and overwrite_mode == "new"
+            else desired_base_name
+        )
+        outcome = "overwritten" if (had_conflict and overwrite_mode == "overwrite") else "created"
+        out = os.path.join(output_mode[1], f"{base_name}.gpkg")
+
+        status_cb(f"Writing output file: {source_label}...")
+        _write_gpkg(b_gdf, out)
+
+        vm_out = None
+        if not qa_gdf.empty:
+            try:
+                status_cb("Writing Visual Measurement layer...")
+                qa_base_name = with_qa_suffix(base_name)
+                qa_out = os.path.join(output_mode[1], f"{qa_base_name}.gpkg")
+                _write_gpkg(qa_gdf, qa_out)
+                vm_out = qa_out
+            except Exception as e:
+                print(f"⚠️ Could not write Visual Measurement layer for '{source_label}': {type(e).__name__}: {e}")
+
+        return source_label, out, vm_out, outcome
+
+    else:
+        if is_db_source:
+            # db-source -> db-output: writes back to the exact SAME
+            # table it read from -- pre-existing, intentional design
+            # (this is a read-modify-write of one dataset, not "here is
+            # a new dataset, does something with this name already
+            # exist" the way a local-file source is). Never goes
+            # through ask_db_overwrite_dialog() -- there's no
+            # meaningful "Create New" here, only ever the same table
+            # it started from.
+            table = source_id
+            outcome = "overwritten"
+        else:
+            # Casing is preserved from the filename -- NOT forced to
+            # lowercase (previously was; confirmed via direct user
+            # testing that this was our own code's doing, not a
+            # PostgreSQL/SQLAlchemy default -- SQLAlchemy correctly
+            # quotes and preserves a mixed-case identifier when asked
+            # to, confirmed empirically). Matching against EXISTING
+            # tables is still case-insensitive (PostgreSQL's own
+            # default table-name comparison), via
+            # _find_existing_table_case_insensitive() -- which returns
+            # the table's ACTUAL existing casing, never desired_name's.
+            desired_name = os.path.splitext(os.path.basename(source_id))[0]
+            all_tables = fetch_tables(schema)
+            existing = _find_existing_table_case_insensitive(desired_name, all_tables)
+            if existing is not None and db_overwrite_mode == "overwrite":
+                table = existing
+                outcome = "overwritten"
+            elif existing is not None and db_overwrite_mode == "new":
+                table = resolve_db_table_name(schema, desired_name)
+                outcome = "created"
+            else:
+                table = desired_name
+                outcome = "created"
+
+        status_cb(
+            "Updating database records..." if outcome == "overwritten"
+            else "Creating new table in database..."
+        )
+        # Atomic per-source database write. to_postgis() is given the
+        # shared, already-in-transaction `conn` (NOT the bare `engine`)
+        # so it reuses this same connection/transaction rather than
+        # opening its own independently-committing one -- confirmed via
+        # geopandas.io.sql._get_conn(), which explicitly checks
+        # Connection.in_transaction() and reuses the given connection
+        # when True (empirically verified against a real SQLAlchemy
+        # engine: passing `engine` to a nested write let that write
+        # survive an outer rollback; passing the shared `conn` correctly
+        # rolled both writes back together). If anything below raises,
+        # the WHOLE block -- including the to_postgis() write -- rolls
+        # back, leaving this table exactly as it was before this call.
+        with engine.begin() as conn:
+            _t_topg_start = time.perf_counter()
+            b_gdf.to_postgis(table, conn, schema=schema, if_exists="replace", index=False)
+            print(f"⏱️ [{source_label}] to_postgis() (full table write): {time.perf_counter() - _t_topg_start:.2f}s")
+
+            conn.execute(text(f"""
+                CREATE TABLE IF NOT EXISTS "{schema}"."CAMA_Table" (
+                    id SERIAL PRIMARY KEY,
+                    PIN TEXT UNIQUE NOT NULL
+                );
+            """))
+            conn.execute(text(f"""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema='{schema}'
+                          AND table_name='CAMA_Table'
+                          AND column_name='cama_road_width'
+                    ) THEN
+                        EXECUTE 'ALTER TABLE "{schema}"."CAMA_Table" ADD COLUMN "cama_road_width" NUMERIC';
+                    END IF;
+                END $$;
+            """))
+            pin_field = _detect_pin_column(b_gdf)
+            if pin_field:
+                _t_cama_start = time.perf_counter()
+                # Batched execution instead of one .execute() call per
+                # row (was: 11,911 individual round-trips for an
+                # 11,911-row source, confirmed via direct user testing
+                # to be the dominant cost of the whole DB-write phase --
+                # far more than to_postgis() itself). SQLAlchemy's
+                # Connection.execute() accepts a LIST of parameter
+                # dicts for the same statement and forwards it to the
+                # DBAPI's executemany-equivalent, which psycopg2 batches
+                # into far fewer network round-trips than issuing each
+                # one separately from a Python loop -- same SQL, same
+                # ON CONFLICT DO UPDATE semantics per row, same
+                # transaction, same rollback-on-failure guarantee
+                # (still inside the `with engine.begin() as conn:`
+                # block above) -- purely a performance change, no
+                # difference in what ends up in the table.
+                #
+                # Chunked (not one single call for all 11,911 rows) so
+                # progress can be reported incrementally instead of the
+                # progress window sitting on one static message for the
+                # DB write's entire duration -- and to keep each
+                # individual batch a reasonable size regardless of how
+                # large a given source is.
+                CAMA_BATCH_SIZE = 1000
+                sql = text(f"""
+                    INSERT INTO "{schema}"."CAMA_Table" (PIN, cama_road_width)
+                    VALUES (:pin, :rw)
+                    ON CONFLICT (PIN) DO UPDATE
+                    SET cama_road_width = EXCLUDED.cama_road_width;
+                """)
+                all_params = [
+                    {
+                        "pin": str(row[pin_field]),
+                        "rw": float(row[output_column_name]) if row[output_column_name] is not None else None,
+                    }
+                    for _, row in b_gdf.iterrows()
+                ]
+                total_rows = len(all_params)
+                for batch_start in range(0, total_rows, CAMA_BATCH_SIZE):
+                    batch = all_params[batch_start:batch_start + CAMA_BATCH_SIZE]
+                    conn.execute(sql, batch)
+                    done = min(batch_start + CAMA_BATCH_SIZE, total_rows)
+                    status_cb(f"Updating database records: {done} / {total_rows}...")
+                print(f"⏱️ [{source_label}] CAMA_Table update ({total_rows} rows, batched): {time.perf_counter() - _t_cama_start:.2f}s")
+
+        # Visual Measurement layer -- best-effort, own separate write,
+        # deliberately NOT inside the transaction above (see this
+        # function's own docstring for why).
+        vm_table = None
+        if not qa_gdf.empty:
+            try:
+                status_cb("Writing Visual Measurement layer...")
+                _t_vm_start = time.perf_counter()
+                qa_table = f"{table}_VM"
+                qa_gdf.to_postgis(qa_table, engine, schema=schema, if_exists="replace", index=False)
+                vm_table = qa_table
+                print(f"⏱️ [{source_label}] Visual Measurement layer write: {time.perf_counter() - _t_vm_start:.2f}s")
+            except Exception as e:
+                print(f"⚠️ Could not write Visual Measurement layer to DB for '{source_label}': {type(e).__name__}: {e}")
+
+        return source_label, table, vm_table, outcome
+
+
+def run_processing(app_root, overwrite_mode=None):
+    # overwrite_mode: passed from on_run() -- see PRIORITY 2 block there.
+    # Shadows the module-level global of the same name intentionally.
+    """
+    Runs the full batch (all selected parcel sources) on a background
+    thread, showing live progress and a final summary via
+    ProgressWindow + show_success_dialog().
+
+    Ports the background-thread + queue.Queue() + poll_queue() pattern
+    already used in road_frontage.py/lot_location.py onto this tool --
+    this function previously ran entirely on the GUI's main thread,
+    freezing the whole CAMA Tools window (indistinguishable from a
+    crash to the user, per direct user report) for the full duration of
+    a batch.
+
+    Threading discipline: worker() below never touches Tkinter directly
+    -- it only puts messages onto `q`. All widget updates happen in
+    poll_queue(), on the main thread, via app_root.after(100,
+    poll_queue).
+
+    Per-source failure isolation: if one parcel source fails, it is
+    skipped and the rest of the batch continues. See
+    _process_one_source()'s own docstring for the atomicity guarantees
+    that make this safe -- a failed source's existing output (if any)
+    is left completely untouched, and a source that already completed
+    successfully before a LATER source's failure remains committed, not
+    rolled back. A summary naming every failed source and why is shown
+    at the end, grouped by reason, instead of a raw crash aborting the
+    whole batch with no explanation.
+    """
     global barangay_source, road_source, output_mode
     global parcel_classification_selection, filter_by_road_type_active, road_type_excluded_values
+    global parcel_road_width_column_overrides
+
     if not barangay_source or not road_source or not output_mode:
-        messagebox.showerror("Error","Selections incomplete (Barangay, Road, Output required).")
+        messagebox.showerror("Error", "Selections incomplete (Barangay, Road, Output required).")
         return
 
-    # overwrite_mode: "overwrite" | "new" | None (no conflicts found, or
-    # not applicable -- output_mode isn't local). Resolved ONCE, up
-    # front, before any file is read or written, via
-    # ask_overwrite_dialog() -- see that function's docstring for why
-    # this is a single combined decision for the whole batch rather than
-    # a per-file prompt. Desired names only need each source's own
-    # filename/table name (no need to actually read/measure anything
-    # yet), so this check is cheap and happens before the more expensive
-    # DB connection / road reading below.
-    overwrite_mode = None
-    if output_mode[0] == "local":
-        desired_names = [
-            os.path.splitext(os.path.basename(p))[0] for p in barangay_source[1]
-        ] if barangay_source[0] == "local" else list(barangay_source[1])
-        conflicting_names = [
-            f"{name}.gpkg" for name in desired_names
-            if os.path.exists(os.path.join(output_mode[1], f"{name}.gpkg"))
-        ]
-        if conflicting_names:
-            overwrite_mode = ask_overwrite_dialog(root, conflicting_names)
-            if overwrite_mode == "cancel":
-                print("Run cancelled by user (existing output file(s) found).")
-                return
-
+    # overwrite_mode: resolved ONCE, up front, in on_run() on the main
+    # thread -- BEFORE win.destroy() -- and passed here as a parameter.
+    # This is intentional: moving the dialog to on_run() means win is
+    # still live (proper parent), and the user can cancel without losing
+    # the main window. The downstream had_conflict/overwrite_mode logic
+    # inside worker() is captured via closure and remains unchanged.
+    # See on_run()'s PRIORITY 2 block for the full resolution logic.
     creds = load_db_credentials()
     if not creds:
         return
@@ -3011,361 +3927,185 @@ def run_processing():
         f"postgresql://{creds['username']}:{creds['password']}@{creds['host']}:{creds['port']}/{creds['database']}"
     )
 
-    # --- Load road layer ---
-    if road_source[0] == "local":
-        road_gdf = gpd.read_file(road_source[1][0])
-    else:
-        road_table = road_source[1][0]
-        road_gdf = read_postgis_clean(road_table, engine, schema)
+    # db_overwrite_mode: same "resolved ONCE, up front" philosophy as
+    # overwrite_mode above, for database table output. Only relevant
+    # when a LOCAL parcel source is being written to a DATABASE table --
+    # a source that was ITSELF read from the database always writes
+    # back to that exact same table (see _process_one_source()'s own
+    # docstring), which never has a naming conflict to resolve here.
+    db_overwrite_mode = None
+    if output_mode[0] == "db" and barangay_source[0] == "local":
+        desired_names = [os.path.splitext(os.path.basename(p))[0] for p in barangay_source[1]]
+        all_tables = fetch_tables(schema)
+        conflicting_pairs = [
+            (name, existing)
+            for name in desired_names
+            for existing in [_find_existing_table_case_insensitive(name, all_tables)]
+            if existing is not None
+        ]
+        if conflicting_pairs:
+            db_overwrite_mode = ask_db_overwrite_dialog(root, conflicting_pairs)
+            if db_overwrite_mode == "cancel":
+                print("Run cancelled by user (existing database table(s) found).")
+                return
 
-    # count total features (local or db)
-    total_features = 0
-    if barangay_source[0] == "local":
-        for p in barangay_source[1]:
-            total_features += len(gpd.read_file(p))
-    else:
-        for t in barangay_source[1]:
-            total_features += len(read_postgis_clean(t, engine, schema))
+    progress = ProgressWindow(app_root, "ROAD WIDTH TOOL")
+    q = queue.Queue()
 
-    progress_win, progress_lbl, progress_bar, progress_count = create_progress_window(root, total_features)
-
-    progress_win.transient(root)
-    progress_win.grab_set()
-
-    progress_win.update_idletasks()
-    progress_win.deiconify()
-    progress_win.lift()
-    progress_win.focus_force()
-    progress_win.attributes("-topmost", True)
-    progress_win.after(100, lambda: progress_win.attributes("-topmost", False))
-
-    current_step = 0
-
-    # saved_files: human-readable entries for every output actually
-    # written this run (local file paths, or "Database table: X" for db
-    # output mode) -- collected as each write succeeds, shown together
-    # in show_success_dialog() at the end instead of a generic message.
-    saved_files = []
-
-    def progress_cb(_):
-        nonlocal current_step
-        current_step += 1
-        update_progress(
-            progress_win,
-            progress_lbl,
-            progress_bar,
-            progress_count,
-            current_step,
-            total_features,
-            f"Processing feature {current_step}"
-        )
-
-
-
-    # --- Process barangays ---
-    if barangay_source[0] == "local":
-        for path in barangay_source[1]:
-            b_gdf = gpd.read_file(path)
-
-            # output_column_name: preserves the exact existing ROAD_WIDTH-
-            # like column name/casing for this source if a conflict was
-            # detected and confirmed in on_run() (see
-            # parcel_road_width_column_overrides above); defaults to
-            # "CAMA_ROAD_WIDTH" when no conflict was found for this source.
-            output_column_name = parcel_road_width_column_overrides.get(path, "CAMA_ROAD_WIDTH")
-
-            # Road Classification: resolved independently for THIS
-            # parcel source. use_classification_for_source comes from
-            # the per-source checkbox the user checked (or didn't) for
-            # exactly this file/table in the GUI -- mixed batches (some
-            # sources checked, some not, or some lacking a usable column
-            # entirely) are intentionally supported.
-            use_classification_for_source = parcel_classification_selection.get(path, False)
-            classification = resolve_classification(
-                b_gdf, use_classification_for_source, filter_by_road_type_active,
-                road_type_excluded_values
-            )
-            b_gdf, qa_gdf = process(b_gdf, road_gdf, os.path.basename(path), progress_cb, classification=classification, output_column_name=output_column_name)
-            if output_mode[0] == "local":
-                desired_base_name = os.path.splitext(os.path.basename(path))[0]
-                candidate_path = os.path.join(output_mode[1], f"{desired_base_name}.gpkg")
-                had_conflict = os.path.exists(candidate_path)
-                # overwrite_mode was already resolved ONCE, up front, for
-                # the whole batch (see the pre-scan + ask_overwrite_dialog()
-                # near the top of this function) -- no per-file prompt here.
-                if had_conflict and overwrite_mode == "new":
-                    base_name = resolve_output_base_name(output_mode[1], desired_base_name)
-                    main_status = "New"
-                elif had_conflict and overwrite_mode == "overwrite":
-                    base_name = desired_base_name
-                    main_status = "Overwritten"
+    def worker():
+        # Everything below runs inside an outer try/finally so that
+        # engine.dispose() (further down) is GUARANTEED to run exactly
+        # once no matter how this function exits -- full success, a
+        # per-source failure (already caught inside the loop below,
+        # doesn't escape this far), or the outer fatal_error path.
+        # Releases the ENTIRE connection pool back to the database, not
+        # just the individual per-source connections already released
+        # by each `with engine.begin() as conn:` block inside
+        # _process_one_source() -- without this, idle pooled
+        # connections could accumulate across repeated runs of this
+        # tool within the same CAMA Tools session.
+        try:
+            try:
+                q.put(("update", "Loading road network...", None, None))
+                if road_source[0] == "local":
+                    road_gdf = gpd.read_file(road_source[1][0])
                 else:
-                    base_name = desired_base_name
-                    main_status = None
-                out = os.path.join(output_mode[1], f"{base_name}.gpkg")
-                _write_gpkg(b_gdf, out)
-                print(f"✅ Saved {out}")
-                load_in_global_mapper(out)
+                    road_gdf = read_postgis_clean(road_source[1][0], engine, schema)
 
-                # Visual Measurement layer -- separate file, not merged into
-                # the main output, so it can be toggled independently in
-                # QGIS. Only written if at least one parcel actually got
-                # a measurement (an all-empty file would just be visual
-                # clutter with nothing to show). Base name is derived
-                # from the ALREADY-FINALIZED main output name above --
-                # never a separate numbering scan -- so the two always
-                # stay paired (e.g. "landparcel_1.gpkg" +
-                # "landparcel_1_VM.gpkg"). No New/Overwritten marker of
-                # its own -- it's a consequence of the main output's
-                # decision, not an independent one (see
-                # show_success_dialog()'s docstring).
-                vm_out = None
-                if not qa_gdf.empty:
-                    qa_base_name = with_qa_suffix(base_name)
-                    qa_out = os.path.join(output_mode[1], f"{qa_base_name}.gpkg")
-                    _write_gpkg(qa_gdf, qa_out)
-                    print(f"✅ Saved Visual Measurement layer {qa_out}")
-                    load_in_global_mapper(qa_out)
-                    vm_out = qa_out
-
-                saved_files.append({"main": out, "main_status": main_status, "vm": vm_out})
-            else:
-                # Exact match only -- previously used find_matching_table(),
-                # a SUBSTRING match (normalize_name() strips non-letters,
-                # then checks "a in b or b in a"). That's a real bug: a
-                # desired name like "landparcel" would match an unrelated
-                # existing table like "landparcel_backup_2023" (which
-                # normalizes to "landparcelbackup", containing
-                # "landparcel" as a substring) and silently overwrite it.
-                # Exact match -- same pattern as the db-source ->
-                # db-output branch elsewhere in this function -- never
-                # touches a table unless its name is precisely the one
-                # this run intends to write to.
-                desired_table = os.path.splitext(os.path.basename(path))[0].lower()
-                all_tables = fetch_tables(schema)
-                table_action = "replaced" if desired_table in all_tables else "new"
-                table = desired_table
-                b_gdf.to_postgis(table, engine, schema=schema, if_exists="replace", index=False)
-                print(f"🔄 Saved to DB: {table} ({table_action})")
-                # DB is always automatic -- no dialog, no user choice.
-                # "Overwritten" only for a genuine exact-match conflict;
-                # a brand-new table is normal, expected behavior, not a
-                # conflict, so it gets no marker at all.
-                main_status = "Overwritten" if table_action == "replaced" else None
-
-                # Visual Measurement layer -- separate table, mirroring the
-                # local-output branch above.
-                vm_table = None
-                if not qa_gdf.empty:
-                    qa_table = f"{table}_VM"
-                    qa_gdf.to_postgis(qa_table, engine, schema=schema, if_exists="replace", index=False)
-                    print(f"🔄 Saved Visual Measurement layer to DB: {qa_table}")
-                    vm_table = f"Database table: {qa_table}"
-
-                saved_files.append({
-                    "main": f"Database table: {table}",
-                    "main_status": main_status,
-                    "vm": vm_table,
-                })
-
-                # ---------------- 🟢 CAMA Table + Transaction Log ----------------
-                with engine.begin() as conn:
-                    # Ensure CAMA_Table exists
-                    conn.execute(text(f"""
-                        CREATE TABLE IF NOT EXISTS "{schema}"."CAMA_Table" (
-                            id SERIAL PRIMARY KEY,
-                            PIN TEXT UNIQUE NOT NULL
-                        );
-                    """))
-
-                    # Ensure column for road width
-                    conn.execute(text(f"""
-                        DO $$
-                        BEGIN
-                            IF NOT EXISTS (
-                                SELECT 1 FROM information_schema.columns
-                                WHERE table_schema='{schema}'
-                                  AND table_name='CAMA_Table'
-                                  AND column_name='cama_road_width'
-                            ) THEN
-                                EXECUTE 'ALTER TABLE "{schema}"."CAMA_Table" ADD COLUMN "cama_road_width" NUMERIC';
-                            END IF;
-                        END $$;
-                    """))
-
-                    # Update or insert per PIN
-                    pin_field = _detect_pin_column(b_gdf)
-                    if pin_field:
-                        for _, row in b_gdf.iterrows():
-                            sql = f"""
-                                INSERT INTO "{schema}"."CAMA_Table" (PIN, cama_road_width)
-                                VALUES (:pin, :rw)
-                                ON CONFLICT (PIN) DO UPDATE
-                                SET cama_road_width = EXCLUDED.cama_road_width;
-                            """
-                            params = {
-                                "pin": str(row[pin_field]),
-                                "rw": float(row[output_column_name]) if row[output_column_name] is not None else None,
-                            }
-                            conn.execute(text(sql), params)
-
-                    # Ensure log table exists
-                    conn.execute(text(f"""
-                        CREATE TABLE IF NOT EXISTS "{schema}"."CAMA_Transaction_Log" (
-                            id SERIAL PRIMARY KEY,
-                            table_name TEXT,
-                            cama_tool TEXT,
-                            cama_fields TEXT,
-                            transaction_date_time TIMESTAMP DEFAULT NOW()
-                        );
-                    """))
-
-                    # Log transaction with (new) or (replaced)
-                    conn.execute(text(f"""
-                        INSERT INTO "{schema}"."CAMA_Transaction_Log"
-                        (table_name, cama_tool, cama_fields)
-                        VALUES (:tbl, :type, :details);
-                    """), {
-                        "tbl": f"{table} ({table_action})",
-                        "type": "cama_road_width",
-                        "details": output_column_name
-                    })
-
-    else:  # --- barangay_source == "db" ---
-        for table in barangay_source[1]:
-            b_gdf = read_postgis_clean(table, engine, schema)
-
-            # output_column_name: see comment in the "local"
-            # barangay_source branch above for the full rationale.
-            output_column_name = parcel_road_width_column_overrides.get(table, "CAMA_ROAD_WIDTH")
-
-            # Road Classification: resolved independently for THIS
-            # parcel source (see comment in the "local" branch above).
-            use_classification_for_source = parcel_classification_selection.get(table, False)
-            classification = resolve_classification(
-                b_gdf, use_classification_for_source, filter_by_road_type_active,
-                road_type_excluded_values
-            )
-            b_gdf, qa_gdf = process(b_gdf, road_gdf, table, progress_cb, classification=classification, output_column_name=output_column_name)
-            if output_mode[0] == "local":
-                candidate_path = os.path.join(output_mode[1], f"{table}.gpkg")
-                had_conflict = os.path.exists(candidate_path)
-                if had_conflict and overwrite_mode == "new":
-                    out_base = resolve_output_base_name(output_mode[1], table)
-                    main_status = "New"
-                elif had_conflict and overwrite_mode == "overwrite":
-                    out_base = table
-                    main_status = "Overwritten"
+                q.put(("update", "Counting parcels...", None, None))
+                total_features = 0
+                if barangay_source[0] == "local":
+                    for p in barangay_source[1]:
+                        total_features += len(gpd.read_file(p))
                 else:
-                    out_base = table
-                    main_status = None
-                out = os.path.join(output_mode[1], f"{out_base}.gpkg")
-                _write_gpkg(b_gdf, out)
-                print(f"✅ Saved {out}")
-                load_in_global_mapper(out)
+                    for t in barangay_source[1]:
+                        total_features += len(read_postgis_clean(t, engine, schema))
+                q.put(("found_total", f"Found {total_features} parcel(s).", total_features, None))
 
-                # Visual Measurement layer -- see comment in the "local"
-                # barangay_source branch above for the full rationale.
-                vm_out = None
-                if not qa_gdf.empty:
-                    qa_out_base = with_qa_suffix(out_base)
-                    qa_out = os.path.join(output_mode[1], f"{qa_out_base}.gpkg")
-                    _write_gpkg(qa_gdf, qa_out)
-                    print(f"✅ Saved Visual Measurement layer {qa_out}")
-                    load_in_global_mapper(qa_out)
-                    vm_out = qa_out
+                current_step = 0
+                current_source_label = [""]  # mutable box -- progress_cb below closes over this
 
-                saved_files.append({"main": out, "main_status": main_status, "vm": vm_out})
-            else:
-                # Check if table already exists before overwrite. Output
-                # deliberately writes back to the SAME table name it read
-                # from in this branch (db source -> db output) -- this is
-                # pre-existing, intentional behavior; confirmed fine to
-                # overwrite in place, unrelated to the local-output
-                # filename-suffix fix above.
-                all_tables = fetch_tables(schema)
-                table_action = "replaced" if table in all_tables else "new"
-                main_status = "Overwritten" if table_action == "replaced" else None
+                def progress_cb(_):
+                    nonlocal current_step
+                    current_step += 1
+                    msg = (
+                        f"Measuring road width...\n"
+                        f"Parcel {current_step} / {total_features}\n"
+                        f"Source: {current_source_label[0]}"
+                    )
+                    q.put(("update", msg, current_step, total_features))
 
-                b_gdf.to_postgis(table, engine, schema=schema, if_exists="replace", index=False)
-                print(f"🔄 Updated DB table: {table} ({table_action})")
+                def status_cb(message):
+                    q.put(("update", message, current_step, total_features))
 
-                # Visual Measurement layer -- separate table.
-                vm_table = None
-                if not qa_gdf.empty:
-                    qa_table = f"{table}_VM"
-                    qa_gdf.to_postgis(qa_table, engine, schema=schema, if_exists="replace", index=False)
-                    print(f"🔄 Saved Visual Measurement layer to DB: {qa_table}")
-                    vm_table = f"Database table: {qa_table}"
+                sources = (
+                    [(p, False) for p in barangay_source[1]]
+                    if barangay_source[0] == "local"
+                    else [(t, True) for t in barangay_source[1]]
+                )
 
-                saved_files.append({
-                    "main": f"Database table: {table}",
-                    "main_status": main_status,
-                    "vm": vm_table,
-                })
+                failed_sources = []
+                success_count = 0
+                # Only meaningfully used when len(sources) == 1 -- the
+                # single-source success case gets its own precise
+                # message ("'landparcel' overwritten successfully.")
+                # instead of the generic batch-count summary, which
+                # reads oddly ("1 of 1 source(s)...") for something that
+                # was never really a "batch". See show_success_dialog().
+                single_success_detail = None
 
-                # ---------------- 🟢 CAMA Table + Transaction Log ----------------
-                with engine.begin() as conn:
-                    conn.execute(text(f"""
-                        CREATE TABLE IF NOT EXISTS "{schema}"."CAMA_Table" (
-                            id SERIAL PRIMARY KEY,
-                            PIN TEXT UNIQUE NOT NULL
-                        );
-                    """))
-                    conn.execute(text(f"""
-                        DO $$
-                        BEGIN
-                            IF NOT EXISTS (
-                                SELECT 1 FROM information_schema.columns
-                                WHERE table_schema='{schema}'
-                                  AND table_name='CAMA_Table'
-                                  AND column_name='cama_road_width'
-                            ) THEN
-                                EXECUTE 'ALTER TABLE "{schema}"."CAMA_Table" ADD COLUMN "cama_road_width" NUMERIC';
-                            END IF;
-                        END $$;
-                    """))
-                    pin_field = _detect_pin_column(b_gdf)
-                    if pin_field:
-                        for _, row in b_gdf.iterrows():
-                            sql = f"""
-                                INSERT INTO "{schema}"."CAMA_Table" (PIN, cama_road_width)
-                                VALUES (:pin, :rw)
-                                ON CONFLICT (PIN) DO UPDATE
-                                SET cama_road_width = EXCLUDED.cama_road_width;
-                            """
-                            params = {
-                                "pin": str(row[pin_field]),
-                                "rw": float(row[output_column_name]) if row[output_column_name] is not None else None,
-                            }
-                            conn.execute(text(sql), params)
+                for source_id, is_db_source in sources:
+                    source_label = source_id if is_db_source else os.path.basename(source_id)
+                    current_source_label[0] = source_label
+                    q.put(("update", f"Loading parcel source: {source_label}...", None, None))
+                    try:
+                        label, out_ref, vm_ref, outcome = _process_one_source(
+                            source_id, is_db_source, road_gdf, engine, schema,
+                            output_mode, overwrite_mode, db_overwrite_mode,
+                            parcel_classification_selection, filter_by_road_type_active,
+                            road_type_excluded_values, parcel_road_width_column_overrides,
+                            progress_cb, status_cb,
+                        )
+                        success_count += 1
 
-                    conn.execute(text(f"""
-                        CREATE TABLE IF NOT EXISTS "{schema}"."CAMA_Transaction_Log" (
-                            id SERIAL PRIMARY KEY,
-                            table_name TEXT,
-                            cama_tool TEXT,
-                            cama_fields TEXT,
-                            transaction_date_time TIMESTAMP DEFAULT NOW()
-                        );
-                    """))
-                    conn.execute(text(f"""
-                        INSERT INTO "{schema}"."CAMA_Transaction_Log"
-                        (table_name, cama_tool, cama_fields)
-                        VALUES (:tbl, :type, :details);
-                    """), {
-                        "tbl": f"{table} ({table_action})",
-                        "type": "cama_road_width",
-                        "details": output_column_name
-                    })
-    progress_win.destroy()
+                        if len(sources) == 1:
+                            display_name = os.path.basename(out_ref) if output_mode[0] == "local" else out_ref
+                            single_success_detail = f"'{display_name}' {outcome} successfully."
 
-    # Reverted to the original simple message for now, per explicit
-    # request -- the custom show_success_dialog() (bulleted file list,
-    # New/Overwritten markers, scrollable) is still defined above and
-    # still fed by saved_files throughout this function, so switching
-    # back is just a matter of changing this one call again later.
-    messagebox.showinfo("Success", "✅ Processing done and logged to CAMA!")
+                        if output_mode[0] == "local":
+                            q.put(("open_gm", out_ref, None, None))
+                            if vm_ref:
+                                q.put(("open_gm", vm_ref, None, None))
+                            q.put(("update", "Opening in Global Mapper...", None, None))
+
+                    except Exception as e:
+                        reason = _translate_exception(e, source_label)
+                        failed_sources.append((source_label, reason))
+                        print(f"⚠️ Skipped '{source_label}': {type(e).__name__}: {e}")
+
+                q.put(("done", success_count + len(failed_sources), failed_sources, single_success_detail))
+
+            except Exception as e:
+                # Failure OUTSIDE the per-source loop (e.g. the road network
+                # itself couldn't be loaded) -- genuinely affects the whole
+                # batch, since nothing can be measured without it. Not
+                # per-source, so not added to failed_sources -- this aborts
+                # the whole run with its own dialog instead.
+                q.put(("fatal_error", str(e), None, None))
+        finally:
+            try:
+                engine.dispose()
+            except Exception as e:
+                print(f"⚠️ Could not cleanly dispose of the database engine: {e}")
+
+    def poll_queue():
+        try:
+            while True:
+                msg = q.get_nowait()
+                kind = msg[0]
+
+                if kind == "update":
+                    progress.update(msg[1], msg[2], msg[3])
+
+                elif kind == "found_total":
+                    progress.switch_to_determinate(msg[2])
+                    progress.update(msg[1], 0, msg[2])
+
+                elif kind == "open_gm":
+                    load_in_global_mapper(msg[1])
+
+                elif kind == "done":
+                    progress.close()
+                    show_success_dialog(app_root, msg[1], msg[2], msg[3])
+                    return
+
+                elif kind == "fatal_error":
+                    progress.close()
+                    messagebox.showerror(
+                        "Error",
+                        f"Could not complete processing: {msg[1]}"
+                    )
+                    return
+
+        except queue.Empty:
+            pass
+        except tk.TclError as e:
+            # Belt-and-suspenders alongside ProgressWindow's own
+            # winfo_exists() guards above: if the progress window (or
+            # any other widget touched in this loop) was destroyed by
+            # some path this function doesn't already account for, stop
+            # polling quietly instead of letting an uncaught TclError
+            # surface as a visible "Exception in Tkinter callback" on
+            # what may otherwise have been a fully successful run. Logged
+            # to the console, not silently swallowed, so it's still
+            # visible for debugging if it recurs.
+            print(f"⚠️ poll_queue() stopped early (widget no longer exists): {e}")
+            return
+
+        app_root.after(100, poll_queue)
+
+    threading.Thread(target=worker, daemon=True).start()
+    poll_queue()
 
 
 # ----------------- MAIN -----------------

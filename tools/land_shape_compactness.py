@@ -71,6 +71,59 @@ CREDENTIALS_FILE = _get_credentials_path()
 barangay_source = None
 output_mode = None
 
+# ========================= EXISTING OUTPUT-COLUMN CONFLICT DETECTION =========================
+# OUTPUT_COLUMN_TARGETS: this tool's eight output column names, checked
+# for pre-existing conflicts in a selected LOCAL Land Parcel source (see
+# _check_parcel_shape_conflicts() below, and the combined dialog in
+# on_run()). Mirrors road_frontage.py's / terrain.py's
+# OUTPUT_COLUMN_TARGETS exactly: ALL eight are checked, not just
+# PP_RATIO/LOT_SHAPE -- they are one feature set computed together in
+# the same run (confirmed decision: all 8 get the CAMA_ prefix, not
+# just the two "headline" columns), so a source with (for example) an
+# existing CAMA_TRIANGLE column but no existing CAMA_PP_RATIO column
+# still needs a conflict warning, to avoid ending up with an old
+# CAMA_TRIANGLE value sitting alongside a freshly-computed CAMA_PP_RATIO
+# from a DIFFERENT run/computation -- an inconsistent, misleading
+# combination.
+#
+# Cross-tool CAMA_ prefix standard: every column this tool CREATES gets
+# a "CAMA_" prefix -- matches road_width.py's own CAMA_ROAD_WIDTH
+# convention. These targets check for the NEW, prefixed names ONLY --
+# never the OLD, non-prefixed names (e.g. a plain "LOT_SHAPE" column
+# left over from a pre-CAMA_-prefix version of this tool). This tool
+# never auto-detects, auto-removes, or auto-overwrites an old,
+# non-prefixed column -- if one exists, it is simply left alone,
+# untouched, and a NEW CAMA_-prefixed column is created alongside it.
+# Only conflicts against the NEW naming scheme are ever surfaced to the
+# user.
+#
+# Matching is EXACT (case-insensitive) -- "CAMA_LOT_SHAPE" vs
+# "LOT_SHAPE_OLD" is not a match; only "cama_lot_shape"/"CAMA_LOT_SHAPE"/
+# "Cama_Lot_Shape"/etc. (same letters, any casing) count as the same
+# column.
+OUTPUT_COLUMN_TARGETS = (
+    "CAMA_PP_RATIO", "CAMA_VTX_COUNT", "CAMA_ANGS_TXT",
+    "CAMA_TRIANGLE", "CAMA_RECTANGLE", "CAMA_L_SHAPED",
+    "CAMA_OTHERS", "CAMA_LOT_SHAPE",
+)
+
+# parcel_output_column_overrides: {path: {"CAMA_PP_RATIO": name, ...}} --
+# for any LOCAL Land Parcel source where one or more pre-existing
+# CAMA_-prefixed output columns were detected (see
+# _check_parcel_shape_conflicts() below) and the user confirmed
+# proceeding at Run time. Read by run_processing() and resolved into
+# the eight individual *_col keyword arguments passed to
+# compute_ppr_and_lot_shape_gdf() -- matches the exact same
+# override-storage-as-dict / function-signature-as-individual-kwargs
+# split already established in terrain.py and road_frontage.py, so the
+# tool writes back into the EXACT existing column(s) (preserving
+# original casing) instead of always writing hardcoded "CAMA_*" names.
+# A source with no entry here (or a target missing from its entry) uses
+# that target's default CAMA_ name. Scope: LOCAL sources only --
+# Database Land Parcel sources are explicitly out of scope for this
+# check.
+parcel_output_column_overrides = {}
+
 # ---------------- Geometry Fix ----------------
 def fix_geometry(geom):
     if geom is None or geom.is_empty: return None
@@ -163,7 +216,288 @@ def auto_utm_epsg_from_gdf(gdf):
     return 32600 + zone
 
 # ---------------- Core ----------------
-def compute_ppr_and_lot_shape_gdf(gdf):
+def _detect_existing_output_columns(gdf):
+    """
+    Checks a parcel GeoDataFrame for pre-existing columns matching any of
+    OUTPUT_COLUMN_TARGETS (CAMA_PP_RATIO, CAMA_VTX_COUNT, CAMA_ANGS_TXT,
+    CAMA_TRIANGLE, CAMA_RECTANGLE, CAMA_L_SHAPED, CAMA_OTHERS,
+    CAMA_LOT_SHAPE), exact match (case-insensitive) -- "cama_pp_ratio"
+    matches "CAMA_PP_RATIO", but a column like "CAMA_PP_RATIO_OLD" or
+    "PP_RATIO" does NOT match (no substring/partial matching, and no
+    matching against the old, unprefixed names -- see
+    OUTPUT_COLUMN_TARGETS' own docstring).
+
+    Mirrors road_frontage.py's / terrain.py's
+    _detect_existing_output_columns() exactly.
+
+    Returns a dict {target_name: actual_existing_column_name}, containing
+    ONLY the targets that actually have a match. Empty dict if none of
+    the eight targets have any existing column. The actual column's
+    ORIGINAL casing is preserved in the returned value -- this is what
+    gets shown to the user in the confirmation dialog and what
+    compute_ppr_and_lot_shape_gdf() writes back into, so an existing
+    differently-cased column is reused exactly as found rather than
+    renamed or duplicated.
+    """
+    found = {}
+    for target in OUTPUT_COLUMN_TARGETS:
+        match = next((c for c in gdf.columns if c.lower() == target.lower()), None)
+        if match is not None:
+            found[target] = match
+    return found
+
+
+# ========================= PARCEL COLUMN-CONFLICT CHECK =========================
+# _check_parcel_shape_conflicts(): checks LOCAL Land Parcel source(s)
+# for pre-existing columns matching any of OUTPUT_COLUMN_TARGETS -- this
+# tool is about to write its eight computed shape/compactness columns
+# into those columns, and on_run() below shows a combined confirmation
+# dialog before proceeding.
+#
+# Unlike road_frontage.py/road_width.py, this tool has no background
+# worker thread -- run_processing() runs synchronously on the main
+# thread (on_run() validates, destroys the window, then calls
+# run_processing() directly). So this check also runs synchronously,
+# called directly from on_run() right before Run actually starts --
+# same adaptation already applied in road_density.py, road_surface.py,
+# and terrain.py. Adding threading here would be a separate,
+# out-of-scope architectural change.
+#
+# Read approach: plain gpd.read_file(path), matching road_width.py's own
+# canonical _read_gdf_worker() exactly -- no partial/schema-only read
+# trick.
+#
+# A read failure here is NEVER treated as a column-conflict failure --
+# it only skips the conflict check for that one source (logged to
+# console). The real read inside run_processing() further below remains
+# solely responsible for surfacing any genuine read error to the user.
+#
+# Scope: LOCAL sources only. Database Land Parcel sources are
+# explicitly out of scope for this check per the project task
+# definition -- callers must not invoke this for "db"-mode sources.
+def _check_parcel_shape_conflicts(local_paths):
+    """
+    Returns a list of (path, existing_output_cols) tuples -- one entry
+    only for local sources where at least one OUTPUT_COLUMN_TARGETS
+    match was found. existing_output_cols is the dict returned by
+    _detect_existing_output_columns() for that source (target name ->
+    actual existing column name, original casing preserved).
+    """
+    conflicts = []
+    for path in local_paths:
+        try:
+            gdf = gpd.read_file(path)
+        except Exception as e:
+            print(f"⚠️ Could not read parcel layer to check for existing "
+                  f"output column(s): {path}: {e}")
+            continue
+        existing_output_cols = _detect_existing_output_columns(gdf)
+        if existing_output_cols:
+            conflicts.append((path, existing_output_cols))
+    return conflicts
+
+
+# ---------------- Output filename helpers ----------------
+# Ported from road_width.py's validated pattern, already successfully
+# adapted in road_frontage.py, lot_location.py, road_density.py,
+# road_surface.py, and terrain.py. Implementations are identical across
+# all ports -- do not introduce variations.
+
+def _split_trailing_number(base_name: str):
+    """
+    Splits a base name into (root, existing_number) if it ends with
+    "_<digits>" (e.g. "landparcel_1" -> ("landparcel", 1)), else returns
+    (base_name, None) unchanged.
+    """
+    m = re.match(r'^(.*)_(\d+)$', base_name)
+    if m:
+        return m.group(1), int(m.group(2))
+    return base_name, None
+
+
+def resolve_output_base_name(folder: str, desired_base_name: str, ext: str = "gpkg") -> str:
+    """
+    Determines the actual output base name (no extension) to use for a
+    NEW file in `folder`, given the DESIRED name -- normally the Land
+    Parcel source's own filename, unchanged, with no tool-name suffix
+    appended.
+
+    Rule: reuse the desired name exactly if nothing of that name exists
+    yet in `folder`. If it already exists, strip any existing trailing
+    "_<N>" from the desired name to get a root, scan `folder` for every
+    file matching "<root>_<N>.<ext>", and use "<root>_<max(N)+1>" --
+    the highest N found ANYWHERE in the folder, not just "the source
+    file's own N + 1".
+
+    This tool has no companion/QA outputs, so there is no
+    with_output_suffix call needed here.
+    """
+    candidate_path = os.path.join(folder, f"{desired_base_name}.{ext}")
+    if not os.path.exists(candidate_path):
+        return desired_base_name
+
+    root, _existing_number = _split_trailing_number(desired_base_name)
+
+    pattern = re.compile(rf'^{re.escape(root)}_(\d+)\.{re.escape(ext)}$', re.IGNORECASE)
+    max_n = 0
+    try:
+        for fname in os.listdir(folder):
+            m = pattern.match(fname)
+            if m:
+                max_n = max(max_n, int(m.group(1)))
+    except OSError:
+        pass  # folder unreadable -- fall through with max_n=0, worst case uses N=1
+
+    return f"{root}_{max_n + 1}"
+
+
+def ask_overwrite_dialog(parent, conflicting_names):
+    """
+    Combined dialog shown ONCE, before any processing starts, when one or
+    more Land Parcel sources' desired local output filename already
+    exists in the chosen output folder. Not a per-file prompt -- every
+    conflicting name in the batch is listed together, and the chosen
+    action applies to ALL of them:
+
+      - "Overwrite": every conflicting file is replaced in place, using
+        its plain desired name (no numbering).
+      - "Create New File": every conflicting file is instead saved under
+        a new, non-colliding name via resolve_output_base_name()'s
+        auto-numbering -- the existing files are left untouched.
+      - "Cancel": aborts the ENTIRE run. Nothing is written, including
+        sources that had no conflict at all.
+
+    Returns "overwrite", "new", or "cancel" (also returned if the
+    dialog's own titlebar close button is used).
+
+    Ported from road_width.py's validated implementation, already
+    adapted in road_frontage.py, lot_location.py, road_density.py,
+    road_surface.py, and terrain.py. Deliberately does NOT call
+    dialog.transient(parent): this app's root is permanently withdrawn
+    (see main()), and transient() on a withdrawn parent is a known
+    source of window-manager-dependent "dialog never becomes viewable"
+    behavior. grab_set()+deiconify()+lift()+focus_force()+topmost is
+    used instead, matching this file's own existing dialog pattern
+    (see _pick_db_tables()).
+    """
+    result = {"choice": "cancel"}
+
+    dialog = tk.Toplevel(parent)
+    apply_icon(dialog)
+    dialog.title("File(s) Already Exist")
+    dialog.resizable(False, False)
+    dialog.grab_set()
+    dialog.deiconify()
+    dialog.lift()
+    dialog.focus_force()
+    dialog.attributes("-topmost", True)
+    dialog.after(100, lambda: dialog.attributes("-topmost", False))
+
+    def choose(value):
+        result["choice"] = value
+        dialog.destroy()
+
+    dialog.protocol("WM_DELETE_WINDOW", lambda: choose("cancel"))
+
+    # Buttons packed first, at the bottom -- guaranteed visible/reachable
+    # regardless of how long the scrollable list above them ends up being.
+    btn_frame = tk.Frame(dialog)
+    btn_frame.pack(side="bottom", fill="x", pady=(4, 12))
+    tk.Button(btn_frame, text="Overwrite", width=14, cursor="hand2",
+              command=lambda: choose("overwrite")).pack(side="left", padx=(16, 4))
+    tk.Button(btn_frame, text="Create New File", width=16, cursor="hand2",
+              command=lambda: choose("new")).pack(side="left", padx=4)
+    tk.Button(btn_frame, text="Cancel", width=10, cursor="hand2",
+              command=lambda: choose("cancel")).pack(side="left", padx=(4, 16))
+
+    tk.Label(dialog, text="The following output file(s) already exist:",
+             font=("Segoe UI", 10, "bold"), anchor="w"
+             ).pack(fill="x", padx=16, pady=(16, 4))
+
+    MAX_LIST_LINES = 10
+    TEXT_WIDTH_CHARS = 55
+
+    list_frame = tk.Frame(dialog)
+    list_frame.pack(fill="both", expand=True, padx=16, pady=(0, 4))
+    vscroll = tk.Scrollbar(list_frame, orient="vertical")
+    hscroll = tk.Scrollbar(list_frame, orient="horizontal")
+    text = tk.Text(
+        list_frame, wrap="none", height=min(len(conflicting_names), MAX_LIST_LINES),
+        width=TEXT_WIDTH_CHARS, yscrollcommand=vscroll.set, xscrollcommand=hscroll.set,
+        relief="flat", bg=dialog.cget("bg"), font=("Segoe UI", 9))
+    vscroll.config(command=text.yview)
+    hscroll.config(command=text.xview)
+    if len(conflicting_names) > MAX_LIST_LINES:
+        vscroll.pack(side="right", fill="y")
+    needs_hscroll = any(len(f"• {name}") > TEXT_WIDTH_CHARS for name in conflicting_names)
+    if needs_hscroll:
+        hscroll.pack(side="bottom", fill="x")
+    text.pack(side="left", fill="both", expand=True)
+    for name in conflicting_names:
+        text.insert("end", f"• {name}\n")
+    text.config(state="disabled")
+
+    tk.Label(dialog, text=(
+        "Overwrite will replace these files. Create New File will save "
+        "them under a new name instead, leaving the existing files "
+        "untouched. This choice applies to all files listed above."
+    ), wraplength=380, justify="left", anchor="w"
+    ).pack(fill="x", padx=16, pady=(4, 8))
+
+    dialog.update_idletasks()
+    req_w = max(dialog.winfo_reqwidth(), 420)
+    req_h = dialog.winfo_reqheight()
+    sw = dialog.winfo_screenwidth()
+    sh = dialog.winfo_screenheight()
+    x = (sw - req_w) // 2
+    y = (sh - req_h) // 2
+    dialog.geometry(f"{req_w}x{req_h}+{x}+{y}")
+
+    dialog.wait_window()
+    return result["choice"]
+
+
+def compute_ppr_and_lot_shape_gdf(gdf,
+        pp_ratio_col="CAMA_PP_RATIO", vtx_count_col="CAMA_VTX_COUNT",
+        angs_txt_col="CAMA_ANGS_TXT", triangle_col="CAMA_TRIANGLE",
+        rectangle_col="CAMA_RECTANGLE", l_shaped_col="CAMA_L_SHAPED",
+        others_col="CAMA_OTHERS", lot_shape_col="CAMA_LOT_SHAPE"):
+    """
+    pp_ratio_col, vtx_count_col, angs_txt_col, triangle_col,
+    rectangle_col, l_shaped_col, others_col, lot_shape_col : str -- the
+    column names this tool's eight computed outputs are written to.
+    Each defaults to its standard CAMA_-prefixed name (this tool's
+    normal output, matching road_width.py's own ROAD_WIDTH ->
+    CAMA_ROAD_WIDTH convention). The GUI overrides these per-source when
+    the selected LOCAL parcel layer already has existing matching
+    columns (see OUTPUT_COLUMN_TARGETS / _detect_existing_output_columns())
+    -- the exact existing name/casing is passed here so processing
+    writes back into that same column instead of creating a hardcoded
+    CAMA_-prefixed duplicate.
+
+    classify_lot_shape() itself is UNCHANGED -- it still returns the
+    bare internal labels "TRIANGLE"/"RECTANGLE"/"L_SHAPED"/"OTHERS".
+    Those bare labels are used here only as an internal lookup key
+    (shape_col_map below) to pick which of the four one-hot *_col
+    columns gets set to 1 -- they are never written to any column
+    as-is. The lot_shape_col VALUE (not just the column NAME) is
+    deliberately prefixed too, per explicit project decision: it is
+    written as "CAMA_TRIANGLE"/"CAMA_RECTANGLE"/"CAMA_L_SHAPED"/
+    "CAMA_OTHERS", not the bare label -- confirmed: no other tool in
+    this project reads/depends on this tool's LOT_SHAPE values, so this
+    is a safe, isolated change.
+    """
+    # Internal label (from classify_lot_shape()/the invalid-geometry
+    # fallback) -> which one-hot *_col column to set to 1. Keys are the
+    # bare internal labels this function has always used internally;
+    # values are this call's resolved, possibly-overridden column names.
+    shape_col_map = {
+        "TRIANGLE": triangle_col,
+        "RECTANGLE": rectangle_col,
+        "L_SHAPED": l_shaped_col,
+        "OTHERS": others_col,
+    }
+
     # Save the original CRS
     original_crs = gdf.crs
 
@@ -190,15 +524,15 @@ def compute_ppr_and_lot_shape_gdf(gdf):
     # ---- Do calculations in projected CRS, using the repaired geometry ----
     area = fixed_geoms.area
     perimeter = fixed_geoms.length
-    gdf["PP_RATIO"] = ((4 * np.pi * area) / (perimeter ** 2)).round(2)
+    gdf[pp_ratio_col] = ((4 * np.pi * area) / (perimeter ** 2)).round(2)
 
-    gdf["VTX_COUNT"] = 0
-    gdf["ANGS_TXT"] = ""
+    gdf[vtx_count_col] = 0
+    gdf[angs_txt_col] = ""
 
-    for col in ["TRIANGLE", "RECTANGLE", "L_SHAPED", "OTHERS"]:
+    for col in [triangle_col, rectangle_col, l_shaped_col, others_col]:
         if col not in gdf.columns:
             gdf[col] = 0
-    gdf["LOT_SHAPE"] = ""
+    gdf[lot_shape_col] = ""
 
     # .items() yields gdf's actual index LABELS (not positions), which
     # gdf.at[] requires. enumerate() gives positional 0..N-1 instead --
@@ -214,7 +548,7 @@ def compute_ppr_and_lot_shape_gdf(gdf):
             # Temporary behavior: parcels whose geometry cannot be
             # repaired are retained in the output (never dropped --
             # every input row must appear exactly once in the output)
-            # with LOT_SHAPE="OTHERS" and PP_RATIO=NaN (area/perimeter
+            # with LOT_SHAPE="CAMA_OTHERS" and PP_RATIO=NaN (area/perimeter
             # above are NaN for a None entry in fixed_geoms, so
             # PP_RATIO is already NaN for this row without extra code
             # here) until the business rule for a dedicated
@@ -222,24 +556,24 @@ def compute_ppr_and_lot_shape_gdf(gdf):
             # team lead. The parcel's OWN geometry in the output stays
             # exactly as originally read -- only this repaired local
             # `poly` failed, not gdf's own geometry column.
-            gdf.at[idx, "TRIANGLE"] = 0
-            gdf.at[idx, "RECTANGLE"] = 0
-            gdf.at[idx, "L_SHAPED"] = 0
-            gdf.at[idx, "OTHERS"] = 1
-            gdf.at[idx, "LOT_SHAPE"] = "OTHERS"
+            gdf.at[idx, triangle_col] = 0
+            gdf.at[idx, rectangle_col] = 0
+            gdf.at[idx, l_shaped_col] = 0
+            gdf.at[idx, others_col] = 1
+            gdf.at[idx, lot_shape_col] = "CAMA_OTHERS"
             continue
 
         angles = vertex_angles(poly)
         shape_type = classify_lot_shape(angles)
 
-        gdf.at[idx, "TRIANGLE"] = 0
-        gdf.at[idx, "RECTANGLE"] = 0
-        gdf.at[idx, "L_SHAPED"] = 0
-        gdf.at[idx, "OTHERS"] = 0
-        gdf.at[idx, shape_type] = 1
-        gdf.at[idx, "LOT_SHAPE"] = shape_type
-        gdf.at[idx, "VTX_COUNT"] = len(angles)
-        gdf.at[idx, "ANGS_TXT"] = ",".join(map(str, angles))
+        gdf.at[idx, triangle_col] = 0
+        gdf.at[idx, rectangle_col] = 0
+        gdf.at[idx, l_shaped_col] = 0
+        gdf.at[idx, others_col] = 0
+        gdf.at[idx, shape_col_map[shape_type]] = 1
+        gdf.at[idx, lot_shape_col] = f"CAMA_{shape_type}"
+        gdf.at[idx, vtx_count_col] = len(angles)
+        gdf.at[idx, angs_txt_col] = ",".join(map(str, angles))
 
     # ✅ Reproject back to original CRS before returning
     if original_crs:
@@ -527,8 +861,84 @@ def open_main_window(root):
         else:
             output_mode = ("db", None)
 
+        # Existing OUTPUT-COLUMN conflict warning. Checks all eight output
+        # columns (CAMA_PP_RATIO, CAMA_VTX_COUNT, CAMA_ANGS_TXT,
+        # CAMA_TRIANGLE, CAMA_RECTANGLE, CAMA_L_SHAPED, CAMA_OTHERS,
+        # CAMA_LOT_SHAPE) -- not just PP_RATIO/LOT_SHAPE -- per the same
+        # project-lead decision already applied in road_frontage.py and
+        # terrain.py: they are one feature set computed together, so a
+        # conflict on ANY of them warrants one combined warning covering
+        # all affected sources and columns, shown once here (never
+        # per-file mid-processing, never only at Browse time). Declining
+        # cancels the run entirely rather than skipping just the
+        # affected source(s). Column names are shown with their EXACT
+        # existing casing, and that exact casing/name is what
+        # compute_ppr_and_lot_shape_gdf() will write into later -- never
+        # renamed to the standard casing. LOCAL sources only -- Database
+        # Land Parcel sources are explicitly out of scope for this check.
+        # ------------------------------------------------------------------
+        global parcel_output_column_overrides
+        if parcel_source_type.get() == "local":
+            conflicts = _check_parcel_shape_conflicts(parcel_local_paths)
+            if conflicts:
+                lines = "\n".join(
+                    f"- '{os.path.basename(path)}': found "
+                    + ", ".join(
+                        f"'{existing_name}' column (for {target})"
+                        for target, existing_name in existing_output_cols.items()
+                    )
+                    for path, existing_output_cols in conflicts
+                )
+                proceed = messagebox.askyesno(
+                    "Existing output column(s) found",
+                    f"{lines}\n\n"
+                    "Processing will overwrite the existing column(s) with the "
+                    "newly computed values. The column name(s) will not change.\n\n"
+                    "Proceed?"
+                )
+                if not proceed:
+                    print("Run cancelled by user (existing output column(s) found).")
+                    return
+                # Preserve each source's existing column name(s)/casing
+                # exactly -- e.g. a detected "caMA_PP_RATIO" is written
+                # back to "caMA_PP_RATIO", not a hardcoded
+                # "CAMA_PP_RATIO" -- so no duplicate column is ever
+                # created regardless of the existing casing. A source
+                # with no entry here (no conflict was found) simply
+                # uses the default names in
+                # compute_ppr_and_lot_shape_gdf() below.
+                parcel_output_column_overrides = dict(conflicts)
+            else:
+                parcel_output_column_overrides = {}
+        else:
+            parcel_output_column_overrides = {}
+        # PRIORITY 2: existing OUTPUT-FILE conflict check (local output only).
+        # Resolved ONCE, up front, on the main thread -- before win.destroy()
+        # so the dialog has a live parent window. The chosen action applies
+        # to ALL conflicting sources in the batch (one combined dialog, not
+        # per-file). Cancel aborts the entire run; nothing is written.
+        # Ported from road_width.py / road_frontage.py's validated pattern.
+        overwrite_mode = None
+        if output_mode[0] == "local":
+            desired_names = (
+                [os.path.splitext(os.path.basename(p))[0] for p in barangay_source[1]]
+                if barangay_source[0] == "local"
+                else list(barangay_source[1])
+            )
+            conflicting_names = [
+                f"{name}.gpkg" for name in desired_names
+                if os.path.exists(os.path.join(output_mode[1], f"{name}.gpkg"))
+            ]
+            if conflicting_names:
+                overwrite_mode = ask_overwrite_dialog(win, conflicting_names)
+                if overwrite_mode == "cancel":
+                    print("Run cancelled by user (existing output file(s) found).")
+                    return
+
+        # ------------------------------------------------------------------
+
         win.destroy()
-        run_processing()
+        run_processing(overwrite_mode)
 
     # Single source of truth for the Run button's enabled/disabled
     # colors -- used both at button creation and inside
@@ -590,7 +1000,11 @@ def open_main_window(root):
 
 
 # ---------------- Processing ----------------
-def run_processing():
+def run_processing(overwrite_mode=None):
+    # overwrite_mode: "overwrite", "new", or None (no conflict existed).
+    # Resolved ONCE, up front, on the main thread in on_run() before
+    # win.destroy() -- passed here as a parameter (not a global).
+    # See ask_overwrite_dialog() for the full behavior contract.
     global barangay_source, output_mode
     if not barangay_source or not output_mode:
         messagebox.showerror("Error", "Selections incomplete (Barangay + Output required).")
@@ -610,13 +1024,46 @@ def run_processing():
             # parcel whose geometry can't be repaired is no longer
             # dropped -- compute_ppr_and_lot_shape_gdf() below keeps it
             # in the output with its ORIGINAL geometry, PP_RATIO=NaN,
-            # and LOT_SHAPE="OTHERS" as a temporary placeholder pending
-            # a dedicated "INVALID_GEOMETRY" classification once that
-            # business rule is finalized with the team lead.
-            result = compute_ppr_and_lot_shape_gdf(gdf)
+            # and LOT_SHAPE="CAMA_OTHERS" as a temporary placeholder
+            # pending a dedicated "INVALID_GEOMETRY" classification once
+            # that business rule is finalized with the team lead.
+            #
+            # output_col_overrides: preserves each source's existing
+            # output column name(s)/casing exactly, if a conflict was
+            # detected and confirmed in on_run() -- e.g. a detected
+            # "caMA_PP_RATIO" is written back to "caMA_PP_RATIO", not a
+            # hardcoded "CAMA_PP_RATIO". Defaults to the standard
+            # CAMA_-prefixed name for any output this source has no
+            # override for.
+            output_col_overrides = parcel_output_column_overrides.get(path, {})
+            result = compute_ppr_and_lot_shape_gdf(
+                gdf,
+                pp_ratio_col=output_col_overrides.get("CAMA_PP_RATIO", "CAMA_PP_RATIO"),
+                vtx_count_col=output_col_overrides.get("CAMA_VTX_COUNT", "CAMA_VTX_COUNT"),
+                angs_txt_col=output_col_overrides.get("CAMA_ANGS_TXT", "CAMA_ANGS_TXT"),
+                triangle_col=output_col_overrides.get("CAMA_TRIANGLE", "CAMA_TRIANGLE"),
+                rectangle_col=output_col_overrides.get("CAMA_RECTANGLE", "CAMA_RECTANGLE"),
+                l_shaped_col=output_col_overrides.get("CAMA_L_SHAPED", "CAMA_L_SHAPED"),
+                others_col=output_col_overrides.get("CAMA_OTHERS", "CAMA_OTHERS"),
+                lot_shape_col=output_col_overrides.get("CAMA_LOT_SHAPE", "CAMA_LOT_SHAPE"),
+            )
             if output_mode[0] == "local":
+                # Desired output filename = the Land Parcel source's own
+                # name, unchanged -- no tool-name suffix appended (matching
+                # road_width.py / road_frontage.py's established convention).
+                # overwrite_mode was resolved ONCE, up front in on_run(),
+                # for the whole batch -- no per-file prompt here.
                 base = os.path.splitext(os.path.basename(path))[0]
-                out = os.path.join(output_mode[1], f"{base}_lotshape.gpkg")
+                desired_base_name = base
+                candidate_path = os.path.join(output_mode[1], f"{desired_base_name}.gpkg")
+                had_conflict = os.path.exists(candidate_path)
+                if had_conflict and overwrite_mode == "new":
+                    base_name = resolve_output_base_name(output_mode[1], desired_base_name)
+                else:
+                    # No conflict, or user chose "Overwrite" --
+                    # both cases use the plain desired name.
+                    base_name = desired_base_name
+                out = os.path.join(output_mode[1], f"{base_name}.gpkg")
                 result.to_file(out, driver="GPKG")
                 print(f"✅ Saved {out}")
                 load_in_global_mapper(out)
@@ -627,13 +1074,27 @@ def run_processing():
                 result.to_postgis(table, engine, schema=schema, if_exists="replace", index=False)
                 print(f"🔄 Saved to DB: {table}")
     else:
+        # Database Land Parcel sources: column-conflict check is out of
+        # scope (see _check_parcel_shape_conflicts()) -- always uses
+        # compute_ppr_and_lot_shape_gdf()'s eight default CAMA_-prefixed
+        # names.
         for table in barangay_source[1]:
             gdf = read_postgis_clean(table, engine, schema)
             # Row-dropping REMOVED -- same reasoning as the local-source
             # branch above.
             result = compute_ppr_and_lot_shape_gdf(gdf)
             if output_mode[0] == "local":
-                out = os.path.join(output_mode[1], f"{table}_lotshape.gpkg")
+                # DB parcel source: table name used as desired base name
+                # directly (no .splitext() needed). Same overwrite/create-new
+                # logic as the local parcel source branch above.
+                desired_base_name = table
+                candidate_path = os.path.join(output_mode[1], f"{desired_base_name}.gpkg")
+                had_conflict = os.path.exists(candidate_path)
+                if had_conflict and overwrite_mode == "new":
+                    base_name = resolve_output_base_name(output_mode[1], desired_base_name)
+                else:
+                    base_name = desired_base_name
+                out = os.path.join(output_mode[1], f"{base_name}.gpkg")
                 result.to_file(out, driver="GPKG")
                 print(f"✅ Saved {out}")
                 load_in_global_mapper(out)
@@ -641,7 +1102,7 @@ def run_processing():
                 result.to_postgis(table, engine, schema=schema, if_exists="replace", index=False)
                 print(f"🔄 Updated DB table: {table}")
 
-    messagebox.showinfo("Success", "✅ Processing done!")
+    messagebox.showinfo("Success", "Processing done!")
 
 
 # ---------------- Main ----------------
