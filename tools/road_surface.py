@@ -1,4 +1,5 @@
 import os
+import re
 import math
 import tkinter as tk
 from tkinter import filedialog, messagebox, Listbox
