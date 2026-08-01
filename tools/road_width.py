@@ -1521,8 +1521,11 @@ def open_main_window(root):
     road_source_type   = tk.StringVar(master=win, value="local")
     output_dest_type   = tk.StringVar(master=win, value="local")
 
-    parcel_local_paths = []
-    parcel_db_tables   = []
+    # Single-selection architecture: one local file and one DB table
+    # may exist in memory at any time. Authority variables -- all GUI
+    # labels and run-button state are derived from them, never the reverse.
+    parcel_local_path = None   # authority: single local file path
+    parcel_db_table   = None   # authority: single DB table name
     road_local_path    = tk.StringVar(master=win)
     # road_db_table: DEDICATED var for the DB-mode road selection.
     # road_width.py originally reused road_local_path for both local
@@ -1538,8 +1541,8 @@ def open_main_window(root):
     road_db_table       = tk.StringVar(master=win)
     output_local_dir   = tk.StringVar(master=win)
 
-    parcel_files_var = tk.StringVar(master=win, value="No file(s) selected")
-    parcel_db_var    = tk.StringVar(master=win, value="No table(s) selected")
+    parcel_files_var = tk.StringVar(master=win, value="No file selected")
+    parcel_db_var    = tk.StringVar(master=win, value="No table selected")
     road_file_var    = tk.StringVar(master=win, value="No file selected")
     road_db_var      = tk.StringVar(master=win, value="No table selected")
     output_dir_var   = tk.StringVar(master=win, value="No folder selected")
@@ -1591,7 +1594,7 @@ def open_main_window(root):
     # road_width_existing_col) tuples, one per selected parcel source.
     parcel_read_details = []
     # parcel_road_width_conflicts: derived from parcel_read_details (see
-    # _derive_road_width_conflicts() below) -- list of (path_or_table,
+    # _check_parcel_road_width_conflicts() below) -- list of (path_or_table,
     # existing_col_name) tuples, one per source with an existing
     # ROAD_WIDTH-like column. Consumed by the single combined
     # confirmation dialog in on_run().
@@ -1828,8 +1831,8 @@ def open_main_window(root):
         without extra parameters.
         """
         has_any_parcel_source = (
-            bool(parcel_local_paths) if parcel_source_type.get() == "local"
-            else bool(parcel_db_tables)
+            bool(parcel_local_path) if parcel_source_type.get() == "local"
+            else bool(parcel_db_table)
         )
 
         if not has_any_parcel_source:
@@ -1971,22 +1974,25 @@ def open_main_window(root):
         parcel_radio_db.config(state=state)
 
         if reading:
-            # Singular vs plural depends on how many sources are
-            # actually selected for the CURRENT mode -- "Reading Land
-            # Parcel..." for exactly one, "Reading Land Parcels..." for
-            # two or more. Color matches the Road Network side's own
-            # "Reading..." indicator (#b36b00, amber) for visual
-            # consistency between the two sections.
-            n_selected = len(parcel_local_paths) if parcel_source_type.get() == "local" else len(parcel_db_tables)
-            reading_text = "⏳ Reading Land Parcel..." if n_selected == 1 else "⏳ Reading Land Parcels..."
-            parcel_files_var.set(reading_text)
-            parcel_db_var.set(reading_text)
+            # Plural logic is removed: under the single-selection
+            # architecture, it is structurally impossible for more than
+            # one source to be selected, so the plural branch can never
+            # fire. The invariant is the reason, not an assumption about
+            # runtime state.
+            parcel_files_var.set("⏳ Reading Land Parcel...")
+            parcel_db_var.set("⏳ Reading Land Parcel...")
             parcel_lbl_widget.config(fg="#b36b00")
         else:
-            n_local = len(parcel_local_paths)
-            parcel_files_var.set(f"{n_local} file(s) selected" if n_local else "No file(s) selected")
-            n_db = len(parcel_db_tables)
-            parcel_db_var.set(f"{n_db} table(s) selected" if n_db else "No table(s) selected")
+            # Restore from authority variables -- never from StringVar
+            # state. Same pattern as toggle_parcel() below.
+            parcel_files_var.set(
+                os.path.basename(parcel_local_path) if parcel_local_path
+                else "No file selected"
+            )
+            parcel_db_var.set(
+                parcel_db_table if parcel_db_table
+                else "No table selected"
+            )
             parcel_lbl_widget.config(fg="gray")
 
     def _set_road_reading_state(reading):
@@ -2035,7 +2041,7 @@ def open_main_window(root):
         widget's assigned cursor either -- both must be set explicitly
         for each state.
         """
-        has_parcel = bool(parcel_local_paths) if parcel_source_type.get() == "local" else bool(parcel_db_tables)
+        has_parcel = bool(parcel_local_path) if parcel_source_type.get() == "local" else bool(parcel_db_table)
         has_road = bool(road_local_path.get()) if road_source_type.get() == "local" else bool(road_db_table.get())
         has_output = bool(output_local_dir.get()) if output_dest_type.get() == "local" else True
 
@@ -2065,7 +2071,7 @@ def open_main_window(root):
             run_btn.config(state="disabled", cursor="no",
                             bg="#e0e0e0", fg="#888888", disabledforeground="#888888")
 
-    def _derive_road_width_conflicts(details):
+    def _check_parcel_road_width_conflicts(details):
         """
         Extracts the ROAD_WIDTH-conflict subset out of parcel_read_details
         (or an equivalent list, e.g. a cache slot's stored details) --
@@ -2122,10 +2128,15 @@ def open_main_window(root):
 
         if parcel_source_type.get() == "local":
             source_type = "local"
-            sources = list(parcel_local_paths)
+            # Single-selection: build a one-element list from the authority
+            # variable, or empty list if nothing selected. The early-return
+            # on "if not sources:" below is completely unchanged -- only
+            # the list construction changes, not when or whether the
+            # refresh fires.
+            sources = [parcel_local_path] if parcel_local_path else []
         else:
             source_type = "db"
-            sources = list(parcel_db_tables)
+            sources = [parcel_db_table] if parcel_db_table else []
 
         if not sources:
             parcel_read_details = []
@@ -2139,7 +2150,7 @@ def open_main_window(root):
         slot = _parcel_classification_cache[source_type]
         if not force_refresh and slot["key"] == cache_key and slot["details"] is not None:
             parcel_read_details = slot["details"]
-            parcel_road_width_conflicts = _derive_road_width_conflicts(parcel_read_details)
+            parcel_road_width_conflicts = _check_parcel_road_width_conflicts(parcel_read_details)
             _rebuild_lot_classification_checklist(reuse_vars=slot["vars"])
             _update_parcel_classification_visibility()
             _update_run_button_state()
@@ -2188,7 +2199,7 @@ def open_main_window(root):
         parcel_is_reading = False
         _set_parcel_reading_state(False)
         parcel_read_details = per_source_results
-        parcel_road_width_conflicts = _derive_road_width_conflicts(per_source_results)
+        parcel_road_width_conflicts = _check_parcel_road_width_conflicts(per_source_results)
 
         failed = [src for (src, state, _c, _k, _rw) in per_source_results if state is None]
         for src in failed:
@@ -2478,14 +2489,15 @@ def open_main_window(root):
 
     # ── parcel browse callbacks ───────────────────────────────────
     def browse_parcel_files():
-        files = filedialog.askopenfilenames(filetypes=[
+        file = filedialog.askopenfilename(filetypes=[
             ("Shapefiles", "*.shp"),
             ("GeoPackage", "*.gpkg"),
             ("All", "*.*")])
-        if files:
-            parcel_local_paths.clear()
-            parcel_local_paths.extend(files)
-            parcel_files_var.set(f"{len(files)} file(s) selected")
+        # Cancel returns "" -- do not assign, preserving previous selection.
+        if file:
+            nonlocal parcel_local_path
+            parcel_local_path = file
+            parcel_files_var.set(os.path.basename(file))
             # A new Land Parcel selection invalidates any prior
             # LOT_LOCATION detection -- re-inspect it.
             # Deliberately NOT calling _reflow_window() here: doing so
@@ -2513,9 +2525,12 @@ def open_main_window(root):
             return
 
         def _on_parcel_tables_selected(sel):
-            parcel_db_tables.clear()
-            parcel_db_tables.extend(sel)
-            parcel_db_var.set(f"{len(sel)} table(s) selected")
+            # Only called on confirmed selection (Confirm button in
+            # _pick_db_tables) -- Cancel never calls on_select, so
+            # parcel_db_table retains its previous value automatically.
+            nonlocal parcel_db_table
+            parcel_db_table = sel[0]
+            parcel_db_var.set(sel[0])
             # See browse_parcel_files() above for why _reflow_window()
             # is deliberately NOT called here.
             # force_refresh=True: actively chosen just now via the table
@@ -2523,19 +2538,29 @@ def open_main_window(root):
             # browse_parcel_files() above.
             _refresh_parcel_classification(force_refresh=True)
 
-        _pick_db_tables(win, tables, multi=True, on_select=_on_parcel_tables_selected)
+        _pick_db_tables(win, tables, multi=False, on_select=_on_parcel_tables_selected)
 
     # ── parcel toggle ─────────────────────────────────────────────
     def toggle_parcel(*_):
+        # Always render from authority variables -- never from StringVar state.
+        # Guarantees Local → DB → Local always restores the original selection.
         mode = parcel_source_type.get()
         if mode == "local":
             parcel_lbl_widget.config(textvariable=parcel_files_var,
                                      font=("Segoe UI", 9))
             parcel_btn.config(text="Browse…", command=browse_parcel_files)
+            parcel_files_var.set(
+                os.path.basename(parcel_local_path) if parcel_local_path
+                else "No file selected"
+            )
         else:
             parcel_lbl_widget.config(textvariable=parcel_db_var,
                                      font=("Segoe UI", 9))
             parcel_btn.config(text="Select…", command=browse_parcel_db)
+            parcel_db_var.set(
+                parcel_db_table if parcel_db_table
+                else "No table selected"
+            )
         # Switching Local <-> Database does NOT clear the other mode's
         # remembered selection or cached checklist state -- that's the
         # whole point of the dual-slot _parcel_classification_cache. This
@@ -2545,11 +2570,11 @@ def open_main_window(root):
         _refresh_parcel_classification()
 
     # ── parcel radio buttons (command wired AFTER toggle defined) ─
-    parcel_radio_local = tk.Radiobutton(parcel_radio_row, text="Local File(s)",
+    parcel_radio_local = tk.Radiobutton(parcel_radio_row, text="Local File",
                    variable=parcel_source_type, value="local",
                    command=toggle_parcel)
     parcel_radio_local.pack(side="left")
-    parcel_radio_db = tk.Radiobutton(parcel_radio_row, text="Database Table(s)",
+    parcel_radio_db = tk.Radiobutton(parcel_radio_row, text="Database Table",
                    variable=parcel_source_type, value="db",
                    command=toggle_parcel)
     parcel_radio_db.pack(side="left", padx=(12, 0))
@@ -2786,17 +2811,19 @@ def open_main_window(root):
 
         # validate parcel
         if parcel_source_type.get() == "local":
-            if not parcel_local_paths:
+            if not parcel_local_path:
                 messagebox.showerror("Missing Input",
-                    "Please select at least one Land Parcel file.")
+                    "Please select a Land Parcel file.")
                 return
-            barangay_source = ("local", tuple(parcel_local_paths))
+            # Validation guarantees parcel_local_path is not None here --
+            # barangay_source never contains None (Phase 1 invariant 3).
+            barangay_source = ("local", (parcel_local_path,))
         else:
-            if not parcel_db_tables:
+            if not parcel_db_table:
                 messagebox.showerror("Missing Input",
-                    "Please select at least one Land Parcel table.")
+                    "Please select a Land Parcel table.")
                 return
-            barangay_source = ("db", parcel_db_tables)
+            barangay_source = ("db", (parcel_db_table,))
 
         # validate road
         if road_source_type.get() == "local":
@@ -2887,23 +2914,13 @@ def open_main_window(root):
         else:
             parcel_road_width_column_overrides = {}
 
-        # ------------------------------------------------------------------
-        # PRIORITY 2: output FILENAME conflict pre-scan. Resolved ONCE, up
-        # front, here on the main thread -- BEFORE the window is destroyed
-        # and BEFORE run_processing()'s background worker starts (Tkinter
-        # dialogs must never be shown from a worker thread). Desired names
-        # only need each source's own filename/table name (no need to
-        # actually read/measure anything yet), so this check is cheap.
-        # Moved here from run_processing() so that:
+        # PRIORITY 2: file conflict check -- warn if an output file with
+        # the same name already exists in the chosen output folder.
+        # Resolved here on the main thread, before win.destroy(), so:
         #   (a) win is still live, giving the dialog a proper parent, and
-        #   (b) the user can cancel without losing the main window --
-        #       consistent with all other tools in this project.
-        # overwrite_mode shadows the module-level global of the same name
-        # (line ~125) -- this is intentional and preferred: the parameter
-        # passed into run_processing() is the per-run resolved value;
-        # the module-level default (None) is only a fallback for
-        # callers that don't pass it.
-        # ------------------------------------------------------------------
+        #   (b) the user can cancel without losing the configuration window.
+        # overwrite_mode is passed explicitly to run_processing() as a
+        # parameter -- no module-level global needed.
         overwrite_mode = None
         if output_mode[0] == "local":
             desired_names = [
@@ -3875,8 +3892,10 @@ def _process_one_source(
 
 
 def run_processing(app_root, overwrite_mode=None):
-    # overwrite_mode: passed from on_run() -- see PRIORITY 2 block there.
-    # Shadows the module-level global of the same name intentionally.
+    # overwrite_mode: passed from on_run() -- resolved before win.destroy()
+    # so the dialog has a live parent and Cancel returns the user to the
+    # configuration window. Replaces the previous implementation that
+    # resolved the dialog inside run_processing() after win was destroyed.
     """
     Runs the full batch (all selected parcel sources) on a background
     thread, showing live progress and a final summary via
@@ -3912,13 +3931,6 @@ def run_processing(app_root, overwrite_mode=None):
         messagebox.showerror("Error", "Selections incomplete (Barangay, Road, Output required).")
         return
 
-    # overwrite_mode: resolved ONCE, up front, in on_run() on the main
-    # thread -- BEFORE win.destroy() -- and passed here as a parameter.
-    # This is intentional: moving the dialog to on_run() means win is
-    # still live (proper parent), and the user can cancel without losing
-    # the main window. The downstream had_conflict/overwrite_mode logic
-    # inside worker() is captured via closure and remains unchanged.
-    # See on_run()'s PRIORITY 2 block for the full resolution logic.
     creds = load_db_credentials()
     if not creds:
         return

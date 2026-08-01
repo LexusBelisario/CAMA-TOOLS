@@ -1,5 +1,4 @@
 import os
-import re
 import math
 import pyproj
 os.environ["PROJ_LIB"] = pyproj.datadir.get_data_dir()
@@ -374,165 +373,6 @@ def _check_parcel_terrain_conflicts(local_paths):
     return conflicts
 
 
-# ---------------- Output filename helpers ----------------
-# Ported from road_width.py's validated pattern, already successfully
-# adapted in road_frontage.py, lot_location.py, road_density.py, and
-# road_surface.py. See those files for the full design rationale.
-
-def _split_trailing_number(base_name: str):
-    """
-    Splits a base name into (root, existing_number) if it ends with
-    "_<digits>" (e.g. "landparcel_1" -> ("landparcel", 1)), else returns
-    (base_name, None) unchanged.
-    """
-    m = re.match(r'^(.*)_(\d+)$', base_name)
-    if m:
-        return m.group(1), int(m.group(2))
-    return base_name, None
-
-
-def resolve_output_base_name(folder: str, desired_base_name: str, ext: str = "gpkg") -> str:
-    """
-    Determines the actual output base name (no extension) to use for a
-    NEW file in `folder`, given the DESIRED name -- normally the Land
-    Parcel source's own filename, unchanged, with no tool-name suffix
-    appended.
-
-    Rule: reuse the desired name exactly if nothing of that name exists
-    yet in `folder`. If it already exists, strip any existing trailing
-    "_<N>" from the desired name to get a root, scan `folder` for every
-    file matching "<root>_<N>.<ext>", and use "<root>_<max(N)+1>" --
-    the highest N found ANYWHERE in the folder, not just "the source
-    file's own N + 1".
-
-    This tool has no companion/QA outputs, so there is no
-    with_output_suffix call needed here.
-    """
-    candidate_path = os.path.join(folder, f"{desired_base_name}.{ext}")
-    if not os.path.exists(candidate_path):
-        return desired_base_name
-
-    root, _existing_number = _split_trailing_number(desired_base_name)
-
-    pattern = re.compile(rf'^{re.escape(root)}_(\d+)\.{re.escape(ext)}$', re.IGNORECASE)
-    max_n = 0
-    try:
-        for fname in os.listdir(folder):
-            m = pattern.match(fname)
-            if m:
-                max_n = max(max_n, int(m.group(1)))
-    except OSError:
-        pass  # folder unreadable -- fall through with max_n=0, worst case uses N=1
-
-    return f"{root}_{max_n + 1}"
-
-
-def ask_overwrite_dialog(parent, conflicting_names):
-    """
-    Combined dialog shown ONCE, before any processing starts, when one or
-    more Land Parcel sources' desired local output filename already
-    exists in the chosen output folder. Not a per-file prompt -- every
-    conflicting name in the batch is listed together, and the chosen
-    action applies to ALL of them:
-
-      - "Overwrite": every conflicting file is replaced in place, using
-        its plain desired name (no numbering).
-      - "Create New File": every conflicting file is instead saved under
-        a new, non-colliding name via resolve_output_base_name()'s
-        auto-numbering -- the existing files are left untouched.
-      - "Cancel": aborts the ENTIRE run. Nothing is written, including
-        sources that had no conflict at all.
-
-    Returns "overwrite", "new", or "cancel" (also returned if the
-    dialog's own titlebar close button is used).
-
-    Ported from road_width.py's validated implementation, already
-    adapted in road_frontage.py, lot_location.py, road_density.py, and
-    road_surface.py. Deliberately does NOT call dialog.transient(parent):
-    this app's root is permanently withdrawn (see main()), and
-    transient() on a withdrawn parent is a known source of
-    window-manager-dependent "dialog never becomes viewable" behavior.
-    grab_set()+deiconify()+lift()+focus_force()+topmost is used instead,
-    matching this file's own existing dialog pattern (see
-    _pick_db_tables()).
-    """
-    result = {"choice": "cancel"}
-
-    dialog = tk.Toplevel(parent)
-    apply_icon(dialog)
-    dialog.title("File(s) Already Exist")
-    dialog.resizable(False, False)
-    dialog.grab_set()
-    dialog.deiconify()
-    dialog.lift()
-    dialog.focus_force()
-    dialog.attributes("-topmost", True)
-    dialog.after(100, lambda: dialog.attributes("-topmost", False))
-
-    def choose(value):
-        result["choice"] = value
-        dialog.destroy()
-
-    dialog.protocol("WM_DELETE_WINDOW", lambda: choose("cancel"))
-
-    # Buttons packed first, at the bottom -- guaranteed visible/reachable
-    # regardless of how long the scrollable list above them ends up being.
-    btn_frame = tk.Frame(dialog)
-    btn_frame.pack(side="bottom", fill="x", pady=(4, 12))
-    tk.Button(btn_frame, text="Overwrite", width=14, cursor="hand2",
-              command=lambda: choose("overwrite")).pack(side="left", padx=(16, 4))
-    tk.Button(btn_frame, text="Create New File", width=16, cursor="hand2",
-              command=lambda: choose("new")).pack(side="left", padx=4)
-    tk.Button(btn_frame, text="Cancel", width=10, cursor="hand2",
-              command=lambda: choose("cancel")).pack(side="left", padx=(4, 16))
-
-    tk.Label(dialog, text="The following output file(s) already exist:",
-             font=("Segoe UI", 10, "bold"), anchor="w"
-             ).pack(fill="x", padx=16, pady=(16, 4))
-
-    MAX_LIST_LINES = 10
-    TEXT_WIDTH_CHARS = 55
-
-    list_frame = tk.Frame(dialog)
-    list_frame.pack(fill="both", expand=True, padx=16, pady=(0, 4))
-    vscroll = tk.Scrollbar(list_frame, orient="vertical")
-    hscroll = tk.Scrollbar(list_frame, orient="horizontal")
-    text = tk.Text(
-        list_frame, wrap="none", height=min(len(conflicting_names), MAX_LIST_LINES),
-        width=TEXT_WIDTH_CHARS, yscrollcommand=vscroll.set, xscrollcommand=hscroll.set,
-        relief="flat", bg=dialog.cget("bg"), font=("Segoe UI", 9))
-    vscroll.config(command=text.yview)
-    hscroll.config(command=text.xview)
-    if len(conflicting_names) > MAX_LIST_LINES:
-        vscroll.pack(side="right", fill="y")
-    needs_hscroll = any(len(f"• {name}") > TEXT_WIDTH_CHARS for name in conflicting_names)
-    if needs_hscroll:
-        hscroll.pack(side="bottom", fill="x")
-    text.pack(side="left", fill="both", expand=True)
-    for name in conflicting_names:
-        text.insert("end", f"• {name}\n")
-    text.config(state="disabled")
-
-    tk.Label(dialog, text=(
-        "Overwrite will replace these files. Create New File will save "
-        "them under a new name instead, leaving the existing files "
-        "untouched. This choice applies to all files listed above."
-    ), wraplength=380, justify="left", anchor="w"
-    ).pack(fill="x", padx=16, pady=(4, 8))
-
-    dialog.update_idletasks()
-    req_w = max(dialog.winfo_reqwidth(), 420)
-    req_h = dialog.winfo_reqheight()
-    sw = dialog.winfo_screenwidth()
-    sh = dialog.winfo_screenheight()
-    x = (sw - req_w) // 2
-    y = (sh - req_h) // 2
-    dialog.geometry(f"{req_w}x{req_h}+{x}+{y}")
-
-    dialog.wait_window()
-    return result["choice"]
-
-
 def process_parcels_fast(parcels, roads, dtm, parcels_crs,
                           slope_col="CAMA_SLOPE", terrain_col="CAMA_TERRAIN",
                           prcl_elev_col="CAMA_PRCL_ELEV", road_elev_col="CAMA_ROAD_ELEV",
@@ -652,6 +492,106 @@ def process_parcels_fast(parcels, roads, dtm, parcels_crs,
 # place to avoid a future fix being silently applied to the dead copy
 # instead of the live one.
 
+
+# ---------------- Output filename helpers ----------------
+def _split_trailing_number(base_name: str):
+    m = re.match(r'^(.*)_(\d+)$', base_name)
+    if m:
+        return m.group(1), int(m.group(2))
+    return base_name, None
+
+
+def resolve_output_base_name(folder: str, desired_base_name: str, ext: str = "gpkg") -> str:
+    candidate_path = os.path.join(folder, f"{desired_base_name}.{ext}")
+    if not os.path.exists(candidate_path):
+        return desired_base_name
+    root, _existing_number = _split_trailing_number(desired_base_name)
+    pattern = re.compile(rf'^{re.escape(root)}_(\d+)\.{re.escape(ext)}$', re.IGNORECASE)
+    max_n = 0
+    try:
+        for fname in os.listdir(folder):
+            m = pattern.match(fname)
+            if m:
+                max_n = max(max_n, int(m.group(1)))
+    except OSError:
+        pass
+    return f"{root}_{max_n + 1}"
+
+
+def ask_overwrite_dialog(parent, conflicting_names):
+    result = {"choice": "cancel"}
+    dialog = tk.Toplevel(parent)
+    apply_icon(dialog)
+    dialog.title("File(s) Already Exist")
+    dialog.resizable(False, False)
+    dialog.grab_set()
+    dialog.deiconify()
+    dialog.lift()
+    dialog.focus_force()
+    dialog.attributes("-topmost", True)
+    dialog.after(100, lambda: dialog.attributes("-topmost", False))
+
+    def choose(value):
+        result["choice"] = value
+        dialog.destroy()
+
+    dialog.protocol("WM_DELETE_WINDOW", lambda: choose("cancel"))
+
+    btn_frame = tk.Frame(dialog)
+    btn_frame.pack(side="bottom", fill="x", pady=(4, 12))
+    tk.Button(btn_frame, text="Overwrite", width=14, cursor="hand2",
+              command=lambda: choose("overwrite")).pack(side="left", padx=(16, 4))
+    tk.Button(btn_frame, text="Create New File", width=16, cursor="hand2",
+              command=lambda: choose("new")).pack(side="left", padx=4)
+    tk.Button(btn_frame, text="Cancel", width=10, cursor="hand2",
+              command=lambda: choose("cancel")).pack(side="left", padx=(4, 16))
+
+    tk.Label(dialog, text="The following output file(s) already exist:",
+             font=("Segoe UI", 10, "bold"), anchor="w"
+             ).pack(fill="x", padx=16, pady=(16, 4))
+
+    MAX_LIST_LINES = 10
+    TEXT_WIDTH_CHARS = 55
+    list_frame = tk.Frame(dialog)
+    list_frame.pack(fill="both", expand=True, padx=16, pady=(0, 4))
+    vscroll = tk.Scrollbar(list_frame, orient="vertical")
+    hscroll = tk.Scrollbar(list_frame, orient="horizontal")
+    text = tk.Text(
+        list_frame, wrap="none", height=min(len(conflicting_names), MAX_LIST_LINES),
+        width=TEXT_WIDTH_CHARS, yscrollcommand=vscroll.set, xscrollcommand=hscroll.set,
+        relief="flat", bg=dialog.cget("bg"), font=("Segoe UI", 9))
+    vscroll.config(command=text.yview)
+    hscroll.config(command=text.xview)
+    if len(conflicting_names) > MAX_LIST_LINES:
+        vscroll.pack(side="right", fill="y")
+    needs_hscroll = any(len(f"\u2022 {name}") > TEXT_WIDTH_CHARS for name in conflicting_names)
+    if needs_hscroll:
+        hscroll.pack(side="bottom", fill="x")
+    text.pack(side="left", fill="both", expand=True)
+    for name in conflicting_names:
+        text.insert("end", f"\u2022 {name}\n")
+    text.config(state="disabled")
+
+    tk.Label(dialog, text=(
+        "Overwrite will replace these files. Create New File will save "
+        "them under a new name instead, leaving the existing files "
+        "untouched. This choice applies to all files listed above."
+    ), wraplength=380, justify="left", anchor="w"
+    ).pack(fill="x", padx=16, pady=(4, 8))
+
+    dialog.update_idletasks()
+    req_w = max(dialog.winfo_reqwidth(), 420)
+    req_h = dialog.winfo_reqheight()
+    sw = dialog.winfo_screenwidth()
+    sh = dialog.winfo_screenheight()
+    x = (sw - req_w) // 2
+    y = (sh - req_h) // 2
+    dialog.geometry(f"{req_w}x{req_h}+{x}+{y}")
+
+    dialog.wait_window()
+    return result["choice"]
+
+
 # ========================= GLOBAL MAPPER =========================
 def load_in_global_mapper(filepath):
     try:
@@ -728,8 +668,11 @@ def open_main_window(root):
     dtm_source_type    = tk.StringVar(master=win, value="local")
     output_dest_type   = tk.StringVar(master=win, value="local")
 
-    parcel_local_paths = []
-    parcel_db_tables   = []
+    # Single-selection architecture: one local file and one DB table
+    # may exist in memory at any time. Authority variables -- all GUI
+    # labels and run-button state are derived from them, never the reverse.
+    parcel_local_path = None   # authority: single local file path
+    parcel_db_table   = None   # authority: single DB table name
     road_local_path    = tk.StringVar(master=win)
     road_db_table      = tk.StringVar(master=win)
     dtm_local_path     = tk.StringVar(master=win)
@@ -764,15 +707,15 @@ def open_main_window(root):
 
     radio_row = tk.Frame(parcel_frame)
     radio_row.pack(fill="x")
-    tk.Radiobutton(radio_row, text="Local File(s)",
+    tk.Radiobutton(radio_row, text="Local File",
                    variable=parcel_source_type, value="local",
                    command=lambda: _toggle_parcel()).pack(side="left")
-    tk.Radiobutton(radio_row, text="Database Table(s)",
+    tk.Radiobutton(radio_row, text="Database Table",
                    variable=parcel_source_type, value="db",
                    command=lambda: _toggle_parcel()).pack(side="left", padx=(12, 0))
 
-    parcel_files_var = tk.StringVar(master=win, value="No file(s) selected")
-    parcel_db_label  = tk.StringVar(master=win, value="No table(s) selected")
+    parcel_files_var = tk.StringVar(master=win, value="No file selected")
+    parcel_db_label  = tk.StringVar(master=win, value="No table selected")
 
     parcel_action_row = tk.Frame(parcel_frame)
     parcel_action_row.pack(fill="x", pady=2)
@@ -785,18 +728,21 @@ def open_main_window(root):
     parcel_btn.pack(side="left", **PAD)
 
     def browse_parcel_files():
-        files = filedialog.askopenfilenames(filetypes=[
+        file = filedialog.askopenfilename(filetypes=[
             ("Shapefiles", "*.shp"), ("GeoPackage", "*.gpkg"), ("All", "*.*")])
-        if files:
-            parcel_local_paths.clear()
-            parcel_local_paths.extend(files)
-            parcel_files_var.set(f"{len(files)} file(s) selected")
-            _update_run_button_state()
+        # Cancel returns "" -- do not assign, preserving previous selection.
+        if file:
+            nonlocal parcel_local_path
+            parcel_local_path = file
+            parcel_files_var.set(os.path.basename(file))
+        _update_run_button_state()
 
     def _on_parcel_db_selected(sel):
-        parcel_db_tables.clear()
-        parcel_db_tables.extend(sel)
-        parcel_db_label.set(f"{len(sel)} table(s) selected")
+        # Only called on confirmed selection -- Cancel never calls on_select,
+        # so parcel_db_table retains its previous value automatically.
+        nonlocal parcel_db_table
+        parcel_db_table = sel[0]
+        parcel_db_label.set(sel[0])
         _update_run_button_state()
 
     def browse_parcel_db():
@@ -809,15 +755,25 @@ def open_main_window(root):
         if not tables:
             messagebox.showwarning("No Tables", "No tables found in the database schema.")
             return
-        _pick_db_tables(win, tables, multi=True, on_select=_on_parcel_db_selected)
+        _pick_db_tables(win, tables, multi=False, on_select=_on_parcel_db_selected)
 
     def _toggle_parcel():
+        # Always render from authority variables -- never from StringVar state.
+        # Guarantees Local → DB → Local always restores the original selection.
         if parcel_source_type.get() == "local":
             parcel_lbl.config(textvariable=parcel_files_var)
             parcel_btn.config(text="Browse…", command=browse_parcel_files)
+            parcel_files_var.set(
+                os.path.basename(parcel_local_path) if parcel_local_path
+                else "No file selected"
+            )
         else:
             parcel_lbl.config(textvariable=parcel_db_label)
             parcel_btn.config(text="Select…", command=browse_parcel_db)
+            parcel_db_label.set(
+                parcel_db_table if parcel_db_table
+                else "No table selected"
+            )
         _update_run_button_state()
 
     # ── SECTION 2: ROAD NETWORK ──────────────────────────────────
@@ -1008,17 +964,19 @@ def open_main_window(root):
 
         # validate parcel
         if parcel_source_type.get() == "local":
-            if not parcel_local_paths:
+            if not parcel_local_path:
                 messagebox.showerror("Missing Input",
-                    "Please select at least one Land Parcel file.")
+                    "Please select a Land Parcel file.")
                 return
-            barangay_source = ("local", tuple(parcel_local_paths))
+            # Validation guarantees parcel_local_path is not None here --
+            # barangay_source never contains None (Phase 1 invariant 3).
+            barangay_source = ("local", (parcel_local_path,))
         else:
-            if not parcel_db_tables:
+            if not parcel_db_table:
                 messagebox.showerror("Missing Input",
-                    "Please select at least one Land Parcel table.")
+                    "Please select a Land Parcel table.")
                 return
-            barangay_source = ("db", parcel_db_tables)
+            barangay_source = ("db", (parcel_db_table,))
 
         # validate road
         if road_source_type.get() == "local":
@@ -1058,24 +1016,22 @@ def open_main_window(root):
         else:
             output_mode = ("db", None)
 
-        # Existing OUTPUT-COLUMN conflict warning. Checks all six output
-        # columns (CAMA_SLOPE, CAMA_TERRAIN, CAMA_PRCL_ELEV,
-        # CAMA_ROAD_ELEV, CAMA_PRCL_ROAD, CAMA_TOPO_LVL) -- not just one
-        # -- per the same project-lead decision already applied in
-        # road_frontage.py: they are one feature set computed together,
-        # so a conflict on ANY of them warrants one combined warning
-        # covering all affected sources and columns, shown once here
-        # (never per-file mid-processing, never only at Browse time).
-        # Declining cancels the run entirely rather than skipping just
-        # the affected source(s). Column names are shown with their
-        # EXACT existing casing, and that exact casing/name is what
-        # process_parcels_fast() will write into later -- never renamed
-        # to the standard casing. LOCAL sources only -- Database Land
-        # Parcel sources are explicitly out of scope for this check.
+
+        # ------------------------------------------------------------------
+        # PRIORITY 1: column conflict check -- warn if the selected Land
+        # Parcel source already has any of the 6 output columns
+        # (CAMA_SLOPE, CAMA_TERRAIN, CAMA_PRCL_ELEV, CAMA_ROAD_ELEV,
+        # CAMA_PRCL_ROAD, CAMA_TOPO_LVL). Shown before the file-conflict
+        # dialog so the user can decide whether to proceed at all before
+        # being asked about filename conflicts. Declining cancels the
+        # run entirely; main window stays open. LOCAL sources only --
+        # Database Land Parcel sources are explicitly out of scope.
         # ------------------------------------------------------------------
         global parcel_output_column_overrides
         if parcel_source_type.get() == "local":
-            conflicts = _check_parcel_terrain_conflicts(parcel_local_paths)
+            # parcel_local_path is guaranteed non-None here -- validation
+            # above already returned if it was falsy.
+            conflicts = _check_parcel_terrain_conflicts([parcel_local_path])
             if conflicts:
                 lines = "\n".join(
                     f"- '{os.path.basename(path)}': found "
@@ -1107,12 +1063,13 @@ def open_main_window(root):
                 parcel_output_column_overrides = {}
         else:
             parcel_output_column_overrides = {}
-        # PRIORITY 2: existing OUTPUT-FILE conflict check (local output only).
-        # Resolved ONCE, up front, on the main thread -- before win.destroy()
-        # so the dialog has a live parent window. The chosen action applies
-        # to ALL conflicting sources in the batch (one combined dialog, not
-        # per-file). Cancel aborts the entire run; nothing is written.
-        # Ported from road_width.py / road_frontage.py's validated pattern.
+
+        # PRIORITY 2: file conflict check -- warn if an output file with
+        # the same name already exists in the chosen output folder.
+        # Root cause of bug fixed here: overwrite_mode was previously
+        # local to on_run() and never reached run_processing(), causing
+        # a NameError at runtime whenever a file conflict existed.
+        # Fix: pass overwrite_mode explicitly as a parameter.
         overwrite_mode = None
         if output_mode[0] == "local":
             desired_names = (
@@ -1129,8 +1086,6 @@ def open_main_window(root):
                 if overwrite_mode == "cancel":
                     print("Run cancelled by user (existing output file(s) found).")
                     return
-
-        # ------------------------------------------------------------------
 
         win.destroy()
         run_processing(root, overwrite_mode)
@@ -1163,7 +1118,7 @@ def open_main_window(root):
         widget's assigned cursor either -- both must be set explicitly
         for each state.
         """
-        has_parcel = bool(parcel_local_paths) if parcel_source_type.get() == "local" else bool(parcel_db_tables)
+        has_parcel = bool(parcel_local_path) if parcel_source_type.get() == "local" else bool(parcel_db_table)
         has_road = bool(road_local_path.get()) if road_source_type.get() == "local" else bool(road_db_table.get())
         has_dtm = bool(dtm_local_path.get()) if dtm_source_type.get() == "local" else bool(dtm_db_table.get())
         has_output = bool(output_local_dir.get()) if output_dest_type.get() == "local" else True
@@ -1213,10 +1168,9 @@ def open_main_window(root):
 
 # ========================= RUN =========================
 def run_processing(app_root, overwrite_mode=None):
-    # overwrite_mode: "overwrite", "new", or None (no conflict existed).
-    # Resolved ONCE, up front, on the main thread in on_run() before
-    # win.destroy() -- passed here as a parameter (not a global).
-    # See ask_overwrite_dialog() for the full behavior contract.
+    # overwrite_mode: passed from on_run(). Root cause of original bug:
+    # no parameter existed, so overwrite_mode was unbound inside this
+    # function, causing a NameError whenever a file conflict existed.
     open_progress_window(app_root)
     try:
         global barangay_source, road_source, dtm_source, output_mode
@@ -1291,19 +1245,12 @@ def run_processing(app_root, overwrite_mode=None):
 
             update_progress("Saving output...")
             if output_mode[0] == "local":
-                # Desired output filename = the Land Parcel source's own
-                # name, unchanged -- no tool-name suffix appended (matching
-                # road_width.py / road_frontage.py's established convention).
-                # overwrite_mode was resolved ONCE, up front in on_run(),
-                # for the whole batch -- no per-file prompt here.
                 desired_base_name = name
                 candidate_path = os.path.join(output_mode[1], f"{desired_base_name}.gpkg")
                 had_conflict = os.path.exists(candidate_path)
                 if had_conflict and overwrite_mode == "new":
                     base_name = resolve_output_base_name(output_mode[1], desired_base_name)
                 else:
-                    # No conflict, or user chose "Overwrite" --
-                    # both cases use the plain desired name.
                     base_name = desired_base_name
                 out = os.path.join(output_mode[1], f"{base_name}.gpkg")
                 result.to_file(out, driver="GPKG")
