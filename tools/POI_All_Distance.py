@@ -619,6 +619,106 @@ def _pick_db_tables(parent, tables, multi, on_select):
               width=20).pack(pady=(0, 10))
 
 
+
+# ---------------- Output filename helpers ----------------
+def _split_trailing_number(base_name: str):
+    m = re.match(r'^(.*)_(\d+)$', base_name)
+    if m:
+        return m.group(1), int(m.group(2))
+    return base_name, None
+
+
+def resolve_output_base_name(folder: str, desired_base_name: str, ext: str = "gpkg") -> str:
+    candidate_path = os.path.join(folder, f"{desired_base_name}.{ext}")
+    if not os.path.exists(candidate_path):
+        return desired_base_name
+    root, _existing_number = _split_trailing_number(desired_base_name)
+    pattern = re.compile(rf'^{re.escape(root)}_(\d+)\.{re.escape(ext)}$', re.IGNORECASE)
+    max_n = 0
+    try:
+        for fname in os.listdir(folder):
+            m = pattern.match(fname)
+            if m:
+                max_n = max(max_n, int(m.group(1)))
+    except OSError:
+        pass
+    return f"{root}_{max_n + 1}"
+
+
+def ask_overwrite_dialog(parent, conflicting_names):
+    result = {"choice": "cancel"}
+    dialog = tk.Toplevel(parent)
+    apply_icon(dialog)
+    dialog.title("File(s) Already Exist")
+    dialog.resizable(False, False)
+    dialog.grab_set()
+    dialog.deiconify()
+    dialog.lift()
+    dialog.focus_force()
+    dialog.attributes("-topmost", True)
+    dialog.after(100, lambda: dialog.attributes("-topmost", False))
+
+    def choose(value):
+        result["choice"] = value
+        dialog.destroy()
+
+    dialog.protocol("WM_DELETE_WINDOW", lambda: choose("cancel"))
+
+    btn_frame = tk.Frame(dialog)
+    btn_frame.pack(side="bottom", fill="x", pady=(4, 12))
+    tk.Button(btn_frame, text="Overwrite", width=14, cursor="hand2",
+              command=lambda: choose("overwrite")).pack(side="left", padx=(16, 4))
+    tk.Button(btn_frame, text="Create New File", width=16, cursor="hand2",
+              command=lambda: choose("new")).pack(side="left", padx=4)
+    tk.Button(btn_frame, text="Cancel", width=10, cursor="hand2",
+              command=lambda: choose("cancel")).pack(side="left", padx=(4, 16))
+
+    tk.Label(dialog, text="The following output file(s) already exist:",
+             font=("Segoe UI", 10, "bold"), anchor="w"
+             ).pack(fill="x", padx=16, pady=(16, 4))
+
+    MAX_LIST_LINES = 10
+    TEXT_WIDTH_CHARS = 55
+    list_frame = tk.Frame(dialog)
+    list_frame.pack(fill="both", expand=True, padx=16, pady=(0, 4))
+    vscroll = tk.Scrollbar(list_frame, orient="vertical")
+    hscroll = tk.Scrollbar(list_frame, orient="horizontal")
+    text = tk.Text(
+        list_frame, wrap="none", height=min(len(conflicting_names), MAX_LIST_LINES),
+        width=TEXT_WIDTH_CHARS, yscrollcommand=vscroll.set, xscrollcommand=hscroll.set,
+        relief="flat", bg=dialog.cget("bg"), font=("Segoe UI", 9))
+    vscroll.config(command=text.yview)
+    hscroll.config(command=text.xview)
+    if len(conflicting_names) > MAX_LIST_LINES:
+        vscroll.pack(side="right", fill="y")
+    needs_hscroll = any(len(f"\u2022 {name}") > TEXT_WIDTH_CHARS for name in conflicting_names)
+    if needs_hscroll:
+        hscroll.pack(side="bottom", fill="x")
+    text.pack(side="left", fill="both", expand=True)
+    for name in conflicting_names:
+        text.insert("end", f"\u2022 {name}\n")
+    text.config(state="disabled")
+
+    tk.Label(dialog, text=(
+        "Overwrite will replace these files. Create New File will save "
+        "them under a new name instead, leaving the existing files "
+        "untouched. This choice applies to all files listed above."
+    ), wraplength=380, justify="left", anchor="w"
+    ).pack(fill="x", padx=16, pady=(4, 8))
+
+    dialog.update_idletasks()
+    req_w = max(dialog.winfo_reqwidth(), 420)
+    req_h = dialog.winfo_reqheight()
+    sw = dialog.winfo_screenwidth()
+    sh = dialog.winfo_screenheight()
+    x = (sw - req_w) // 2
+    y = (sh - req_h) // 2
+    dialog.geometry(f"{req_w}x{req_h}+{x}+{y}")
+
+    dialog.wait_window()
+    return result["choice"]
+
+
 def load_in_global_mapper(filepath):
     try:
         import ctypes.wintypes
@@ -663,8 +763,9 @@ def open_main_window(app_root):
     road_source_type   = tk.StringVar(master=win, value="local")
     output_dest_type   = tk.StringVar(master=win, value="local")
 
-    parcel_local_paths = []
-    parcel_db_tables   = []
+    # Single-selection architecture
+    parcel_local_path = None   # authority: single local file path
+    parcel_db_table   = None   # authority: single DB table name
     poi_local_path     = tk.StringVar(master=win)
     poi_db_table       = tk.StringVar(master=win)
     road_local_path    = tk.StringVar(master=win)
@@ -699,15 +800,15 @@ def open_main_window(app_root):
 
     radio_row = tk.Frame(parcel_frame)
     radio_row.pack(fill="x")
-    tk.Radiobutton(radio_row, text="Local File(s)",
+    tk.Radiobutton(radio_row, text="Local File",
                    variable=parcel_source_type, value="local",
                    command=lambda: _toggle_parcel()).pack(side="left")
-    tk.Radiobutton(radio_row, text="Database Table(s)",
+    tk.Radiobutton(radio_row, text="Database Table",
                    variable=parcel_source_type, value="db",
                    command=lambda: _toggle_parcel()).pack(side="left", padx=(12, 0))
 
-    parcel_files_var = tk.StringVar(master=win, value="No file(s) selected")
-    parcel_db_label  = tk.StringVar(master=win, value="No table(s) selected")
+    parcel_files_var = tk.StringVar(master=win, value="No file selected")
+    parcel_db_label  = tk.StringVar(master=win, value="No table selected")
 
     parcel_action_row = tk.Frame(parcel_frame)
     parcel_action_row.pack(fill="x", pady=2)
@@ -720,18 +821,18 @@ def open_main_window(app_root):
     parcel_btn.pack(side="left", **PAD)
 
     def browse_parcel_files():
-        files = filedialog.askopenfilenames(filetypes=[
+        file = filedialog.askopenfilename(filetypes=[
             ("Shapefiles", "*.shp"), ("GeoPackage", "*.gpkg"), ("All", "*.*")])
-        if files:
-            parcel_local_paths.clear()
-            parcel_local_paths.extend(files)
-            parcel_files_var.set(f"{len(files)} file(s) selected")
-            _update_run_button_state()
+        if file:
+            nonlocal parcel_local_path
+            parcel_local_path = file
+            parcel_files_var.set(os.path.basename(file))
+        _update_run_button_state()
 
     def _on_parcel_db_selected(sel):
-        parcel_db_tables.clear()
-        parcel_db_tables.extend(sel)
-        parcel_db_label.set(f"{len(sel)} table(s) selected")
+        nonlocal parcel_db_table
+        parcel_db_table = sel[0]
+        parcel_db_label.set(sel[0])
         _update_run_button_state()
 
     def browse_parcel_db():
@@ -743,15 +844,23 @@ def open_main_window(app_root):
         if not tables:
             messagebox.showwarning("No Tables", "No tables found in the database schema.")
             return
-        _pick_db_tables(win, tables, multi=True, on_select=_on_parcel_db_selected)
+        _pick_db_tables(win, tables, multi=False, on_select=_on_parcel_db_selected)
 
     def _toggle_parcel():
         if parcel_source_type.get() == "local":
             parcel_lbl.config(textvariable=parcel_files_var)
             parcel_btn.config(text="Browse…", command=browse_parcel_files)
+            parcel_files_var.set(
+                os.path.basename(parcel_local_path) if parcel_local_path
+                else "No file selected"
+            )
         else:
             parcel_lbl.config(textvariable=parcel_db_label)
             parcel_btn.config(text="Select…", command=browse_parcel_db)
+            parcel_db_label.set(
+                parcel_db_table if parcel_db_table
+                else "No table selected"
+            )
         _update_run_button_state()
 
     # ── SECTION 2: POI SOURCE ────────────────────────────────────
@@ -940,17 +1049,17 @@ def open_main_window(app_root):
 
         # validate parcel
         if parcel_source_type.get() == "local":
-            if not parcel_local_paths:
+            if not parcel_local_path:
                 messagebox.showerror("Missing Input",
-                    "Please select at least one Land Parcel file.")
+                    "Please select a Land Parcel file.")
                 return
-            parcel_source = ("local", tuple(parcel_local_paths))
+            parcel_source = ("local", (parcel_local_path,))
         else:
-            if not parcel_db_tables:
+            if not parcel_db_table:
                 messagebox.showerror("Missing Input",
-                    "Please select at least one Land Parcel table.")
+                    "Please select a Land Parcel table.")
                 return
-            parcel_source = ("db", parcel_db_tables)
+            parcel_source = ("db", (parcel_db_table,))
 
         # validate poi
         if poi_source_type.get() == "local":
@@ -1032,7 +1141,7 @@ def open_main_window(app_root):
             if poi_types_for_check:
                 targets_for_check = _realizable_targets(poi_types_for_check)
                 conflicts = _check_parcel_poi_distance_conflicts(
-                    parcel_local_paths, targets_for_check)
+                    [parcel_local_path], targets_for_check)
                 if conflicts:
                     lines = "\n".join(
                         f"- '{os.path.basename(path)}': found "
@@ -1053,8 +1162,27 @@ def open_main_window(app_root):
                         print("Run cancelled by user (existing output column(s) found).")
                         return
 
+
+        # OUTPUT-FILE conflict check (local output only) -- PRIORITY 2
+        overwrite_mode = None
+        if output_mode[0] == "local":
+            desired_names = (
+                [os.path.splitext(os.path.basename(p))[0] for p in parcel_source[1]]
+                if parcel_source[0] == "local"
+                else list(parcel_source[1])
+            )
+            conflicting_names = [
+                f"{name}.gpkg" for name in desired_names
+                if os.path.exists(os.path.join(output_mode[1], f"{name}.gpkg"))
+            ]
+            if conflicting_names:
+                overwrite_mode = ask_overwrite_dialog(win, conflicting_names)
+                if overwrite_mode == "cancel":
+                    print("Run cancelled by user (existing output file(s) found).")
+                    return
+
         win.destroy()
-        run_with_progress(app_root)
+        run_with_progress(app_root, overwrite_mode)
 
     # Single source of truth for the Run button's enabled/disabled
     # colors -- used both at button creation and inside
@@ -1086,7 +1214,7 @@ def open_main_window(app_root):
         widget's assigned cursor either -- both must be set explicitly
         for each state.
         """
-        has_parcel = bool(parcel_local_paths) if parcel_source_type.get() == "local" else bool(parcel_db_tables)
+        has_parcel = bool(parcel_local_path) if parcel_source_type.get() == "local" else bool(parcel_db_table)
         has_poi = bool(poi_local_path.get()) if poi_source_type.get() == "local" else bool(poi_db_table.get())
         has_road = bool(road_local_path.get()) if road_source_type.get() == "local" else bool(road_db_table.get())
         has_output = bool(output_local_dir.get()) if output_dest_type.get() == "local" else True
@@ -1134,7 +1262,7 @@ def open_main_window(app_root):
     _update_run_button_state()
 
 
-def run_with_progress(app_root):
+def run_with_progress(app_root, overwrite_mode=None):
     if hasattr(app_root, "_poi_progress_open") and app_root._poi_progress_open:
         return
     app_root._poi_progress_open = True
@@ -1182,9 +1310,9 @@ def run_with_progress(app_root):
 
             target_table = None
             if output_mode[0] == "db":
-                if parcel_source[0] != "db" or len(parcel_source[1]) != 1:
+                if parcel_source[0] != "db":
                     raise Exception(
-                        "Database output requires selecting exactly ONE parcel table.")
+                        "Database output requires a Database parcel source.")
                 target_table = parcel_source[1][0]
 
             parcel_gdfs = []
@@ -1279,11 +1407,18 @@ def run_with_progress(app_root):
                 for i in range(1, 4):
                     gdf[f"CAMA_{t.upper()}{i}"] = np.nan
 
-            output_path = (
-                os.path.join(output_mode[1], "parcels_with_poi_distances.gpkg")
-                if output_mode[0] == "local"
-                else None
-            )
+            if output_mode[0] == "local":
+                if parcel_source[0] == "local":
+                    desired_base = os.path.splitext(os.path.basename(parcel_source[1][0]))[0]
+                else:
+                    desired_base = parcel_source[1][0]
+                candidate_path = os.path.join(output_mode[1], f"{desired_base}.gpkg")
+                had_conflict = os.path.exists(candidate_path)
+                if had_conflict and overwrite_mode == "new":
+                    desired_base = resolve_output_base_name(output_mode[1], desired_base)
+                output_path = os.path.join(output_mode[1], f"{desired_base}.gpkg")
+            else:
+                output_path = None
 
             status_var.set("Computing network distances...")
             eta_var.set("ETA: calculating...")
