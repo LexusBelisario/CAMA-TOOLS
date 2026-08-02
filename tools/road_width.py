@@ -459,6 +459,51 @@ def resolve_db_table_name(schema, desired_base_name):
     return f"{root}_{max_n + 1}"
 
 
+def normalize_name(name: str) -> str:
+    """
+    Lowercases name and strips everything that isn't a letter (digits,
+    underscores, spaces, hyphens, etc.) -- e.g. "LandParcel_2026" and
+    "Land Parcel Final" both normalize to "landparcelfinal"-style
+    strings with no separators left, so filenames and table names that
+    differ only by punctuation/casing/trailing numbers can still be
+    recognized as referring to the same logical table.
+    """
+    return re.sub(r'[^a-z]', '', name.lower())
+
+
+def find_matching_tables(desired_name, all_tables):
+    """
+    Returns the list of candidate table names from all_tables whose
+    normalized form is a substring of (or contains) the normalized
+    desired_name -- checked in both directions, so "landparcel" matches
+    "landparcel_final" and "landparcel_2026" matches "landparcel"
+    equally. This is intentionally permissive (fuzzy) matching: the
+    caller is responsible for confirming the match with the user
+    before treating it as a definite overwrite target (see
+    confirm_db_overwrite_dialog() / choose_db_overwrite_dialog() and
+    resolve_db_output_table()) -- this function only proposes
+    candidates, it never decides on its own.
+
+    Always excludes "CAMA_Table", "CAMA_Transaction_Log", and any table
+    ending in "_VM" (case-insensitive) from the candidate list, since
+    none of these are ever valid "main output" overwrite targets even
+    if their name happens to contain a substring match (e.g. a
+    Visual Measurement layer table like "landparcel_VM" would otherwise
+    also match a "landparcel" search).
+    """
+    lname = normalize_name(desired_name)
+    candidates = []
+    for t in all_tables:
+        if t.lower() in ("cama_table", "cama_transaction_log"):
+            continue
+        if t.lower().endswith("_vm"):
+            continue
+        tnorm = normalize_name(t)
+        if lname in tnorm or tnorm in lname:
+            candidates.append(t)
+    return candidates
+
+
 def ask_db_overwrite_dialog(parent, conflicting_pairs):
     """
     Combined dialog shown ONCE, before any processing starts, when one
@@ -513,6 +558,24 @@ def ask_db_overwrite_dialog(parent, conflicting_pairs):
 
     dialog.protocol("WM_DELETE_WINDOW", lambda: choose("cancel"))
 
+    # Buttons packed first, at the bottom -- same reasoning as
+    # ask_overwrite_dialog() (the local-file version of this same
+    # dialog): guaranteed visible/reachable at the bottom of the
+    # window regardless of how tall the scrollable table list above
+    # them ends up being. Packing this LAST (as before) left the
+    # buttons wherever they fell in call order -- visually stranded
+    # in the middle of the dialog, above the explanation label -- since
+    # Tkinter's default side="top" packing places each widget in call
+    # order, not by where the caller might expect it to land.
+    btn_frame = tk.Frame(dialog)
+    btn_frame.pack(side="bottom", fill="x", pady=(4, 12))
+    tk.Button(btn_frame, text="Overwrite", width=14, cursor="hand2",
+              command=lambda: choose("overwrite")).pack(side="left", padx=(16, 4))
+    tk.Button(btn_frame, text="Create New", width=14, cursor="hand2",
+              command=lambda: choose("new")).pack(side="left", padx=4)
+    tk.Button(btn_frame, text="Cancel", width=14, cursor="hand2",
+              command=lambda: choose("cancel")).pack(side="left", padx=(4, 16))
+
     tk.Label(
         dialog, text="Found existing table(s):",
         font=("Segoe UI", 10, "bold"), anchor="w"
@@ -539,15 +602,6 @@ def ask_db_overwrite_dialog(parent, conflicting_pairs):
     tk.Label(dialog, text="Do you want to overwrite them?",
              anchor="w").pack(fill="x", padx=16, pady=(0, 12))
 
-    btn_frame = tk.Frame(dialog)
-    btn_frame.pack(fill="x", padx=16, pady=(0, 8))
-    tk.Button(btn_frame, text="Overwrite", width=14, cursor="hand2",
-              command=lambda: choose("overwrite")).pack(side="left", padx=(0, 8))
-    tk.Button(btn_frame, text="Create New", width=14, cursor="hand2",
-              command=lambda: choose("new")).pack(side="left", padx=(0, 8))
-    tk.Button(btn_frame, text="Cancel", width=14, cursor="hand2",
-              command=lambda: choose("cancel")).pack(side="left")
-
     tk.Label(dialog, text=(
         "\"Overwrite\" replaces the existing table(s) shown above with "
         "the new results. \"Create New\" saves the new results under a "
@@ -564,6 +618,137 @@ def ask_db_overwrite_dialog(parent, conflicting_pairs):
 
     dialog.wait_window()
     return result["choice"]
+
+
+def confirm_db_overwrite_dialog(parent, table_name):
+    """
+    Shown when find_matching_tables() returns EXACTLY ONE candidate for
+    the DB-output destination table. Asks the user to confirm before
+    overwriting that specific table -- fuzzy matching only PROPOSES a
+    candidate (see find_matching_tables()'s own docstring); this dialog
+    is the actual safety check before anything is overwritten.
+
+    Returns True (Yes -- proceed with overwriting table_name) or False
+    (No, or the dialog was closed -- caller must treat this as a full
+    cancel, not "create new" -- there is no "create new" for DB output).
+    """
+    result = {"confirmed": False}
+
+    dialog = tk.Toplevel(parent)
+    apply_icon(dialog)
+    dialog.title("ROAD WIDTH TOOL")
+    dialog.resizable(False, False)
+    dialog.grab_set()
+    dialog.deiconify()
+    dialog.lift()
+    dialog.focus_force()
+    dialog.attributes("-topmost", True)
+    dialog.after(100, lambda: dialog.attributes("-topmost", False))
+
+    def choose(confirmed):
+        result["confirmed"] = confirmed
+        dialog.destroy()
+
+    dialog.protocol("WM_DELETE_WINDOW", lambda: choose(False))
+
+    # Buttons packed first, at the bottom -- same reasoning as
+    # ask_db_overwrite_dialog() above.
+    btn_frame = tk.Frame(dialog)
+    btn_frame.pack(side="bottom", fill="x", pady=(4, 12))
+    tk.Button(btn_frame, text="Yes", width=14, cursor="hand2",
+              command=lambda: choose(True)).pack(side="left", padx=(16, 4))
+    tk.Button(btn_frame, text="No", width=14, cursor="hand2",
+              command=lambda: choose(False)).pack(side="left", padx=(4, 16))
+
+    tk.Label(
+        dialog, text="Found existing table:",
+        font=("Segoe UI", 10, "bold"), anchor="w"
+    ).pack(fill="x", padx=16, pady=(16, 4))
+
+    tk.Label(
+        dialog, text=table_name, anchor="w", font=("Segoe UI", 9)
+    ).pack(fill="x", padx=16, pady=(0, 12))
+
+    tk.Label(dialog, text="Overwrite this table?", anchor="w"
+             ).pack(fill="x", padx=16, pady=(0, 16))
+
+    dialog.update_idletasks()
+    req_w = max(dialog.winfo_reqwidth(), 360)
+    req_h = dialog.winfo_reqheight()
+    x, y = _get_dialog_center_position(dialog, req_w, req_h)
+    dialog.geometry(f"{req_w}x{req_h}+{x}+{y}")
+
+    dialog.wait_window()
+    return result["confirmed"]
+
+
+def choose_db_overwrite_dialog(parent, candidates):
+    """
+    Shown when find_matching_tables() returns MORE THAN ONE candidate
+    for the DB-output destination table -- e.g. both "landparcel_draft"
+    and "landparcel_final" exist and both fuzzy-match the incoming
+    filename. Lets the user pick exactly which one to overwrite via
+    radio buttons; the FIRST candidate in the list is pre-selected by
+    default.
+
+    Returns the chosen table name, or None if the user cancelled (must
+    be treated as a full cancel by the caller -- there is no "create
+    new" for DB output).
+    """
+    result = {"chosen": None}
+    selected = tk.StringVar(value=candidates[0])
+
+    dialog = tk.Toplevel(parent)
+    apply_icon(dialog)
+    dialog.title("ROAD WIDTH TOOL")
+    dialog.resizable(False, False)
+    dialog.grab_set()
+    dialog.deiconify()
+    dialog.lift()
+    dialog.focus_force()
+    dialog.attributes("-topmost", True)
+    dialog.after(100, lambda: dialog.attributes("-topmost", False))
+
+    def choose(confirm):
+        result["chosen"] = selected.get() if confirm else None
+        dialog.destroy()
+
+    dialog.protocol("WM_DELETE_WINDOW", lambda: choose(False))
+
+    # Buttons packed first, at the bottom -- same reasoning as
+    # ask_db_overwrite_dialog() above.
+    btn_frame = tk.Frame(dialog)
+    btn_frame.pack(side="bottom", fill="x", pady=(4, 12))
+    tk.Button(btn_frame, text="Confirm", width=14, cursor="hand2",
+              command=lambda: choose(True)).pack(side="left", padx=(16, 4))
+    tk.Button(btn_frame, text="Cancel", width=14, cursor="hand2",
+              command=lambda: choose(False)).pack(side="left", padx=(4, 16))
+
+    tk.Label(
+        dialog, text="Multiple possible matches found.",
+        font=("Segoe UI", 10, "bold"), anchor="w"
+    ).pack(fill="x", padx=16, pady=(16, 4))
+
+    tk.Label(
+        dialog, text="Select the table to overwrite:", anchor="w"
+    ).pack(fill="x", padx=16, pady=(0, 8))
+
+    radio_frame = tk.Frame(dialog)
+    radio_frame.pack(fill="x", padx=16, pady=(0, 16))
+    for name in candidates:
+        tk.Radiobutton(
+            radio_frame, text=name, variable=selected, value=name,
+            anchor="w"
+        ).pack(fill="x", anchor="w")
+
+    dialog.update_idletasks()
+    req_w = max(dialog.winfo_reqwidth(), 360)
+    req_h = dialog.winfo_reqheight()
+    x, y = _get_dialog_center_position(dialog, req_w, req_h)
+    dialog.geometry(f"{req_w}x{req_h}+{x}+{y}")
+
+    dialog.wait_window()
+    return result["chosen"]
 
 
 def with_qa_suffix(main_base_name: str) -> str:
@@ -3629,12 +3814,63 @@ def _translate_exception(e, source_label):
     return f"An unexpected error occurred while processing '{source_label}'."
 
 
+def resolve_db_output_table(root, schema, barangay_source):
+    """
+    Determines the DB-output destination table for the Land Parcel
+    source, BEFORE the worker thread starts -- same "resolve everything
+    up front, main thread only" philosophy as ask_overwrite_dialog() /
+    ask_db_overwrite_dialog() (see run_processing()). This is what lets
+    the fuzzy-match + confirmation flow avoid ever needing a
+    thread-safe dialog mechanism: the Land Parcel source is singular
+    (see parcel_local_path / parcel_db_table -- single-select
+    architecture), so everything needed to resolve the destination
+    table is already known before any background processing begins.
+
+    Two cases:
+      - DB-source Land Parcel (barangay_source[0] == "db"): always
+        writes back to the exact same table it was read from -- no
+        matching, no dialog, matches _process_one_source()'s own
+        pre-existing is_db_source handling.
+      - Local-file Land Parcel: fuzzy-matches the filename against
+        existing tables via find_matching_tables() (which already
+        excludes CAMA_Table, CAMA_Transaction_Log, and any "_VM"
+        table), then requires user confirmation before treating a
+        match as an overwrite target -- zero candidates skips the
+        dialog entirely and creates a new table under the filename.
+
+    Returns (resolved_table_name, resolved_outcome), or (None, None) if
+    the user cancelled -- caller must abort the entire run in that
+    case, matching ask_overwrite_dialog()'s existing
+    cancel-aborts-everything semantics (there is no "create new" choice
+    for DB output).
+    """
+    if barangay_source[0] == "db":
+        return barangay_source[1][0], "overwritten"
+
+    desired_name = os.path.splitext(os.path.basename(barangay_source[1][0]))[0]
+    all_tables = fetch_tables(schema)
+    candidates = find_matching_tables(desired_name, all_tables)
+
+    if len(candidates) == 0:
+        return desired_name, "created"
+    elif len(candidates) == 1:
+        if not confirm_db_overwrite_dialog(root, candidates[0]):
+            return None, None
+        return candidates[0], "overwritten"
+    else:
+        chosen = choose_db_overwrite_dialog(root, candidates)
+        if chosen is None:
+            return None, None
+        return chosen, "overwritten"
+
+
 def _process_one_source(
     source_id, is_db_source, road_gdf, engine, schema,
-    output_mode, overwrite_mode, db_overwrite_mode,
+    output_mode, overwrite_mode,
     parcel_classification_selection, filter_by_road_type_active,
     road_type_excluded_values, parcel_road_width_column_overrides,
     progress_cb, status_cb,
+    resolved_table_name=None, resolved_outcome=None,
 ):
     """
     Fully processes ONE parcel source: load, classify, measure, and
@@ -3676,13 +3912,22 @@ def _process_one_source(
         raised further, so a VM failure can never undo or block an
         already-successful main output.
 
-    db_overwrite_mode: "overwrite" | "new" | None -- the batch-wide
-    choice from ask_db_overwrite_dialog() (see run_processing()),
-    parallel to overwrite_mode for local output. Only consulted for a
-    LOCAL parcel source being written to a DATABASE table (is_db_source
-    is False, output_mode[0] == "db") -- a source that was ITSELF read
+    resolved_table_name, resolved_outcome: the DB-output destination
+    already decided by resolve_db_output_table() (see run_processing()),
+    BEFORE this function or the worker thread even starts -- parallel
+    to overwrite_mode for local output, but resolved per-source rather
+    than batch-wide, since the Land Parcel source is singular (see
+    resolve_db_output_table()'s own docstring for why this avoids
+    needing a thread-safe dialog mechanism). Only consulted for a LOCAL
+    parcel source being written to a DATABASE table (is_db_source is
+    False, output_mode[0] == "db") -- a source that was ITSELF read
     from the database always writes back to that exact same table (see
-    below), which never goes through this dialog at all.
+    below), which never depends on these parameters at all. Both
+    default to None so this function remains independently callable/
+    testable without requiring the full DB-resolution flow; when None
+    for a DB-output local source, falls back to creating a new table
+    under the source filename (see the is_db_source-is-False branch
+    below).
 
     status_cb(message): called at each stage transition within this
     function (before classification, before each write) so the
@@ -3756,34 +4001,29 @@ def _process_one_source(
             # table it read from -- pre-existing, intentional design
             # (this is a read-modify-write of one dataset, not "here is
             # a new dataset, does something with this name already
-            # exist" the way a local-file source is). Never goes
-            # through ask_db_overwrite_dialog() -- there's no
-            # meaningful "Create New" here, only ever the same table
-            # it started from.
+            # exist" the way a local-file source is). resolve_db_output_
+            # table() already returns this same (source_id,
+            # "overwritten") pair for a DB-source Land Parcel -- this
+            # branch's own direct handling is kept here too so this
+            # function stays independently correct even if called with
+            # resolved_table_name=None (see the docstring above).
             table = source_id
             outcome = "overwritten"
         else:
-            # Casing is preserved from the filename -- NOT forced to
-            # lowercase (previously was; confirmed via direct user
-            # testing that this was our own code's doing, not a
-            # PostgreSQL/SQLAlchemy default -- SQLAlchemy correctly
-            # quotes and preserves a mixed-case identifier when asked
-            # to, confirmed empirically). Matching against EXISTING
-            # tables is still case-insensitive (PostgreSQL's own
-            # default table-name comparison), via
-            # _find_existing_table_case_insensitive() -- which returns
-            # the table's ACTUAL existing casing, never desired_name's.
-            desired_name = os.path.splitext(os.path.basename(source_id))[0]
-            all_tables = fetch_tables(schema)
-            existing = _find_existing_table_case_insensitive(desired_name, all_tables)
-            if existing is not None and db_overwrite_mode == "overwrite":
-                table = existing
-                outcome = "overwritten"
-            elif existing is not None and db_overwrite_mode == "new":
-                table = resolve_db_table_name(schema, desired_name)
-                outcome = "created"
+            # The actual destination table was already decided by
+            # resolve_db_output_table(), BEFORE this function (and the
+            # worker thread) even started -- fuzzy matching + user
+            # confirmation already happened there (see that function's
+            # docstring for why). This function just uses the result.
+            # Falls back to creating a new table under the source
+            # filename if resolved_table_name is None (e.g. this
+            # function called directly/independently, without going
+            # through the DB-resolution pre-processing step).
+            if resolved_table_name is not None:
+                table = resolved_table_name
+                outcome = resolved_outcome
             else:
-                table = desired_name
+                table = os.path.splitext(os.path.basename(source_id))[0]
                 outcome = "created"
 
         status_cb(
@@ -3868,9 +4108,41 @@ def _process_one_source(
                 total_rows = len(all_params)
                 for batch_start in range(0, total_rows, CAMA_BATCH_SIZE):
                     batch = all_params[batch_start:batch_start + CAMA_BATCH_SIZE]
+                    # --- TEMPORARY DIAGNOSTIC INSTRUMENTATION ---
+                    # Not permanent telemetry -- added to confirm whether
+                    # the ~402s CAMA_Table update time (see profiling
+                    # below this loop) is consistently spent inside the
+                    # UPSERT execution itself (conn.execute(sql, batch))
+                    # or concentrated in specific batches, which would
+                    # point to a different cause (lock waits, connection
+                    # warm-up, autovacuum, etc.) instead. Confirmed via
+                    # the official SQLAlchemy 2.0 changelog that
+                    # insertmanyvalues -- the multi-row VALUES batching
+                    # optimization -- is disabled whenever the statement
+                    # has an ON CONFLICT clause (as this one does), so
+                    # conn.execute(sql, batch) here falls back to
+                    # SQLAlchemy's legacy per-row execution path. That
+                    # confirms batching is NOT happening, but does not by
+                    # itself confirm this loop is where the 402s actually
+                    # goes -- this print exists to check that directly
+                    # against a real production run before deciding
+                    # whether to change the UPSERT implementation. Remove
+                    # or replace with proper structured logging once a
+                    # decision is made from real profiling output -- do
+                    # not treat this as a finished/permanent addition.
+                    _t_batch_start = time.perf_counter()
                     conn.execute(sql, batch)
+                    _batch_elapsed = time.perf_counter() - _t_batch_start
+                    _batch_num = batch_start // CAMA_BATCH_SIZE + 1
+                    print(
+                        f"⏱️🔎 [{source_label}] CAMA_Table UPSERT batch "
+                        f"#{_batch_num} ({len(batch)} rows): "
+                        f"{_batch_elapsed:.2f}s "
+                        f"({_batch_elapsed / len(batch) * 1000:.1f} ms/row)"
+                    )
+                    # --- END TEMPORARY DIAGNOSTIC INSTRUMENTATION ---
                     done = min(batch_start + CAMA_BATCH_SIZE, total_rows)
-                    status_cb(f"Updating database records: {done} / {total_rows}...")
+                    status_cb(f"Updating database records: {done} / {total_rows}...", done, total_rows)
                 print(f"⏱️ [{source_label}] CAMA_Table update ({total_rows} rows, batched): {time.perf_counter() - _t_cama_start:.2f}s")
 
         # Visual Measurement layer -- best-effort, own separate write,
@@ -3939,27 +4211,23 @@ def run_processing(app_root, overwrite_mode=None):
         f"postgresql://{creds['username']}:{creds['password']}@{creds['host']}:{creds['port']}/{creds['database']}"
     )
 
-    # db_overwrite_mode: same "resolved ONCE, up front" philosophy as
-    # overwrite_mode above, for database table output. Only relevant
-    # when a LOCAL parcel source is being written to a DATABASE table --
-    # a source that was ITSELF read from the database always writes
-    # back to that exact same table (see _process_one_source()'s own
-    # docstring), which never has a naming conflict to resolve here.
-    db_overwrite_mode = None
-    if output_mode[0] == "db" and barangay_source[0] == "local":
-        desired_names = [os.path.splitext(os.path.basename(p))[0] for p in barangay_source[1]]
-        all_tables = fetch_tables(schema)
-        conflicting_pairs = [
-            (name, existing)
-            for name in desired_names
-            for existing in [_find_existing_table_case_insensitive(name, all_tables)]
-            if existing is not None
-        ]
-        if conflicting_pairs:
-            db_overwrite_mode = ask_db_overwrite_dialog(root, conflicting_pairs)
-            if db_overwrite_mode == "cancel":
-                print("Run cancelled by user (existing database table(s) found).")
-                return
+    # resolved_table_name / resolved_outcome: the DB-output destination
+    # table, resolved ONCE, up front -- same "main thread, before the
+    # worker starts" philosophy as overwrite_mode above, now via the
+    # dedicated resolve_db_output_table() helper (fuzzy matching +
+    # confirmation dialog(s) all happen inside it; see its own
+    # docstring). Only relevant when output_mode[0] == "db" -- stays
+    # None/None for local output, where _process_one_source() ignores
+    # them entirely.
+    resolved_table_name = None
+    resolved_outcome = None
+    if output_mode[0] == "db":
+        resolved_table_name, resolved_outcome = resolve_db_output_table(
+            root, schema, barangay_source
+        )
+        if resolved_table_name is None:
+            print("Run cancelled by user (database output table not confirmed).")
+            return
 
     progress = ProgressWindow(app_root, "ROAD WIDTH TOOL")
     q = queue.Queue()
@@ -4007,8 +4275,28 @@ def run_processing(app_root, overwrite_mode=None):
                     )
                     q.put(("update", msg, current_step, total_features))
 
-                def status_cb(message):
-                    q.put(("update", message, current_step, total_features))
+                def status_cb(message, value=None, total=None):
+                    # value/total let a caller report its OWN live
+                    # progress (e.g. the database-write phase's
+                    # "Updating database records: N / Total..." -- see
+                    # the status_cb() call inside _process_one_source())
+                    # instead of falling back to current_step/
+                    # total_features, which belong to the PARCEL
+                    # MEASUREMENT phase (via progress_cb above) and are
+                    # already maxed out (current_step == total_features)
+                    # by the time any later phase runs -- previously
+                    # caused the progress bar to render full/green
+                    # throughout the entire database-write phase even
+                    # while the status text above it correctly showed
+                    # real incremental progress. Every OTHER existing
+                    # status_cb(message) call (no value/total passed)
+                    # keeps working exactly as before: falls back to
+                    # current_step/total_features, same as always.
+                    q.put((
+                        "update", message,
+                        value if value is not None else current_step,
+                        total if total is not None else total_features,
+                    ))
 
                 sources = (
                     [(p, False) for p in barangay_source[1]]
@@ -4033,10 +4321,12 @@ def run_processing(app_root, overwrite_mode=None):
                     try:
                         label, out_ref, vm_ref, outcome = _process_one_source(
                             source_id, is_db_source, road_gdf, engine, schema,
-                            output_mode, overwrite_mode, db_overwrite_mode,
+                            output_mode, overwrite_mode,
                             parcel_classification_selection, filter_by_road_type_active,
                             road_type_excluded_values, parcel_road_width_column_overrides,
                             progress_cb, status_cb,
+                            resolved_table_name=resolved_table_name,
+                            resolved_outcome=resolved_outcome,
                         )
                         success_count += 1
 
