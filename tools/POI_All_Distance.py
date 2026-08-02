@@ -610,19 +610,14 @@ def run_cpu_parallel_with_progress(
     if output_path:
         if original_crs is not None:
             gdf = gdf.to_crs(original_crs)
-        gdf.to_file(output_path)
+        _write_gpkg(gdf, output_path)
 
         if all_route_records:
             routes_gdf = gpd.GeoDataFrame(all_route_records, crs=projected_crs)
             routes_path = os.path.join(os.path.dirname(output_path), "poi_routes.gpkg")
-            if os.path.exists(routes_path):
-                try:
-                    os.remove(routes_path)
-                except Exception as e:
-                    print(f"⚠️ Could not remove existing {routes_path}: {e}")
             if original_crs is not None:
                 routes_gdf = routes_gdf.to_crs(original_crs)
-            routes_gdf.to_file(routes_path)
+            _write_gpkg(routes_gdf, routes_path)
             print(f"ℹ️ Exported {len(routes_gdf)} route(s) with Road/Straight labels: {routes_path}")
             return routes_path
     return None
@@ -677,6 +672,53 @@ def resolve_output_base_name(folder: str, desired_base_name: str, ext: str = "gp
     except OSError:
         pass
     return f"{root}_{max_n + 1}"
+
+
+def _write_gpkg(gdf, path):
+    """
+    Writes a GeoDataFrame to a .gpkg file, atomically.
+
+    Why atomicity is necessary here specifically: a plain
+    gdf.to_file(path, driver="GPKG") call, or a manual
+    os.remove()-before-write, can fail partway through -- a crash, the
+    machine losing power, disk full mid-write -- leaving `path` either
+    gone entirely (if a pre-existing file was deleted first, with
+    nothing written in its place) or corrupted/incomplete.
+
+    This version writes to a temporary file first, VERIFIES that file
+    is actually readable back (a write that raised no exception but
+    produced something GDAL itself can't re-open is exactly the
+    failure this guards against), and only then atomically replaces
+    the destination via os.replace() -- which is atomic on the same
+    filesystem on both Windows and POSIX: there is no window where
+    `path` doesn't exist. If ANY step before the final os.replace()
+    fails, `path` is left completely untouched, exactly as if this
+    call never happened.
+    """
+    tmp_path = f"{os.path.splitext(path)[0]}.tmp{os.path.splitext(path)[1]}"
+    if os.path.exists(tmp_path):
+        os.remove(tmp_path)
+
+    gdf.to_file(tmp_path, driver="GPKG")
+
+    try:
+        verify_gdf = gpd.read_file(tmp_path)
+        if len(verify_gdf) != len(gdf):
+            raise ValueError(
+                f"Row count mismatch after write: expected {len(gdf)}, "
+                f"got {len(verify_gdf)}."
+            )
+    except Exception as e:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"Could not verify the written file before replacing the "
+            f"destination -- destination left unchanged. Details: {e}"
+        )
+
+    os.replace(tmp_path, path)
 
 
 def ask_overwrite_dialog(parent, conflicting_names):
@@ -1484,8 +1526,9 @@ def run_with_progress(app_root, overwrite_mode=None):
                     # the working CRS for the distance computation.
                     if original_crs is not None:
                         gdf = gdf.to_crs(original_crs)
-                    gdf.to_postgis(target_table, engine, schema=schema,
-                                   if_exists="replace", index=False)
+                    with engine.begin() as conn:
+                        gdf.to_postgis(target_table, conn, schema=schema,
+                                       if_exists="replace", index=False)
                     messagebox.showinfo(
                         "Success",
                         f"✅ Updated DB table: {target_table} ({table_action})"

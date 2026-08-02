@@ -899,49 +899,61 @@ def with_output_suffix(main_base_name: str, suffix: str) -> str:
 # ========================= GPKG OVERWRITE SAFETY =========================
 def _write_gpkg(gdf, path):
     """
-    Writes `gdf` to `path` as a GeoPackage, guaranteeing a clean overwrite
-    if a file already exists at that path -- regardless of the bundled
-    GDAL/pyogrio version's own default "overwrite layer" behavior.
+    Writes a GeoDataFrame to a .gpkg file, atomically.
 
-    Bug this fixes: plain gdf.to_file(path, driver="GPKG") can raise
-    pyogrio.errors.DataLayerError ("Layer <name> already exists,
-    CreateLayer failed. Use the layer creation option OVERWRITE=YES to
-    replace it.") instead of silently overwriting, on certain
-    GDAL/pyogrio version combinations -- confirmed as a REAL, reproduced
-    production crash in road_width.py (the same tool this fix was first
-    found and fixed in), NOT a theoretical concern. Version-dependent:
-    could not be reproduced against every GDAL/pyogrio combination in
-    every dev sandbox, which is itself part of why this needs an
-    explicit, version-independent fix rather than trusting the
-    library's own overwrite handling to behave consistently everywhere
-    this tool's compiled .exe might run.
+    Why atomicity is necessary here specifically: the previous version
+    of this function deleted any pre-existing file at `path` FIRST,
+    then wrote the new content -- necessary because GeoPackage is a
+    SQLite-based container that can hold multiple named layers, and
+    calling gdf.to_file(path, driver="GPKG") when `path` already exists
+    does NOT simply replace its contents; pyogrio/GDAL tries to create
+    a new layer inside the existing file and fails with "Layer <name>
+    already exists, CreateLayer failed" if a layer of that name is
+    already there (confirmed reproduced when a user chose "Overwrite"
+    in ask_overwrite_dialog() -- crashed the whole run with no success
+    dialog and no clear message, just a console traceback invisible in
+    the compiled EXE).
 
-    This is NOT limited to the new filename-conflict feature (Priority 1
-    item #1) -- road_frontage.py's pre-existing, unconditional
-    "_road_frontage" suffix (now removed in favor of reusing the source's
-    own name -- see resolve_output_base_name()) meant ANY re-run against
-    the same output folder could already hit this crash today, with no
-    dependency on the newer conflict-handling feature at all. Applied at
-    every to_file() call site in this file -- the main parcel output and
-    both QA layers.
+    But delete-then-write has its own, worse failure mode: if anything
+    interrupts the process between the delete and the write completing
+    (a crash, the machine losing power, disk full mid-write), the
+    result isn't a corrupted file -- there is NO FILE AT ALL at `path`
+    anymore, having deleted the original with nothing to show for it.
 
-    os.remove() before to_file() rather than relying on an
-    OVERWRITE=YES-style driver option: works identically regardless of
-    which GDAL/pyogrio version is bundled into the compiled .exe, so
-    there is no dependency on that option being supported/honored
-    consistently across versions.
+    This version instead writes to a temporary file first, VERIFIES
+    that file is actually readable back (a write that raised no
+    exception but produced something GDAL itself can't re-open is
+    exactly the failure this guards against), and only then atomically
+    replaces the destination via os.replace() -- which is atomic on
+    the same filesystem on both Windows and POSIX, unlike
+    os.remove()+os.rename(): there is no window where `path` doesn't
+    exist. If ANY step before the final os.replace() fails, `path` is
+    left completely untouched, exactly as if this call never happened.
     """
-    if os.path.exists(path):
+    tmp_path = f"{os.path.splitext(path)[0]}.tmp{os.path.splitext(path)[1]}"
+    if os.path.exists(tmp_path):
+        os.remove(tmp_path)
+
+    gdf.to_file(tmp_path, driver="GPKG")
+
+    try:
+        verify_gdf = gpd.read_file(tmp_path)
+        if len(verify_gdf) != len(gdf):
+            raise ValueError(
+                f"Row count mismatch after write: expected {len(gdf)}, "
+                f"got {len(verify_gdf)}."
+            )
+    except Exception as e:
         try:
-            os.remove(path)
-        except OSError as e:
-            # Genuinely can't remove (e.g. file locked/open elsewhere) --
-            # let the subsequent to_file() call surface its own error
-            # rather than silently swallowing this one; removal failing
-            # here means the write below would likely fail too, but with
-            # a clearer, driver-level error message for the user.
-            print(f"⚠️ Could not remove existing file before overwrite: {path} ({e})")
-    gdf.to_file(path, driver="GPKG")
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"Could not verify the written file before replacing the "
+            f"destination -- destination left unchanged. Details: {e}"
+        )
+
+    os.replace(tmp_path, path)
 
 
 def open_in_global_mapper(output_path):
@@ -1198,6 +1210,14 @@ def read_postgis_clean(table, engine, schema):
 
 
 def normalize_name(name: str) -> str:
+    """
+    Lowercases name and strips everything that isn't a letter (digits,
+    underscores, spaces, hyphens, etc.) -- e.g. "LandParcel_2026" and
+    "Land Parcel Final" both normalize to "landparcelfinal"-style
+    strings with no separators left, so filenames and table names that
+    differ only by punctuation/casing/trailing numbers can still be
+    recognized as referring to the same logical table.
+    """
     return re.sub(r'[^a-z]', '', name.lower())
 
 
@@ -1222,14 +1242,37 @@ def fetch_tables(schema):
         return []
 
 
-def find_matching_table(local_name, schema):
-    all_tables = fetch_tables(schema)
-    lname = normalize_name(local_name)
+def find_matching_tables(desired_name, all_tables):
+    """
+    Returns the list of candidate table names from all_tables whose
+    normalized form is a substring of (or contains) the normalized
+    desired_name -- checked in both directions, so "landparcel" matches
+    "landparcel_final" and "landparcel_2026" matches "landparcel"
+    equally. This is intentionally permissive (fuzzy) matching: the
+    caller is responsible for confirming the match with the user
+    before treating it as a definite overwrite target (see
+    confirm_db_overwrite_dialog() / choose_db_overwrite_dialog() and
+    resolve_db_output_table()) -- this function only proposes
+    candidates, it never decides on its own.
+
+    Always excludes "CAMA_Table", "CAMA_Transaction_Log", and any table
+    ending in "_VM" (case-insensitive) from the candidate list, since
+    none of these are ever valid "main output" overwrite targets even
+    if their name happens to contain a substring match (e.g. a
+    Visual Measurement layer table like "landparcel_VM" would otherwise
+    also match a "landparcel" search).
+    """
+    lname = normalize_name(desired_name)
+    candidates = []
     for t in all_tables:
+        if t.lower() in ("cama_table", "cama_transaction_log"):
+            continue
+        if t.lower().endswith("_vm"):
+            continue
         tnorm = normalize_name(t)
         if lname in tnorm or tnorm in lname:
-            return t
-    return None
+            candidates.append(t)
+    return candidates
 
 
 # ========================= PROGRESS WINDOW =========================
@@ -1987,6 +2030,56 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
     }
 
 
+def resolve_db_output_table(root, schema, barangay_source):
+    """
+    Determines the DB-output destination table for the Land Parcel
+    source, BEFORE the worker thread starts -- same "resolve everything
+    up front, main thread only" philosophy as ask_overwrite_dialog()
+    (see run_processing()). This is what lets the fuzzy-match +
+    confirmation flow avoid ever needing a thread-safe dialog
+    mechanism: the Land Parcel source is singular (see parcel_local_path
+    / parcel_db_table -- single-select architecture), so everything
+    needed to resolve the destination table is already known before any
+    background processing begins.
+
+    Two cases:
+      - DB-source Land Parcel (barangay_source[0] == "db"): always
+        writes back to the exact same table it was read from -- no
+        matching, no dialog, matches worker()'s own pre-existing
+        src_type handling (out_base = name).
+      - Local-file Land Parcel: fuzzy-matches the filename against
+        existing tables via find_matching_tables() (which already
+        excludes CAMA_Table, CAMA_Transaction_Log, and any "_VM"
+        table), then requires user confirmation before treating a
+        match as an overwrite target -- zero candidates skips the
+        dialog entirely and creates a new table under the filename.
+
+    Returns (resolved_table_name, resolved_outcome), or (None, None) if
+    the user cancelled -- caller must abort the entire run in that
+    case, matching ask_overwrite_dialog()'s existing
+    cancel-aborts-everything semantics (there is no "create new" choice
+    for DB output).
+    """
+    if barangay_source[0] == "db":
+        return barangay_source[1][0], "overwritten"
+
+    desired_name = os.path.splitext(os.path.basename(barangay_source[1][0]))[0]
+    all_tables = fetch_tables(schema)
+    candidates = find_matching_tables(desired_name, all_tables)
+
+    if len(candidates) == 0:
+        return desired_name, "created"
+    elif len(candidates) == 1:
+        if not confirm_db_overwrite_dialog(root, candidates[0]):
+            return None, None
+        return candidates[0], "overwritten"
+    else:
+        chosen = choose_db_overwrite_dialog(root, candidates)
+        if chosen is None:
+            return None, None
+        return chosen, "overwritten"
+
+
 # ========================= MAIN PROCESS =========================
 def run_processing(app_root):
     global barangay_source, road_source, output_mode, overwrite_mode, parcel_output_column_overrides
@@ -2003,6 +2096,23 @@ def run_processing(app_root):
     engine = create_engine(
         f"postgresql://{creds['username']}:{creds['password']}@{creds['host']}:{creds['port']}/{creds['database']}"
     )
+
+    # resolved_table_name / resolved_outcome: the DB-output destination
+    # table, resolved ONCE, up front -- same "main thread, before the
+    # worker starts" philosophy as ask_overwrite_dialog(), via the
+    # dedicated resolve_db_output_table() helper (fuzzy matching +
+    # confirmation dialog(s) all happen inside it; see its own
+    # docstring). Only relevant when output_mode[0] == "db" -- stays
+    # None/None for local output, where worker() ignores them entirely.
+    resolved_table_name = None
+    resolved_outcome = None
+    if output_mode[0] == "db":
+        resolved_table_name, resolved_outcome = resolve_db_output_table(
+            app_root, schema, barangay_source
+        )
+        if resolved_table_name is None:
+            print("Run cancelled by user (database output table not confirmed).")
+            return
 
     progress = ProgressWindow(app_root, "Road Frontage Progress")
 
@@ -2151,13 +2261,25 @@ def run_processing(app_root):
                             _write_gpkg(buffers_gdf, buffers_out)
                             q.put(("open_gm", buffers_out, None, None))
                     else:
-                        brgy_gdf.to_postgis(
-                            out_base,
-                            engine,
-                            schema=schema,
-                            if_exists="replace",
-                            index=False
-                        )
+                        # The actual destination table was already
+                        # decided by resolve_db_output_table(), BEFORE
+                        # this function (and the worker thread) even
+                        # started -- fuzzy matching + user confirmation
+                        # already happened there (see that function's
+                        # docstring). This just uses the result. Falls
+                        # back to out_base only if resolved_table_name
+                        # is somehow None here (output_mode[0] != "db"
+                        # can't reach this branch, so this is just a
+                        # defensive fallback).
+                        db_table = resolved_table_name if resolved_table_name is not None else out_base
+                        with engine.begin() as conn:
+                            brgy_gdf.to_postgis(
+                                db_table,
+                                conn,
+                                schema=schema,
+                                if_exists="replace",
+                                index=False
+                            )
                         # frontage_lines is a QA-only artifact — not written to DB.
 
                 except Exception as source_err:
@@ -2346,6 +2468,139 @@ def ask_overwrite_dialog(parent, conflicting_names):
 
     dialog.wait_window()
     return result["choice"]
+
+
+def confirm_db_overwrite_dialog(parent, table_name):
+    """
+    Shown when find_matching_tables() returns EXACTLY ONE candidate for
+    the DB-output destination table. Asks the user to confirm before
+    overwriting that specific table -- fuzzy matching only PROPOSES a
+    candidate (see find_matching_tables()'s own docstring); this dialog
+    is the actual safety check before anything is overwritten.
+
+    Returns True (Yes -- proceed with overwriting table_name) or False
+    (No, or the dialog was closed -- caller must treat this as a full
+    cancel, not "create new" -- there is no "create new" for DB output).
+    """
+    result = {"confirmed": False}
+
+    dialog = tk.Toplevel(parent)
+    apply_icon(dialog)
+    dialog.title("ROAD FRONTAGE TOOL")
+    dialog.resizable(False, False)
+    dialog.grab_set()
+    dialog.deiconify()
+    dialog.lift()
+    dialog.focus_force()
+    dialog.attributes("-topmost", True)
+    dialog.after(100, lambda: dialog.attributes("-topmost", False))
+
+    def choose(confirmed):
+        result["confirmed"] = confirmed
+        dialog.destroy()
+
+    dialog.protocol("WM_DELETE_WINDOW", lambda: choose(False))
+
+    # Buttons packed first, at the bottom -- same reasoning as
+    # ask_overwrite_dialog() above.
+    btn_frame = tk.Frame(dialog)
+    btn_frame.pack(side="bottom", fill="x", pady=(4, 12))
+    tk.Button(btn_frame, text="Yes", width=14, cursor="hand2",
+              command=lambda: choose(True)).pack(side="left", padx=(16, 4))
+    tk.Button(btn_frame, text="No", width=14, cursor="hand2",
+              command=lambda: choose(False)).pack(side="left", padx=(4, 16))
+
+    tk.Label(
+        dialog, text="Found existing table:",
+        font=("Segoe UI", 10, "bold"), anchor="w"
+    ).pack(fill="x", padx=16, pady=(16, 4))
+
+    tk.Label(
+        dialog, text=table_name, anchor="w", font=("Segoe UI", 9)
+    ).pack(fill="x", padx=16, pady=(0, 12))
+
+    tk.Label(dialog, text="Overwrite this table?", anchor="w"
+             ).pack(fill="x", padx=16, pady=(0, 16))
+
+    dialog.update_idletasks()
+    req_w = max(dialog.winfo_reqwidth(), 360)
+    req_h = dialog.winfo_reqheight()
+    x = parent.winfo_x() + (parent.winfo_width() - req_w) // 2
+    y = parent.winfo_y() + (parent.winfo_height() - req_h) // 2
+    dialog.geometry(f"{req_w}x{req_h}+{max(x,0)}+{max(y,0)}")
+
+    dialog.wait_window()
+    return result["confirmed"]
+
+
+def choose_db_overwrite_dialog(parent, candidates):
+    """
+    Shown when find_matching_tables() returns MORE THAN ONE candidate
+    for the DB-output destination table -- e.g. both "landparcel_draft"
+    and "landparcel_final" exist and both fuzzy-match the incoming
+    filename. Lets the user pick exactly which one to overwrite via
+    radio buttons; the FIRST candidate in the list is pre-selected by
+    default.
+
+    Returns the chosen table name, or None if the user cancelled (must
+    be treated as a full cancel by the caller -- there is no "create
+    new" for DB output).
+    """
+    result = {"chosen": None}
+    selected = tk.StringVar(value=candidates[0])
+
+    dialog = tk.Toplevel(parent)
+    apply_icon(dialog)
+    dialog.title("ROAD FRONTAGE TOOL")
+    dialog.resizable(False, False)
+    dialog.grab_set()
+    dialog.deiconify()
+    dialog.lift()
+    dialog.focus_force()
+    dialog.attributes("-topmost", True)
+    dialog.after(100, lambda: dialog.attributes("-topmost", False))
+
+    def choose(confirm):
+        result["chosen"] = selected.get() if confirm else None
+        dialog.destroy()
+
+    dialog.protocol("WM_DELETE_WINDOW", lambda: choose(False))
+
+    # Buttons packed first, at the bottom -- same reasoning as
+    # ask_overwrite_dialog() above.
+    btn_frame = tk.Frame(dialog)
+    btn_frame.pack(side="bottom", fill="x", pady=(4, 12))
+    tk.Button(btn_frame, text="Confirm", width=14, cursor="hand2",
+              command=lambda: choose(True)).pack(side="left", padx=(16, 4))
+    tk.Button(btn_frame, text="Cancel", width=14, cursor="hand2",
+              command=lambda: choose(False)).pack(side="left", padx=(4, 16))
+
+    tk.Label(
+        dialog, text="Multiple possible matches found.",
+        font=("Segoe UI", 10, "bold"), anchor="w"
+    ).pack(fill="x", padx=16, pady=(16, 4))
+
+    tk.Label(
+        dialog, text="Select the table to overwrite:", anchor="w"
+    ).pack(fill="x", padx=16, pady=(0, 8))
+
+    radio_frame = tk.Frame(dialog)
+    radio_frame.pack(fill="x", padx=16, pady=(0, 16))
+    for name in candidates:
+        tk.Radiobutton(
+            radio_frame, text=name, variable=selected, value=name,
+            anchor="w"
+        ).pack(fill="x", anchor="w")
+
+    dialog.update_idletasks()
+    req_w = max(dialog.winfo_reqwidth(), 360)
+    req_h = dialog.winfo_reqheight()
+    x = parent.winfo_x() + (parent.winfo_width() - req_w) // 2
+    y = parent.winfo_y() + (parent.winfo_height() - req_h) // 2
+    dialog.geometry(f"{req_w}x{req_h}+{max(x,0)}+{max(y,0)}")
+
+    dialog.wait_window()
+    return result["chosen"]
 
 
 def open_main_window(root):
