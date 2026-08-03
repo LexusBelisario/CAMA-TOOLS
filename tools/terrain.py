@@ -17,6 +17,8 @@ import json
 import psycopg2
 from sqlalchemy import create_engine, inspect, text
 from scipy.ndimage import sobel
+import threading
+import queue
 
 # ============================
 # FORCE WINDOWS APP ICON
@@ -77,8 +79,6 @@ barangay_source = None
 road_source = None
 dtm_source = None
 output_mode = None
-progress_window = None
-progress_label = None
 
 # ========================= EXISTING OUTPUT-COLUMN CONFLICT DETECTION =========================
 # OUTPUT_COLUMN_TARGETS: this tool's six output column names, checked
@@ -126,31 +126,81 @@ OUTPUT_COLUMN_TARGETS = (
 parcel_output_column_overrides = {}
 
 
-# ---------------- Progress Window ----------------
-def open_progress_window(parent=None):
-    global progress_window, progress_label
-    progress_window = tk.Toplevel(parent)
-    apply_icon(progress_window)
-    progress_window.title("Processing Progress")
-    progress_window.geometry("320x100")
-    progress_window.resizable(False, False)
-    progress_label = tk.Label(progress_window, text="Starting...", wraplength=300)
-    progress_label.pack(pady=20)
-    progress_window.update()
+# ============================================================
+# Progress Event Protocol v9 -- this tool's migration.
+# ============================================================
+# This tool previously had a minimal, ad-hoc progress mechanism
+# (open_progress_window()/update_progress()/close_progress_window(),
+# module globals, no actual progress bar -- just a status text label)
+# and NO background worker thread -- run_processing() ran entirely
+# synchronously on the main thread, using .update() calls to keep the
+# window minimally repainted while blocking. That mechanism is fully
+# replaced here by the same ProgressWindow shape used by the other five
+# migrated tools, reusing progress_framework.py's
+# PresentationState/ProgressPresentationPolicy/TkinterProgressView
+# directly -- no tool-local copies, no new abstraction. Every call site
+# that used to call update_progress(msg) directly (in
+# compute_slope_array(), process_parcels_fast(), and run_processing()
+# itself) now goes through an explicit `progress` parameter instead --
+# see each function's own docstring/comment for the 1:1 message
+# translation.
+#
+# Deliberately NOT done in this task:
+#   - No per-source failure isolation added (this tool's existing
+#     try/except in run_processing() already wraps the whole loop as
+#     one unit -- that all-or-nothing behavior is preserved exactly).
+#   - The 3 overwrite dialogs in this file are untouched.
+# ============================================================
+from tools.progress_framework import (
+    PresentationState,
+    ProgressPresentationPolicy,
+    TkinterProgressView,
+)
 
 
-def update_progress(msg):
-    global progress_label, progress_window
-    if progress_window and progress_label:
-        progress_label.config(text=msg)
-        progress_window.update()
+class ProgressWindow:
+    """
+    Progress dialog shown while run_processing() works on a background
+    thread. Same shape as the other migrated tools' ProgressWindow --
+    status label + determinate progress bar, no cancel/stop_flag
+    support. Progress Event Protocol v9 role: ProgressWindow is the
+    host, not the decision-maker (see ProgressPresentationPolicy /
+    TkinterProgressView, imported from progress_framework.py, shared
+    with lot_location.py/road_frontage.py/land_shape_compactness.py/
+    road_surface.py/road_density.py/influence_to_barangay.py).
+    """
+    def __init__(self, root, title="Processing"):
+        from tkinter import ttk
+        self.win = tk.Toplevel(root)
+        apply_icon(self.win)
+        self.win.title(title)
+        self.win.minsize(400, 120)
+        self.win.resizable(False, False)
+        self.status_var = tk.StringVar(master=self.win)
+        self.status_var.set("Starting...")
+        tk.Label(
+            self.win, textvariable=self.status_var, anchor="center",
+            justify="left", wraplength=380,
+        ).pack(pady=10, padx=10, fill="x")
+        self.progress = ttk.Progressbar(self.win, orient="horizontal", mode="determinate", length=350)
+        self.progress.pack(pady=10)
+        self.win.attributes("-topmost", True)
+        self.win.update()
 
+        self.win.focus_force()
+        self.win.lift()
+        self.win.attributes("-topmost", True)
+        self.win.after(100, lambda: self.win.attributes("-topmost", False))
 
-def close_progress_window():
-    global progress_window
-    if progress_window:
-        progress_window.destroy()
-        progress_window = None
+        self._policy = ProgressPresentationPolicy()
+        self._view = TkinterProgressView(self.win, self.status_var, self.progress)
+
+    def update(self, message, value=None, maximum=None):
+        state = self._policy.compute(message, value, maximum)
+        self._view.render(state)
+
+    def close(self):
+        self._view.destroy()
 
 
 # ---------------- DB Helpers ----------------
@@ -274,9 +324,18 @@ def reproject_raster_to_prs92(dtm, target_epsg):
 
 
 # ---------------- Fast Terrain Processing ----------------
-def compute_slope_array(dtm):
-    """Compute slope in degrees for entire DTM using Sobel gradient."""
-    update_progress("Precomputing slope from DTM...")
+def compute_slope_array(dtm, progress=None):
+    """Compute slope in degrees for entire DTM using Sobel gradient.
+
+    progress : optional callable progress(message, value=None, maximum=None),
+    replacing the previous direct call to the old module-level
+    update_progress(msg) -- see process_parcels_fast()'s docstring for
+    the full migration rationale. Optional and defaults to None so this
+    function's existing signature is unchanged for any call site that
+    doesn't pass it.
+    """
+    if progress:
+        progress("Precomputing slope from DTM...")
     arr = dtm.read(1)
     arr[arr == dtm.nodata] = np.nan
     xres, yres = dtm.res
@@ -331,15 +390,16 @@ def _detect_existing_output_columns(gdf):
 # columns, and on_run() below shows a combined confirmation dialog
 # before proceeding.
 #
-# Unlike road_frontage.py/road_width.py, this tool has no background
-# worker thread -- run_processing() itself already runs synchronously
-# on the main thread with a simple modal progress window (see
-# open_progress_window()/update_progress()), not a queue-polling
-# pattern. So this check also runs synchronously, called directly from
-# on_run() right before Run actually starts -- same adaptation already
-# applied in road_density.py's _check_parcel_density_conflicts() and
-# road_surface.py's _check_parcel_surface_conflicts(). Adding threading
-# here would be a separate, out-of-scope architectural change.
+# Unlike road_frontage.py/road_width.py, this specific check
+# (_check_parcel_terrain_conflicts()) is not part of the background
+# worker thread run_processing() now uses (see run_processing()'s own
+# Progress Event Protocol v9 migration comment further below) -- it
+# still runs synchronously, called directly from on_run() right before
+# Run actually starts, BEFORE the worker thread (and its ProgressWindow)
+# are even created. Same adaptation already applied in road_density.py's
+# _check_parcel_density_conflicts() and road_surface.py's
+# _check_parcel_surface_conflicts(). Adding threading to THIS check
+# specifically would be a separate, out-of-scope change.
 #
 # Read approach: plain gpd.read_file(path), matching road_width.py's own
 # canonical _read_gdf_worker() exactly -- no partial/schema-only read
@@ -378,7 +438,8 @@ def _check_parcel_terrain_conflicts(local_paths):
 def process_parcels_fast(parcels, roads, dtm, parcels_crs,
                           slope_col="CAMA_SLOPE", terrain_col="CAMA_TERRAIN",
                           prcl_elev_col="CAMA_PRCL_ELEV", road_elev_col="CAMA_ROAD_ELEV",
-                          prcl_road_col="CAMA_PRCL_ROAD", topo_lvl_col="CAMA_TOPO_LVL"):
+                          prcl_road_col="CAMA_PRCL_ROAD", topo_lvl_col="CAMA_TOPO_LVL",
+                          progress=None):
     """
     slope_col, terrain_col, prcl_elev_col, road_elev_col, prcl_road_col,
     topo_lvl_col : str -- the column names this tool's six computed
@@ -391,6 +452,18 @@ def process_parcels_fast(parcels, roads, dtm, parcels_crs,
         the exact existing name/casing is passed here so processing
         writes back into that same column instead of creating a
         hardcoded CAMA_-prefixed duplicate.
+
+    progress : optional callable progress(message, value=None, maximum=None).
+    Replaces this function's previous direct calls to the old
+    module-level update_progress(msg) (main-thread-only, unsafe to call
+    from a background thread) -- the four existing stage messages below
+    are a straight 1:1 translation (same text, same points in the
+    function), plus new fine-grained value/maximum reporting inside the
+    final per-parcel loop, which the old text-only update_progress()
+    couldn't represent. Optional and defaults to None so this
+    function's existing signature is unchanged for any call site that
+    doesn't pass it -- added as part of this tool's Progress Event
+    Protocol v9 migration (see run_processing() below).
     """
     # NOTE (Part A3 investigation, resolved as NOT needed): like
     # road_density.py, this function only reads parcels.geometry.centroid
@@ -401,7 +474,8 @@ def process_parcels_fast(parcels, roads, dtm, parcels_crs,
     # Centroid computation is already confirmed safe on invalid geometry
     # elsewhere in this project (no crash, unlike unary_union). No
     # fix_geometry() added.
-    update_progress("Building road spatial index...")
+    if progress:
+        progress("Building road spatial index...")
     # Split roads into segments and index them
     segments = []
     for geom in roads.geometry:
@@ -416,16 +490,18 @@ def process_parcels_fast(parcels, roads, dtm, parcels_crs,
     tree = STRtree(segments)
 
     # Compute slope array
-    slope_arr = compute_slope_array(dtm)
+    slope_arr = compute_slope_array(dtm, progress=progress)
     band1 = dtm.read(1)
     transform = dtm.transform
 
-    update_progress("Sampling parcel elevations...")
+    if progress:
+        progress("Sampling parcel elevations...")
     centroids = parcels.geometry.centroid
     coords = [(p.x, p.y) for p in centroids]
     prcl_elevs = [v[0] for v in dtm.sample(coords)]
 
-    update_progress("Finding nearest road and road elevations...")
+    if progress:
+        progress("Finding nearest road and road elevations...")
     nearest_segments = []
     for p in centroids:
         res = tree.nearest(p)
@@ -437,10 +513,12 @@ def process_parcels_fast(parcels, roads, dtm, parcels_crs,
     road_points = [seg.interpolate(0.5, normalized=True) for seg in nearest_segments]
     road_elevs = [v[0] for v in dtm.sample([(p.x, p.y) for p in road_points])]
 
-    update_progress("Calculating slope and elevation differences...")
     diffs, slopes, terrains, topos = [], [], [], []
 
+    total = len(centroids)
     for i, c in enumerate(centroids):
+        if progress:
+            progress(f"Calculating slope and elevation differences: {i + 1}/{total}", i + 1, total)
         elev = prcl_elevs[i]
         road = road_elevs[i]
         diff = elev - road if elev and road else None
@@ -1506,107 +1584,154 @@ def run_processing(app_root, overwrite_mode=None):
             print("Run cancelled by user (database output table not confirmed).")
             return
 
-    open_progress_window(app_root)
-    try:
-        update_progress("Loading road data...")
-        road_gdf = (
-            gpd.read_file(road_source[1][0]) if road_source[0] == "local"
-            else read_postgis_clean(road_source[1][0], engine, schema)
-        )
+    # ============================================================
+    # Progress Event Protocol v9 -- this tool's migration.
+    # ============================================================
+    # Everything ABOVE this point (validation via load_db_credentials(),
+    # resolve_db_output_table() + its confirmation dialog(s)) is
+    # unchanged and stays on the main thread, exactly as before.
+    #
+    # Everything below is the exact same single loop this function
+    # always had (NOT split into separate local/db branches -- the
+    # local/db distinction happens via if/else INSIDE this one loop,
+    # same as before), including the existing try/except that already
+    # wrapped the whole thing as one all-or-nothing unit -- that
+    # try/except is preserved here as worker()'s own, now routing
+    # through the "error" event instead of calling messagebox directly
+    # (which would be unsafe from a background thread). Every previous
+    # update_progress(msg) call is now progress_cb(msg) instead -- same
+    # message, same point in the flow, 1:1 translation.
+    progress = ProgressWindow(app_root, "Terrain Progress")
+    q = queue.Queue()
 
-        barangay_list = barangay_source[1]
-        for idx, src in enumerate(barangay_list, 1):
-            update_progress(f"Loading parcel {idx}/{len(barangay_list)}...")
-            if barangay_source[0] == "local":
-                parcels = gpd.read_file(src)
-                name = os.path.splitext(os.path.basename(src))[0]
-            else:
-                parcels = read_postgis_clean(src, engine, schema)
-                name = src
+    def worker():
+        try:
+            def progress_cb(msg, val=None, maxv=None):
+                q.put(("update", msg, val, maxv))
 
-            target_epsg = detect_prs92_zone([("Land Parcel", parcels), ("Road Network", road_gdf)])
-            parcels_crs = parcels.crs
-            parcels = parcels.to_crs(epsg=target_epsg)
-            roads = road_gdf.to_crs(epsg=target_epsg)
-
-            update_progress("Loading DTM...")
-            if dtm_source[0] == "local":
-                dtm_raw = rasterio.open(dtm_source[1])
-                dtm = reproject_raster_to_prs92(dtm_raw, target_epsg)
-            else:
-                dtm_table = dtm_source[1]
-                dtm_raw = rasterio.open(
-                    f"PG:dbname={creds['database']} host={creds['host']} "
-                    f"user={creds['username']} password={creds['password']} "
-                    f"schema={schema} table={dtm_table} column=rast"
-                )
-                srid = get_raster_srid(engine, schema, dtm_table)
-                dtm = reproject_raster_to_prs92(dtm_raw, target_epsg) \
-                    if srid != target_epsg else dtm_raw
-
-            # Preserves each source's existing output column name(s)/
-            # casing exactly, if a conflict was detected and confirmed
-            # in on_run() -- e.g. a detected "caMA_SLOPE" is written
-            # back to "caMA_SLOPE", not a hardcoded "CAMA_SLOPE".
-            # Defaults to the standard CAMA_-prefixed name for any
-            # output this source has no override for. Always {} for
-            # DB-sourced parcels (column-conflict check is LOCAL-only),
-            # so this naturally falls back to every default in that
-            # case.
-            output_col_overrides = parcel_output_column_overrides.get(src, {})
-            slope_col = output_col_overrides.get("CAMA_SLOPE", "CAMA_SLOPE")
-            terrain_col = output_col_overrides.get("CAMA_TERRAIN", "CAMA_TERRAIN")
-            prcl_elev_col = output_col_overrides.get("CAMA_PRCL_ELEV", "CAMA_PRCL_ELEV")
-            road_elev_col = output_col_overrides.get("CAMA_ROAD_ELEV", "CAMA_ROAD_ELEV")
-            prcl_road_col = output_col_overrides.get("CAMA_PRCL_ROAD", "CAMA_PRCL_ROAD")
-            topo_lvl_col = output_col_overrides.get("CAMA_TOPO_LVL", "CAMA_TOPO_LVL")
-
-            result = process_parcels_fast(
-                parcels, roads, dtm, parcels_crs,
-                slope_col=slope_col, terrain_col=terrain_col,
-                prcl_elev_col=prcl_elev_col, road_elev_col=road_elev_col,
-                prcl_road_col=prcl_road_col, topo_lvl_col=topo_lvl_col
+            progress_cb("Loading road data...")
+            road_gdf = (
+                gpd.read_file(road_source[1][0]) if road_source[0] == "local"
+                else read_postgis_clean(road_source[1][0], engine, schema)
             )
 
-            update_progress("Saving output...")
-            if output_mode[0] == "local":
-                desired_base_name = name
-                candidate_path = os.path.join(output_mode[1], f"{desired_base_name}.gpkg")
-                had_conflict = os.path.exists(candidate_path)
-                if had_conflict and overwrite_mode == "new":
-                    base_name = resolve_output_base_name(output_mode[1], desired_base_name)
+            barangay_list = barangay_source[1]
+            for idx, src in enumerate(barangay_list, 1):
+                progress_cb(f"Loading parcel {idx}/{len(barangay_list)}...", idx, len(barangay_list))
+                if barangay_source[0] == "local":
+                    parcels = gpd.read_file(src)
+                    name = os.path.splitext(os.path.basename(src))[0]
                 else:
-                    base_name = desired_base_name
-                out = os.path.join(output_mode[1], f"{base_name}.gpkg")
-                _write_gpkg(result, out)
-                print(f"✅ Saved: {out}")
-                load_in_global_mapper(out)
-            else:
-                # The actual destination table was already decided by
-                # resolve_db_output_table(), BEFORE the ProgressWindow
-                # was even opened -- fuzzy matching + user confirmation
-                # already happened there (see that function's
-                # docstring), and correctly bypasses matching entirely
-                # for DB-source parcels (writes back to the exact
-                # source table, unlike the old logic this replaces).
-                # Falls back to the old "name + _terrain" behavior only
-                # if resolved_table_name is somehow None here
-                # (output_mode[0] != "db" can't reach this branch, so
-                # this is just a defensive fallback).
-                out_table = resolved_table_name if resolved_table_name is not None else name + "_terrain"
-                with engine.begin() as conn:
-                    result.to_postgis(out_table, conn, schema=schema,
-                                      if_exists="replace", index=False)
-                print(f"✅ Saved to DB: {out_table}")
+                    parcels = read_postgis_clean(src, engine, schema)
+                    name = src
 
-            update_progress(f"✅ Completed {name}")
+                target_epsg = detect_prs92_zone([("Land Parcel", parcels), ("Road Network", road_gdf)])
+                parcels_crs = parcels.crs
+                parcels = parcels.to_crs(epsg=target_epsg)
+                roads = road_gdf.to_crs(epsg=target_epsg)
 
-        close_progress_window()
-        messagebox.showinfo("Success", "Terrain processing complete!")
+                progress_cb("Loading DTM...")
+                if dtm_source[0] == "local":
+                    dtm_raw = rasterio.open(dtm_source[1])
+                    dtm = reproject_raster_to_prs92(dtm_raw, target_epsg)
+                else:
+                    dtm_table = dtm_source[1]
+                    dtm_raw = rasterio.open(
+                        f"PG:dbname={creds['database']} host={creds['host']} "
+                        f"user={creds['username']} password={creds['password']} "
+                        f"schema={schema} table={dtm_table} column=rast"
+                    )
+                    srid = get_raster_srid(engine, schema, dtm_table)
+                    dtm = reproject_raster_to_prs92(dtm_raw, target_epsg) \
+                        if srid != target_epsg else dtm_raw
 
-    except Exception as e:
-        close_progress_window()
-        messagebox.showerror("Error", f"Processing failed:\n{str(e)}")
+                # Preserves each source's existing output column name(s)/
+                # casing exactly, if a conflict was detected and confirmed
+                # in on_run() -- e.g. a detected "caMA_SLOPE" is written
+                # back to "caMA_SLOPE", not a hardcoded "CAMA_SLOPE".
+                # Defaults to the standard CAMA_-prefixed name for any
+                # output this source has no override for. Always {} for
+                # DB-sourced parcels (column-conflict check is LOCAL-only),
+                # so this naturally falls back to every default in that
+                # case.
+                output_col_overrides = parcel_output_column_overrides.get(src, {})
+                slope_col = output_col_overrides.get("CAMA_SLOPE", "CAMA_SLOPE")
+                terrain_col = output_col_overrides.get("CAMA_TERRAIN", "CAMA_TERRAIN")
+                prcl_elev_col = output_col_overrides.get("CAMA_PRCL_ELEV", "CAMA_PRCL_ELEV")
+                road_elev_col = output_col_overrides.get("CAMA_ROAD_ELEV", "CAMA_ROAD_ELEV")
+                prcl_road_col = output_col_overrides.get("CAMA_PRCL_ROAD", "CAMA_PRCL_ROAD")
+                topo_lvl_col = output_col_overrides.get("CAMA_TOPO_LVL", "CAMA_TOPO_LVL")
+
+                result = process_parcels_fast(
+                    parcels, roads, dtm, parcels_crs,
+                    slope_col=slope_col, terrain_col=terrain_col,
+                    prcl_elev_col=prcl_elev_col, road_elev_col=road_elev_col,
+                    prcl_road_col=prcl_road_col, topo_lvl_col=topo_lvl_col,
+                    progress=progress_cb,
+                )
+
+                progress_cb("Saving output...")
+                if output_mode[0] == "local":
+                    desired_base_name = name
+                    candidate_path = os.path.join(output_mode[1], f"{desired_base_name}.gpkg")
+                    had_conflict = os.path.exists(candidate_path)
+                    if had_conflict and overwrite_mode == "new":
+                        base_name = resolve_output_base_name(output_mode[1], desired_base_name)
+                    else:
+                        base_name = desired_base_name
+                    out = os.path.join(output_mode[1], f"{base_name}.gpkg")
+                    _write_gpkg(result, out)
+                    print(f"✅ Saved: {out}")
+                    q.put(("open_gm", out, None, None))
+                else:
+                    # The actual destination table was already decided by
+                    # resolve_db_output_table(), BEFORE the ProgressWindow
+                    # was even opened -- fuzzy matching + user confirmation
+                    # already happened there (see that function's
+                    # docstring), and correctly bypasses matching entirely
+                    # for DB-source parcels (writes back to the exact
+                    # source table, unlike the old logic this replaces).
+                    # Falls back to the old "name + _terrain" behavior only
+                    # if resolved_table_name is somehow None here
+                    # (output_mode[0] != "db" can't reach this branch, so
+                    # this is just a defensive fallback).
+                    out_table = resolved_table_name if resolved_table_name is not None else name + "_terrain"
+                    with engine.begin() as conn:
+                        result.to_postgis(out_table, conn, schema=schema,
+                                          if_exists="replace", index=False)
+                    print(f"✅ Saved to DB: {out_table}")
+
+                progress_cb(f"✅ Completed {name}")
+
+            q.put(("done", "Terrain processing complete!", None, None))
+
+        except Exception as e:
+            q.put(("error", f"Processing failed:\n{str(e)}", None, None))
+
+    def poll_queue():
+        if not app_root.winfo_exists():
+            return
+        try:
+            while True:
+                kind, *rest = q.get_nowait()
+                if kind == "update":
+                    progress.update(rest[0], rest[1], rest[2])
+                elif kind == "open_gm":
+                    load_in_global_mapper(rest[0])
+                elif kind == "done":
+                    progress.close()
+                    messagebox.showinfo("Success", rest[0])
+                    return
+                elif kind == "error":
+                    progress.close()
+                    messagebox.showerror("Error", rest[0])
+                    return
+        except queue.Empty:
+            pass
+        app_root.after(100, poll_queue)
+
+    threading.Thread(target=worker, daemon=True).start()
+    poll_queue()
 
 
 # ---------------- Main ----------------

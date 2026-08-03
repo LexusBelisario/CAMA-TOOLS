@@ -10,6 +10,8 @@ import json
 import psycopg2
 from sqlalchemy import create_engine, inspect, text
 from shapely.validation import make_valid
+import threading
+import queue
 
 # ============================
 # FORCE WINDOWS APP ICON
@@ -287,7 +289,7 @@ def find_matching_tables(desired_name, all_tables):
     return candidates
 
 # ---------------- Core Processing ----------------
-def process_density(brgy_gdf, road_gdf, source_name="", output_column_name="CAMA_DENS_ROAD"):
+def process_density(brgy_gdf, road_gdf, source_name="", output_column_name="CAMA_DENS_ROAD", progress=None):
     """Compute road density (m/m²) for each barangay polygon.
 
     output_column_name : str -- the column name the computed density is
@@ -300,6 +302,13 @@ def process_density(brgy_gdf, road_gdf, source_name="", output_column_name="CAMA
         processing writes back into that same column instead of
         creating a hardcoded "CAMA_DENS_ROAD" alongside it as a
         confusing duplicate.
+
+    progress : optional callable progress(message, value=None, maximum=None),
+    called from inside the per-parcel loop below (never from anywhere
+    else in this function). Optional and defaults to None so this
+    function's existing signature is unchanged for any call site that
+    doesn't pass it -- added as part of this tool's Progress Event
+    Protocol v9 migration (see run_processing() below).
     """
     global buffer_size
     orig_crs = brgy_gdf.crs
@@ -320,7 +329,10 @@ def process_density(brgy_gdf, road_gdf, source_name="", output_column_name="CAMA
     radius = buffer_size if buffer_size else 1000  # meters
     buffer_area = math.pi * (radius ** 2)
 
-    for idx, row in brgy_proj.iterrows():
+    total = len(brgy_proj)
+    for i, (idx, row) in enumerate(brgy_proj.iterrows(), start=1):
+        if progress:
+            progress(f"[{source_name}] Computing density: {i}/{total}", i, total)
         centroid = row.geometry.centroid
         buffer = centroid.buffer(radius)
         intersecting = road_proj[road_proj.geometry.intersects(buffer)]
@@ -1266,6 +1278,73 @@ def resolve_db_output_table(root, schema, barangay_source):
         return chosen, "overwritten"
 
 
+# ============================================================
+# Progress Event Protocol v9 -- this tool's migration.
+# ============================================================
+# Same shape of migration as land_shape_compactness.py's and
+# road_surface.py's: this tool had NO background worker thread and NO
+# progress dialog at all -- run_processing() ran entirely synchronously
+# on the main thread. Reuses progress_framework.py's
+# PresentationState/ProgressPresentationPolicy/TkinterProgressView
+# directly -- no tool-local copies, no new abstraction.
+#
+# Deliberately NOT done in this task:
+#   - No per-source failure isolation added.
+#   - The 3 overwrite dialogs in this file are untouched -- any
+#     topmost/hiding fix for them is a separate, dedicated follow-up.
+# ============================================================
+from tools.progress_framework import (
+    PresentationState,
+    ProgressPresentationPolicy,
+    TkinterProgressView,
+)
+
+
+class ProgressWindow:
+    """
+    Progress dialog shown while run_processing() works on a background
+    thread. Same shape as the other migrated tools' ProgressWindow --
+    status label + determinate progress bar, no cancel/stop_flag
+    support. Progress Event Protocol v9 role: ProgressWindow is the
+    host, not the decision-maker (see ProgressPresentationPolicy /
+    TkinterProgressView, imported from progress_framework.py, shared
+    with lot_location.py/road_frontage.py/land_shape_compactness.py/
+    road_surface.py).
+    """
+    def __init__(self, root, title="Processing"):
+        from tkinter import ttk
+        self.win = tk.Toplevel(root)
+        apply_icon(self.win)
+        self.win.title(title)
+        self.win.minsize(400, 120)
+        self.win.resizable(False, False)
+        self.status_var = tk.StringVar(master=self.win)
+        self.status_var.set("Starting...")
+        tk.Label(
+            self.win, textvariable=self.status_var, anchor="center",
+            justify="left", wraplength=380,
+        ).pack(pady=10, padx=10, fill="x")
+        self.progress = ttk.Progressbar(self.win, orient="horizontal", mode="determinate", length=350)
+        self.progress.pack(pady=10)
+        self.win.attributes("-topmost", True)
+        self.win.update()
+
+        self.win.focus_force()
+        self.win.lift()
+        self.win.attributes("-topmost", True)
+        self.win.after(100, lambda: self.win.attributes("-topmost", False))
+
+        self._policy = ProgressPresentationPolicy()
+        self._view = TkinterProgressView(self.win, self.status_var, self.progress)
+
+    def update(self, message, value=None, maximum=None):
+        state = self._policy.compute(message, value, maximum)
+        self._view.render(state)
+
+    def close(self):
+        self._view.destroy()
+
+
 # ---------------- Main Processing ----------------
 def run_processing(root, overwrite_mode=None):
     # overwrite_mode: passed from on_run(). See PRIORITY 2 block there.
@@ -1302,79 +1381,142 @@ def run_processing(root, overwrite_mode=None):
             print("Run cancelled by user (database output table not confirmed).")
             return
 
-    road_gdf = (
-        gpd.read_file(road_source[1][0]) if road_source[0] == "local"
-        else read_postgis_clean(road_source[1][0], engine, schema)
-    )
+    # ============================================================
+    # Progress Event Protocol v9 -- this tool's migration.
+    # ============================================================
+    # Everything ABOVE this point (validation, credential loading,
+    # resolve_db_output_table() + its confirmation dialog(s)) is
+    # unchanged and stays on the main thread, exactly as before.
+    #
+    # road_gdf loading moves into worker() below -- matches
+    # lot_location.py's/road_frontage.py's own established convention.
+    #
+    # Everything else below is the exact same two-loop body this
+    # function always had (local-source loop, then the separate
+    # DB-source loop -- NOT merged), including the fix_geometry() calls
+    # that already ran here (unchanged, just relocated along with the
+    # rest of the loop body), now wrapped inside a background worker()
+    # thread instead of running inline on the main thread.
+    progress = ProgressWindow(root, "Road Density Progress")
+    q = queue.Queue()
 
-    if barangay_source[0] == "local":
-        for path in barangay_source[1]:
-            brgy_gdf = gpd.read_file(path)
-            brgy_gdf["geometry"] = brgy_gdf["geometry"].apply(fix_geometry)
-            # output_column_name: preserves the exact existing column
-            # name/casing this LOCAL source's parcel layer already had
-            # (if the user confirmed overwriting one at Run time -- see
-            # on_run()'s confirmation dialog). A source with no entry
-            # here falls back to process_density()'s own default
-            # ("CAMA_DENS_ROAD").
-            output_column_name = density_column_overrides.get(path, "CAMA_DENS_ROAD")
-            result = process_density(brgy_gdf, road_gdf, os.path.basename(path),
-                                      output_column_name=output_column_name)
-            if output_mode[0] == "local":
-                desired_base_name = os.path.splitext(os.path.basename(path))[0]
-                candidate_path = os.path.join(output_mode[1], f"{desired_base_name}.gpkg")
-                had_conflict = os.path.exists(candidate_path)
-                if had_conflict and overwrite_mode == "new":
-                    base_name = resolve_output_base_name(output_mode[1], desired_base_name)
-                else:
-                    base_name = desired_base_name
-                out = os.path.join(output_mode[1], f"{base_name}.gpkg")
-                _write_gpkg(result, out)
-                print(f"✅ Saved {out}")
-                load_in_global_mapper(out)
-            else:
-                # The actual destination table was already decided by
-                # resolve_db_output_table(), BEFORE this loop even
-                # started -- fuzzy matching + user confirmation already
-                # happened there (see that function's docstring). This
-                # just uses the result. Falls back to the old
-                # filename-lowercased behavior only if
-                # resolved_table_name is somehow None here
-                # (output_mode[0] != "db" can't reach this branch, so
-                # this is just a defensive fallback).
-                local_name = os.path.splitext(os.path.basename(path))[0]
-                table = resolved_table_name if resolved_table_name is not None else local_name.lower()
-                with engine.begin() as conn:
-                    result.to_postgis(table, conn, schema=schema,
-                                      if_exists="replace", index=False)
-                print(f"🔄 Saved to DB: {table}")
-    else:
-        # Database Land Parcel sources: column-conflict check is out of
-        # scope (see _check_parcel_density_conflicts()) -- always uses
-        # process_density()'s default "CAMA_DENS_ROAD" name.
-        for table in barangay_source[1]:
-            brgy_gdf = read_postgis_clean(table, engine, schema)
-            brgy_gdf["geometry"] = brgy_gdf["geometry"].apply(fix_geometry)
-            result = process_density(brgy_gdf, road_gdf, table)
-            if output_mode[0] == "local":
-                desired_base_name = table
-                candidate_path = os.path.join(output_mode[1], f"{desired_base_name}.gpkg")
-                had_conflict = os.path.exists(candidate_path)
-                if had_conflict and overwrite_mode == "new":
-                    base_name = resolve_output_base_name(output_mode[1], desired_base_name)
-                else:
-                    base_name = desired_base_name
-                out = os.path.join(output_mode[1], f"{base_name}.gpkg")
-                _write_gpkg(result, out)
-                print(f"✅ Saved {out}")
-                load_in_global_mapper(out)
-            else:
-                with engine.begin() as conn:
-                    result.to_postgis(table, conn, schema=schema,
-                                      if_exists="replace", index=False)
-                print(f"🔄 Updated DB table: {table}")
+    def worker():
+        try:
+            def progress_cb(msg, val=None, maxv=None):
+                q.put(("update", msg, val, maxv))
 
-    messagebox.showinfo("Success", "Processing done!")
+            q.put(("update", "Loading road network...", None, None))
+            road_gdf = (
+                gpd.read_file(road_source[1][0]) if road_source[0] == "local"
+                else read_postgis_clean(road_source[1][0], engine, schema)
+            )
+
+            if barangay_source[0] == "local":
+                for path in barangay_source[1]:
+                    q.put(("update", f"Loading {os.path.basename(path)}", None, None))
+                    brgy_gdf = gpd.read_file(path)
+                    brgy_gdf["geometry"] = brgy_gdf["geometry"].apply(fix_geometry)
+                    # output_column_name: preserves the exact existing column
+                    # name/casing this LOCAL source's parcel layer already had
+                    # (if the user confirmed overwriting one at Run time -- see
+                    # on_run()'s confirmation dialog). A source with no entry
+                    # here falls back to process_density()'s own default
+                    # ("CAMA_DENS_ROAD").
+                    output_column_name = density_column_overrides.get(path, "CAMA_DENS_ROAD")
+                    result = process_density(
+                        brgy_gdf, road_gdf, os.path.basename(path),
+                        output_column_name=output_column_name,
+                        progress=progress_cb,
+                    )
+                    if output_mode[0] == "local":
+                        desired_base_name = os.path.splitext(os.path.basename(path))[0]
+                        candidate_path = os.path.join(output_mode[1], f"{desired_base_name}.gpkg")
+                        had_conflict = os.path.exists(candidate_path)
+                        if had_conflict and overwrite_mode == "new":
+                            base_name = resolve_output_base_name(output_mode[1], desired_base_name)
+                        else:
+                            base_name = desired_base_name
+                        out = os.path.join(output_mode[1], f"{base_name}.gpkg")
+                        _write_gpkg(result, out)
+                        print(f"✅ Saved {out}")
+                        q.put(("open_gm", out, None, None))
+                    else:
+                        # The actual destination table was already decided by
+                        # resolve_db_output_table(), BEFORE this loop even
+                        # started -- fuzzy matching + user confirmation already
+                        # happened there (see that function's docstring). This
+                        # just uses the result. Falls back to the old
+                        # filename-lowercased behavior only if
+                        # resolved_table_name is somehow None here
+                        # (output_mode[0] != "db" can't reach this branch, so
+                        # this is just a defensive fallback).
+                        local_name = os.path.splitext(os.path.basename(path))[0]
+                        table = resolved_table_name if resolved_table_name is not None else local_name.lower()
+                        with engine.begin() as conn:
+                            result.to_postgis(table, conn, schema=schema,
+                                              if_exists="replace", index=False)
+                        print(f"🔄 Saved to DB: {table}")
+            else:
+                # Database Land Parcel sources: column-conflict check is out of
+                # scope (see _check_parcel_density_conflicts()) -- always uses
+                # process_density()'s default "CAMA_DENS_ROAD" name.
+                for table in barangay_source[1]:
+                    q.put(("update", f"Loading DB table {table}", None, None))
+                    brgy_gdf = read_postgis_clean(table, engine, schema)
+                    brgy_gdf["geometry"] = brgy_gdf["geometry"].apply(fix_geometry)
+                    result = process_density(brgy_gdf, road_gdf, table, progress=progress_cb)
+                    if output_mode[0] == "local":
+                        desired_base_name = table
+                        candidate_path = os.path.join(output_mode[1], f"{desired_base_name}.gpkg")
+                        had_conflict = os.path.exists(candidate_path)
+                        if had_conflict and overwrite_mode == "new":
+                            base_name = resolve_output_base_name(output_mode[1], desired_base_name)
+                        else:
+                            base_name = desired_base_name
+                        out = os.path.join(output_mode[1], f"{base_name}.gpkg")
+                        _write_gpkg(result, out)
+                        print(f"✅ Saved {out}")
+                        q.put(("open_gm", out, None, None))
+                    else:
+                        with engine.begin() as conn:
+                            result.to_postgis(table, conn, schema=schema,
+                                              if_exists="replace", index=False)
+                        print(f"🔄 Updated DB table: {table}")
+
+            q.put(("done", "Processing done!", None, None))
+
+        except Exception as e:
+            # New: this function had no top-level try/except before --
+            # an uncaught exception here previously propagated silently
+            # (no graceful dialog). Required by moving to a background
+            # thread: an exception on a non-main thread that nobody
+            # catches is otherwise simply lost.
+            q.put(("error", str(e), None, None))
+
+    def poll_queue():
+        if not root.winfo_exists():
+            return
+        try:
+            while True:
+                kind, *rest = q.get_nowait()
+                if kind == "update":
+                    progress.update(rest[0], rest[1], rest[2])
+                elif kind == "open_gm":
+                    load_in_global_mapper(rest[0])
+                elif kind == "done":
+                    progress.close()
+                    messagebox.showinfo("Success", rest[0])
+                    return
+                elif kind == "error":
+                    progress.close()
+                    messagebox.showerror("Error", rest[0])
+                    return
+        except queue.Empty:
+            pass
+        root.after(100, poll_queue)
+
+    threading.Thread(target=worker, daemon=True).start()
+    poll_queue()
 
 
 # ---------------- Main ----------------

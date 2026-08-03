@@ -11,6 +11,8 @@ import psycopg2
 from sqlalchemy import create_engine, inspect, text
 from shapely.validation import make_valid
 import re
+import threading
+import queue
 
 # ============================
 # FORCE WINDOWS APP ICON
@@ -593,8 +595,15 @@ def compute_ppr_and_lot_shape_gdf(gdf,
         pp_ratio_col="CAMA_PP_RATIO", vtx_count_col="CAMA_VTX_COUNT",
         angs_txt_col="CAMA_ANGS_TXT", triangle_col="CAMA_TRIANGLE",
         rectangle_col="CAMA_RECTANGLE", l_shaped_col="CAMA_L_SHAPED",
-        others_col="CAMA_OTHERS", lot_shape_col="CAMA_LOT_SHAPE"):
+        others_col="CAMA_OTHERS", lot_shape_col="CAMA_LOT_SHAPE",
+        progress=None):
     """
+    progress : optional callable progress(message, value=None, maximum=None),
+    called from inside the per-feature classification loop below (never
+    from anywhere else in this function). Optional and defaults to None
+    so this function's existing signature/behavior is unchanged for any
+    call site that doesn't pass it -- added as part of this tool's
+    Progress Event Protocol v9 migration (see run_processing() below).
     pp_ratio_col, vtx_count_col, angs_txt_col, triangle_col,
     rectangle_col, l_shaped_col, others_col, lot_shape_col : str -- the
     column names this tool's eight computed outputs are written to.
@@ -674,7 +683,17 @@ def compute_ppr_and_lot_shape_gdf(gdf,
     # raising an error. Confirmed empirically. Independent of the
     # geometry-repair change above -- this indexing correctness issue
     # applies regardless of what fixed_geoms contains.
-    for idx, geom in fixed_geoms.items():
+    #
+    # total/enumerate(..., start=1): added for the optional progress
+    # callback below only. idx/geom themselves are completely unaffected
+    # -- enumerate() here just wraps fixed_geoms.items() to also yield a
+    # 1-based running count `i`; it does not change what idx/geom bind
+    # to on each iteration, so the gdf.at[idx, ...] label-based indexing
+    # this loop depends on (see comment above) is untouched.
+    total = len(fixed_geoms)
+    for i, (idx, geom) in enumerate(fixed_geoms.items(), start=1):
+        if progress:
+            progress(f"Classifying feature {i}/{total}", i, total)
         poly = largest_polygon(geom)
         if poly is None:
             # Temporary behavior: parcels whose geometry cannot be
@@ -1231,6 +1250,93 @@ def resolve_db_output_table(root, schema, barangay_source):
         return chosen, "overwritten"
 
 
+# ============================================================
+# Progress Event Protocol v9 -- this tool's migration.
+# ============================================================
+# This tool previously had NO background worker thread and NO progress
+# dialog at all -- run_processing() ran entirely synchronously on the
+# main thread (see run_processing()'s own comments further below).
+# Unlike lot_location.py's/road_frontage.py's migrations (pure
+# extractions of an EXISTING ProgressWindow into shared code, zero
+# behavior change), this is new functionality: a progress dialog is
+# added where none existed before. It reuses progress_framework.py's
+# PresentationState/ProgressPresentationPolicy/TkinterProgressView
+# directly -- no tool-local copies, no new abstraction, same shared
+# classes already validated by lot_location.py and road_frontage.py.
+#
+#   Worker (worker(), inside run_processing())      -> new
+#   Main-thread Message Handler (poll_queue())       -> new
+#   ProgressWindow                                   -> new (this class)
+#
+# Deliberately NOT done in this task (see conversation record):
+#   - No per-source failure isolation added -- this tool's existing
+#     all-or-nothing failure behavior (one exception aborts the whole
+#     run) is preserved exactly. Only the ERROR REPORTING changed (an
+#     uncaught exception now surfaces as a graceful "error" dialog via
+#     the Progress Event Protocol, instead of the previous silent
+#     crash with no dialog at all -- unavoidable side effect of moving
+#     work onto a background thread, since an uncaught exception on a
+#     non-main thread that nobody catches is otherwise simply lost).
+#   - The 3 overwrite dialogs in this file (ask_overwrite_dialog,
+#     confirm_db_overwrite_dialog, choose_db_overwrite_dialog) are
+#     untouched -- any topmost/hiding fix for them is a separate,
+#     dedicated follow-up task, not bundled into this migration.
+# ============================================================
+from tools.progress_framework import (
+    PresentationState,
+    ProgressPresentationPolicy,
+    TkinterProgressView,
+)
+
+
+class ProgressWindow:
+    """
+    Progress dialog shown while run_processing() works on a background
+    thread. Same shape as lot_location.py's/road_frontage.py's own
+    ProgressWindow -- status label + determinate progress bar, no
+    cancel/stop_flag support. Progress Event Protocol v9 role:
+    ProgressWindow is the host, not the decision-maker (see
+    ProgressPresentationPolicy / TkinterProgressView, imported from
+    progress_framework.py, shared with the other two migrated tools).
+    """
+    def __init__(self, root, title="Processing"):
+        from tkinter import ttk
+        self.win = tk.Toplevel(root)
+        apply_icon(self.win)
+        self.win.title(title)
+        self.win.minsize(400, 120)
+        self.win.resizable(False, False)
+        self.status_var = tk.StringVar(master=self.win)
+        self.status_var.set("Starting...")
+        tk.Label(
+            self.win, textvariable=self.status_var, anchor="center",
+            justify="left", wraplength=380,
+        ).pack(pady=10, padx=10, fill="x")
+        self.progress = ttk.Progressbar(self.win, orient="horizontal", mode="determinate", length=350)
+        self.progress.pack(pady=10)
+        self.win.attributes("-topmost", True)
+        self.win.update()
+
+        self.win.focus_force()
+        self.win.lift()
+        self.win.attributes("-topmost", True)
+        self.win.after(100, lambda: self.win.attributes("-topmost", False))
+
+        # Presentation Policy + Tkinter View collaborators (Progress
+        # Event Protocol v9), shared with lot_location.py/road_frontage.py
+        # via progress_framework.py. Constructed after the widgets they
+        # render into already exist.
+        self._policy = ProgressPresentationPolicy()
+        self._view = TkinterProgressView(self.win, self.status_var, self.progress)
+
+    def update(self, message, value=None, maximum=None):
+        state = self._policy.compute(message, value, maximum)
+        self._view.render(state)
+
+    def close(self):
+        self._view.destroy()
+
+
 def run_processing(root, overwrite_mode=None):
     # root: the live top-level window (passed from on_run(); NOT
     # `win`, which is destroyed before run_processing() is ever
@@ -1268,92 +1374,158 @@ def run_processing(root, overwrite_mode=None):
             print("Run cancelled by user (database output table not confirmed).")
             return
 
-    if barangay_source[0] == "local":
-        for path in barangay_source[1]:
-            gdf = gpd.read_file(path)
-            # Row-dropping REMOVED (Phase 1B decision, approved): every
-            # input parcel must appear exactly once in the output. A
-            # parcel whose geometry can't be repaired is no longer
-            # dropped -- compute_ppr_and_lot_shape_gdf() below keeps it
-            # in the output with its ORIGINAL geometry, PP_RATIO=NaN,
-            # and LOT_SHAPE="CAMA_OTHERS" as a temporary placeholder
-            # pending a dedicated "INVALID_GEOMETRY" classification once
-            # that business rule is finalized with the team lead.
-            #
-            # output_col_overrides: preserves each source's existing
-            # output column name(s)/casing exactly, if a conflict was
-            # detected and confirmed in on_run() -- e.g. a detected
-            # "caMA_PP_RATIO" is written back to "caMA_PP_RATIO", not a
-            # hardcoded "CAMA_PP_RATIO". Defaults to the standard
-            # CAMA_-prefixed name for any output this source has no
-            # override for.
-            output_col_overrides = parcel_output_column_overrides.get(path, {})
-            result = compute_ppr_and_lot_shape_gdf(
-                gdf,
-                pp_ratio_col=output_col_overrides.get("CAMA_PP_RATIO", "CAMA_PP_RATIO"),
-                vtx_count_col=output_col_overrides.get("CAMA_VTX_COUNT", "CAMA_VTX_COUNT"),
-                angs_txt_col=output_col_overrides.get("CAMA_ANGS_TXT", "CAMA_ANGS_TXT"),
-                triangle_col=output_col_overrides.get("CAMA_TRIANGLE", "CAMA_TRIANGLE"),
-                rectangle_col=output_col_overrides.get("CAMA_RECTANGLE", "CAMA_RECTANGLE"),
-                l_shaped_col=output_col_overrides.get("CAMA_L_SHAPED", "CAMA_L_SHAPED"),
-                others_col=output_col_overrides.get("CAMA_OTHERS", "CAMA_OTHERS"),
-                lot_shape_col=output_col_overrides.get("CAMA_LOT_SHAPE", "CAMA_LOT_SHAPE"),
-            )
-            if output_mode[0] == "local":
-                desired_base_name = os.path.splitext(os.path.basename(path))[0]
-                candidate_path = os.path.join(output_mode[1], f"{desired_base_name}.gpkg")
-                had_conflict = os.path.exists(candidate_path)
-                if had_conflict and overwrite_mode == "new":
-                    base_name = resolve_output_base_name(output_mode[1], desired_base_name)
-                else:
-                    base_name = desired_base_name
-                out = os.path.join(output_mode[1], f"{base_name}.gpkg")
-                _write_gpkg(result, out)
-                print(f"✅ Saved {out}")
-                load_in_global_mapper(out)
-            else:
-                # The actual destination table was already decided by
-                # resolve_db_output_table(), BEFORE this loop even
-                # started -- fuzzy matching + user confirmation already
-                # happened there (see that function's docstring). This
-                # just uses the result. Falls back to the old
-                # filename-lowercased behavior only if
-                # resolved_table_name is somehow None here
-                # (output_mode[0] != "db" can't reach this branch, so
-                # this is just a defensive fallback).
-                local_name = os.path.splitext(os.path.basename(path))[0]
-                table = resolved_table_name if resolved_table_name is not None else local_name.lower()
-                with engine.begin() as conn:
-                    result.to_postgis(table, conn, schema=schema, if_exists="replace", index=False)
-                print(f"🔄 Saved to DB: {table}")
-    else:
-        # Database Land Parcel sources: column-conflict check is out of
-        # scope (see _check_parcel_shape_conflicts()) -- always uses
-        # compute_ppr_and_lot_shape_gdf()'s eight default CAMA_-prefixed
-        # names.
-        for table in barangay_source[1]:
-            gdf = read_postgis_clean(table, engine, schema)
-            # Row-dropping REMOVED -- same reasoning as the local-source
-            # branch above.
-            result = compute_ppr_and_lot_shape_gdf(gdf)
-            if output_mode[0] == "local":
-                desired_base_name = table
-                candidate_path = os.path.join(output_mode[1], f"{desired_base_name}.gpkg")
-                had_conflict = os.path.exists(candidate_path)
-                if had_conflict and overwrite_mode == "new":
-                    base_name = resolve_output_base_name(output_mode[1], desired_base_name)
-                else:
-                    base_name = desired_base_name
-                out = os.path.join(output_mode[1], f"{base_name}.gpkg")
-                _write_gpkg(result, out)
-                print(f"✅ Saved {out}")
-                load_in_global_mapper(out)
-            else:
-                with engine.begin() as conn:
-                    result.to_postgis(table, conn, schema=schema, if_exists="replace", index=False)
-                print(f"🔄 Updated DB table: {table}")
+    # ============================================================
+    # Progress Event Protocol v9 -- this tool's migration.
+    # ============================================================
+    # Everything ABOVE this point (validation, credential loading,
+    # resolve_db_output_table() + its confirmation dialog(s)) is
+    # unchanged and stays on the main thread, exactly as before --
+    # matches lot_location.py's/road_frontage.py's own convention:
+    # Tkinter dialogs must never be shown from a background thread, so
+    # anything that can pop one up is resolved here, BEFORE worker()
+    # below is ever started.
+    #
+    # Everything BELOW this point is the exact same two-loop body this
+    # function always had (local-source loop, then the separate
+    # DB-source loop -- deliberately NOT merged into one loop, per
+    # explicit instruction), now wrapped inside a background worker()
+    # thread instead of running inline on the main thread. No business
+    # logic, read/write logic, or naming/output behavior is changed --
+    # only WHERE this code runs and how its progress/completion is
+    # reported.
+    progress = ProgressWindow(root, "Land Shape Progress")
+    q = queue.Queue()
 
-    messagebox.showinfo("Success", "Processing done!")
+    def worker():
+        try:
+            def progress_cb(msg, val=None, maxv=None):
+                q.put(("update", msg, val, maxv))
+
+            if barangay_source[0] == "local":
+                for path in barangay_source[1]:
+                    q.put(("update", f"Loading {os.path.basename(path)}", None, None))
+                    gdf = gpd.read_file(path)
+                    # Row-dropping REMOVED (Phase 1B decision, approved): every
+                    # input parcel must appear exactly once in the output. A
+                    # parcel whose geometry can't be repaired is no longer
+                    # dropped -- compute_ppr_and_lot_shape_gdf() below keeps it
+                    # in the output with its ORIGINAL geometry, PP_RATIO=NaN,
+                    # and LOT_SHAPE="CAMA_OTHERS" as a temporary placeholder
+                    # pending a dedicated "INVALID_GEOMETRY" classification once
+                    # that business rule is finalized with the team lead.
+                    #
+                    # output_col_overrides: preserves each source's existing
+                    # output column name(s)/casing exactly, if a conflict was
+                    # detected and confirmed in on_run() -- e.g. a detected
+                    # "caMA_PP_RATIO" is written back to "caMA_PP_RATIO", not a
+                    # hardcoded "CAMA_PP_RATIO". Defaults to the standard
+                    # CAMA_-prefixed name for any output this source has no
+                    # override for.
+                    output_col_overrides = parcel_output_column_overrides.get(path, {})
+                    result = compute_ppr_and_lot_shape_gdf(
+                        gdf,
+                        pp_ratio_col=output_col_overrides.get("CAMA_PP_RATIO", "CAMA_PP_RATIO"),
+                        vtx_count_col=output_col_overrides.get("CAMA_VTX_COUNT", "CAMA_VTX_COUNT"),
+                        angs_txt_col=output_col_overrides.get("CAMA_ANGS_TXT", "CAMA_ANGS_TXT"),
+                        triangle_col=output_col_overrides.get("CAMA_TRIANGLE", "CAMA_TRIANGLE"),
+                        rectangle_col=output_col_overrides.get("CAMA_RECTANGLE", "CAMA_RECTANGLE"),
+                        l_shaped_col=output_col_overrides.get("CAMA_L_SHAPED", "CAMA_L_SHAPED"),
+                        others_col=output_col_overrides.get("CAMA_OTHERS", "CAMA_OTHERS"),
+                        lot_shape_col=output_col_overrides.get("CAMA_LOT_SHAPE", "CAMA_LOT_SHAPE"),
+                        progress=progress_cb,
+                    )
+                    if output_mode[0] == "local":
+                        desired_base_name = os.path.splitext(os.path.basename(path))[0]
+                        candidate_path = os.path.join(output_mode[1], f"{desired_base_name}.gpkg")
+                        had_conflict = os.path.exists(candidate_path)
+                        if had_conflict and overwrite_mode == "new":
+                            base_name = resolve_output_base_name(output_mode[1], desired_base_name)
+                        else:
+                            base_name = desired_base_name
+                        out = os.path.join(output_mode[1], f"{base_name}.gpkg")
+                        _write_gpkg(result, out)
+                        print(f"✅ Saved {out}")
+                        q.put(("open_gm", out, None, None))
+                    else:
+                        # The actual destination table was already decided by
+                        # resolve_db_output_table(), BEFORE this loop even
+                        # started -- fuzzy matching + user confirmation already
+                        # happened there (see that function's docstring). This
+                        # just uses the result. Falls back to the old
+                        # filename-lowercased behavior only if
+                        # resolved_table_name is somehow None here
+                        # (output_mode[0] != "db" can't reach this branch, so
+                        # this is just a defensive fallback).
+                        local_name = os.path.splitext(os.path.basename(path))[0]
+                        table = resolved_table_name if resolved_table_name is not None else local_name.lower()
+                        with engine.begin() as conn:
+                            result.to_postgis(table, conn, schema=schema, if_exists="replace", index=False)
+                        print(f"🔄 Saved to DB: {table}")
+            else:
+                # Database Land Parcel sources: column-conflict check is out of
+                # scope (see _check_parcel_shape_conflicts()) -- always uses
+                # compute_ppr_and_lot_shape_gdf()'s eight default CAMA_-prefixed
+                # names.
+                for table in barangay_source[1]:
+                    q.put(("update", f"Loading DB table {table}", None, None))
+                    gdf = read_postgis_clean(table, engine, schema)
+                    # Row-dropping REMOVED -- same reasoning as the local-source
+                    # branch above.
+                    result = compute_ppr_and_lot_shape_gdf(gdf, progress=progress_cb)
+                    if output_mode[0] == "local":
+                        desired_base_name = table
+                        candidate_path = os.path.join(output_mode[1], f"{desired_base_name}.gpkg")
+                        had_conflict = os.path.exists(candidate_path)
+                        if had_conflict and overwrite_mode == "new":
+                            base_name = resolve_output_base_name(output_mode[1], desired_base_name)
+                        else:
+                            base_name = desired_base_name
+                        out = os.path.join(output_mode[1], f"{base_name}.gpkg")
+                        _write_gpkg(result, out)
+                        print(f"✅ Saved {out}")
+                        q.put(("open_gm", out, None, None))
+                    else:
+                        with engine.begin() as conn:
+                            result.to_postgis(table, conn, schema=schema, if_exists="replace", index=False)
+                        print(f"🔄 Updated DB table: {table}")
+
+            q.put(("done", "Processing done!", None, None))
+
+        except Exception as e:
+            # New: this function had no top-level try/except before --
+            # an uncaught exception here previously propagated silently
+            # (no graceful dialog). Required by moving to a background
+            # thread: an exception on a non-main thread that nobody
+            # catches is otherwise simply lost, with no way for the
+            # user to ever learn the run failed. This is the "error"
+            # kind of the Progress Event Protocol, same as the other
+            # three already-migrated tools.
+            q.put(("error", str(e), None, None))
+
+    def poll_queue():
+        if not root.winfo_exists():
+            return
+        try:
+            while True:
+                kind, *rest = q.get_nowait()
+                if kind == "update":
+                    progress.update(rest[0], rest[1], rest[2])
+                elif kind == "open_gm":
+                    load_in_global_mapper(rest[0])
+                elif kind == "done":
+                    progress.close()
+                    messagebox.showinfo("Success", rest[0])
+                    return
+                elif kind == "error":
+                    progress.close()
+                    messagebox.showerror("Error", rest[0])
+                    return
+        except queue.Empty:
+            pass
+        root.after(100, poll_queue)
+
+    threading.Thread(target=worker, daemon=True).start()
+    poll_queue()
 
 
 # ---------------- Main ----------------

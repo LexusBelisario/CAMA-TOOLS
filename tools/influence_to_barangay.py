@@ -9,6 +9,8 @@ from sqlalchemy import create_engine, text
 from shapely.geometry import Point
 import argparse
 import subprocess
+import threading
+import queue
 
 # ============================
 # FORCE WINDOWS APP ICON
@@ -396,7 +398,7 @@ def _check_parcel_influence_conflicts(local_paths, targets):
     return conflicts
 
 
-def transfer_attributes(barangay_gdf, influence_gdfs, output_column_map=None):
+def transfer_attributes(barangay_gdf, influence_gdfs, output_column_map=None, progress=None):
     """
     output_column_map : optional {attr_name: output_col_name} -- for
         each (infl_gdf, attr_name) pair, the joined value is written
@@ -418,9 +420,21 @@ def transfer_attributes(barangay_gdf, influence_gdfs, output_column_map=None):
         change (see the CAMA_Table section of run_processing() below,
         which reads from the resolved column name here but writes
         into CAMA_Table under the same unprefixed name it always has).
+
+    progress : optional callable progress(message, value=None, maximum=None),
+    called once per influence layer (never per parcel -- each layer's
+    spatial join below is a single vectorized gpd.sjoin() call with no
+    per-row visibility to report progress against). Optional and
+    defaults to None so this function's existing signature is unchanged
+    for any call site that doesn't pass it -- added as part of this
+    tool's Progress Event Protocol v9 migration (see run_processing()
+    below).
     """
     output_column_map = output_column_map or {}
-    for infl_gdf, attr_name in influence_gdfs:
+    total = len(influence_gdfs)
+    for i, (infl_gdf, attr_name) in enumerate(influence_gdfs, start=1):
+        if progress:
+            progress(f"Transferring attribute {i}/{total}: {attr_name}", i, total)
         infl_clean = infl_gdf[[attr_name, "geometry"]].copy()
         infl_clean = infl_clean.rename(columns={attr_name: "joined_attr"})
 
@@ -484,6 +498,77 @@ def resolve_db_output_table(root, schema, barangay_source):
         return chosen, "overwritten"
 
 
+# ============================================================
+# Progress Event Protocol v9 -- this tool's migration.
+# ============================================================
+# This tool had NO background worker thread and NO progress dialog at
+# all -- run_processing() ran entirely synchronously on the main
+# thread. Same shape of migration as land_shape_compactness.py's,
+# road_surface.py's, and road_density.py's: reuses
+# progress_framework.py's PresentationState/ProgressPresentationPolicy/
+# TkinterProgressView directly -- no tool-local copies, no new
+# abstraction.
+#
+# The existing unified per-source loop (local/db reading merged into
+# one loop, per explicit instruction) is preserved exactly as-is --
+# not split into two separate loops like the other migrated tools.
+#
+# Deliberately NOT done in this task:
+#   - No per-source failure isolation added.
+#   - The 3 overwrite dialogs in this file are untouched.
+# ============================================================
+from tools.progress_framework import (
+    PresentationState,
+    ProgressPresentationPolicy,
+    TkinterProgressView,
+)
+
+
+class ProgressWindow:
+    """
+    Progress dialog shown while run_processing() works on a background
+    thread. Same shape as the other migrated tools' ProgressWindow --
+    status label + determinate progress bar, no cancel/stop_flag
+    support. Progress Event Protocol v9 role: ProgressWindow is the
+    host, not the decision-maker (see ProgressPresentationPolicy /
+    TkinterProgressView, imported from progress_framework.py, shared
+    with lot_location.py/road_frontage.py/land_shape_compactness.py/
+    road_surface.py/road_density.py).
+    """
+    def __init__(self, root, title="Processing"):
+        from tkinter import ttk
+        self.win = tk.Toplevel(root)
+        apply_icon(self.win)
+        self.win.title(title)
+        self.win.minsize(400, 120)
+        self.win.resizable(False, False)
+        self.status_var = tk.StringVar(master=self.win)
+        self.status_var.set("Starting...")
+        tk.Label(
+            self.win, textvariable=self.status_var, anchor="center",
+            justify="left", wraplength=380,
+        ).pack(pady=10, padx=10, fill="x")
+        self.progress = ttk.Progressbar(self.win, orient="horizontal", mode="determinate", length=350)
+        self.progress.pack(pady=10)
+        self.win.attributes("-topmost", True)
+        self.win.update()
+
+        self.win.focus_force()
+        self.win.lift()
+        self.win.attributes("-topmost", True)
+        self.win.after(100, lambda: self.win.attributes("-topmost", False))
+
+        self._policy = ProgressPresentationPolicy()
+        self._view = TkinterProgressView(self.win, self.status_var, self.progress)
+
+    def update(self, message, value=None, maximum=None):
+        state = self._policy.compute(message, value, maximum)
+        self._view.render(state)
+
+    def close(self):
+        self._view.destroy()
+
+
 # -------------------- PROCESSING --------------------
 def run_processing(root, overwrite_mode=None):
     # root: the live top-level window (passed from on_run(); NOT
@@ -535,274 +620,352 @@ def run_processing(root, overwrite_mode=None):
             print("Run cancelled by user (database output table not confirmed).")
             return
 
-    influence_gdfs = []
-    added_fields = []
+    # ============================================================
+    # Progress Event Protocol v9 -- this tool's migration.
+    # ============================================================
+    # Everything ABOVE this point (validation, credential loading,
+    # resolve_db_output_table() + its confirmation dialog(s)) is
+    # unchanged and stays on the main thread, exactly as before.
+    #
+    # Everything below is the exact same logic this function always
+    # had: influence-layer loading, then the single UNIFIED per-source
+    # loop (deliberately left unified, not split into separate
+    # local/db branches like the other tools -- this tool's original
+    # structure already merges local/db reading into one loop with an
+    # if/else inside it, and a separate if/else for the write step;
+    # that shape is preserved exactly, not restructured), including the
+    # full CAMA_Table/CAMA_Transaction_Log transaction -- now wrapped
+    # inside a background worker() thread instead of running inline on
+    # the main thread.
+    progress = ProgressWindow(root, "Influence to Barangay Progress")
+    q = queue.Queue()
 
-    # --- Load influence layers ---
-    if influence_source[0] == "local":
-        for path in influence_source[1]:
-            gdf = read_vector_file(path).to_crs(epsg=3857)
-            gdf = ensure_geometry_column(gdf)
-            name_guess = get_local_name(path)
-            attr_name = detect_attr_name(gdf, name_guess)
-            influence_gdfs.append((gdf, attr_name))
-            added_fields.append(attr_name)
-    else:
-        for table in influence_source[1]:
-            geom_col = get_geom_column(engine, schema, table)
-            gdf = gpd.read_postgis(
-                f'SELECT * FROM "{schema}"."{table}"', engine, geom_col=geom_col
-            ).to_crs(epsg=3857)
-            gdf = ensure_geometry_column(gdf)
-            attr_name = detect_attr_name(gdf, table)
-            influence_gdfs.append((gdf, attr_name))
-            added_fields.append(attr_name)
+    def worker():
+        try:
+            def progress_cb(msg, val=None, maxv=None):
+                q.put(("update", msg, val, maxv))
 
-    # --- Process Barangay ---
-    sources = barangay_source[1]
-    for src in sources:
-        if barangay_source[0] == "local":
-            local_name = get_local_name(src)
-            b_gdf_raw = read_vector_file(src)
-        else:
-            local_name = src
-            geom_col = get_geom_column(engine, schema, src)
-            b_gdf_raw = gpd.read_postgis(
-                f'SELECT * FROM "{schema}"."{src}"', engine, geom_col=geom_col
-            )
+            influence_gdfs = []
+            added_fields = []
 
-        # Preserve the parcel layer's original CRS so the final output
-        # can be reprojected back to it before saving. 3857 (below) is
-        # only the working CRS used for the spatial join against the
-        # influence/thematic layers -- not the intended CRS of the
-        # saved output. Captured now, before b_gdf gets reprojected.
-        original_crs = b_gdf_raw.crs
-        b_gdf = b_gdf_raw.to_crs(epsg=3857)
-
-        b_gdf = ensure_geometry_column(b_gdf)
-
-        # output_column_map: preserves this source's existing output
-        # column name(s)/casing exactly, if a conflict was detected and
-        # confirmed in on_run() -- e.g. a detected "caMA_FloodLevel" is
-        # written back to "caMA_FloodLevel", not a hardcoded
-        # "CAMA_FloodLevel". Defaults to the standard CAMA_-prefixed
-        # name for any attr_name this source has no override for.
-        # Always {} for DB-sourced parcels (column-conflict check is
-        # LOCAL-only), so this naturally falls back to every default in
-        # that case.
-        src_col_overrides = (
-            parcel_output_column_overrides.get(src, {})
-            if barangay_source[0] == "local" else {}
-        )
-        output_column_map = {
-            attr_name: src_col_overrides.get(f"CAMA_{attr_name}", f"CAMA_{attr_name}")
-            for attr_name in added_fields
-        }
-        b_gdf = transfer_attributes(b_gdf, influence_gdfs, output_column_map=output_column_map)
-
-        # --- Save outputs ---
-        if output_mode[0] == "local":
-            out_dir = output_mode[1]
-            desired_base_name = local_name
-            candidate_path = os.path.join(out_dir, f"{desired_base_name}.gpkg")
-            had_conflict = os.path.exists(candidate_path)
-            if had_conflict and overwrite_mode == "new":
-                base_name = resolve_output_base_name(out_dir, desired_base_name)
+            # --- Load influence layers ---
+            total_influence = len(influence_source[1])
+            if influence_source[0] == "local":
+                for i, path in enumerate(influence_source[1], start=1):
+                    progress_cb(f"Loading influence layer {i}/{total_influence}", i, total_influence)
+                    gdf = read_vector_file(path).to_crs(epsg=3857)
+                    gdf = ensure_geometry_column(gdf)
+                    name_guess = get_local_name(path)
+                    attr_name = detect_attr_name(gdf, name_guess)
+                    influence_gdfs.append((gdf, attr_name))
+                    added_fields.append(attr_name)
             else:
-                base_name = desired_base_name
-            out_path = os.path.join(out_dir, f"{base_name}.gpkg")
+                for i, table in enumerate(influence_source[1], start=1):
+                    progress_cb(f"Loading influence layer {i}/{total_influence}", i, total_influence)
+                    geom_col = get_geom_column(engine, schema, table)
+                    gdf = gpd.read_postgis(
+                        f'SELECT * FROM "{schema}"."{table}"', engine, geom_col=geom_col
+                    ).to_crs(epsg=3857)
+                    gdf = ensure_geometry_column(gdf)
+                    attr_name = detect_attr_name(gdf, table)
+                    influence_gdfs.append((gdf, attr_name))
+                    added_fields.append(attr_name)
 
-            # 1️⃣ Ensure CRS exists
-            if b_gdf.crs is None:
-                raise RuntimeError("❌ Cannot write file: CRS is None")
-
-            # 2️⃣ Restore the parcel layer's original CRS (captured
-            # above, before the 3857 working-CRS reprojection). Falls
-            # back to WGS84 only if the source itself had no CRS to
-            # begin with -- there's nothing to "restore" in that case.
-            if original_crs is not None:
-                b_gdf = b_gdf.to_crs(original_crs)
-            else:
-                b_gdf = b_gdf.to_crs(epsg=4326)
-            print("🧭 CRS before save:", b_gdf.crs)
-
-            # 3️⃣ Fix invalid geometries
-            if not b_gdf.is_valid.all():
-                print("⚠️ Fixing invalid geometries")
-                b_gdf["geometry"] = b_gdf.geometry.buffer(0)
-
-            # 4️⃣ Write GeoPackage
-            _write_gpkg(b_gdf, out_path)
-
-            print(f"✅ Saved: {out_path}")
-            load_in_global_mapper(out_path)
-
-        else:
-            # The actual destination table was already decided by
-            # resolve_db_output_table(), BEFORE this loop even
-            # started -- fuzzy matching + user confirmation already
-            # happened there (see that function's docstring). This
-            # just uses the result. Falls back to the old
-            # filename-lowercased behavior only if resolved_table_name
-            # is somehow None here (output_mode[0] != "db" can't reach
-            # this branch, so this is just a defensive fallback).
-            target_table = resolved_table_name if resolved_table_name is not None else local_name.lower()
-            table_action = resolved_outcome if resolved_outcome is not None else "new"
-
-            print(f"🗂️ Saving to DB: {target_table} ({table_action})")
-
-            # Same restoration as the local-file save path above --
-            # b_gdf is still in the 3857 working CRS at this point.
-            if original_crs is not None:
-                b_gdf = b_gdf.to_crs(original_crs)
-            else:
-                b_gdf = b_gdf.to_crs(epsg=4326)
-
-            # --------------- 🟢 Main table + CAMA Table and Log --------------- #
-            # The main table write and the CAMA_Table/log updates below
-            # now share ONE transaction -- previously the main table
-            # write used a bare `engine` (auto-committing on its own,
-            # outside any transaction), while only the CAMA_Table
-            # portion had real engine.begin() atomicity. That meant a
-            # CAMA_Table failure could leave the main table already
-            # committed with no rollback. Merging them closes that gap:
-            # if ANY part fails -- the main table write, CAMA_Table, or
-            # CAMA_Transaction_Log -- everything rolls back together as
-            # one unit.
-            with engine.begin() as conn:
-                b_gdf.to_postgis(
-                    target_table,
-                    conn,
-                    schema=schema,
-                    if_exists="replace",
-                    index=False
-                )
-
-                # Ensure CAMA_Table exists
-                conn.execute(
-                    text(
-                        f"""
-                    CREATE TABLE IF NOT EXISTS "{schema}"."CAMA_Table" (
-                        id SERIAL PRIMARY KEY,
-                        PIN TEXT UNIQUE NOT NULL
-                    );
-                """
+            # --- Process Barangay ---
+            sources = barangay_source[1]
+            for src in sources:
+                if barangay_source[0] == "local":
+                    local_name = get_local_name(src)
+                    progress_cb(f"Loading {local_name}", None, None)
+                    b_gdf_raw = read_vector_file(src)
+                else:
+                    local_name = src
+                    progress_cb(f"Loading DB table {local_name}", None, None)
+                    geom_col = get_geom_column(engine, schema, src)
+                    b_gdf_raw = gpd.read_postgis(
+                        f'SELECT * FROM "{schema}"."{src}"', engine, geom_col=geom_col
                     )
+
+                # Preserve the parcel layer's original CRS so the final output
+                # can be reprojected back to it before saving. 3857 (below) is
+                # only the working CRS used for the spatial join against the
+                # influence/thematic layers -- not the intended CRS of the
+                # saved output. Captured now, before b_gdf gets reprojected.
+                original_crs = b_gdf_raw.crs
+                b_gdf = b_gdf_raw.to_crs(epsg=3857)
+
+                b_gdf = ensure_geometry_column(b_gdf)
+
+                # output_column_map: preserves this source's existing output
+                # column name(s)/casing exactly, if a conflict was detected and
+                # confirmed in on_run() -- e.g. a detected "caMA_FloodLevel" is
+                # written back to "caMA_FloodLevel", not a hardcoded
+                # "CAMA_FloodLevel". Defaults to the standard CAMA_-prefixed
+                # name for any attr_name this source has no override for.
+                # Always {} for DB-sourced parcels (column-conflict check is
+                # LOCAL-only), so this naturally falls back to every default in
+                # that case.
+                src_col_overrides = (
+                    parcel_output_column_overrides.get(src, {})
+                    if barangay_source[0] == "local" else {}
+                )
+                output_column_map = {
+                    attr_name: src_col_overrides.get(f"CAMA_{attr_name}", f"CAMA_{attr_name}")
+                    for attr_name in added_fields
+                }
+                b_gdf = transfer_attributes(
+                    b_gdf, influence_gdfs,
+                    output_column_map=output_column_map,
+                    progress=progress_cb,
                 )
 
-                # Add missing columns as NUMERIC
-                for col in added_fields:
-                    conn.execute(
-                        text(
-                            f"""
-                        DO $$
-                        BEGIN
-                            IF NOT EXISTS (
-                                SELECT 1 FROM information_schema.columns
-                                WHERE table_schema='{schema}'
-                                  AND table_name='CAMA_Table'
-                                  AND column_name='{col.lower()}'
-                            ) THEN
-                                EXECUTE 'ALTER TABLE "{schema}"."CAMA_Table" ADD COLUMN "{col.lower()}" NUMERIC';
-                            END IF;
-                        END $$;
-                    """
+                # --- Save outputs ---
+                if output_mode[0] == "local":
+                    out_dir = output_mode[1]
+                    desired_base_name = local_name
+                    candidate_path = os.path.join(out_dir, f"{desired_base_name}.gpkg")
+                    had_conflict = os.path.exists(candidate_path)
+                    if had_conflict and overwrite_mode == "new":
+                        base_name = resolve_output_base_name(out_dir, desired_base_name)
+                    else:
+                        base_name = desired_base_name
+                    out_path = os.path.join(out_dir, f"{base_name}.gpkg")
+
+                    # 1️⃣ Ensure CRS exists
+                    if b_gdf.crs is None:
+                        raise RuntimeError("❌ Cannot write file: CRS is None")
+
+                    # 2️⃣ Restore the parcel layer's original CRS (captured
+                    # above, before the 3857 working-CRS reprojection). Falls
+                    # back to WGS84 only if the source itself had no CRS to
+                    # begin with -- there's nothing to "restore" in that case.
+                    if original_crs is not None:
+                        b_gdf = b_gdf.to_crs(original_crs)
+                    else:
+                        b_gdf = b_gdf.to_crs(epsg=4326)
+                    print("🧭 CRS before save:", b_gdf.crs)
+
+                    # 3️⃣ Fix invalid geometries
+                    if not b_gdf.is_valid.all():
+                        print("⚠️ Fixing invalid geometries")
+                        b_gdf["geometry"] = b_gdf.geometry.buffer(0)
+
+                    # 4️⃣ Write GeoPackage
+                    _write_gpkg(b_gdf, out_path)
+
+                    print(f"✅ Saved: {out_path}")
+                    q.put(("open_gm", out_path, None, None))
+
+                else:
+                    # The actual destination table was already decided by
+                    # resolve_db_output_table(), BEFORE this loop even
+                    # started -- fuzzy matching + user confirmation already
+                    # happened there (see that function's docstring). This
+                    # just uses the result. Falls back to the old
+                    # filename-lowercased behavior only if resolved_table_name
+                    # is somehow None here (output_mode[0] != "db" can't reach
+                    # this branch, so this is just a defensive fallback).
+                    target_table = resolved_table_name if resolved_table_name is not None else local_name.lower()
+                    table_action = resolved_outcome if resolved_outcome is not None else "new"
+
+                    print(f"🗂️ Saving to DB: {target_table} ({table_action})")
+
+                    # Same restoration as the local-file save path above --
+                    # b_gdf is still in the 3857 working CRS at this point.
+                    if original_crs is not None:
+                        b_gdf = b_gdf.to_crs(original_crs)
+                    else:
+                        b_gdf = b_gdf.to_crs(epsg=4326)
+
+                    # --------------- 🟢 Main table + CAMA Table and Log --------------- #
+                    # The main table write and the CAMA_Table/log updates below
+                    # now share ONE transaction -- previously the main table
+                    # write used a bare `engine` (auto-committing on its own,
+                    # outside any transaction), while only the CAMA_Table
+                    # portion had real engine.begin() atomicity. That meant a
+                    # CAMA_Table failure could leave the main table already
+                    # committed with no rollback. Merging them closes that gap:
+                    # if ANY part fails -- the main table write, CAMA_Table, or
+                    # CAMA_Transaction_Log -- everything rolls back together as
+                    # one unit.
+                    with engine.begin() as conn:
+                        b_gdf.to_postgis(
+                            target_table,
+                            conn,
+                            schema=schema,
+                            if_exists="replace",
+                            index=False
                         )
-                    )
 
-                # Insert or update PIN-based values using named parameters
-                pin_field = next((c for c in b_gdf.columns if c.lower() == "pin"), None)
-                if pin_field:
-                    for _, row in b_gdf.iterrows():
-                        insert_cols = ["PIN"] + [c.lower() for c in added_fields]
-                        insert_placeholders = [f":{c.lower()}" for c in insert_cols]
-                        update_assignments = [f'"{c.lower()}" = :{c.lower()}_upd' for c in added_fields]
-
-                        sql = f"""
-                        INSERT INTO "{schema}"."CAMA_Table" ({', '.join(insert_cols)})
-                        VALUES ({', '.join(insert_placeholders)})
-                        ON CONFLICT (PIN) DO UPDATE
-                        SET {', '.join(update_assignments)};
+                        # Ensure CAMA_Table exists
+                        conn.execute(
+                            text(
+                                f"""
+                            CREATE TABLE IF NOT EXISTS "{schema}"."CAMA_Table" (
+                                id SERIAL PRIMARY KEY,
+                                PIN TEXT UNIQUE NOT NULL
+                            );
                         """
+                            )
+                        )
 
-                        params = {}
-                        params["pin"] = str(row[pin_field])
-                        
-                        for c in added_fields:
-                            # Source-side lookup only -- CAMA_Table's
-                            # OWN column names (c.lower(), used for
-                            # insert_cols/update_assignments/params keys
-                            # above and below) are UNCHANGED by this
-                            # fix. This only changes WHERE the value is
-                            # read FROM in b_gdf: prefer the new
-                            # CAMA_-prefixed column (the one
-                            # transfer_attributes() actually wrote this
-                            # run -- output_column_map already resolved
-                            # any per-source override casing), falling
-                            # back to the legacy unprefixed column name
-                            # if the new one somehow isn't present (e.g.
-                            # a barangay/parcel source that still has an
-                            # old, pre-CAMA_-prefix column from before
-                            # this change, and for whatever reason the
-                            # new column wasn't created this run).
-                            # Without this fallback-aware lookup, every
-                            # CAMA_Table value would silently become
-                            # NULL after the CAMA_ prefix rollout, since
-                            # b_gdf no longer has a column literally
-                            # named `c`.
-                            resolved_col = output_column_map.get(c, f"CAMA_{c}")
-                            if resolved_col in row:
-                                source_val = row[resolved_col]
-                            elif c in row:
-                                source_val = row[c]
-                            else:
-                                source_val = None
+                        # Add missing columns as NUMERIC
+                        for col in added_fields:
+                            conn.execute(
+                                text(
+                                    f"""
+                                DO $$
+                                BEGIN
+                                    IF NOT EXISTS (
+                                        SELECT 1 FROM information_schema.columns
+                                        WHERE table_schema='{schema}'
+                                          AND table_name='CAMA_Table'
+                                          AND column_name='{col.lower()}'
+                                    ) THEN
+                                        EXECUTE 'ALTER TABLE "{schema}"."CAMA_Table" ADD COLUMN "{col.lower()}" NUMERIC';
+                                    END IF;
+                                END $$;
+                            """
+                                )
+                            )
 
-                            if source_val is not None:
-                                try:
-                                    params[c.lower()] = float(source_val)
-                                    params[f"{c.lower()}_upd"] = float(source_val)
-                                except (ValueError, TypeError):
-                                    params[c.lower()] = None
-                                    params[f"{c.lower()}_upd"] = None
-                            else:
-                                params[c.lower()] = None
-                                params[f"{c.lower()}_upd"] = None
+                        # Insert or update PIN-based values using named parameters
+                        pin_field = next((c for c in b_gdf.columns if c.lower() == "pin"), None)
+                        if pin_field:
+                            # Instrumentation only (per explicit instruction):
+                            # total/enumerate(..., start=1) added purely to
+                            # report progress -- the SQL logic and transaction
+                            # flow inside this loop are completely unchanged.
+                            # This loop executes one SQL statement per parcel
+                            # row and can become the longest-running part of
+                            # the operation, so it gets its own progress
+                            # messages rather than leaving the dialog looking
+                            # stalled for its whole duration.
+                            total_rows = len(b_gdf)
+                            for row_i, (_, row) in enumerate(b_gdf.iterrows(), start=1):
+                                progress_cb(f"Updating CAMA_Table: {row_i}/{total_rows}", row_i, total_rows)
+                                insert_cols = ["PIN"] + [c.lower() for c in added_fields]
+                                insert_placeholders = [f":{c.lower()}" for c in insert_cols]
+                                update_assignments = [f'"{c.lower()}" = :{c.lower()}_upd' for c in added_fields]
 
-                        conn.execute(text(sql), params)
+                                sql = f"""
+                                INSERT INTO "{schema}"."CAMA_Table" ({', '.join(insert_cols)})
+                                VALUES ({', '.join(insert_placeholders)})
+                                ON CONFLICT (PIN) DO UPDATE
+                                SET {', '.join(update_assignments)};
+                                """
 
-                # Ensure CAMA_Transaction_Log exists
-                conn.execute(
-                    text(
-                        f"""
-                    CREATE TABLE IF NOT EXISTS "{schema}"."CAMA_Transaction_Log" (
-                        id SERIAL PRIMARY KEY,
-                        table_name TEXT,
-                        cama_tool TEXT,
-                        cama_fields TEXT,
-                        transaction_date_time TIMESTAMP DEFAULT NOW()
-                    );
-                """
-                    )
-                )
+                                params = {}
+                                params["pin"] = str(row[pin_field])
 
-                # Log transaction
-                conn.execute(
-                    text(
-                        f"""
-                    INSERT INTO "{schema}"."CAMA_Transaction_Log" 
-                    (table_name, cama_tool, cama_fields)
-                    VALUES (:tbl, :tool, :details);
-                """
-                    ),
-                    {
-                        "tbl": f"{target_table} ({table_action})",
-                        "tool": "influence_to_barangay",
-                        "details": ", ".join(added_fields),
-                    },
-                )
+                                for c in added_fields:
+                                    # Source-side lookup only -- CAMA_Table's
+                                    # OWN column names (c.lower(), used for
+                                    # insert_cols/update_assignments/params keys
+                                    # above and below) are UNCHANGED by this
+                                    # fix. This only changes WHERE the value is
+                                    # read FROM in b_gdf: prefer the new
+                                    # CAMA_-prefixed column (the one
+                                    # transfer_attributes() actually wrote this
+                                    # run -- output_column_map already resolved
+                                    # any per-source override casing), falling
+                                    # back to the legacy unprefixed column name
+                                    # if the new one somehow isn't present (e.g.
+                                    # a barangay/parcel source that still has an
+                                    # old, pre-CAMA_-prefix column from before
+                                    # this change, and for whatever reason the
+                                    # new column wasn't created this run).
+                                    # Without this fallback-aware lookup, every
+                                    # CAMA_Table value would silently become
+                                    # NULL after the CAMA_ prefix rollout, since
+                                    # b_gdf no longer has a column literally
+                                    # named `c`.
+                                    resolved_col = output_column_map.get(c, f"CAMA_{c}")
+                                    if resolved_col in row:
+                                        source_val = row[resolved_col]
+                                    elif c in row:
+                                        source_val = row[c]
+                                    else:
+                                        source_val = None
 
-    messagebox.showinfo("Success", "✅ Processing done with CAMA logs!")
+                                    if source_val is not None:
+                                        try:
+                                            params[c.lower()] = float(source_val)
+                                            params[f"{c.lower()}_upd"] = float(source_val)
+                                        except (ValueError, TypeError):
+                                            params[c.lower()] = None
+                                            params[f"{c.lower()}_upd"] = None
+                                    else:
+                                        params[c.lower()] = None
+                                        params[f"{c.lower()}_upd"] = None
+
+                                conn.execute(text(sql), params)
+
+                        # Ensure CAMA_Transaction_Log exists
+                        conn.execute(
+                            text(
+                                f"""
+                            CREATE TABLE IF NOT EXISTS "{schema}"."CAMA_Transaction_Log" (
+                                id SERIAL PRIMARY KEY,
+                                table_name TEXT,
+                                cama_tool TEXT,
+                                cama_fields TEXT,
+                                transaction_date_time TIMESTAMP DEFAULT NOW()
+                            );
+                        """
+                            )
+                        )
+
+                        # Log transaction
+                        conn.execute(
+                            text(
+                                f"""
+                            INSERT INTO "{schema}"."CAMA_Transaction_Log" 
+                            (table_name, cama_tool, cama_fields)
+                            VALUES (:tbl, :tool, :details);
+                        """
+                            ),
+                            {
+                                "tbl": f"{target_table} ({table_action})",
+                                "tool": "influence_to_barangay",
+                                "details": ", ".join(added_fields),
+                            },
+                        )
+
+            q.put(("done", "✅ Processing done with CAMA logs!", None, None))
+
+        except Exception as e:
+            # New: this function had no top-level try/except before --
+            # an uncaught exception here previously propagated silently
+            # (no graceful dialog). Required by moving to a background
+            # thread: an exception on a non-main thread that nobody
+            # catches is otherwise simply lost.
+            q.put(("error", str(e), None, None))
+
+    def poll_queue():
+        if not root.winfo_exists():
+            return
+        try:
+            while True:
+                kind, *rest = q.get_nowait()
+                if kind == "update":
+                    progress.update(rest[0], rest[1], rest[2])
+                elif kind == "open_gm":
+                    load_in_global_mapper(rest[0])
+                elif kind == "done":
+                    progress.close()
+                    messagebox.showinfo("Success", rest[0])
+                    return
+                elif kind == "error":
+                    progress.close()
+                    messagebox.showerror("Error", rest[0])
+                    return
+        except queue.Empty:
+            pass
+        root.after(100, poll_queue)
+
+    threading.Thread(target=worker, daemon=True).start()
+    poll_queue()
 
 
 
