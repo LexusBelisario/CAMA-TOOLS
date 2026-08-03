@@ -9,6 +9,8 @@ import subprocess
 import json
 import psycopg2
 from sqlalchemy import create_engine, inspect, text
+import threading
+import queue
 
 # ============================
 # FORCE WINDOWS APP ICON
@@ -234,7 +236,7 @@ def _check_parcel_surface_conflicts(local_paths):
 # elsewhere in this project. Empirically confirmed .intersects() and
 # .distance() both return without crashing on a self-intersecting test
 # polygon, including at GeoSeries batch level. No fix_geometry() added.
-def process_surface(brgy_gdf, road_gdf, output_column_name="CAMA_RD_SURFACE"):
+def process_surface(brgy_gdf, road_gdf, output_column_name="CAMA_RD_SURFACE", progress=None):
     """
     output_column_name : str -- the column name the computed road
         surface(s) are written to. Defaults to "CAMA_RD_SURFACE" (this
@@ -246,6 +248,13 @@ def process_surface(brgy_gdf, road_gdf, output_column_name="CAMA_RD_SURFACE"):
         existing name/casing is passed here so processing writes back
         into that same column instead of creating a hardcoded
         "CAMA_RD_SURFACE" alongside it as a confusing duplicate.
+
+    progress : optional callable progress(message, value=None, maximum=None),
+    called from inside the two loops below (never from anywhere else in
+    this function). Optional and defaults to None so this function's
+    existing signature is unchanged for any call site that doesn't pass
+    it -- added as part of this tool's Progress Event Protocol v9
+    migration (see run_processing() below).
     """
     # Save original CRS
     orig_crs = brgy_gdf.crs
@@ -262,12 +271,26 @@ def process_surface(brgy_gdf, road_gdf, output_column_name="CAMA_RD_SURFACE"):
         None
     )
     if surface_col is None:
-        messagebox.showerror(
-            "Missing Column",
+        # BUG FIX (deliberate, not a preserved behavior -- see
+        # run_processing()'s Progress Event Protocol v9 migration
+        # comment for the full record): the previous version of this
+        # branch called messagebox.showerror(...) and then
+        # `return brgy_gdf` -- the caller had no way to know a fatal
+        # validation error had occurred, so run_processing() continued
+        # on to write this INCOMPLETE gdf (missing the output column
+        # entirely) to the destination, and still showed the final
+        # "Success" dialog afterward. Raising here instead makes this a
+        # real fatal error: the caller (worker(), in run_processing())
+        # already has a try/except that turns any raised exception into
+        # the Progress Event Protocol's "error" event -- which shows
+        # the modal error on the MAIN thread (never from here, the
+        # worker thread), writes nothing, and never reaches "done"/the
+        # Success dialog. Also fixes the pre-existing Tkinter-call-from
+        # -background-thread hazard this line would otherwise have had.
+        raise ValueError(
             f"Road layer has no 'surface' column.\n\n"
             f"Available columns: {', '.join(road_gdf.columns.tolist())}"
         )
-        return brgy_gdf
 
     print(f"ℹ️ Using road surface column: '{surface_col}'")
 
@@ -278,7 +301,10 @@ def process_surface(brgy_gdf, road_gdf, output_column_name="CAMA_RD_SURFACE"):
     brgy_gdf[output_column_name] = [[] for _ in range(len(brgy_gdf))]
 
     # Assign surfaces from intersecting roads
-    for _, road in road_buffer.iterrows():
+    total_roads = len(road_buffer)
+    for i, (_, road) in enumerate(road_buffer.iterrows(), start=1):
+        if progress:
+            progress(f"Assigning road surfaces: {i}/{total_roads}", i, total_roads)
         surface_val = str(road.get(surface_col, "")).strip()
         if not surface_val:
             continue
@@ -289,7 +315,11 @@ def process_surface(brgy_gdf, road_gdf, output_column_name="CAMA_RD_SURFACE"):
 
     # Nearest road for those with no intersections
     no_surface_mask = brgy_gdf[output_column_name].apply(lambda x: len(x) == 0)
-    for idx, row in brgy_gdf[no_surface_mask].iterrows():
+    unmatched = brgy_gdf[no_surface_mask]
+    total_unmatched = len(unmatched)
+    for i, (idx, row) in enumerate(unmatched.iterrows(), start=1):
+        if progress:
+            progress(f"Resolving unmatched parcels: {i}/{total_unmatched}", i, total_unmatched)
         centroid: Point = row.geometry.centroid
         distances = road_gdf.distance(centroid)
         nearest_idx = distances.idxmin()
@@ -1181,6 +1211,83 @@ def resolve_db_output_table(root, schema, barangay_source):
         return chosen, "overwritten"
 
 
+# ============================================================
+# Progress Event Protocol v9 -- this tool's migration.
+# ============================================================
+# This tool previously had NO background worker thread and NO progress
+# dialog at all -- run_processing() ran entirely synchronously on the
+# main thread. Same shape of migration as land_shape_compactness.py's:
+# new functionality (a progress dialog where none existed), reusing
+# progress_framework.py's PresentationState/ProgressPresentationPolicy/
+# TkinterProgressView directly -- no tool-local copies, no new
+# abstraction.
+#
+# One additional fix beyond land_shape_compactness.py's migration: this
+# tool's process_surface() had a pre-existing bug where a missing
+# 'surface' column on the road layer showed an error dialog but then
+# CONTINUED -- writing an incomplete output and still reaching the
+# final "Success" dialog afterward. That is not preserved -- see
+# process_surface()'s own comment at the raise ValueError(...) for the
+# full record. It's now a genuine fatal error, routed through the same
+# "error" event every other exception already uses -- no new event
+# kind was needed.
+#
+# Deliberately NOT done in this task:
+#   - No per-source failure isolation added.
+#   - The 3 overwrite dialogs in this file are untouched -- any
+#     topmost/hiding fix for them is a separate, dedicated follow-up.
+# ============================================================
+from tools.progress_framework import (
+    PresentationState,
+    ProgressPresentationPolicy,
+    TkinterProgressView,
+)
+
+
+class ProgressWindow:
+    """
+    Progress dialog shown while run_processing() works on a background
+    thread. Same shape as the other migrated tools' ProgressWindow --
+    status label + determinate progress bar, no cancel/stop_flag
+    support. Progress Event Protocol v9 role: ProgressWindow is the
+    host, not the decision-maker (see ProgressPresentationPolicy /
+    TkinterProgressView, imported from progress_framework.py, shared
+    with lot_location.py/road_frontage.py/land_shape_compactness.py).
+    """
+    def __init__(self, root, title="Processing"):
+        from tkinter import ttk
+        self.win = tk.Toplevel(root)
+        apply_icon(self.win)
+        self.win.title(title)
+        self.win.minsize(400, 120)
+        self.win.resizable(False, False)
+        self.status_var = tk.StringVar(master=self.win)
+        self.status_var.set("Starting...")
+        tk.Label(
+            self.win, textvariable=self.status_var, anchor="center",
+            justify="left", wraplength=380,
+        ).pack(pady=10, padx=10, fill="x")
+        self.progress = ttk.Progressbar(self.win, orient="horizontal", mode="determinate", length=350)
+        self.progress.pack(pady=10)
+        self.win.attributes("-topmost", True)
+        self.win.update()
+
+        self.win.focus_force()
+        self.win.lift()
+        self.win.attributes("-topmost", True)
+        self.win.after(100, lambda: self.win.attributes("-topmost", False))
+
+        self._policy = ProgressPresentationPolicy()
+        self._view = TkinterProgressView(self.win, self.status_var, self.progress)
+
+    def update(self, message, value=None, maximum=None):
+        state = self._policy.compute(message, value, maximum)
+        self._view.render(state)
+
+    def close(self):
+        self._view.destroy()
+
+
 # ---------------- Run ----------------
 def run_processing(root, overwrite_mode=None):
     # root: the live top-level window (passed from on_run(); NOT
@@ -1219,82 +1326,151 @@ def run_processing(root, overwrite_mode=None):
             print("Run cancelled by user (database output table not confirmed).")
             return
 
-    if road_source[0] == "local":
-        road_gdf = gpd.read_file(road_source[1][0])
-    else:
-        road_gdf = read_postgis_clean(road_source[1][0], engine, schema)
+    # ============================================================
+    # Progress Event Protocol v9 -- this tool's migration.
+    # ============================================================
+    # Everything ABOVE this point (validation, credential loading,
+    # resolve_db_output_table() + its confirmation dialog(s)) is
+    # unchanged and stays on the main thread, exactly as before.
+    #
+    # road_gdf loading moves into worker() below (it previously ran
+    # inline here, before either loop) -- matches lot_location.py's/
+    # road_frontage.py's own established convention of loading the
+    # shared road layer inside the background thread, with a status
+    # message, rather than blocking the GUI on the main thread first.
+    #
+    # Everything else below is the exact same two-loop body this
+    # function always had (local-source loop, then the separate
+    # DB-source loop -- NOT merged), now wrapped inside a background
+    # worker() thread instead of running inline on the main thread.
+    progress = ProgressWindow(root, "Road Surface Progress")
+    q = queue.Queue()
 
-    if barangay_source[0] == "local":
-        for path in barangay_source[1]:
-            brgy_gdf = gpd.read_file(path)
-            # output_column_name: preserves the exact existing column
-            # name/casing this LOCAL source's parcel layer already had
-            # (if the user confirmed overwriting one at Run time -- see
-            # on_run()'s confirmation dialog). A source with no entry
-            # here falls back to process_surface()'s own default
-            # ("CAMA_RD_SURFACE").
-            output_column_name = surface_column_overrides.get(path, "CAMA_RD_SURFACE")
-            result = process_surface(brgy_gdf, road_gdf, output_column_name=output_column_name)
-            if output_mode[0] == "local":
-                desired_base_name = os.path.splitext(os.path.basename(path))[0]
-                candidate_path = os.path.join(output_mode[1], f"{desired_base_name}.gpkg")
-                had_conflict = os.path.exists(candidate_path)
-                if had_conflict and overwrite_mode == "new":
-                    base_name = resolve_output_base_name(output_mode[1], desired_base_name)
-                else:
-                    base_name = desired_base_name
-                out = os.path.join(output_mode[1], f"{base_name}.gpkg")
-                _write_gpkg(result, out)
-                print(f"✅ Saved {out}")
-                load_in_global_mapper(out)
-            else:
-                # The actual destination table was already decided by
-                # resolve_db_output_table(), BEFORE this loop even
-                # started -- fuzzy matching + user confirmation already
-                # happened there (see that function's docstring).
-                # Falls back to the old "base + _roadsurface" behavior
-                # only if resolved_table_name is somehow None here
-                # (output_mode[0] != "db" can't reach this branch, so
-                # this is just a defensive fallback).
-                base = os.path.splitext(os.path.basename(path))[0]
-                out_table = resolved_table_name if resolved_table_name is not None else base + "_roadsurface"
-                with engine.begin() as conn:
-                    result.to_postgis(out_table, conn, schema=schema,
-                                      if_exists="replace", index=False)
-                print(f"🔄 Saved to DB: {out_table}")
-    else:
-        # Database Land Parcel sources: column-conflict check is out of
-        # scope (see _check_parcel_surface_conflicts()) -- always uses
-        # process_surface()'s default "CAMA_RD_SURFACE" name.
-        for table in barangay_source[1]:
-            brgy_gdf = read_postgis_clean(table, engine, schema)
-            result = process_surface(brgy_gdf, road_gdf)
-            if output_mode[0] == "local":
-                desired_base_name = table
-                candidate_path = os.path.join(output_mode[1], f"{desired_base_name}.gpkg")
-                had_conflict = os.path.exists(candidate_path)
-                if had_conflict and overwrite_mode == "new":
-                    base_name = resolve_output_base_name(output_mode[1], desired_base_name)
-                else:
-                    base_name = desired_base_name
-                out = os.path.join(output_mode[1], f"{base_name}.gpkg")
-                _write_gpkg(result, out)
-                print(f"✅ Saved {out}")
-                load_in_global_mapper(out)
-            else:
-                # DB-source -> DB-output: writes back to the exact SAME
-                # table it read from -- no matching, no dialog. This
-                # replaces the previous inline `table.lower() in
-                # t.lower()` check, which was a confirmed regression:
-                # even a DB-source run wasn't guaranteed to write back
-                # to its own source table if a differently-named table
-                # in the schema happened to substring-match.
-                with engine.begin() as conn:
-                    result.to_postgis(table, conn, schema=schema,
-                                      if_exists="replace", index=False)
-                print(f"🔄 Saved to DB: {table}")
+    def worker():
+        try:
+            def progress_cb(msg, val=None, maxv=None):
+                q.put(("update", msg, val, maxv))
 
-    messagebox.showinfo("Success", "Processing complete!")
+            q.put(("update", "Loading road network...", None, None))
+            if road_source[0] == "local":
+                road_gdf = gpd.read_file(road_source[1][0])
+            else:
+                road_gdf = read_postgis_clean(road_source[1][0], engine, schema)
+
+            if barangay_source[0] == "local":
+                for path in barangay_source[1]:
+                    q.put(("update", f"Loading {os.path.basename(path)}", None, None))
+                    brgy_gdf = gpd.read_file(path)
+                    # output_column_name: preserves the exact existing column
+                    # name/casing this LOCAL source's parcel layer already had
+                    # (if the user confirmed overwriting one at Run time -- see
+                    # on_run()'s confirmation dialog). A source with no entry
+                    # here falls back to process_surface()'s own default
+                    # ("CAMA_RD_SURFACE").
+                    output_column_name = surface_column_overrides.get(path, "CAMA_RD_SURFACE")
+                    result = process_surface(
+                        brgy_gdf, road_gdf,
+                        output_column_name=output_column_name,
+                        progress=progress_cb,
+                    )
+                    if output_mode[0] == "local":
+                        desired_base_name = os.path.splitext(os.path.basename(path))[0]
+                        candidate_path = os.path.join(output_mode[1], f"{desired_base_name}.gpkg")
+                        had_conflict = os.path.exists(candidate_path)
+                        if had_conflict and overwrite_mode == "new":
+                            base_name = resolve_output_base_name(output_mode[1], desired_base_name)
+                        else:
+                            base_name = desired_base_name
+                        out = os.path.join(output_mode[1], f"{base_name}.gpkg")
+                        _write_gpkg(result, out)
+                        print(f"✅ Saved {out}")
+                        q.put(("open_gm", out, None, None))
+                    else:
+                        # The actual destination table was already decided by
+                        # resolve_db_output_table(), BEFORE this loop even
+                        # started -- fuzzy matching + user confirmation already
+                        # happened there (see that function's docstring).
+                        # Falls back to the old "base + _roadsurface" behavior
+                        # only if resolved_table_name is somehow None here
+                        # (output_mode[0] != "db" can't reach this branch, so
+                        # this is just a defensive fallback).
+                        base = os.path.splitext(os.path.basename(path))[0]
+                        out_table = resolved_table_name if resolved_table_name is not None else base + "_roadsurface"
+                        with engine.begin() as conn:
+                            result.to_postgis(out_table, conn, schema=schema,
+                                              if_exists="replace", index=False)
+                        print(f"🔄 Saved to DB: {out_table}")
+            else:
+                # Database Land Parcel sources: column-conflict check is out of
+                # scope (see _check_parcel_surface_conflicts()) -- always uses
+                # process_surface()'s default "CAMA_RD_SURFACE" name.
+                for table in barangay_source[1]:
+                    q.put(("update", f"Loading DB table {table}", None, None))
+                    brgy_gdf = read_postgis_clean(table, engine, schema)
+                    result = process_surface(brgy_gdf, road_gdf, progress=progress_cb)
+                    if output_mode[0] == "local":
+                        desired_base_name = table
+                        candidate_path = os.path.join(output_mode[1], f"{desired_base_name}.gpkg")
+                        had_conflict = os.path.exists(candidate_path)
+                        if had_conflict and overwrite_mode == "new":
+                            base_name = resolve_output_base_name(output_mode[1], desired_base_name)
+                        else:
+                            base_name = desired_base_name
+                        out = os.path.join(output_mode[1], f"{base_name}.gpkg")
+                        _write_gpkg(result, out)
+                        print(f"✅ Saved {out}")
+                        q.put(("open_gm", out, None, None))
+                    else:
+                        # DB-source -> DB-output: writes back to the exact SAME
+                        # table it read from -- no matching, no dialog. This
+                        # replaces the previous inline `table.lower() in
+                        # t.lower()` check, which was a confirmed regression:
+                        # even a DB-source run wasn't guaranteed to write back
+                        # to its own source table if a differently-named table
+                        # in the schema happened to substring-match.
+                        with engine.begin() as conn:
+                            result.to_postgis(table, conn, schema=schema,
+                                              if_exists="replace", index=False)
+                        print(f"🔄 Saved to DB: {table}")
+
+            q.put(("done", "Processing complete!", None, None))
+
+        except Exception as e:
+            # New: this function had no top-level try/except before --
+            # an uncaught exception here previously propagated silently
+            # (no graceful dialog), EXCEPT for the missing-surface-column
+            # case, which previously showed messagebox.showerror() then
+            # incorrectly continued (see process_surface()'s own
+            # comment) -- that bug is fixed by this same try/except now
+            # catching the raise it performs instead, and routing it
+            # through the identical "error" event as every other
+            # exception. No new event kind was needed for that fix.
+            q.put(("error", str(e), None, None))
+
+    def poll_queue():
+        if not root.winfo_exists():
+            return
+        try:
+            while True:
+                kind, *rest = q.get_nowait()
+                if kind == "update":
+                    progress.update(rest[0], rest[1], rest[2])
+                elif kind == "open_gm":
+                    load_in_global_mapper(rest[0])
+                elif kind == "done":
+                    progress.close()
+                    messagebox.showinfo("Success", rest[0])
+                    return
+                elif kind == "error":
+                    progress.close()
+                    messagebox.showerror("Error", rest[0])
+                    return
+        except queue.Empty:
+            pass
+        root.after(100, poll_queue)
+
+    threading.Thread(target=worker, daemon=True).start()
+    poll_queue()
 
 
 # ---------------- Main ----------------

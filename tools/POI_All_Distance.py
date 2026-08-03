@@ -58,6 +58,44 @@ def apply_icon(win):
             pass
 
 
+def _remove_close_button(win):
+    """
+    Strips the titlebar's close (X) button (and system menu) via the
+    Win32 API directly, ported from road_width.py's implementation
+    (also used by poi_within_200_meters_for_parcellary_church_mall_
+    police_park.py's own progress dialog for the same reason).
+
+    protocol("WM_DELETE_WINDOW", lambda: None) (used alongside this,
+    see run_with_progress() below) only prevents the CLICK from doing
+    anything -- the X itself stays fully visible, still highlights on
+    hover, and still looks clickable, since Tkinter/the OS's own
+    window chrome has no idea the close action has been neutralized,
+    which reads as broken (a button that does nothing when clicked)
+    rather than intentionally absent. This function is a stronger fix
+    -- actually removing the button from the titlebar so there's
+    nothing there to click in the first place.
+
+    NOTE: clearing WS_SYSMENU via GetWindowLongW/SetWindowLongW is the
+    correct, well-documented Win32 pattern for this, but its actual
+    visual result can vary by Windows/DWM build/theme -- confirmed in
+    practice on this project's own deployment target that it does not
+    always visibly remove the X, in which case the protocol()-based
+    "click does nothing" behavior below is what actually takes effect.
+    Kept anyway (it's the more correct fix when it does work, and is
+    fully harmless when it doesn't -- any failure here is caught and
+    silently ignored, falling back to the protocol() behavior).
+    """
+    try:
+        import ctypes
+        GWL_STYLE = -16
+        WS_SYSMENU = 0x00080000
+        hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+        style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_STYLE)
+        ctypes.windll.user32.SetWindowLongW(hwnd, GWL_STYLE, style & ~WS_SYSMENU)
+    except Exception:
+        pass
+
+
 GM_EXE_PATH = r"C:\Program Files\GlobalMapper26.1_64bit\global_mapper.exe"
 
 def _get_credentials_path():
@@ -536,7 +574,7 @@ def run_cpu_parallel_with_progress(
     gdf, poi_gdf, road_gdf,
     poi_types, poi_coords_dict,
     output_path,
-    progress_bar, status_var, eta_var,
+    progress_bar, status_var,
     stop_flag,
     original_crs=None,
 ):
@@ -575,7 +613,6 @@ def run_cpu_parallel_with_progress(
     total = len(args_list)
     processed = 0
     errors = 0
-    start_time = time.time()
     all_route_records = []
 
     total_cpus = os.cpu_count() or 1
@@ -585,10 +622,6 @@ def run_cpu_parallel_with_progress(
     for i, args in enumerate(args_list, start=1):
         if stop_flag["stop"]:
             return None
-
-        elapsed = time.time() - start_time
-        avg = elapsed / max(1, i)
-        remaining = (total - i) * avg
 
         idx, res, route_records = worker_process(args)
 
@@ -602,7 +635,6 @@ def run_cpu_parallel_with_progress(
 
         progress_bar["value"] = i
         status_var.set(f"Processed {i} / {total} parcels")
-        eta_var.set(f"ETA: {remaining/60:.1f} min")
 
         progress_bar.master.update_idletasks()
         progress_bar.master.update()
@@ -1338,10 +1370,314 @@ def open_main_window(app_root):
     _update_run_button_state()
 
 
+def normalize_name(name: str) -> str:
+    """
+    Lowercases name and strips everything that isn't a letter (digits,
+    underscores, spaces, hyphens, etc.) -- e.g. "LandParcel_2026" and
+    "Land Parcel Final" both normalize to "landparcelfinal"-style
+    strings with no separators left, so filenames and table names that
+    differ only by punctuation/casing/trailing numbers can still be
+    recognized as referring to the same logical table.
+
+    Ported from road_frontage.py's own normalize_name(), as part of
+    adding this tool's missing DB-output resolution workflow (see
+    resolve_db_output_table() below).
+    """
+    return re.sub(r'[^a-z]', '', name.lower())
+
+
+def find_matching_tables(desired_name, all_tables):
+    """
+    Returns the list of candidate table names from all_tables whose
+    normalized form is a substring of (or contains) the normalized
+    desired_name -- checked in both directions, so "landparcel" matches
+    "landparcel_final" and "landparcel_2026" matches "landparcel"
+    equally. This is intentionally permissive (fuzzy) matching: the
+    caller is responsible for confirming the match with the user
+    before treating it as a definite overwrite target (see
+    confirm_db_overwrite_dialog() / choose_db_overwrite_dialog() and
+    resolve_db_output_table()) -- this function only proposes
+    candidates, it never decides on its own.
+
+    Always excludes "CAMA_Table", "CAMA_Transaction_Log", and any table
+    ending in "_VM" (case-insensitive) from the candidate list, since
+    none of these are ever valid "main output" overwrite targets even
+    if their name happens to contain a substring match.
+
+    Ported from road_frontage.py's own find_matching_tables(), as part
+    of adding this tool's missing DB-output resolution workflow.
+    """
+    lname = normalize_name(desired_name)
+    candidates = []
+    for t in all_tables:
+        if t.lower() in ("cama_table", "cama_transaction_log"):
+            continue
+        if t.lower().endswith("_vm"):
+            continue
+        tnorm = normalize_name(t)
+        if lname in tnorm or tnorm in lname:
+            candidates.append(t)
+    return candidates
+
+
+def confirm_db_overwrite_dialog(parent, table_name):
+    """
+    Shown when find_matching_tables() returns EXACTLY ONE candidate for
+    the DB-output destination table. Asks the user to confirm before
+    overwriting that specific table -- fuzzy matching only PROPOSES a
+    candidate (see find_matching_tables()'s own docstring); this dialog
+    is the actual safety check before anything is overwritten.
+
+    Returns True (Yes -- proceed with overwriting table_name) or False
+    (No, or the dialog was closed -- caller must treat this as a full
+    cancel, not "create new" -- there is no "create new" for DB output).
+
+    Ported from road_frontage.py's own confirm_db_overwrite_dialog(),
+    including its topmost-persistence fix (no premature after(100, ...)
+    reset), its content-then-geometry-then-topmost ordering fix, its
+    periodic re-assert loop, and its screen-centered geometry fix --
+    see that file's version of this function for the full history/
+    rationale behind each of those. Not reproduced verbatim here to
+    avoid drift between the two files' comments diverging over time on
+    what is otherwise the same, already-validated dialog.
+    """
+    result = {"confirmed": False}
+
+    dialog = tk.Toplevel(parent)
+    apply_icon(dialog)
+    dialog.title("POI ALL DISTANCE TOOL")
+    dialog.resizable(False, False)
+    dialog.grab_set()
+
+    def choose(confirmed):
+        result["confirmed"] = confirmed
+        dialog.destroy()
+
+    dialog.protocol("WM_DELETE_WINDOW", lambda: choose(False))
+
+    btn_frame = tk.Frame(dialog)
+    btn_frame.pack(side="bottom", fill="x", pady=(4, 12))
+    tk.Button(btn_frame, text="Yes", width=14, cursor="hand2",
+              command=lambda: choose(True)).pack(side="left", padx=(16, 4))
+    tk.Button(btn_frame, text="No", width=14, cursor="hand2",
+              command=lambda: choose(False)).pack(side="left", padx=(4, 16))
+
+    tk.Label(
+        dialog, text="Found existing table:",
+        font=("Segoe UI", 10, "bold"), anchor="w"
+    ).pack(fill="x", padx=16, pady=(16, 4))
+
+    tk.Label(
+        dialog, text=table_name, anchor="w", font=("Segoe UI", 9)
+    ).pack(fill="x", padx=16, pady=(0, 12))
+
+    tk.Label(dialog, text="Overwrite this table?", anchor="w"
+             ).pack(fill="x", padx=16, pady=(0, 16))
+
+    dialog.update_idletasks()
+    req_w = max(dialog.winfo_reqwidth(), 360)
+    req_h = dialog.winfo_reqheight()
+    screen_w = dialog.winfo_screenwidth()
+    screen_h = dialog.winfo_screenheight()
+    x = (screen_w - req_w) // 2
+    y = (screen_h - req_h) // 2
+    dialog.geometry(f"{req_w}x{req_h}+{max(x,0)}+{max(y,0)}")
+
+    dialog.deiconify()
+    dialog.lift()
+    dialog.focus_force()
+    dialog.attributes("-topmost", True)
+
+    def _keep_dialog_on_top():
+        if dialog.winfo_exists():
+            dialog.lift()
+            dialog.attributes("-topmost", True)
+            dialog.after(250, _keep_dialog_on_top)
+    dialog.after(250, _keep_dialog_on_top)
+
+    dialog.wait_window()
+    return result["confirmed"]
+
+
+def choose_db_overwrite_dialog(parent, candidates):
+    """
+    Shown when find_matching_tables() returns MORE THAN ONE candidate
+    for the DB-output destination table. Lets the user pick exactly
+    which one to overwrite via radio buttons; the FIRST candidate in
+    the list is pre-selected by default.
+
+    Returns the chosen table name, or None if the user cancelled (must
+    be treated as a full cancel by the caller -- there is no "create
+    new" for DB output).
+
+    Ported from road_frontage.py's own choose_db_overwrite_dialog(),
+    same fixes as confirm_db_overwrite_dialog() above.
+    """
+    result = {"chosen": None}
+    selected = tk.StringVar(value=candidates[0])
+
+    dialog = tk.Toplevel(parent)
+    apply_icon(dialog)
+    dialog.title("POI ALL DISTANCE TOOL")
+    dialog.resizable(False, False)
+    dialog.grab_set()
+
+    def choose(confirm):
+        result["chosen"] = selected.get() if confirm else None
+        dialog.destroy()
+
+    dialog.protocol("WM_DELETE_WINDOW", lambda: choose(False))
+
+    btn_frame = tk.Frame(dialog)
+    btn_frame.pack(side="bottom", fill="x", pady=(4, 12))
+    tk.Button(btn_frame, text="Confirm", width=14, cursor="hand2",
+              command=lambda: choose(True)).pack(side="left", padx=(16, 4))
+    tk.Button(btn_frame, text="Cancel", width=14, cursor="hand2",
+              command=lambda: choose(False)).pack(side="left", padx=(4, 16))
+
+    tk.Label(
+        dialog, text="Multiple possible matches found.",
+        font=("Segoe UI", 10, "bold"), anchor="w"
+    ).pack(fill="x", padx=16, pady=(16, 4))
+
+    tk.Label(
+        dialog, text="Select the table to overwrite:", anchor="w"
+    ).pack(fill="x", padx=16, pady=(0, 8))
+
+    radio_frame = tk.Frame(dialog)
+    radio_frame.pack(fill="x", padx=16, pady=(0, 16))
+    for name in candidates:
+        tk.Radiobutton(
+            radio_frame, text=name, variable=selected, value=name,
+            anchor="w"
+        ).pack(fill="x", anchor="w")
+
+    dialog.update_idletasks()
+    req_w = max(dialog.winfo_reqwidth(), 360)
+    req_h = dialog.winfo_reqheight()
+    screen_w = dialog.winfo_screenwidth()
+    screen_h = dialog.winfo_screenheight()
+    x = (screen_w - req_w) // 2
+    y = (screen_h - req_h) // 2
+    dialog.geometry(f"{req_w}x{req_h}+{max(x,0)}+{max(y,0)}")
+
+    dialog.deiconify()
+    dialog.lift()
+    dialog.focus_force()
+    dialog.attributes("-topmost", True)
+
+    def _keep_dialog_on_top():
+        if dialog.winfo_exists():
+            dialog.lift()
+            dialog.attributes("-topmost", True)
+            dialog.after(250, _keep_dialog_on_top)
+    dialog.after(250, _keep_dialog_on_top)
+
+    dialog.wait_window()
+    return result["chosen"]
+
+
+def resolve_db_output_table(root, schema, parcel_source):
+    """
+    Determines the DB-output destination table for the Land Parcel
+    source, BEFORE the progress window is even opened -- same "resolve
+    everything up front, main thread only" philosophy as
+    ask_overwrite_dialog() (see run_with_progress() below).
+
+    Two cases:
+      - DB-source Land Parcel (parcel_source[0] == "db"): always writes
+        back to the exact same table it was read from -- no matching,
+        no dialog.
+      - Local-file Land Parcel: fuzzy-matches the filename against
+        existing tables via find_matching_tables(), then requires user
+        confirmation before treating a match as an overwrite target --
+        zero candidates skips the dialog entirely and creates a new
+        table under the filename. Only the FIRST selected local source
+        (parcel_source[1][0]) is used to derive the desired name --
+        this tool always merges every selected parcel source into one
+        combined output/table, so there is only ever one destination
+        table to resolve, matching the same convention already used by
+        lot_location.py/road_frontage.py/etc.'s own
+        resolve_db_output_table().
+
+    Returns (resolved_table_name, resolved_outcome), or (None, None) if
+    the user cancelled -- caller must abort the entire run in that
+    case.
+
+    This function -- and the DB-output resolution workflow it
+    implements -- did not previously exist in this file. Its absence
+    is why this tool used to require output_mode[0]=="db" AND
+    parcel_source[0]=="db" together, raising "Database output requires
+    a Database parcel source." otherwise (see run_with_progress()'s own
+    comment below for the full removal record). Ported from
+    road_frontage.py's canonical implementation, adapted only for this
+    file's `parcel_source` naming (same shape/semantics as that file's
+    `barangay_source`).
+    """
+    if parcel_source[0] == "db":
+        return parcel_source[1][0], "overwritten"
+
+    desired_name = os.path.splitext(os.path.basename(parcel_source[1][0]))[0]
+    all_tables = fetch_tables(schema)
+    candidates = find_matching_tables(desired_name, all_tables)
+
+    if len(candidates) == 0:
+        return desired_name, "created"
+    elif len(candidates) == 1:
+        if not confirm_db_overwrite_dialog(root, candidates[0]):
+            return None, None
+        return candidates[0], "overwritten"
+    else:
+        chosen = choose_db_overwrite_dialog(root, candidates)
+        if chosen is None:
+            return None, None
+        return chosen, "overwritten"
+
+
 def run_with_progress(app_root, overwrite_mode=None):
     if hasattr(app_root, "_poi_progress_open") and app_root._poi_progress_open:
         return
     app_root._poi_progress_open = True
+
+    # ============================================================
+    # DB-output resolution -- newly added, previously missing.
+    # ============================================================
+    # This tool used to require output_mode[0]=="db" AND
+    # parcel_source[0]=="db" together, raising "Database output
+    # requires a Database parcel source." otherwise from deep inside
+    # task() -- see that removed line's replacement below. It never
+    # had the fuzzy-match + confirmation workflow the other migrated
+    # tools have (see resolve_db_output_table()'s own docstring above).
+    #
+    # Resolved HERE, before the progress window is created, same
+    # "resolve everything up front, main thread only" convention as
+    # every other tool -- if the user cancels the confirmation dialog,
+    # this returns before any progress window is ever shown.
+    #
+    # Option A (explicit project decision): this loads its own
+    # creds/schema/engine, separate from the ones task() further below
+    # loads for itself. task()'s existing internals are intentionally
+    # left completely untouched -- a second, short-lived DB connection
+    # here is a small, one-time cost, preferred over restructuring
+    # task()'s working logic for this fix.
+    resolved_table_name = None
+    if output_mode[0] == "db":
+        creds = load_db_credentials()
+        if not creds:
+            app_root._poi_progress_open = False
+            return
+        schema = creds["schema"]
+        engine = create_engine(
+            f"postgresql://{creds['username']}:{creds['password']}@"
+            f"{creds['host']}:{creds['port']}/{creds['database']}"
+        )
+        resolved_table_name, resolved_outcome = resolve_db_output_table(
+            app_root, schema, parcel_source
+        )
+        if resolved_table_name is None:
+            print("Run cancelled by user (database output table not confirmed).")
+            app_root._poi_progress_open = False
+            return
 
     progress_win = tk.Toplevel(app_root)
     progress_win.title("Processing Parcels...")
@@ -1358,20 +1694,47 @@ def run_with_progress(app_root, overwrite_mode=None):
     status_var = tk.StringVar(value="Starting...")
     tk.Label(progress_win, textvariable=status_var).pack(pady=5)
 
-    eta_var = tk.StringVar(value="ETA: calculating...")
-    tk.Label(progress_win, textvariable=eta_var).pack(pady=5)
-
     stop_flag = {"stop": False}
 
-    def cancel():
-        stop_flag["stop"] = True
-        status_var.set("Cancelling...")
+    # Cancel button and its cancel() handler removed entirely, per
+    # explicit instruction: there is no reliable in-progress cancel for
+    # this tool's actual workload (sequential per-parcel routing, no
+    # real background thread -- see run_cpu_parallel_with_progress()'s
+    # own docstring/comments), matching the same decision already made
+    # for road_width.py's own progress dialog. The X (close) button is
+    # neutralized the same way -- see _remove_close_button()'s own
+    # docstring for why both the Win32 removal attempt AND the
+    # protocol() no-op fallback are used together. This also fixes a
+    # latent bug: previously this window had NO protocol() override at
+    # all, so clicking X would destroy progress_win (and the
+    # progress_bar/status_var widgets living inside it) while
+    # task() might still be running and referencing them -- a real
+    # TclError risk that a no-op close now prevents entirely.
+    progress_win.protocol("WM_DELETE_WINDOW", lambda: None)
+    _remove_close_button(progress_win)
 
-    tk.Button(progress_win, text="Cancel", command=cancel).pack(pady=10)
     progress_win.lift()
     progress_win.focus_force()
 
     def task():
+        # error_message / success_title / success_message: captured
+        # here instead of calling messagebox.showinfo()/showerror()
+        # directly inline, so that no modal dialog is ever shown while
+        # progress_win is still alive -- both were previously called
+        # from inside the try block (success) or except block (error),
+        # BEFORE finally's progress_win.destroy() ran, since
+        # messagebox calls block until dismissed. That let the
+        # "Processing Parcels..." window sit behind/alongside the
+        # modal for as long as the user took to notice and dismiss it.
+        # Single cleanup path preserved: finally still does exactly the
+        # same two things it always did (destroy progress_win, reset
+        # _poi_progress_open), and does them exactly once, regardless
+        # of which path is taken below. Only the ORDERING changed --
+        # every message shown, its exact text, and all business logic
+        # above are otherwise unchanged.
+        error_message = None
+        success_title = None
+        success_message = None
         try:
             status_var.set("Loading input data...")
             progress_bar["value"] = 0
@@ -1384,12 +1747,16 @@ def run_with_progress(app_root, overwrite_mode=None):
                 f"{creds['host']}:{creds['port']}/{creds['database']}"
             )
 
-            target_table = None
-            if output_mode[0] == "db":
-                if parcel_source[0] != "db":
-                    raise Exception(
-                        "Database output requires a Database parcel source.")
-                target_table = parcel_source[1][0]
+            # target_table is resolved_table_name, computed up front in
+            # run_with_progress() (before this progress window even
+            # opened) via resolve_db_output_table() -- see that call
+            # site's own comment for the full record. The old
+            # `if parcel_source[0] != "db": raise Exception(...)` guard
+            # that used to live here is gone: resolve_db_output_table()
+            # now handles BOTH local and db parcel sources for DB
+            # output, so this can no longer fail this way. Stays None
+            # when output_mode[0] != "db", exactly as before.
+            target_table = resolved_table_name
 
             parcel_gdfs = []
             if parcel_source[0] == "local":
@@ -1497,7 +1864,6 @@ def run_with_progress(app_root, overwrite_mode=None):
                 output_path = None
 
             status_var.set("Computing network distances...")
-            eta_var.set("ETA: calculating...")
             progress_bar["value"] = 0
             progress_win.update_idletasks()
 
@@ -1505,7 +1871,7 @@ def run_with_progress(app_root, overwrite_mode=None):
                 gdf, poi_gdf, road_gdf,
                 poi_types, poi_coords,
                 output_path,
-                progress_bar, status_var, eta_var,
+                progress_bar, status_var,
                 stop_flag,
                 original_crs=original_crs,
             )
@@ -1515,7 +1881,7 @@ def run_with_progress(app_root, overwrite_mode=None):
                     load_in_global_mapper(output_path)
                     if routes_path:
                         load_in_global_mapper(routes_path)
-                    messagebox.showinfo("Success", "✅ Processing complete!")
+                    success_title, success_message = "Success", "✅ Processing complete!"
                 else:
                     all_tables = fetch_tables(schema)
                     table_action = "replaced" if target_table in all_tables else "new"
@@ -1529,16 +1895,20 @@ def run_with_progress(app_root, overwrite_mode=None):
                     with engine.begin() as conn:
                         gdf.to_postgis(target_table, conn, schema=schema,
                                        if_exists="replace", index=False)
-                    messagebox.showinfo(
-                        "Success",
-                        f"✅ Updated DB table: {target_table} ({table_action})"
-                    )
+                    success_title = "Success"
+                    success_message = f"✅ Updated DB table: {target_table} ({table_action})"
 
         except Exception as e:
-            messagebox.showerror("Error", str(e))
+            error_message = str(e)
         finally:
-            progress_win.destroy()
+            if progress_win.winfo_exists():
+                progress_win.destroy()
             app_root._poi_progress_open = False
+
+        if error_message:
+            messagebox.showerror("Error", error_message)
+        elif success_message:
+            messagebox.showinfo(success_title, success_message)
 
     app_root.after(100, task)
 

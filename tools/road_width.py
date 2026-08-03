@@ -546,11 +546,6 @@ def ask_db_overwrite_dialog(parent, conflicting_pairs):
     dialog.title("ROAD WIDTH TOOL")
     dialog.resizable(False, False)
     dialog.grab_set()
-    dialog.deiconify()
-    dialog.lift()
-    dialog.focus_force()
-    dialog.attributes("-topmost", True)
-    dialog.after(100, lambda: dialog.attributes("-topmost", False))
 
     def choose(choice):
         result["choice"] = choice
@@ -616,6 +611,30 @@ def ask_db_overwrite_dialog(parent, conflicting_pairs):
     x, y = _get_dialog_center_position(dialog, req_w, req_h)
     dialog.geometry(f"{req_w}x{req_h}+{x}+{y}")
 
+    # deiconify/lift/focus_force/topmost are called LAST -- after
+    # content and geometry() are finalized, and topmost is never reset
+    # back to False -- see road_frontage.py's matching dialogs for the
+    # full rationale (repositioning can perturb stacking order against
+    # another always-on-top window from a separate process, e.g. the
+    # CAMA Tools floating panel; grab_set() alone cannot protect this
+    # indefinite-duration dialog from being covered by it). The
+    # periodic re-assert loop below keeps winning that z-order fight
+    # for the dialog's whole lifetime, not just at creation -- confirmed
+    # necessary in testing, a single lift() at creation was not enough.
+    # Self-cancels via the winfo_exists() guard once dialog.destroy()
+    # runs.
+    dialog.deiconify()
+    dialog.lift()
+    dialog.focus_force()
+    dialog.attributes("-topmost", True)
+
+    def _keep_dialog_on_top():
+        if dialog.winfo_exists():
+            dialog.lift()
+            dialog.attributes("-topmost", True)
+            dialog.after(250, _keep_dialog_on_top)
+    dialog.after(250, _keep_dialog_on_top)
+
     dialog.wait_window()
     return result["choice"]
 
@@ -639,11 +658,6 @@ def confirm_db_overwrite_dialog(parent, table_name):
     dialog.title("ROAD WIDTH TOOL")
     dialog.resizable(False, False)
     dialog.grab_set()
-    dialog.deiconify()
-    dialog.lift()
-    dialog.focus_force()
-    dialog.attributes("-topmost", True)
-    dialog.after(100, lambda: dialog.attributes("-topmost", False))
 
     def choose(confirmed):
         result["confirmed"] = confirmed
@@ -678,6 +692,30 @@ def confirm_db_overwrite_dialog(parent, table_name):
     x, y = _get_dialog_center_position(dialog, req_w, req_h)
     dialog.geometry(f"{req_w}x{req_h}+{x}+{y}")
 
+    # deiconify/lift/focus_force/topmost are called LAST -- after
+    # content and geometry() are finalized, and topmost is never reset
+    # back to False -- see road_frontage.py's matching dialogs for the
+    # full rationale (repositioning can perturb stacking order against
+    # another always-on-top window from a separate process, e.g. the
+    # CAMA Tools floating panel; grab_set() alone cannot protect this
+    # indefinite-duration dialog from being covered by it). The
+    # periodic re-assert loop below keeps winning that z-order fight
+    # for the dialog's whole lifetime, not just at creation -- confirmed
+    # necessary in testing, a single lift() at creation was not enough.
+    # Self-cancels via the winfo_exists() guard once dialog.destroy()
+    # runs.
+    dialog.deiconify()
+    dialog.lift()
+    dialog.focus_force()
+    dialog.attributes("-topmost", True)
+
+    def _keep_dialog_on_top():
+        if dialog.winfo_exists():
+            dialog.lift()
+            dialog.attributes("-topmost", True)
+            dialog.after(250, _keep_dialog_on_top)
+    dialog.after(250, _keep_dialog_on_top)
+
     dialog.wait_window()
     return result["confirmed"]
 
@@ -703,11 +741,6 @@ def choose_db_overwrite_dialog(parent, candidates):
     dialog.title("ROAD WIDTH TOOL")
     dialog.resizable(False, False)
     dialog.grab_set()
-    dialog.deiconify()
-    dialog.lift()
-    dialog.focus_force()
-    dialog.attributes("-topmost", True)
-    dialog.after(100, lambda: dialog.attributes("-topmost", False))
 
     def choose(confirm):
         result["chosen"] = selected.get() if confirm else None
@@ -746,6 +779,30 @@ def choose_db_overwrite_dialog(parent, candidates):
     req_h = dialog.winfo_reqheight()
     x, y = _get_dialog_center_position(dialog, req_w, req_h)
     dialog.geometry(f"{req_w}x{req_h}+{x}+{y}")
+
+    # deiconify/lift/focus_force/topmost are called LAST -- after
+    # content and geometry() are finalized, and topmost is never reset
+    # back to False -- see road_frontage.py's matching dialogs for the
+    # full rationale (repositioning can perturb stacking order against
+    # another always-on-top window from a separate process, e.g. the
+    # CAMA Tools floating panel; grab_set() alone cannot protect this
+    # indefinite-duration dialog from being covered by it). The
+    # periodic re-assert loop below keeps winning that z-order fight
+    # for the dialog's whole lifetime, not just at creation -- confirmed
+    # necessary in testing, a single lift() at creation was not enough.
+    # Self-cancels via the winfo_exists() guard once dialog.destroy()
+    # runs.
+    dialog.deiconify()
+    dialog.lift()
+    dialog.focus_force()
+    dialog.attributes("-topmost", True)
+
+    def _keep_dialog_on_top():
+        if dialog.winfo_exists():
+            dialog.lift()
+            dialog.attributes("-topmost", True)
+            dialog.after(250, _keep_dialog_on_top)
+    dialog.after(250, _keep_dialog_on_top)
 
     dialog.wait_window()
     return result["chosen"]
@@ -3321,11 +3378,6 @@ def show_success_dialog(parent, total_sources, failed_sources, single_success_de
     # transient()'s normal UX benefits (no separate taskbar entry,
     # staying above its logical parent) for this one case.
     dialog.grab_set()
-    dialog.deiconify()
-    dialog.lift()
-    dialog.focus_force()
-    dialog.attributes("-topmost", True)
-    dialog.after(100, lambda: dialog.attributes("-topmost", False))
 
     # OK button first, at the bottom -- see docstring point 1.
     btn_frame = tk.Frame(dialog)
@@ -3457,6 +3509,30 @@ def show_success_dialog(parent, total_sources, failed_sources, single_success_de
     x, y = _get_dialog_center_position(dialog, req_w, req_h)
     dialog.geometry(f"{req_w}x{req_h}+{x}+{y}")
 
+    # deiconify/lift/focus_force/topmost are called LAST -- after
+    # content and geometry() are finalized, and topmost is never reset
+    # back to False -- see road_frontage.py's matching dialogs for the
+    # full rationale (repositioning can perturb stacking order against
+    # another always-on-top window from a separate process, e.g. the
+    # CAMA Tools floating panel; grab_set() alone cannot protect this
+    # indefinite-duration dialog from being covered by it). The
+    # periodic re-assert loop below keeps winning that z-order fight
+    # for the dialog's whole lifetime, not just at creation -- confirmed
+    # necessary in testing, a single lift() at creation was not enough.
+    # Self-cancels via the winfo_exists() guard once dialog.destroy()
+    # runs.
+    dialog.deiconify()
+    dialog.lift()
+    dialog.focus_force()
+    dialog.attributes("-topmost", True)
+
+    def _keep_dialog_on_top():
+        if dialog.winfo_exists():
+            dialog.lift()
+            dialog.attributes("-topmost", True)
+            dialog.after(250, _keep_dialog_on_top)
+    dialog.after(250, _keep_dialog_on_top)
+
     dialog.wait_window()
 
 def ask_overwrite_dialog(parent, conflicting_names):
@@ -3505,11 +3581,6 @@ def ask_overwrite_dialog(parent, conflicting_names):
     # transient()'s normal UX benefits (no separate taskbar entry,
     # staying above its logical parent) for this one case.
     dialog.grab_set()
-    dialog.deiconify()
-    dialog.lift()
-    dialog.focus_force()
-    dialog.attributes("-topmost", True)
-    dialog.after(100, lambda: dialog.attributes("-topmost", False))
 
     def choose(value):
         result["choice"] = value
@@ -3576,10 +3647,154 @@ def ask_overwrite_dialog(parent, conflicting_names):
     x, y = _get_dialog_center_position(dialog, req_w, req_h)
     dialog.geometry(f"{req_w}x{req_h}+{x}+{y}")
 
+    # deiconify/lift/focus_force/topmost are called LAST -- after
+    # content and geometry() are finalized, and topmost is never reset
+    # back to False -- see road_frontage.py's matching dialogs for the
+    # full rationale (repositioning can perturb stacking order against
+    # another always-on-top window from a separate process, e.g. the
+    # CAMA Tools floating panel; grab_set() alone cannot protect this
+    # indefinite-duration dialog from being covered by it). The
+    # periodic re-assert loop below keeps winning that z-order fight
+    # for the dialog's whole lifetime, not just at creation -- confirmed
+    # necessary in testing, a single lift() at creation was not enough.
+    # Self-cancels via the winfo_exists() guard once dialog.destroy()
+    # runs.
+    dialog.deiconify()
+    dialog.lift()
+    dialog.focus_force()
+    dialog.attributes("-topmost", True)
+
+    def _keep_dialog_on_top():
+        if dialog.winfo_exists():
+            dialog.lift()
+            dialog.attributes("-topmost", True)
+            dialog.after(250, _keep_dialog_on_top)
+    dialog.after(250, _keep_dialog_on_top)
+
     dialog.wait_window()
     return result["choice"]
 
 # ----------------- PROGRESS WINDOW (thread-safe) -----------------
+# ============================================================
+# Progress Event Protocol v9 — Phase 3 migration (road_width.py)
+# ============================================================
+# Same extraction as lot_location.py (Phase 1) / road_frontage.py
+# (Phase 2), adapted for this tool's two additional real behaviors that
+# the simpler pattern didn't have:
+#
+#   - a third public ProgressWindow method, switch_to_determinate(),
+#     driven by poll_queue()'s "found_total" event kind (unique to this
+#     tool's message protocol -- unchanged here, poll_queue() untouched);
+#   - the _closed / winfo_exists() lifecycle guards, and the
+#     count_var second widget.
+#
+# Design decision: the _closed/winfo_exists() guards are lifecycle-host
+# concerns (is the window this operation owns still alive), not
+# presentation decisions or widget mutations -- they stay in
+# ProgressWindow itself, as the first thing each public method does,
+# exactly where they were before this migration. Presentation Policy
+# and Tkinter View are never invoked once the window is closed, so
+# their behavior is unaffected by this guard living one layer up.
+#
+#   Worker (worker(), inside run_processing())      -> unchanged
+#   Main-thread Message Handler (poll_queue())       -> unchanged
+#   ProgressWindow                                   -> owns window/widgets
+#                                                        + lifecycle guard
+#   RoadWidthPresentationPolicy                      -> decides what to show
+#   RoadWidthTkinterView                             -> mutates widgets
+#
+# Objective: preserve behavior while separating presentation decision
+# from widget mutation. No functional changes are permitted -- this is
+# a structural extraction only.
+# ============================================================
+
+from dataclasses import dataclass
+from typing import Optional
+
+
+@dataclass(frozen=True)
+class UpdateState:
+    """
+    Immutable snapshot of what RoadWidthTkinterView.render_update()
+    should render for one "update" progress event. Mirrors this tool's
+    existing update() semantics exactly: value/total are only applied
+    together (AND, not two independent checks like lot_location.py /
+    road_frontage.py's PresentationState) -- do not "harmonize" this
+    with the other two tools' looser semantics, it is a real, intended
+    behavioral difference of this tool's progress bar (see
+    status_cb()'s docstring further down in this file for why).
+    """
+    message: str
+    value: Optional[float] = None
+    total: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class SwitchState:
+    """
+    Immutable snapshot of what RoadWidthTkinterView.render_switch()
+    should render when switching from indeterminate to determinate
+    mode. Deliberately minimal -- just the now-known total.
+    """
+    total: float
+
+
+class RoadWidthPresentationPolicy:
+    """
+    Presentation Policy (Progress Event Protocol v9) for road_width.py.
+    Two static strategies, matching this tool's two existing progress
+    presentations: a plain update (compute_update) and the one-time
+    indeterminate->determinate switch (compute_switch). Neither
+    strategy is dynamically selected/replaced today -- both are always
+    available, driven directly by which ProgressWindow method the
+    Main-thread Message Handler calls, per the existing "update" vs
+    "found_total" event kinds in poll_queue() (unchanged).
+    """
+    def compute_update(self, message, value=None, total=None):
+        return UpdateState(message=message, value=value, total=total)
+
+    def compute_switch(self, total):
+        return SwitchState(total=total)
+
+
+class RoadWidthTkinterView:
+    """
+    Tkinter View (Progress Event Protocol v9) for road_width.py. The
+    only component that touches status_var/progress/count_var/win on a
+    per-event basis. Construction/ownership of those widgets (including
+    the initial indeterminate .start(12) animation, the removed close
+    button, and dialog centering) stays in ProgressWindow.__init__,
+    unchanged. The _closed/winfo_exists() guard is NOT duplicated here
+    -- ProgressWindow checks it before ever calling into this class, so
+    render_update()/render_switch()/destroy() can assume the window is
+    still alive.
+    """
+    def __init__(self, win, status_var, progressbar, count_var):
+        self.win = win
+        self.status_var = status_var
+        self.progress = progressbar
+        self.count_var = count_var
+
+    def render_update(self, state: UpdateState):
+        self.status_var.set(state.message)
+        if state.value is not None and state.total is not None:
+            self.progress["value"] = state.value
+            self.count_var.set(f"{state.value} / {state.total}")
+        self.win.update_idletasks()
+
+    def render_switch(self, state: SwitchState):
+        self.progress.stop()
+        self.progress.config(mode="determinate", maximum=state.total, value=0)
+        self.count_var.set(f"0 / {state.total}")
+
+    def destroy(self):
+        try:
+            self.progress.stop()
+        except Exception:
+            pass
+        self.win.destroy()
+
+
 class ProgressWindow:
     """
     Thread-safe progress display. Ported from road_frontage.py's own
@@ -3594,6 +3809,15 @@ class ProgressWindow:
     feature count genuinely isn't known yet -- switches to determinate
     mode once switch_to_determinate() is called with the real total,
     matching this tool's own "Found N parcels." UX decision.
+
+    Progress Event Protocol v9 role: ProgressWindow is the host, not
+    the decision-maker (see RoadWidthPresentationPolicy /
+    RoadWidthTkinterView above). It also owns the _closed lifecycle
+    guard -- see the module-level comment block above this class for
+    why that guard lives here rather than in Policy or View. Public
+    interface (__init__, update, switch_to_determinate, close) is
+    byte-identical to before this migration; poll_queue() requires no
+    changes.
     """
     def __init__(self, root, title="Processing"):
         self.win = tk.Toplevel(root)
@@ -3641,14 +3865,19 @@ class ProgressWindow:
         self.win.lift()
         self.win.after(100, lambda: self.win.attributes("-topmost", False))
 
+        # Presentation Policy + Tkinter View collaborators (Progress
+        # Event Protocol v9). Constructed after the widgets they render
+        # into already exist.
+        self._policy = RoadWidthPresentationPolicy()
+        self._view = RoadWidthTkinterView(self.win, self.status_var, self.progress, self.count_var)
+
     def switch_to_determinate(self, total):
         """Called once the real parcel count is known -- stops the
         indeterminate animation and switches to a normal 0..total bar."""
         if self._closed or not self.win.winfo_exists():
             return
-        self.progress.stop()
-        self.progress.config(mode="determinate", maximum=total, value=0)
-        self.count_var.set(f"0 / {total}")
+        state = self._policy.compute_switch(total)
+        self._view.render_switch(state)
 
     def update(self, message, value=None, total=None):
         # Defensive: poll_queue() drains the ENTIRE queue in one pass
@@ -3672,19 +3901,12 @@ class ProgressWindow:
         # an otherwise fully successful run.
         if self._closed or not self.win.winfo_exists():
             return
-        self.status_var.set(message)
-        if value is not None and total is not None:
-            self.progress["value"] = value
-            self.count_var.set(f"{value} / {total}")
-        self.win.update_idletasks()
+        state = self._policy.compute_update(message, value, total)
+        self._view.render_update(state)
 
     def close(self):
         self._closed = True
-        try:
-            self.progress.stop()
-        except Exception:
-            pass
-        self.win.destroy()
+        self._view.destroy()
 
 
 # ----------------- PROGRESS WINDOW (OLD -- kept temporarily, unused) -----------------

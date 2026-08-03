@@ -1276,7 +1276,40 @@ def find_matching_tables(desired_name, all_tables):
 
 
 # ========================= PROGRESS WINDOW =========================
+# ============================================================
+# Progress Event Protocol v9 — Phase 4 migration (road_frontage.py)
+# ============================================================
+# PresentationState, the Presentation Policy, and the Tkinter View are
+# no longer defined locally in this file -- identical to
+# lot_location.py's Phase 3 migration, both tools now import the same
+# three classes from tools/progress_framework.py instead of each
+# keeping its own copy. Pure extraction: no behavior change, no new
+# abstraction, no wrapper/adapter/compatibility layer.
+#
+#   Worker (worker(), inside run_processing())      -> unchanged
+#   Main-thread Message Handler (poll_queue())       -> unchanged
+#   ProgressWindow                                   -> owns window/widgets
+#
+# road_width.py is not part of this migration and is not touched by it
+# -- see progress_framework.py's own top-of-file comment for why.
+# ============================================================
+
+from tools.progress_framework import (
+    PresentationState,
+    ProgressPresentationPolicy,
+    TkinterProgressView,
+)
+
+
 class ProgressWindow:
+    """
+    Progress dialog shown while run_processing() works on a background
+    thread. Progress Event Protocol v9 role: host, not decision-maker
+    (see ProgressPresentationPolicy / TkinterProgressView, imported
+    from progress_framework.py, shared with lot_location.py).
+    Public interface (__init__, update, close) is byte-identical to
+    before this migration; poll_queue() requires no changes.
+    """
     def __init__(self, root, title="Processing"):
         self.win = tk.Toplevel(root)
         apply_icon(self.win)
@@ -1299,19 +1332,19 @@ class ProgressWindow:
         self.win.attributes("-topmost", True)
         self.win.after(100, lambda: self.win.attributes("-topmost", False))
 
+        # Presentation Policy + Tkinter View collaborators (Progress
+        # Event Protocol v9), shared with lot_location.py via
+        # progress_framework.py. Constructed after the widgets they
+        # render into already exist.
+        self._policy = ProgressPresentationPolicy()
+        self._view = TkinterProgressView(self.win, self.status_var, self.progress)
 
     def update(self, message, value=None, maximum=None):
-        self.status_var.set(message)
-        if maximum is not None:
-            self.progress["maximum"] = maximum
-        if value is not None:
-            self.progress["value"] = value
-        self.win.update_idletasks()
-        self.win.geometry("")
-        self.win.update()
+        state = self._policy.compute(message, value, maximum)
+        self._view.render(state)
 
     def close(self):
-        self.win.destroy()
+        self._view.destroy()
 
 
 def clip_roads_to_parcels(road_gdf, parcel_gdf, pad=50):
@@ -2398,11 +2431,6 @@ def ask_overwrite_dialog(parent, conflicting_names):
     dialog.title("File(s) Already Exist")
     dialog.resizable(False, False)
     dialog.grab_set()
-    dialog.deiconify()
-    dialog.lift()
-    dialog.focus_force()
-    dialog.attributes("-topmost", True)
-    dialog.after(100, lambda: dialog.attributes("-topmost", False))
 
     def choose(value):
         result["choice"] = value
@@ -2462,9 +2490,56 @@ def ask_overwrite_dialog(parent, conflicting_names):
     dialog.update_idletasks()
     req_w = max(dialog.winfo_reqwidth(), 460)
     req_h = dialog.winfo_reqheight()
-    x = parent.winfo_x() + (parent.winfo_width() - req_w) // 2
-    y = parent.winfo_y() + (parent.winfo_height() - req_h) // 2
+    # Centered on the SCREEN, not on `parent` -- `parent` here is
+    # MAIN.py's _tool_root, a deliberately invisible 1x1 anchor window
+    # placed off-screen at (-9999, -9999) purely for Tk plumbing (icon
+    # binding, mainloop hosting). Centering against it produced a wildly
+    # negative x/y that the old max(x,0)/max(y,0) clamp collapsed to
+    # exactly (0, 0) every time -- pinning the dialog to the screen's
+    # top-left corner regardless of where any real window (the CAMA
+    # Tools panel, Global Mapper, etc.) actually was. Screen dimensions
+    # are a stable, always-meaningful reference this dialog can center
+    # against instead. Button layout (packed side="bottom" above) is
+    # unaffected -- this only changes where the whole window is placed,
+    # not how its own contents are arranged inside it.
+    screen_w = dialog.winfo_screenwidth()
+    screen_h = dialog.winfo_screenheight()
+    x = (screen_w - req_w) // 2
+    y = (screen_h - req_h) // 2
     dialog.geometry(f"{req_w}x{req_h}+{max(x,0)}+{max(y,0)}")
+
+    # deiconify/lift/focus_force/topmost are called LAST -- after content
+    # and geometry() -- see confirm_db_overwrite_dialog()'s matching
+    # comment for the full rationale (repositioning a window can perturb
+    # its stacking order against another always-on-top window from a
+    # separate process on some Windows builds). Topmost is deliberately
+    # never reset back to False afterward -- this dialog can stay open
+    # indefinitely waiting on the user's answer, and grab_set() alone
+    # cannot protect it from being covered by a separate process's window.
+    dialog.deiconify()
+    dialog.lift()
+    dialog.focus_force()
+    dialog.attributes("-topmost", True)
+
+    # A single lift()/topmost assertion at creation time was confirmed
+    # (in testing) to still be insufficient: the CAMA Tools floating
+    # panel is ITSELF persistently topmost (a separate process, always
+    # floating above the map), so whenever it regains z-order priority
+    # over this dialog -- e.g. after the user interacts with the map --
+    # a one-time lift() at dialog-creation time doesn't help, since that
+    # moment has already passed. This keeps re-asserting lift()+topmost
+    # every 250ms for as long as the dialog exists, so it keeps winning
+    # that z-order fight for its entire (indefinite, user-controlled)
+    # lifetime rather than only at the instant it first appeared.
+    # Self-cancels via the winfo_exists() guard once dialog.destroy()
+    # runs in choose() above -- no dangling after() callbacks survive
+    # the dialog closing.
+    def _keep_dialog_on_top():
+        if dialog.winfo_exists():
+            dialog.lift()
+            dialog.attributes("-topmost", True)
+            dialog.after(250, _keep_dialog_on_top)
+    dialog.after(250, _keep_dialog_on_top)
 
     dialog.wait_window()
     return result["choice"]
@@ -2489,11 +2564,6 @@ def confirm_db_overwrite_dialog(parent, table_name):
     dialog.title("ROAD FRONTAGE TOOL")
     dialog.resizable(False, False)
     dialog.grab_set()
-    dialog.deiconify()
-    dialog.lift()
-    dialog.focus_force()
-    dialog.attributes("-topmost", True)
-    dialog.after(100, lambda: dialog.attributes("-topmost", False))
 
     def choose(confirmed):
         result["confirmed"] = confirmed
@@ -2525,9 +2595,51 @@ def confirm_db_overwrite_dialog(parent, table_name):
     dialog.update_idletasks()
     req_w = max(dialog.winfo_reqwidth(), 360)
     req_h = dialog.winfo_reqheight()
-    x = parent.winfo_x() + (parent.winfo_width() - req_w) // 2
-    y = parent.winfo_y() + (parent.winfo_height() - req_h) // 2
+    # Centered on the SCREEN, not on `parent` -- `parent` here is
+    # MAIN.py's _tool_root, a deliberately invisible 1x1 anchor window
+    # placed off-screen at (-9999, -9999) purely for Tk plumbing (icon
+    # binding, mainloop hosting). Centering against it produced a wildly
+    # negative x/y that the old max(x,0)/max(y,0) clamp collapsed to
+    # exactly (0, 0) every time -- pinning the dialog to the screen's
+    # top-left corner regardless of where any real window (the CAMA
+    # Tools panel, Global Mapper, etc.) actually was. Screen dimensions
+    # are a stable, always-meaningful reference this dialog can center
+    # against instead. Button layout (packed side="bottom" above) is
+    # unaffected -- this only changes where the whole window is placed,
+    # not how its own contents are arranged inside it.
+    screen_w = dialog.winfo_screenwidth()
+    screen_h = dialog.winfo_screenheight()
+    x = (screen_w - req_w) // 2
+    y = (screen_h - req_h) // 2
     dialog.geometry(f"{req_w}x{req_h}+{max(x,0)}+{max(y,0)}")
+
+    # deiconify/lift/focus_force/topmost are called LAST -- after all
+    # content is built and geometry() has already repositioned the
+    # window -- not before. Calling them before geometry() risked losing
+    # the z-order fight against another always-on-top window from a
+    # separate process (the CAMA Tools floating panel, which sets its
+    # own -topmost persistently): repositioning a window can perturb its
+    # stacking order on some Windows compositor/window-manager builds,
+    # so asserting "come to front" only after the window has reached its
+    # final size/position is the safer order. See also the comment above
+    # -- topmost is deliberately never reset back to False afterward,
+    # since this dialog can stay open indefinitely waiting on the user.
+    dialog.deiconify()
+    dialog.lift()
+    dialog.focus_force()
+    dialog.attributes("-topmost", True)
+
+    # See ask_overwrite_dialog()'s matching comment -- a one-time lift()
+    # at creation isn't enough against a persistently-topmost window from
+    # a separate process (the CAMA Tools floating panel). Keeps
+    # re-asserting for the dialog's whole (indefinite) lifetime;
+    # self-cancels once dialog.destroy() runs in choose() above.
+    def _keep_dialog_on_top():
+        if dialog.winfo_exists():
+            dialog.lift()
+            dialog.attributes("-topmost", True)
+            dialog.after(250, _keep_dialog_on_top)
+    dialog.after(250, _keep_dialog_on_top)
 
     dialog.wait_window()
     return result["confirmed"]
@@ -2554,11 +2666,6 @@ def choose_db_overwrite_dialog(parent, candidates):
     dialog.title("ROAD FRONTAGE TOOL")
     dialog.resizable(False, False)
     dialog.grab_set()
-    dialog.deiconify()
-    dialog.lift()
-    dialog.focus_force()
-    dialog.attributes("-topmost", True)
-    dialog.after(100, lambda: dialog.attributes("-topmost", False))
 
     def choose(confirm):
         result["chosen"] = selected.get() if confirm else None
@@ -2595,9 +2702,41 @@ def choose_db_overwrite_dialog(parent, candidates):
     dialog.update_idletasks()
     req_w = max(dialog.winfo_reqwidth(), 360)
     req_h = dialog.winfo_reqheight()
-    x = parent.winfo_x() + (parent.winfo_width() - req_w) // 2
-    y = parent.winfo_y() + (parent.winfo_height() - req_h) // 2
+    # Centered on the SCREEN, not on `parent` -- `parent` here is
+    # MAIN.py's _tool_root, a deliberately invisible 1x1 anchor window
+    # placed off-screen at (-9999, -9999) purely for Tk plumbing (icon
+    # binding, mainloop hosting). Centering against it produced a wildly
+    # negative x/y that the old max(x,0)/max(y,0) clamp collapsed to
+    # exactly (0, 0) every time -- pinning the dialog to the screen's
+    # top-left corner regardless of where any real window (the CAMA
+    # Tools panel, Global Mapper, etc.) actually was. Screen dimensions
+    # are a stable, always-meaningful reference this dialog can center
+    # against instead. Button layout (packed side="bottom" above) is
+    # unaffected -- this only changes where the whole window is placed,
+    # not how its own contents are arranged inside it.
+    screen_w = dialog.winfo_screenwidth()
+    screen_h = dialog.winfo_screenheight()
+    x = (screen_w - req_w) // 2
+    y = (screen_h - req_h) // 2
     dialog.geometry(f"{req_w}x{req_h}+{max(x,0)}+{max(y,0)}")
+
+    # deiconify/lift/focus_force/topmost are called LAST -- see
+    # confirm_db_overwrite_dialog()'s matching comment for the full
+    # rationale.
+    dialog.deiconify()
+    dialog.lift()
+    dialog.focus_force()
+    dialog.attributes("-topmost", True)
+
+    # See ask_overwrite_dialog()'s matching comment -- periodic
+    # re-assertion for the dialog's whole lifetime; self-cancels once
+    # dialog.destroy() runs in choose() above.
+    def _keep_dialog_on_top():
+        if dialog.winfo_exists():
+            dialog.lift()
+            dialog.attributes("-topmost", True)
+            dialog.after(250, _keep_dialog_on_top)
+    dialog.after(250, _keep_dialog_on_top)
 
     dialog.wait_window()
     return result["chosen"]

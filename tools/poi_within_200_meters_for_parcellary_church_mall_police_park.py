@@ -49,6 +49,43 @@ def apply_icon(win):
             pass
 
 
+def _remove_close_button(win):
+    """
+    Strips the titlebar's close (X) button (and system menu) via the
+    Win32 API directly, ported from road_width.py's implementation.
+
+    protocol("WM_DELETE_WINDOW", lambda: None) (used alongside this,
+    see create_progress_window() below) only prevents the CLICK from
+    doing anything -- the X itself stays fully visible, still
+    highlights on hover, and still looks clickable, since Tkinter/the
+    OS's own window chrome has no idea the close action has been
+    neutralized, which reads as broken (a button that does nothing
+    when clicked) rather than intentionally absent. This function is a
+    stronger fix -- actually removing the button from the titlebar so
+    there's nothing there to click in the first place.
+
+    NOTE (carried over from road_width.py, still applies here):
+    clearing WS_SYSMENU via GetWindowLongW/SetWindowLongW is the
+    correct, well-documented Win32 pattern for this, but its actual
+    visual result can vary by Windows/DWM build/theme -- confirmed in
+    practice on this project's own deployment target that it does not
+    always visibly remove the X, in which case the protocol()-based
+    "click does nothing" behavior below is what actually takes effect.
+    Kept anyway (it's the more correct fix when it does work, and is
+    fully harmless when it doesn't -- any failure here is caught and
+    silently ignored, falling back to the protocol() behavior).
+    """
+    try:
+        import ctypes
+        GWL_STYLE = -16
+        WS_SYSMENU = 0x00080000
+        hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+        style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_STYLE)
+        ctypes.windll.user32.SetWindowLongW(hwnd, GWL_STYLE, style & ~WS_SYSMENU)
+    except Exception:
+        pass
+
+
 GM_EXE_PATH = r"C:\Program Files\GlobalMapper26.1_64bit\global_mapper.exe"
 
 def _get_credentials_path():
@@ -255,15 +292,19 @@ def create_progress_window(root, total, title="Processing Parcels"):
                                 mode="determinate", maximum=total)
     PROG_BAR.pack(fill="x", padx=12, pady=(0, 6))
 
-    def on_cancel():
-        PROG_STOP_FLAG["stop"] = True
-        PROG_LABEL.config(text="Cancelling... please wait")
-
-    tk.Button(PROG_WIN, text="Cancel", command=on_cancel,
-              width=12).pack(pady=(4, 10))
-
-    # Block X button from just destroying — treat it as cancel
-    PROG_WIN.protocol("WM_DELETE_WINDOW", on_cancel)
+    # Cancel button and its on_cancel() handler removed entirely, per
+    # explicit instruction: there is no reliable in-progress cancel for
+    # this tool's actual workload (network graph download + per-parcel
+    # routing), matching the same decision already made for
+    # road_width.py's own progress dialog. The X (close) button is
+    # neutralized the same way road_width.py's is -- see
+    # _remove_close_button()'s own docstring for why both the Win32
+    # removal attempt AND the protocol() no-op fallback are used
+    # together, and for the caveat that visible removal isn't
+    # guaranteed on every Windows/DWM build (the protocol() fallback is
+    # what actually guarantees clicking X does nothing, even then).
+    PROG_WIN.protocol("WM_DELETE_WINDOW", lambda: None)
+    _remove_close_button(PROG_WIN)
 
     PROG_WIN.transient(root)
     PROG_WIN.grab_set()
@@ -1400,98 +1441,130 @@ def run_processing(app_root, overwrite_mode=None):
             print("Run cancelled by user (database output table not confirmed).")
             return
 
-    print("\n🔷 Loading POI data...")
-    if poi_source[0] == "local":
-        poi_gdf = gpd.read_file(poi_source[1][0])
-    else:
-        poi_gdf = read_postgis_clean(poi_source[1][0], engine, schema)
-    print(f"✅ Loaded {len(poi_gdf)} POIs")
+    # ============================================================
+    # Error handling -- newly added, previously missing entirely.
+    # ============================================================
+    # Everything from here down used to run with NO try/except at all:
+    # any exception (a network failure during OSM graph download, a
+    # bad geometry, a DB write error, etc.) would propagate all the
+    # way up uncaught -- no error dialog would ever appear, and if it
+    # happened while a per-source progress window was open
+    # (create_progress_window() below, one per source in the loop),
+    # that window would never be closed either, since there was no
+    # finally to guarantee it.
+    #
+    # error_message is captured here instead of calling
+    # messagebox.showerror() directly inline, so that no modal dialog
+    # is ever shown while a progress window might still be alive --
+    # same principle already applied to POI_All_Distance.py's
+    # run_with_progress()/task(). close_progress_window() in finally is
+    # safe to call even if no window is currently open (it already
+    # guards internally on `if PROG_WIN and PROG_WIN.winfo_exists()`),
+    # so this is a single, unconditional cleanup path regardless of
+    # which source was being processed (or whether processing had even
+    # started) when/if an exception occurs.
+    error_message = None
+    try:
+        print("\n🔷 Loading POI data...")
+        if poi_source[0] == "local":
+            poi_gdf = gpd.read_file(poi_source[1][0])
+        else:
+            poi_gdf = read_postgis_clean(poi_source[1][0], engine, schema)
+        print(f"✅ Loaded {len(poi_gdf)} POIs")
 
-    if barangay_source[0] == "local":
-        for path in barangay_source[1]:
-            base_name = os.path.splitext(os.path.basename(path))[0]
-            print(f"\n🔷 Processing: {base_name}")
-            gdf = gpd.read_file(path)
+        if barangay_source[0] == "local":
+            for path in barangay_source[1]:
+                base_name = os.path.splitext(os.path.basename(path))[0]
+                print(f"\n🔷 Processing: {base_name}")
+                gdf = gpd.read_file(path)
 
-            # Preserves each source's existing output column name(s)/
-            # casing exactly, if a conflict was detected and confirmed
-            # in on_run() -- e.g. a detected "caMA_NUM_POLICE" is
-            # written back to "caMA_NUM_POLICE", not a hardcoded
-            # "CAMA_NUM_POLICE". Defaults to the standard
-            # CAMA_-prefixed name for any output this source has no
-            # override for.
-            output_col_overrides = parcel_output_column_overrides.get(path, {})
-            num_police_col = output_col_overrides.get("CAMA_NUM_POLICE", "CAMA_NUM_POLICE")
-            num_park_col = output_col_overrides.get("CAMA_NUM_PARK", "CAMA_NUM_PARK")
-            num_mall_col = output_col_overrides.get("CAMA_NUM_MALL", "CAMA_NUM_MALL")
-            num_others_col = output_col_overrides.get("CAMA_NUM_OTHERS", "CAMA_NUM_OTHERS")
+                # Preserves each source's existing output column name(s)/
+                # casing exactly, if a conflict was detected and confirmed
+                # in on_run() -- e.g. a detected "caMA_NUM_POLICE" is
+                # written back to "caMA_NUM_POLICE", not a hardcoded
+                # "CAMA_NUM_POLICE". Defaults to the standard
+                # CAMA_-prefixed name for any output this source has no
+                # override for.
+                output_col_overrides = parcel_output_column_overrides.get(path, {})
+                num_police_col = output_col_overrides.get("CAMA_NUM_POLICE", "CAMA_NUM_POLICE")
+                num_park_col = output_col_overrides.get("CAMA_NUM_PARK", "CAMA_NUM_PARK")
+                num_mall_col = output_col_overrides.get("CAMA_NUM_MALL", "CAMA_NUM_MALL")
+                num_others_col = output_col_overrides.get("CAMA_NUM_OTHERS", "CAMA_NUM_OTHERS")
 
-            create_progress_window(app_root, len(gdf), title=f"Processing: {base_name}")
-            result = process_poi_counts(gdf, poi_gdf, radius_meters,
-                                        progress_cb=update_progress,
-                                        num_police_col=num_police_col, num_park_col=num_park_col,
-                                        num_mall_col=num_mall_col, num_others_col=num_others_col)
-            close_progress_window()
+                create_progress_window(app_root, len(gdf), title=f"Processing: {base_name}")
+                result = process_poi_counts(gdf, poi_gdf, radius_meters,
+                                            progress_cb=update_progress,
+                                            num_police_col=num_police_col, num_park_col=num_park_col,
+                                            num_mall_col=num_mall_col, num_others_col=num_others_col)
+                close_progress_window()
 
-            if output_mode[0] == "local":
-                desired_base_name = base_name
-                candidate_path = os.path.join(output_mode[1], f"{desired_base_name}.gpkg")
-                had_conflict = os.path.exists(candidate_path)
-                if had_conflict and overwrite_mode == "new":
-                    base_name = resolve_output_base_name(output_mode[1], desired_base_name)
+                if output_mode[0] == "local":
+                    desired_base_name = base_name
+                    candidate_path = os.path.join(output_mode[1], f"{desired_base_name}.gpkg")
+                    had_conflict = os.path.exists(candidate_path)
+                    if had_conflict and overwrite_mode == "new":
+                        base_name = resolve_output_base_name(output_mode[1], desired_base_name)
+                    else:
+                        base_name = desired_base_name
+                    out = os.path.join(output_mode[1], f"{base_name}.gpkg")
+                    _write_gpkg(result, out)
+                    print(f"✅ Saved: {out}")
+                    load_in_global_mapper(out)
                 else:
-                    base_name = desired_base_name
-                out = os.path.join(output_mode[1], f"{base_name}.gpkg")
-                _write_gpkg(result, out)
-                print(f"✅ Saved: {out}")
-                load_in_global_mapper(out)
-            else:
-                # The actual destination table was already decided by
-                # resolve_db_output_table(), BEFORE this loop even
-                # started -- fuzzy matching + user confirmation already
-                # happened there (see that function's docstring). This
-                # just uses the result. Falls back to the old
-                # filename-lowercased behavior only if
-                # resolved_table_name is somehow None here
-                # (output_mode[0] != "db" can't reach this branch, so
-                # this is just a defensive fallback).
-                output_table = resolved_table_name if resolved_table_name is not None else base_name.lower()
-                with engine.begin() as conn:
-                    result.to_postgis(output_table, conn, schema=schema,
-                                      if_exists="replace", index=False)
-                print(f"✅ Saved to DB: {output_table}")
-    else:
-        # Database Land Parcel sources: column-conflict check is out of
-        # scope (see _check_parcel_poi_conflicts()) -- always uses
-        # process_poi_counts()'s four default CAMA_-prefixed names.
-        for table in barangay_source[1]:
-            print(f"\n🔷 Processing DB table: {table}")
-            gdf = read_postgis_clean(table, engine, schema)
+                    # The actual destination table was already decided by
+                    # resolve_db_output_table(), BEFORE this loop even
+                    # started -- fuzzy matching + user confirmation already
+                    # happened there (see that function's docstring). This
+                    # just uses the result. Falls back to the old
+                    # filename-lowercased behavior only if
+                    # resolved_table_name is somehow None here
+                    # (output_mode[0] != "db" can't reach this branch, so
+                    # this is just a defensive fallback).
+                    output_table = resolved_table_name if resolved_table_name is not None else base_name.lower()
+                    with engine.begin() as conn:
+                        result.to_postgis(output_table, conn, schema=schema,
+                                          if_exists="replace", index=False)
+                    print(f"✅ Saved to DB: {output_table}")
+        else:
+            # Database Land Parcel sources: column-conflict check is out of
+            # scope (see _check_parcel_poi_conflicts()) -- always uses
+            # process_poi_counts()'s four default CAMA_-prefixed names.
+            for table in barangay_source[1]:
+                print(f"\n🔷 Processing DB table: {table}")
+                gdf = read_postgis_clean(table, engine, schema)
 
-            create_progress_window(app_root, len(gdf), title=f"Processing: {table}")
-            result = process_poi_counts(gdf, poi_gdf, radius_meters,
-                                        progress_cb=update_progress)
-            close_progress_window()
+                create_progress_window(app_root, len(gdf), title=f"Processing: {table}")
+                result = process_poi_counts(gdf, poi_gdf, radius_meters,
+                                            progress_cb=update_progress)
+                close_progress_window()
 
-            if output_mode[0] == "local":
-                desired_base_name = table
-                candidate_path = os.path.join(output_mode[1], f"{desired_base_name}.gpkg")
-                had_conflict = os.path.exists(candidate_path)
-                if had_conflict and overwrite_mode == "new":
-                    base_name = resolve_output_base_name(output_mode[1], desired_base_name)
+                if output_mode[0] == "local":
+                    desired_base_name = table
+                    candidate_path = os.path.join(output_mode[1], f"{desired_base_name}.gpkg")
+                    had_conflict = os.path.exists(candidate_path)
+                    if had_conflict and overwrite_mode == "new":
+                        base_name = resolve_output_base_name(output_mode[1], desired_base_name)
+                    else:
+                        base_name = desired_base_name
+                    out = os.path.join(output_mode[1], f"{base_name}.gpkg")
+                    _write_gpkg(result, out)
+                    print(f"✅ Saved: {out}")
+                    load_in_global_mapper(out)
                 else:
-                    base_name = desired_base_name
-                out = os.path.join(output_mode[1], f"{base_name}.gpkg")
-                _write_gpkg(result, out)
-                print(f"✅ Saved: {out}")
-                load_in_global_mapper(out)
-            else:
-                with engine.begin() as conn:
-                    result.to_postgis(table, conn, schema=schema,
-                                      if_exists="replace", index=False)
-                print(f"✅ Updated DB table: {table}")
+                    with engine.begin() as conn:
+                        result.to_postgis(table, conn, schema=schema,
+                                          if_exists="replace", index=False)
+                    print(f"✅ Updated DB table: {table}")
 
-    messagebox.showinfo("Success", "Processing complete!")
+    except Exception as e:
+        error_message = str(e)
+    finally:
+        close_progress_window()
+
+    if error_message:
+        messagebox.showerror("Error", error_message)
+    else:
+        messagebox.showinfo("Success", "Processing complete!")
 
 
 # ---------------- MAIN ----------------
