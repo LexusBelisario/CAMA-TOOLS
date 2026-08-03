@@ -1,6 +1,5 @@
 import atexit
 import signal
-import logging
 from datetime import datetime
 
 TOOL_PROCESSES = []
@@ -1253,15 +1252,12 @@ def update_database_from_geopackage():
         if _step1_result is None:
             _dump_windows("export navigation lost focus after EXPORT menu item (update_database)")
             raise RuntimeError(
-                "Export navigation failed: none of 'Select Layers', "
-                "'Tip', or 'Select Export Format' appeared as expected "
-                f"(focused window was '{_current_fg}' instead). This "
-                "can happen when the highlighted layer's type changes "
-                "what options exist in Global Mapper's right-click "
-                "menu (e.g. a nested/grouped GeoPackage entry vs. a "
-                "flat shapefile layer). Update Database was aborted "
-                "before any further keystrokes were sent, to avoid "
-                "typing into the wrong window."
+                "Update Database was aborted before any further "
+                "keystrokes were sent to avoid typing into the wrong "
+                "window.\n\n"
+                "Please select the layer you want to update and make "
+                "sure that what you select is a layer without an "
+                "expand icon ('+' or '-') to its left."
             )
 
         # --- Step 3: "Select Layers" dialog -> OK (no Check All) ---
@@ -1466,51 +1462,6 @@ def update_database_from_geopackage():
             database=DB_NAME
         )
         engine = create_engine(connection_url)
-
-        # ── TEMPORARY DIAGNOSTIC ONLY ─────────────────────────────────
-        # Added solely to trace the "idx_roadnetwork_staging_geom already
-        # exists" DuplicateTable investigation. Must be REMOVED once that
-        # root cause is identified — this is not permanent instrumentation.
-        #
-        # Disabled by default: no-op unless CAMA_DEBUG_SQL=1 is set in the
-        # environment before launching the exe. Does not touch any
-        # staging, validation, swap, or PK-resolution logic below — it
-        # only observes the SQL SQLAlchemy sends to PostgreSQL.
-        #
-        # Writes to a dedicated file (not the console) so it works under
-        # the --noconsole PyInstaller build. Verified empirically (not
-        # assumed) that attaching a plain logging.FileHandler to the
-        # "sqlalchemy.engine" logger at INFO level captures the full SQL
-        # text — including DDL from to_postgis()/GeoAlchemy2 — without
-        # needing engine echo=True.
-        #
-        # Idempotent handler attachment: update_database_from_geopackage()
-        # can be invoked multiple times in the same running process (the
-        # "Update Database" button can be clicked more than once per
-        # session). The "sqlalchemy.engine" logger is a process-wide
-        # singleton, so attaching a new FileHandler on every call would
-        # duplicate every log line once per prior call (2nd run logs each
-        # statement twice, 3rd run logs it three times, etc.) — which
-        # would look like a real duplicate-SQL bug even though it's only
-        # a logging artifact. Guarded here via a marker attribute checked
-        # against already-attached handlers before adding a new one.
-        if os.environ.get("CAMA_DEBUG_SQL") == "1":
-            _sql_log_path = os.path.join(TEMP_DIR, "cama_sql_debug.log")
-            _sql_logger = logging.getLogger("sqlalchemy.engine")
-            _sql_logger.setLevel(logging.INFO)
-            _already_attached = any(
-                getattr(h, "_cama_debug_sql_handler", False)
-                for h in _sql_logger.handlers
-            )
-            if not _already_attached:
-                _sql_handler = logging.FileHandler(_sql_log_path, encoding="utf-8")
-                _sql_handler.setLevel(logging.INFO)
-                _sql_handler._cama_debug_sql_handler = True  # marker: prevents duplicate attachment on repeat calls
-                _sql_logger.addHandler(_sql_handler)
-                _log(f"CAMA_DEBUG_SQL enabled — SQL trace will be written to {_sql_log_path}")
-            else:
-                _log("CAMA_DEBUG_SQL enabled — SQL trace handler already attached from a prior call this session")
-        # ── END TEMPORARY DIAGNOSTIC ──────────────────────────────────
 
         conn = engine.connect()
         cursor = conn.connection.cursor()
@@ -2244,15 +2195,11 @@ def update_map_and_select_recorded():
         if _step1_result is None:
             _dump_windows("export navigation lost focus after EXPORT menu item (update_map)")
             raise RuntimeError(
-                "Export navigation failed: none of 'Select Layers', "
-                "'Tip', or 'Select Export Format' appeared as expected "
-                f"(focused window was '{_current_fg}' instead). This "
-                "can happen when the highlighted layer's type changes "
-                "what options exist in Global Mapper's right-click "
-                "menu (e.g. a nested/grouped GeoPackage entry vs. a "
-                "flat shapefile layer). Update Map was aborted before "
-                "any further keystrokes were sent, to avoid typing "
-                "into the wrong window."
+                "Update Map was aborted before any further keystrokes "
+                "were sent to avoid typing into the wrong window.\n\n"
+                "Please select the layer you want to update and make "
+                "sure that what you select is a layer without an "
+                "expand/collapse icon ('+' or '-') to its left."
             )
 
         # "Select Layers" dialog -> OK. Confirmed that "OK" is already
@@ -2543,11 +2490,61 @@ def update_map_and_select_recorded():
             # PHASE: database read (Section 5 - technical + business
             # validation failures both handled here)
             # ============================================================
+            def _get_geometry_column(table_name):
+                """
+                Dynamically detect the actual geometry column name for a
+                table by querying PostGIS's own geometry_columns catalog
+                view - the same approach already used throughout this
+                project's other tool modules (see get_geometry_column()
+                in road_width.py, land_shape_compactness.py, lot_location.py,
+                etc.), confirmed available in this environment. Avoids
+                assuming the geometry column is literally named "geom":
+                tables that were never written by CAMA Tools' own Safe
+                Replace Workflow (e.g. created via QGIS, shp2pgsql, or a
+                manual import) commonly use "geometry", "the_geom", or
+                other conventions instead - Update Database's own write
+                path always normalizes to "geom", but a table that has
+                never been through Update Database yet may not be.
+
+                Local to update_map_and_select_recorded() only, matching
+                this task's scope (no existing equivalent found in this
+                file to reuse). Returns the column name as a string, or
+                None if not found (e.g. the table has no geometry column
+                registered in the catalog, or the query itself failed) -
+                the caller decides how to handle a None result.
+                """
+                try:
+                    with engine.connect() as conn:
+                        result = conn.execute(
+                            text(
+                                "SELECT f_geometry_column FROM geometry_columns "
+                                "WHERE f_table_schema = :schema AND f_table_name = :table"
+                            ),
+                            {"schema": DB_SCHEMA, "table": table_name}
+                        )
+                        row = result.fetchone()
+                        return row[0] if row else None
+                except Exception as geom_col_err:
+                    _log(f"  geometry column detection failed for "
+                         f"'{table_name}': {type(geom_col_err).__name__}: {geom_col_err}")
+                    return None
+
             try:
                 read_results = []  # [(matched_table_name, GeoDataFrame), ...]
                 for layer_name, table_name in matched_pairs:
+                    _geom_col = _get_geometry_column(table_name)
+                    if not _geom_col:
+                        raise RuntimeError(
+                            f"Could not determine the geometry column for "
+                            f"table '{DB_SCHEMA}.{table_name}' (no entry "
+                            "found in PostGIS's geometry_columns catalog). "
+                            "The table may not have a registered geometry "
+                            "column. Update Map was aborted before any "
+                            "changes were made to Global Mapper."
+                        )
+                    _log(f"  detected geometry column '{_geom_col}' for table '{table_name}'")
                     sql = f'SELECT * FROM "{DB_SCHEMA}"."{table_name}"'
-                    gdf = gpd.read_postgis(sql, con=engine, geom_col="geom")
+                    gdf = gpd.read_postgis(sql, con=engine, geom_col=_geom_col)
 
                     # Business validation failure (Section 5, locked):
                     # a table that reads back with zero features is not
@@ -2575,242 +2572,6 @@ def update_map_and_select_recorded():
             # mode="w"/"a" write order)
             # ============================================================
             try:
-                # DIAGNOSTIC (temporary): log which geopandas write backend
-                # is actually available/active in this build, before doing
-                # anything else. A prior run of this exact write loop
-                # failed on the second (append, mode="a") layer with
-                # "DriverError: NULL pointer error" - this could originate
-                # from either the pyogrio or the fiona/GDAL backend, and
-                # this has not yet been confirmed either way. This logging
-                # exists to answer that question directly rather than
-                # guess. Remove once the root cause is confirmed.
-                try:
-                    import geopandas as _gpd_diag
-                    _log(f"DIAG: geopandas version = {_gpd_diag.__version__}")
-                except Exception as diag_e:
-                    _log(f"DIAG: could not import/check geopandas: {diag_e}")
-                try:
-                    import pyogrio as _pyogrio_diag
-                    _log(f"DIAG: pyogrio version = {_pyogrio_diag.__version__} (available)")
-                except Exception as diag_e:
-                    _log(f"DIAG: pyogrio not available/importable: "
-                         f"{type(diag_e).__name__}: {diag_e}")
-
-                # DIAGNOSTIC (temporary): fiona/GDAL version info, requested
-                # to rule out a known bad Fiona/GDAL version combination
-                # before assuming this is a GDAL-environment-state issue.
-                try:
-                    _log(f"DIAG: fiona version = {fiona.__version__}")
-                except Exception as diag_e:
-                    _log(f"DIAG: could not read fiona.__version__: {diag_e}")
-                gdal_version_logged = False
-                for _attr_path in ("fiona.__gdal_version__",):
-                    try:
-                        _log(f"DIAG: fiona.__gdal_version__ = {fiona.__gdal_version__}")
-                        gdal_version_logged = True
-                        break
-                    except Exception:
-                        pass
-                if not gdal_version_logged:
-                    try:
-                        from fiona.env import GDALVersion as _GDALVersion_diag
-                        _log(f"DIAG: GDAL runtime version = {_GDALVersion_diag.runtime()}")
-                        gdal_version_logged = True
-                    except Exception as diag_e:
-                        _log(f"DIAG: could not determine GDAL version: "
-                             f"{type(diag_e).__name__}: {diag_e}")
-
-                # DIAGNOSTIC (temporary) - Experiment A + B: minimal
-                # reproduction, fully isolated from PostGIS, SQLAlchemy,
-                # and Global Mapper automation. Purpose: determine whether
-                # this build's bundled Fiona/GDAL can append a second
-                # layer to an existing GeoPackage AT ALL, independent of
-                # this pipeline's real data. Self-contained - creates its
-                # own tiny GeoDataFrames and its own temp files, cleans up
-                # after itself, and does not affect `read_results` or the
-                # real write attempt that follows. Remove this whole block
-                # once the root cause is confirmed.
-                try:
-                    from shapely.geometry import Point as _Point_diag
-                    _diag_gdf_1 = gpd.GeoDataFrame(
-                        {"id": [1]}, geometry=[_Point_diag(0, 0)], crs="EPSG:4326"
-                    )
-                    _diag_gdf_2 = gpd.GeoDataFrame(
-                        {"id": [1]}, geometry=[_Point_diag(1, 1)], crs="EPSG:4326"
-                    )
-
-                    # ---- Experiment A: two SEPARATE GeoPackage files ----
-                    _diag_a1_path = os.path.join(TEMP_DIR, "diag_expA_1.gpkg")
-                    _diag_a2_path = os.path.join(TEMP_DIR, "diag_expA_2.gpkg")
-                    _exp_a_ok = True
-                    try:
-                        _diag_gdf_1.to_file(_diag_a1_path, layer="layer1", driver="GPKG",
-                                             mode="w", engine="fiona")
-                        _log("DIAG Experiment A: write to separate file 1 - OK")
-                    except Exception as exp_a_err:
-                        _exp_a_ok = False
-                        _log(f"DIAG Experiment A: write to separate file 1 - FAILED: "
-                             f"{type(exp_a_err).__name__}: {exp_a_err}")
-                        _log(f"DIAG Experiment A (file 1) traceback:\n{traceback.format_exc()}")
-                    try:
-                        _diag_gdf_2.to_file(_diag_a2_path, layer="layer2", driver="GPKG",
-                                             mode="w", engine="fiona")
-                        _log("DIAG Experiment A: write to separate file 2 - OK")
-                    except Exception as exp_a_err:
-                        _exp_a_ok = False
-                        _log(f"DIAG Experiment A: write to separate file 2 - FAILED: "
-                             f"{type(exp_a_err).__name__}: {exp_a_err}")
-                        _log(f"DIAG Experiment A (file 2) traceback:\n{traceback.format_exc()}")
-                    for _p in (_diag_a1_path, _diag_a2_path):
-                        try:
-                            if os.path.exists(_p):
-                                os.remove(_p)
-                        except Exception:
-                            pass
-                    _log(f"DIAG Experiment A overall: {'PASS' if _exp_a_ok else 'FAIL'}")
-
-                    # ---- Experiment B: mode='w' then mode='a' on ONE
-                    # shared file (only run if Experiment A fully passed,
-                    # per the requested order - no point testing the
-                    # append path if even isolated single writes fail) ----
-                    # ---- Experiment B: mode='w' then mode='a' on ONE
-                    # shared file (only run if Experiment A fully passed,
-                    # per the requested order - no point testing the
-                    # append path if even isolated single writes fail) ----
-                    _exp_b_ok = False
-                    if _exp_a_ok:
-                        _diag_b_path = os.path.join(TEMP_DIR, "diag_expB.gpkg")
-                        try:
-                            _diag_gdf_1.to_file(_diag_b_path, layer="layer1", driver="GPKG",
-                                                 mode="w", engine="fiona")
-                            _log("DIAG Experiment B: mode='w' first layer - OK")
-                            _diag_gdf_2.to_file(_diag_b_path, layer="layer2", driver="GPKG",
-                                                 mode="a", engine="fiona")
-                            _log("DIAG Experiment B: mode='a' second layer - OK "
-                                 "(minimal reproduction did NOT fail)")
-                            _exp_b_ok = True
-                        except Exception as exp_b_err:
-                            _log(f"DIAG Experiment B: FAILED at mode='a' append: "
-                                 f"{type(exp_b_err).__name__}: {exp_b_err}")
-                            _log(f"DIAG Experiment B traceback:\n{traceback.format_exc()}")
-                        finally:
-                            try:
-                                if os.path.exists(_diag_b_path):
-                                    os.remove(_diag_b_path)
-                            except Exception:
-                                pass
-                    else:
-                        _log("DIAG Experiment B: skipped (Experiment A did not fully pass)")
-
-                    # ---- Experiment C1: EACH write wrapped in its OWN
-                    # fiona.Env() - tests whether GDAL driver/config state
-                    # is being lost between the "w" and "a" calls. Only
-                    # run if Experiment B failed (no point testing a fix
-                    # for a problem that didn't reproduce). ----
-                    _exp_c1_ok = False
-                    if not _exp_b_ok and _exp_a_ok:
-                        _diag_c1_path = os.path.join(TEMP_DIR, "diag_expC1.gpkg")
-                        try:
-                            with fiona.Env():
-                                _diag_gdf_1.to_file(_diag_c1_path, layer="layer1", driver="GPKG",
-                                                     mode="w", engine="fiona")
-                            _log("DIAG Experiment C1: mode='w' first layer (own fiona.Env) - OK")
-                            with fiona.Env():
-                                _diag_gdf_2.to_file(_diag_c1_path, layer="layer2", driver="GPKG",
-                                                     mode="a", engine="fiona")
-                            _log("DIAG Experiment C1: mode='a' second layer (own fiona.Env) "
-                                 "- OK (did NOT fail)")
-                            _exp_c1_ok = True
-                        except Exception as exp_c1_err:
-                            _log(f"DIAG Experiment C1: FAILED: "
-                                 f"{type(exp_c1_err).__name__}: {exp_c1_err}")
-                            _log(f"DIAG Experiment C1 traceback:\n{traceback.format_exc()}")
-                        finally:
-                            try:
-                                if os.path.exists(_diag_c1_path):
-                                    os.remove(_diag_c1_path)
-                            except Exception:
-                                pass
-                    else:
-                        _log("DIAG Experiment C1: skipped "
-                             f"({'Experiment B already passed' if _exp_b_ok else 'Experiment A did not pass'})")
-
-                    # ---- Experiment C2: ONE shared fiona.Env() wrapping
-                    # BOTH writes - tests a different hypothesis than C1
-                    # (persistent vs. per-call environment). Only run if
-                    # C1 failed. ----
-                    _exp_c2_ok = False
-                    if not _exp_c1_ok and _exp_a_ok and not _exp_b_ok:
-                        _diag_c2_path = os.path.join(TEMP_DIR, "diag_expC2.gpkg")
-                        try:
-                            with fiona.Env():
-                                _diag_gdf_1.to_file(_diag_c2_path, layer="layer1", driver="GPKG",
-                                                     mode="w", engine="fiona")
-                                _log("DIAG Experiment C2: mode='w' first layer (shared fiona.Env) - OK")
-                                _diag_gdf_2.to_file(_diag_c2_path, layer="layer2", driver="GPKG",
-                                                     mode="a", engine="fiona")
-                                _log("DIAG Experiment C2: mode='a' second layer (shared fiona.Env) "
-                                     "- OK (did NOT fail)")
-                            _exp_c2_ok = True
-                        except Exception as exp_c2_err:
-                            _log(f"DIAG Experiment C2: FAILED: "
-                                 f"{type(exp_c2_err).__name__}: {exp_c2_err}")
-                            _log(f"DIAG Experiment C2 traceback:\n{traceback.format_exc()}")
-                        finally:
-                            try:
-                                if os.path.exists(_diag_c2_path):
-                                    os.remove(_diag_c2_path)
-                            except Exception:
-                                pass
-                    else:
-                        _log("DIAG Experiment C2: skipped "
-                             f"({'C1 already passed' if _exp_c1_ok else 'prerequisite not met'})")
-
-                    # ---- Experiment D: PURE fiona API, no GeoPandas
-                    # wrapper at all. If this still fails, GeoPandas is
-                    # completely exonerated and the minimal reproducer is
-                    # Fiona itself - useful for filing an upstream issue.
-                    # Only run if BOTH C1 and C2 failed. ----
-                    if not _exp_c1_ok and not _exp_c2_ok and _exp_a_ok and not _exp_b_ok:
-                        _diag_d_path = os.path.join(TEMP_DIR, "diag_expD.gpkg")
-                        _diag_schema = {"geometry": "Point", "properties": {"id": "int"}}
-                        try:
-                            with fiona.open(_diag_d_path, "w", driver="GPKG", layer="layer1",
-                                             schema=_diag_schema, crs="EPSG:4326") as _diag_col:
-                                _diag_col.write({
-                                    "geometry": {"type": "Point", "coordinates": (0, 0)},
-                                    "properties": {"id": 1},
-                                })
-                            _log("DIAG Experiment D: pure fiona mode='w' first layer - OK")
-                            with fiona.open(_diag_d_path, "a", driver="GPKG", layer="layer2",
-                                             schema=_diag_schema, crs="EPSG:4326") as _diag_col:
-                                _diag_col.write({
-                                    "geometry": {"type": "Point", "coordinates": (1, 1)},
-                                    "properties": {"id": 1},
-                                })
-                            _log("DIAG Experiment D: pure fiona mode='a' second layer - OK "
-                                 "(did NOT fail - bug is in the GeoPandas wrapper layer, "
-                                 "not bare Fiona)")
-                        except Exception as exp_d_err:
-                            _log(f"DIAG Experiment D: FAILED (pure fiona, no GeoPandas): "
-                                 f"{type(exp_d_err).__name__}: {exp_d_err}")
-                            _log(f"DIAG Experiment D traceback:\n{traceback.format_exc()}")
-                            _log("DIAG Experiment D conclusion: bug reproduces in bare Fiona "
-                                 "- GeoPandas is exonerated, this is a Fiona/GDAL/PyInstaller "
-                                 "runtime issue")
-                        finally:
-                            try:
-                                if os.path.exists(_diag_d_path):
-                                    os.remove(_diag_d_path)
-                            except Exception:
-                                pass
-                    else:
-                        _log("DIAG Experiment D: skipped (an earlier experiment already "
-                             "passed, or prerequisites not met)")
-                except Exception as diag_block_err:
-                    _log(f"DIAG block (Experiments A/B/C1/C2/D) itself failed to run: "
-                         f"{type(diag_block_err).__name__}: {diag_block_err}")
-
                 if len(read_results) == 1:
                     base_stem = f"updatemap_{read_results[0][0]}"
                 else:
@@ -3605,10 +3366,6 @@ def hwnd_title(hwnd):
     ctypes.windll.user32.GetWindowTextW(hwnd, buf, 256)
     return buf.value
 
-def hwnd_belongs_to(hwnd, titles_substrings):
-    title = hwnd_title(hwnd).lower()
-    return any(t.lower() in title for t in titles_substrings)
-
 def get_foreground_pid():
     hwnd = get_foreground_hwnd()
     pid = ctypes.wintypes.DWORD()
@@ -4038,76 +3795,27 @@ def launch_main_window():
     root.attributes("-alpha", 1)
     root.deiconify()
     root.lift()
-    # Pin as topmost at Win32 level — more reliable than tkinter's -topmost
-    # NOTE: switched from get_hwnd_by_title("CAMA Tools") to the same
-    # GetParent(root.winfo_id()) pattern hide_from_taskbar() already uses.
-    # Diagnostic log evidence (SetWindowPos failing with
-    # ERROR_INVALID_WINDOW_HANDLE=1400 on every single call, across every
-    # call site, for the entire session) showed get_hwnd_by_title() was
-    # returning an hwnd that does not correspond to a live window.
-    # DIAGNOSTIC ONLY — one-time comparison log, so we can see whether
-    # root.winfo_id() and GetParent(root.winfo_id()) resolve to the hwnd
-    # we then pass to SetWindowPos() below. No behavior change.
-    _log(f"HWND STARTUP CHECK | root.winfo_id()={root.winfo_id()} | GetParent(root.winfo_id())={ctypes.windll.user32.GetParent(root.winfo_id())}")
-
+    # Pin as topmost at Win32 level — more reliable than tkinter's -topmost.
+    # Uses GetParent(root.winfo_id()) — the same pattern hide_from_taskbar()
+    # already uses — rather than a title-based lookup, to get CAMA's real
+    # top-level HWND directly.
     cama_hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
     if cama_hwnd:
-        # DIAGNOSTIC ONLY — confirm the hwnd is actually a live window
-        # (IsWindow) and which window it actually refers to (title),
-        # immediately before the existing SetWindowPos() call below.
-        # No change to arguments/timing/behavior.
-        _is_valid = ctypes.windll.user32.IsWindow(cama_hwnd)
-        _title_buf = ctypes.create_unicode_buffer(256)
-        ctypes.windll.user32.GetWindowTextW(cama_hwnd, _title_buf, 256)
-        if _is_valid:
-            _log(f"HWND CHECK | caller=launch_main_window | hwnd={cama_hwnd} | IsWindow={_is_valid} | title='{_title_buf.value}'")
-        else:
-            _iw_err = ctypes.windll.kernel32.GetLastError()
-            _log(f"HWND CHECK | caller=launch_main_window | hwnd={cama_hwnd} | IsWindow={_is_valid} | title='{_title_buf.value}' | GetLastError={_iw_err}")
-
-        # DIAGNOSTIC ONLY (Z-order race investigation) — logs around the
-        # existing call, no change to arguments/timing/behavior.
-        _log(f"SetWindowPos CALL | caller=launch_main_window | hwnd={cama_hwnd} | flags=SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE")
-        _swp_ret = ctypes.windll.user32.SetWindowPos(
+        ctypes.windll.user32.SetWindowPos(
             cama_hwnd, HWND_TOPMOST,
             0, 0, 0, 0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
         )
-        if _swp_ret == 0:
-            _swp_err = ctypes.windll.kernel32.GetLastError()
-            _log(f"SetWindowPos RESULT | caller=launch_main_window | hwnd={cama_hwnd} | ret={_swp_ret} | GetLastError={_swp_err}")
-        else:
-            _log(f"SetWindowPos RESULT | caller=launch_main_window | hwnd={cama_hwnd} | ret={_swp_ret}")
 
     # Force Z-order above GM immediately after showing
     def _force_z_order():
-        # DIAGNOSTIC ONLY — logs when this delayed callback actually
-        # fires (vs. its scheduled 500ms/1500ms), for race analysis.
-        _log("_force_z_order() fired")
-        # See note above launch_main_window()'s cama_hwnd assignment.
         cama_hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
         if cama_hwnd:
-            # DIAGNOSTIC ONLY — see note in launch_main_window().
-            _is_valid = ctypes.windll.user32.IsWindow(cama_hwnd)
-            _title_buf = ctypes.create_unicode_buffer(256)
-            ctypes.windll.user32.GetWindowTextW(cama_hwnd, _title_buf, 256)
-            if _is_valid:
-                _log(f"HWND CHECK | caller=_force_z_order | hwnd={cama_hwnd} | IsWindow={_is_valid} | title='{_title_buf.value}'")
-            else:
-                _iw_err = ctypes.windll.kernel32.GetLastError()
-                _log(f"HWND CHECK | caller=_force_z_order | hwnd={cama_hwnd} | IsWindow={_is_valid} | title='{_title_buf.value}' | GetLastError={_iw_err}")
-
-            _log(f"SetWindowPos CALL | caller=_force_z_order | hwnd={cama_hwnd} | flags=SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE")
-            _swp_ret = ctypes.windll.user32.SetWindowPos(
+            ctypes.windll.user32.SetWindowPos(
                 cama_hwnd, HWND_TOPMOST,
                 0, 0, 0, 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
             )
-            if _swp_ret == 0:
-                _swp_err = ctypes.windll.kernel32.GetLastError()
-                _log(f"SetWindowPos RESULT | caller=_force_z_order | hwnd={cama_hwnd} | ret={_swp_ret} | GetLastError={_swp_err}")
-            else:
-                _log(f"SetWindowPos RESULT | caller=_force_z_order | hwnd={cama_hwnd} | ret={_swp_ret}")
 
             # Z-order fix: CAMA was just re-pinned topmost above — restore
             # any currently-visible tooltip's topmost status so it doesn't
@@ -4116,11 +3824,6 @@ def launch_main_window():
 
     root.after(500, _force_z_order)   # after GM settles
     root.after(1500, _force_z_order)  # second pass in case GM repaints on top
-
-    # DIAGNOSTIC ONLY — marks completion of launch_main_window() for
-    # race-timing analysis against the _force_z_order()/monitor_gm_state()
-    # log lines above/below.
-    _log("launch_main_window() complete")
 
 
 import pygetwindow as gw
@@ -4196,16 +3899,9 @@ prev_position  = [None, None]
 prev_gm_rect   = [None, None, None, None]  # left, top, width, height
 cama_offset    = [None, None]              # CAMA's offset relative to GM
 _topmost_recheck_counter = [0]             # throttles repeated SetWindowPos calls to avoid title-bar flicker
-_monitor_first_tick_logged = [False]       # DIAGNOSTIC ONLY — ensures the "first tick" log fires once, not every 200ms
 _active_tool_titles = set()               # tracks open tool window titles in dev mode
 
 def monitor_gm_state():
-    # DIAGNOSTIC ONLY — logs once, the first time this loop ever ticks,
-    # for race-timing analysis against launch_main_window()'s log lines.
-    if not _monitor_first_tick_logged[0]:
-        _monitor_first_tick_logged[0] = True
-        _log("monitor_gm_state() first tick")
-
     try:
         snap = _locked_gm_snapshot()
         if snap and snap[4]:  # snap[4] = visible - preserves old .visible filter
@@ -4237,60 +3933,22 @@ def monitor_gm_state():
                 # Calling SetWindowPos every 200ms causes visible title-bar flicker.
                 if cama_hwnd:
                     if just_shown:
-                        # DIAGNOSTIC ONLY — see note in launch_main_window().
-                        _is_valid = ctypes.windll.user32.IsWindow(cama_hwnd)
-                        _title_buf = ctypes.create_unicode_buffer(256)
-                        ctypes.windll.user32.GetWindowTextW(cama_hwnd, _title_buf, 256)
-                        if _is_valid:
-                            _log(f"HWND CHECK | caller=monitor_gm_state just_shown | hwnd={cama_hwnd} | IsWindow={_is_valid} | title='{_title_buf.value}'")
-                        else:
-                            _iw_err = ctypes.windll.kernel32.GetLastError()
-                            _log(f"HWND CHECK | caller=monitor_gm_state just_shown | hwnd={cama_hwnd} | IsWindow={_is_valid} | title='{_title_buf.value}' | GetLastError={_iw_err}")
-
-                        # DIAGNOSTIC ONLY — logs around the existing call,
-                        # no change to arguments/timing/behavior.
-                        _log(f"SetWindowPos CALL | caller=monitor_gm_state just_shown | hwnd={cama_hwnd} | flags=SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE")
-                        _swp_ret = ctypes.windll.user32.SetWindowPos(
+                        ctypes.windll.user32.SetWindowPos(
                             cama_hwnd, HWND_TOPMOST,
                             0, 0, 0, 0,
                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
                         )
-                        if _swp_ret == 0:
-                            _swp_err = ctypes.windll.kernel32.GetLastError()
-                            _log(f"SetWindowPos RESULT | caller=monitor_gm_state just_shown | hwnd={cama_hwnd} | ret={_swp_ret} | GetLastError={_swp_err}")
-                        else:
-                            _log(f"SetWindowPos RESULT | caller=monitor_gm_state just_shown | hwnd={cama_hwnd} | ret={_swp_ret}")
-
                         # Z-order fix: see _repin_active_tooltips().
                         _repin_active_tooltips()
                     else:
                         _topmost_recheck_counter[0] += 1
                         if _topmost_recheck_counter[0] >= 10:  # ~every 2s instead of every 200ms
                             _topmost_recheck_counter[0] = 0
-                            # DIAGNOSTIC ONLY — see note in launch_main_window().
-                            _is_valid = ctypes.windll.user32.IsWindow(cama_hwnd)
-                            _title_buf = ctypes.create_unicode_buffer(256)
-                            ctypes.windll.user32.GetWindowTextW(cama_hwnd, _title_buf, 256)
-                            if _is_valid:
-                                _log(f"HWND CHECK | caller=monitor_gm_state throttled | hwnd={cama_hwnd} | IsWindow={_is_valid} | title='{_title_buf.value}'")
-                            else:
-                                _iw_err = ctypes.windll.kernel32.GetLastError()
-                                _log(f"HWND CHECK | caller=monitor_gm_state throttled | hwnd={cama_hwnd} | IsWindow={_is_valid} | title='{_title_buf.value}' | GetLastError={_iw_err}")
-
-                            # DIAGNOSTIC ONLY — logs around the existing call,
-                            # no change to arguments/timing/behavior.
-                            _log(f"SetWindowPos CALL | caller=monitor_gm_state throttled | hwnd={cama_hwnd} | flags=SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE")
-                            _swp_ret = ctypes.windll.user32.SetWindowPos(
+                            ctypes.windll.user32.SetWindowPos(
                                 cama_hwnd, HWND_TOPMOST,
                                 0, 0, 0, 0,
                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
                             )
-                            if _swp_ret == 0:
-                                _swp_err = ctypes.windll.kernel32.GetLastError()
-                                _log(f"SetWindowPos RESULT | caller=monitor_gm_state throttled | hwnd={cama_hwnd} | ret={_swp_ret} | GetLastError={_swp_err}")
-                            else:
-                                _log(f"SetWindowPos RESULT | caller=monitor_gm_state throttled | hwnd={cama_hwnd} | ret={_swp_ret}")
-
                             # Z-order fix: see _repin_active_tooltips().
                             _repin_active_tooltips()
 
