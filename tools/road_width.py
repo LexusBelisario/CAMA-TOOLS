@@ -3134,8 +3134,9 @@ def open_main_window(root):
         # exactly what did or didn't happen instead of a partial batch
         # silently going through.
         if parcel_road_width_conflicts:
-            lines = "\n".join(
-                f"- '{os.path.basename(path_or_table)}' already has a '{existing_col}' column"
+            lines = "\n\n".join(
+                f"'{os.path.basename(path_or_table)}' already has the following column(s):\n"
+                f"  • {existing_col}"
                 for path_or_table, existing_col in parcel_road_width_conflicts
             )
             proceed = messagebox.askyesno(
@@ -3178,8 +3179,38 @@ def open_main_window(root):
                     print("Run cancelled by user (existing output file(s) found).")
                     return
 
+        # PRIORITY 3: DB-output destination table resolution — mirrors
+        # PRIORITY 2 above. Resolved here on the main thread, before
+        # win.destroy(), so confirm_db_overwrite_dialog() /
+        # choose_db_overwrite_dialog() (invoked inside
+        # resolve_db_output_table()) still have a live parent window,
+        # and a Cancel here leaves the fully-configured win intact
+        # instead of forcing a from-scratch reopen. Previously this
+        # resolution happened inside run_processing(), which is only
+        # ever invoked (in the live on_run() flow) AFTER win.destroy()
+        # -- see Fix 1 root cause. resolve_db_output_table()'s own
+        # matching/decision logic is untouched; only the call site
+        # moved here. Both resolved_table_name and resolved_outcome are
+        # handed to run_processing() as already-validated values --
+        # resolved_outcome specifically still matters downstream (see
+        # _process_one_source()'s "overwritten"/"created" outcome
+        # message), so both must be threaded through, not just the name.
+        resolved_table_name = None
+        resolved_outcome = None
+        if output_mode[0] == "db":
+            _resolve_creds = load_db_credentials()
+            if not _resolve_creds:
+                return
+            _resolve_schema = _resolve_creds["schema"]
+            resolved_table_name, resolved_outcome = resolve_db_output_table(
+                win, _resolve_schema, barangay_source
+            )
+            if resolved_table_name is None:
+                print("Run cancelled by user (database output table not confirmed).")
+                return
+
         win.destroy()
-        run_processing(root, overwrite_mode)
+        run_processing(root, overwrite_mode, resolved_table_name, resolved_outcome)
 
     run_btn = tk.Button(win, text="▶  Run Processing", command=on_run,
               bg="#2e7d32", fg="white", font=("Segoe UI", 10, "bold"),
@@ -4385,7 +4416,7 @@ def _process_one_source(
         return source_label, table, vm_table, outcome
 
 
-def run_processing(app_root, overwrite_mode=None):
+def run_processing(app_root, overwrite_mode=None, resolved_table_name=None, resolved_outcome=None):
     # overwrite_mode: passed from on_run() -- resolved before win.destroy()
     # so the dialog has a live parent and Cancel returns the user to the
     # configuration window. Replaces the previous implementation that
@@ -4433,24 +4464,14 @@ def run_processing(app_root, overwrite_mode=None):
         f"postgresql://{creds['username']}:{creds['password']}@{creds['host']}:{creds['port']}/{creds['database']}"
     )
 
-    # resolved_table_name / resolved_outcome: the DB-output destination
-    # table, resolved ONCE, up front -- same "main thread, before the
-    # worker starts" philosophy as overwrite_mode above, now via the
-    # dedicated resolve_db_output_table() helper (fuzzy matching +
-    # confirmation dialog(s) all happen inside it; see its own
-    # docstring). Only relevant when output_mode[0] == "db" -- stays
-    # None/None for local output, where _process_one_source() ignores
-    # them entirely.
-    resolved_table_name = None
-    resolved_outcome = None
-    if output_mode[0] == "db":
-        resolved_table_name, resolved_outcome = resolve_db_output_table(
-            root, schema, barangay_source
-        )
-        if resolved_table_name is None:
-            print("Run cancelled by user (database output table not confirmed).")
-            return
-
+    # resolved_table_name, resolved_outcome: the DB-output destination
+    # table + outcome. Resolution responsibility now belongs to
+    # on_run() (PRIORITY 3), on the main thread, BEFORE win.destroy()
+    # -- see Fix 1. By the time they reach this function they are
+    # treated as already-validated values: either None/None (local
+    # output, or output_mode[0] != "db") or a confirmed table name +
+    # outcome (DB output, user already had the chance to cancel in
+    # on_run()). No re-resolution or re-validation happens here.
     progress = ProgressWindow(app_root, "ROAD WIDTH TOOL")
     q = queue.Queue()
 

@@ -297,17 +297,17 @@ def detect_attr_name(gdf, name_guess: str):
     raise ValueError(f"No suitable attribute column found for {name_guess}")
 
 
-# parcel_output_column_overrides: {path: {"CAMA_<attr_name>": name, ...}}
-# -- for any LOCAL Land Parcel/Barangay source where one or more
-# pre-existing CAMA_-prefixed output columns were detected (see
-# _check_parcel_influence_conflicts() below) and the user confirmed
-# proceeding at Run time. Read by run_processing() and resolved into
-# transfer_attributes()'s output_column_map, so the tool writes back
-# into the EXACT existing column (preserving original casing) instead
-# of always writing a hardcoded "CAMA_*" name. A source with no entry
-# here (or an attr_name missing from its entry) uses the default
-# CAMA_-prefixed name. Scope: LOCAL sources only -- Database Land
-# Parcel sources are explicitly out of scope for this check.
+# parcel_output_column_overrides: {path_or_table: {"CAMA_<attr_name>":
+# name, ...}} -- for any Land Parcel/Barangay source (Local file OR
+# Database table) where one or more pre-existing CAMA_-prefixed output
+# columns were detected (see _check_parcel_influence_conflicts() below)
+# and the user confirmed proceeding at Run time. Read by
+# run_processing() and resolved into transfer_attributes()'s
+# output_column_map, so the tool writes back into the EXACT existing
+# column (preserving original casing) instead of always writing a
+# hardcoded "CAMA_*" name. A source with no entry here (or an
+# attr_name missing from its entry) uses the default CAMA_-prefixed
+# name.
 parcel_output_column_overrides = {}
 
 
@@ -362,31 +362,55 @@ def _get_added_fields_for_check(influence_source, engine, schema):
     return added_fields
 
 
-def _check_parcel_influence_conflicts(local_paths, targets):
+def _check_parcel_influence_conflicts(sources, source_type, targets):
     """
-    Checks LOCAL Land Parcel/Barangay source(s) for pre-existing
-    columns matching any of `targets` (case-insensitive exact match).
-    Same read approach as every other tool's conflict check
-    (read_vector_file() -- this tool's own canonical reader, handling
-    multi-layer GPKGs the same way run_processing() does -- read
-    failure = skip-only, never a conflict-check failure).
+    Checks the selected Land Parcel/Barangay source -- Local file OR
+    Database table (extended to cover both as part of Fix 3; previously
+    LOCAL-only) -- for pre-existing columns matching any of `targets`
+    (case-insensitive exact match). Local sources use read_vector_file()
+    -- this tool's own canonical reader, handling multi-layer GPKGs the
+    same way run_processing() does. Database sources use this tool's
+    own get_geom_column() + gpd.read_postgis() pattern (NOT
+    read_postgis_clean(), which this file does not use anywhere else),
+    loading its own creds/schema/engine, self-contained. Read failure
+    = skip-only, never a conflict-check failure.
 
-    Returns a list of (path, existing_output_cols) tuples -- one entry
-    only for local sources where at least one target match was found.
-    existing_output_cols is {target_name: actual_existing_column_name},
-    original casing preserved -- shown in the confirmation dialog and
-    used verbatim as the write-back column (canonical road_width.py
-    pattern: exact detected casing, per source, no coalescing needed
-    here since -- unlike POI_All_Distance.py -- this tool saves one
-    output per source, never merges multiple sources together).
+    Returns a list of (path_or_table, existing_output_cols) tuples --
+    one entry only for sources where at least one target match was
+    found. existing_output_cols is {target_name: actual_existing_
+    column_name}, original casing preserved -- shown in the
+    confirmation dialog and used verbatim as the write-back column
+    (canonical road_width.py pattern: exact detected casing, per
+    source, no coalescing needed here since -- unlike
+    POI_All_Distance.py -- this tool saves one output per source,
+    never merges multiple sources together).
     """
     conflicts = []
-    for path in local_paths:
+    engine = None
+    schema = None
+    if source_type == "db":
+        creds = load_db_credentials()
+        if not creds:
+            print("⚠️ Could not load DB credentials to check for existing "
+                  "output column(s).")
+            return conflicts
+        schema = creds["schema"]
+        engine = create_engine(
+            f"postgresql://{creds['username']}:{creds['password']}@"
+            f"{creds['host']}:{creds['port']}/{creds['database']}"
+        )
+    for path_or_table in sources:
         try:
-            gdf = read_vector_file(path)
+            if source_type == "local":
+                gdf = read_vector_file(path_or_table)
+            else:
+                geom_col = get_geom_column(engine, schema, path_or_table)
+                gdf = gpd.read_postgis(
+                    f'SELECT * FROM "{schema}"."{path_or_table}"', engine, geom_col=geom_col
+                )
         except Exception as e:
             print(f"⚠️ Could not read parcel layer to check for existing "
-                  f"output column(s): {path}: {e}")
+                  f"output column(s): {path_or_table}: {e}")
             continue
         found = {}
         for target in targets:
@@ -394,7 +418,7 @@ def _check_parcel_influence_conflicts(local_paths, targets):
             if match is not None:
                 found[target] = match
         if found:
-            conflicts.append((path, found))
+            conflicts.append((path_or_table, found))
     return conflicts
 
 
@@ -570,7 +594,7 @@ class ProgressWindow:
 
 
 # -------------------- PROCESSING --------------------
-def run_processing(root, overwrite_mode=None):
+def run_processing(root, overwrite_mode=None, resolved_table_name=None, resolved_outcome=None):
     # root: the live top-level window (passed from on_run(); NOT
     # `win`, which is destroyed before run_processing() is ever
     # called -- see on_run()'s win.destroy() immediately before this
@@ -605,20 +629,16 @@ def run_processing(root, overwrite_mode=None):
         f"postgresql://{creds['username']}:{creds['password']}@{creds['host']}:{creds['port']}/{creds['database']}"
     )
 
-    # resolved_table_name / resolved_outcome: the DB-output destination
-    # table, resolved ONCE, up front -- see resolve_db_output_table()'s
-    # own docstring. Only relevant when output_mode[0] == "db" -- stays
-    # None/None for local output, where the write logic below ignores
-    # them entirely.
-    resolved_table_name = None
-    resolved_outcome = None
-    if output_mode[0] == "db":
-        resolved_table_name, resolved_outcome = resolve_db_output_table(
-            root, schema, barangay_source
-        )
-        if resolved_table_name is None:
-            print("Run cancelled by user (database output table not confirmed).")
-            return
+    # resolved_table_name, resolved_outcome: the DB-output destination
+    # table + outcome. Resolution responsibility now belongs to on_run()
+    # (PRIORITY 3), on the main thread, BEFORE win.destroy() -- see
+    # Fix 1. By the time they reach this function they are treated as
+    # already-validated values: either None/None (local output, or
+    # output_mode[0] != "db") or a confirmed table name + outcome (DB
+    # output, user already had the chance to cancel in on_run()). No
+    # re-resolution or re-validation happens here. resolved_outcome
+    # specifically still matters downstream -- see table_action and the
+    # CAMA_Transaction_Log INSERT further below.
 
     # ============================================================
     # Progress Event Protocol v9 -- this tool's migration.
@@ -702,13 +722,12 @@ def run_processing(root, overwrite_mode=None):
                 # written back to "caMA_FloodLevel", not a hardcoded
                 # "CAMA_FloodLevel". Defaults to the standard CAMA_-prefixed
                 # name for any attr_name this source has no override for.
-                # Always {} for DB-sourced parcels (column-conflict check is
-                # LOCAL-only), so this naturally falls back to every default in
-                # that case.
-                src_col_overrides = (
-                    parcel_output_column_overrides.get(src, {})
-                    if barangay_source[0] == "local" else {}
-                )
+                # Extended (Fix 3) to also apply for Database-sourced parcels
+                # -- previously this always fell back to {} for a DB-sourced
+                # parcel via an explicit "if local else {}" gate, even though
+                # parcel_output_column_overrides itself is now correctly
+                # populated for DB sources too (see on_run()'s PRIORITY 1).
+                src_col_overrides = parcel_output_column_overrides.get(src, {})
                 output_column_map = {
                     attr_name: src_col_overrides.get(f"CAMA_{attr_name}", f"CAMA_{attr_name}")
                     for attr_name in added_fields
@@ -1599,11 +1618,12 @@ def open_main_window(root):
         # PRIORITY 1: existing OUTPUT-COLUMN conflict warning. This tool's
         # output columns are dynamic (see _get_added_fields_for_check()) --
         # the target list is built from whichever Influence Map source(s)
-        # are actually selected this run. LOCAL Land Parcel/Barangay
-        # sources only; Database sources are explicitly out of scope.
-        # Shown once, combined across every affected source, only here
-        # at Run time. Declining cancels the run entirely -- nothing is
-        # processed, including sources that had no conflict.
+        # are actually selected this run. Extended (Fix 3) to cover both
+        # Local and Database Land Parcel/Barangay sources -- previously
+        # LOCAL-only (see _check_parcel_influence_conflicts()'s own
+        # docstring). Shown once, combined across every affected source,
+        # only here at Run time. Declining cancels the run entirely --
+        # nothing is processed, including sources that had no conflict.
         #
         # Unlike POI_All_Distance.py, this tool saves ONE output per
         # source (never merges), so the standard per-source override
@@ -1612,53 +1632,45 @@ def open_main_window(root):
         # by every other per-source tool in this project.
         # ------------------------------------------------------------------
         global parcel_output_column_overrides
-        if parcel_source_type.get() == "local":
+        added_fields_for_check = []
+        try:
+            creds_for_check = load_db_credentials()
+            engine_for_check = None
+            schema_for_check = None
+            if influence_source[0] == "db" and creds_for_check:
+                schema_for_check = creds_for_check["schema"]
+                engine_for_check = create_engine(
+                    f"postgresql://{creds_for_check['username']}:{creds_for_check['password']}@"
+                    f"{creds_for_check['host']}:{creds_for_check['port']}/{creds_for_check['database']}"
+                )
+            added_fields_for_check = _get_added_fields_for_check(
+                influence_source, engine_for_check, schema_for_check)
+        except Exception as e:
+            print(f"⚠️ Could not prepare Influence Map attribute check "
+                  f"for column conflicts: {e}")
             added_fields_for_check = []
-            try:
-                creds_for_check = load_db_credentials()
-                engine_for_check = None
-                schema_for_check = None
-                if influence_source[0] == "db" and creds_for_check:
-                    schema_for_check = creds_for_check["schema"]
-                    engine_for_check = create_engine(
-                        f"postgresql://{creds_for_check['username']}:{creds_for_check['password']}@"
-                        f"{creds_for_check['host']}:{creds_for_check['port']}/{creds_for_check['database']}"
-                    )
-                added_fields_for_check = _get_added_fields_for_check(
-                    influence_source, engine_for_check, schema_for_check)
-            except Exception as e:
-                print(f"⚠️ Could not prepare Influence Map attribute check "
-                      f"for column conflicts: {e}")
-                added_fields_for_check = []
 
-            if added_fields_for_check:
-                targets_for_check = [f"CAMA_{a}" for a in added_fields_for_check]
-                # parcel_local_path is guaranteed non-None here --
-                # validation above already returned if it was falsy.
-                conflicts = _check_parcel_influence_conflicts(
-                    [parcel_local_path], targets_for_check)
-                if conflicts:
-                    lines = "\n".join(
-                        f"- '{os.path.basename(path)}': found "
-                        + ", ".join(
-                            f"'{existing_name}' column (for {target})"
-                            for target, existing_name in existing_output_cols.items()
-                        )
-                        for path, existing_output_cols in conflicts
-                    )
-                    proceed = messagebox.askyesno(
-                        "Existing output column(s) found",
-                        f"{lines}\n\n"
-                        "Processing will overwrite the existing column(s) with the "
-                        "newly computed values. The column name(s) will not change.\n\n"
-                        "Proceed?"
-                    )
-                    if not proceed:
-                        print("Run cancelled by user (existing output column(s) found).")
-                        return
-                    parcel_output_column_overrides = dict(conflicts)
-                else:
-                    parcel_output_column_overrides = {}
+        if added_fields_for_check:
+            targets_for_check = [f"CAMA_{a}" for a in added_fields_for_check]
+            conflicts = _check_parcel_influence_conflicts(
+                list(barangay_source[1]), barangay_source[0], targets_for_check)
+            if conflicts:
+                lines = "\n\n".join(
+                    f"'{os.path.basename(path)}' already has the following column(s):\n"
+                    + "\n".join(f"  • {existing_name}" for existing_name in existing_output_cols.values())
+                    for path, existing_output_cols in conflicts
+                )
+                proceed = messagebox.askyesno(
+                    "Existing output column(s) found",
+                    f"{lines}\n\n"
+                    "Processing will overwrite the existing column(s) with the "
+                    "newly computed values. The column name(s) will not change.\n\n"
+                    "Proceed?"
+                )
+                if not proceed:
+                    print("Run cancelled by user (existing output column(s) found).")
+                    return
+                parcel_output_column_overrides = dict(conflicts)
             else:
                 parcel_output_column_overrides = {}
         else:
@@ -1684,8 +1696,42 @@ def open_main_window(root):
                     print("Run cancelled by user (existing output file(s) found).")
                     return
 
+        # ------------------------------------------------------------------
+        # PRIORITY 3: DB-output destination table resolution — mirrors
+        # PRIORITY 2 above. Resolved here on the main thread, before
+        # win.destroy(), so confirm_db_overwrite_dialog() /
+        # choose_db_overwrite_dialog() (invoked inside
+        # resolve_db_output_table()) still have a live parent window, and
+        # a Cancel here leaves the fully-configured win intact instead of
+        # forcing a from-scratch reopen. Previously this resolution
+        # happened inside run_processing(), which is only ever invoked
+        # AFTER win.destroy() -- see Fix 1 root cause. resolve_db_output_
+        # table()'s own matching/decision logic is untouched; only the
+        # call site moved here.
+        #
+        # Both resolved_table_name AND resolved_outcome are threaded
+        # through to run_processing() -- unlike most other migrated
+        # tools, resolved_outcome is NOT a throwaway here: it feeds
+        # table_action, which is written into the CAMA_Transaction_Log
+        # INSERT further down in worker() (see that do-not-touch block's
+        # own logic). Matches road_width.py's pattern exactly.
+        # ------------------------------------------------------------------
+        resolved_table_name = None
+        resolved_outcome = None
+        if output_mode[0] == "db":
+            _resolve_creds = load_db_credentials()
+            if not _resolve_creds:
+                return
+            _resolve_schema = _resolve_creds["schema"]
+            resolved_table_name, resolved_outcome = resolve_db_output_table(
+                win, _resolve_schema, barangay_source
+            )
+            if resolved_table_name is None:
+                print("Run cancelled by user (database output table not confirmed).")
+                return
+
         win.destroy()
-        run_processing(root, overwrite_mode)
+        run_processing(root, overwrite_mode, resolved_table_name, resolved_outcome)
 
     # Single source of truth for the Run button's enabled/disabled
     # colors -- used both at button creation and inside
