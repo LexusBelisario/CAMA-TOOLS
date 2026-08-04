@@ -3388,6 +3388,7 @@ def is_relevant_window_focused():
     same as before), while an unrelated application never will, no
     matter what text happens to appear in its title.
     """
+    fg = get_foreground_hwnd()
     fg_pid = get_foreground_pid()
 
     # Belongs to the locked Global Mapper process — covers GM's own main
