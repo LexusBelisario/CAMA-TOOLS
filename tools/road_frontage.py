@@ -2114,7 +2114,7 @@ def resolve_db_output_table(root, schema, barangay_source):
 
 
 # ========================= MAIN PROCESS =========================
-def run_processing(app_root):
+def run_processing(app_root, resolved_table_name=None):
     global barangay_source, road_source, output_mode, overwrite_mode, parcel_output_column_overrides
     if not barangay_source or not road_source or not output_mode:
         messagebox.showerror("Error", "Selections incomplete (Barangay, Road, Output required).")
@@ -2130,22 +2130,15 @@ def run_processing(app_root):
         f"postgresql://{creds['username']}:{creds['password']}@{creds['host']}:{creds['port']}/{creds['database']}"
     )
 
-    # resolved_table_name / resolved_outcome: the DB-output destination
-    # table, resolved ONCE, up front -- same "main thread, before the
-    # worker starts" philosophy as ask_overwrite_dialog(), via the
-    # dedicated resolve_db_output_table() helper (fuzzy matching +
-    # confirmation dialog(s) all happen inside it; see its own
-    # docstring). Only relevant when output_mode[0] == "db" -- stays
-    # None/None for local output, where worker() ignores them entirely.
-    resolved_table_name = None
-    resolved_outcome = None
-    if output_mode[0] == "db":
-        resolved_table_name, resolved_outcome = resolve_db_output_table(
-            app_root, schema, barangay_source
-        )
-        if resolved_table_name is None:
-            print("Run cancelled by user (database output table not confirmed).")
-            return
+    # resolved_table_name: the DB-output destination table. Resolution
+    # responsibility now belongs to on_run() (PRIORITY 3), on the main
+    # thread, BEFORE win.destroy() -- see Fix 1. Passed in as a parameter
+    # -- same approach already used in lot_location.py, road_surface.py,
+    # road_density.py, and land_shape_compactness.py. By the time it
+    # reaches this function it is treated as an already-validated value:
+    # either None (local output, or output_mode[0] != "db") or a
+    # confirmed table name (DB output, user already had the chance to
+    # cancel in on_run()). No re-resolution or re-validation happens here.
 
     progress = ProgressWindow(app_root, "Road Frontage Progress")
 
@@ -4149,12 +4142,9 @@ def open_main_window(root):
         # into later -- never renamed to the standard casing.
         # ------------------------------------------------------------------
         if parcel_output_column_conflicts:
-            lines = "\n".join(
-                f"- '{os.path.basename(path_or_table)}': found "
-                + ", ".join(
-                    f"'{existing_name}' column (for {target})"
-                    for target, existing_name in existing_output_cols.items()
-                )
+            lines = "\n\n".join(
+                f"'{os.path.basename(path_or_table)}' already has the following column(s):\n"
+                + "\n".join(f"  • {existing_name}" for existing_name in existing_output_cols.values())
                 for path_or_table, existing_output_cols in parcel_output_column_conflicts
             )
             proceed = messagebox.askyesno(
@@ -4210,11 +4200,49 @@ def open_main_window(root):
                     print("Run cancelled by user (existing output file(s) found).")
                     return
 
+        # ------------------------------------------------------------------
+        # PRIORITY 3: DB-output destination table resolution — mirrors
+        # PRIORITY 2 above. Resolved here on the main thread, before
+        # win.destroy(), so confirm_db_overwrite_dialog() /
+        # choose_db_overwrite_dialog() (invoked inside
+        # resolve_db_output_table()) still have a live parent window, and
+        # a Cancel here leaves the fully-configured win intact instead of
+        # forcing a from-scratch reopen. Previously this resolution
+        # happened inside run_processing(), which is only ever invoked
+        # AFTER win.destroy() -- see Fix 1 root cause. resolve_db_output_
+        # table()'s own matching/decision logic is untouched; only the
+        # call site moved here.
+        #
+        # resolved_table_name is passed into run_processing() as a
+        # parameter -- same approach already used in lot_location.py,
+        # road_surface.py, road_density.py, and land_shape_compactness.py.
+        # overwrite_mode above is left exactly as-is (module-level global,
+        # unique to this file) -- not refactored to match. resolved_outcome
+        # is not threaded through (same as road_surface.py/road_density.py/
+        # land_shape_compactness.py) because nothing downstream in this
+        # file's worker() consumes it -- only resolved_table_name is read
+        # (see the db_table fallback near "Falls back to out_base only
+        # if...").
+        # ------------------------------------------------------------------
+        resolved_table_name = None
+        if output_mode[0] == "db":
+            _resolve_creds = load_db_credentials()
+            if not _resolve_creds:
+                messagebox.showerror("Error", "Missing pg_credentials.json")
+                return
+            _resolve_schema = _resolve_creds["schema"]
+            resolved_table_name, _resolved_outcome = resolve_db_output_table(
+                win, _resolve_schema, barangay_source
+            )
+            if resolved_table_name is None:
+                print("Run cancelled by user (database output table not confirmed).")
+                return
+
         win.destroy()
         if _app_root is None:
             messagebox.showerror("Error", "No root window available. Please restart the tool.")
             return
-        run_processing(_app_root)
+        run_processing(_app_root, resolved_table_name)
 
     run_btn = tk.Button(win, text="▶  Run Processing", command=on_run,
               bg="#2e7d32", fg="white",

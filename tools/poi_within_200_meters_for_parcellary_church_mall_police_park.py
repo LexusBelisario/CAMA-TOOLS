@@ -147,12 +147,12 @@ OUTPUT_COLUMN_TARGETS = (
     "CAMA_NUM_POLICE", "CAMA_NUM_PARK", "CAMA_NUM_MALL", "CAMA_NUM_OTHERS",
 )
 
-# parcel_output_column_overrides: {path: {"CAMA_NUM_POLICE": name, ...}} --
-# for any LOCAL Land Parcel source where one or more pre-existing
-# CAMA_-prefixed output columns were detected (see
-# _check_parcel_poi_conflicts() below) and the user confirmed
-# proceeding at Run time. Read by run_processing() and resolved into
-# the four individual *_col keyword arguments passed to
+# parcel_output_column_overrides: {path_or_table: {"CAMA_NUM_POLICE":
+# name, ...}} -- for any Land Parcel source (Local file OR Database
+# table) where one or more pre-existing CAMA_-prefixed output columns
+# were detected (see _check_parcel_poi_conflicts() below) and the user
+# confirmed proceeding at Run time. Read by run_processing() and
+# resolved into the four individual *_col keyword arguments passed to
 # process_poi_counts() -- matches the exact same override-storage-as-
 # dict / function-signature-as-individual-kwargs split already
 # established in terrain.py, road_frontage.py, and
@@ -160,8 +160,6 @@ OUTPUT_COLUMN_TARGETS = (
 # existing column(s) (preserving original casing) instead of always
 # writing hardcoded "CAMA_*" names. A source with no entry here (or a
 # target missing from its entry) uses that target's default CAMA_ name.
-# Scope: LOCAL sources only -- Database Land Parcel sources are
-# explicitly out of scope for this check.
 parcel_output_column_overrides = {}
 
 
@@ -375,11 +373,13 @@ def _detect_existing_output_columns(gdf):
 
 
 # ========================= PARCEL COLUMN-CONFLICT CHECK =========================
-# _check_parcel_poi_conflicts(): checks LOCAL Land Parcel source(s) for
-# pre-existing columns matching any of OUTPUT_COLUMN_TARGETS -- this
-# tool is about to write its four computed POI-count columns into those
-# columns, and on_run() below shows a combined confirmation dialog
-# before proceeding.
+# _check_parcel_poi_conflicts(): checks the selected Land Parcel
+# source -- Local file OR Database table (extended to cover both as
+# part of Fix 3; previously LOCAL-only) -- for pre-existing columns
+# matching any of OUTPUT_COLUMN_TARGETS -- this tool is about to write
+# its four computed POI-count columns into those columns, and on_run()
+# below shows a combined confirmation dialog before proceeding,
+# regardless of which source type was selected.
 #
 # Unlike road_frontage.py/road_width.py, this tool has no background
 # worker thread -- run_processing() runs synchronously on the main
@@ -393,37 +393,55 @@ def _detect_existing_output_columns(gdf):
 # land_shape_compactness.py. Adding threading here would be a separate,
 # out-of-scope architectural change.
 #
-# Read approach: plain gpd.read_file(path), matching road_width.py's own
-# canonical _read_gdf_worker() exactly -- no partial/schema-only read
-# trick.
+# Read approach: plain gpd.read_file(path) for a Local source, matching
+# road_width.py's own canonical _read_gdf_worker() exactly -- no
+# partial/schema-only read trick. For a Database source,
+# read_postgis_clean() is used instead, loading its own creds/schema/
+# engine (self-contained, matching the pattern already used by
+# on_run()'s PRIORITY 3 block).
 #
 # A read failure here is NEVER treated as a column-conflict failure --
 # it only skips the conflict check for that one source (logged to
 # console). The real read inside run_processing() further below remains
 # solely responsible for surfacing any genuine read error to the user.
-#
-# Scope: LOCAL sources only. Database Land Parcel sources are
-# explicitly out of scope for this check per the project task
-# definition -- callers must not invoke this for "db"-mode sources.
-def _check_parcel_poi_conflicts(local_paths):
+def _check_parcel_poi_conflicts(sources, source_type):
     """
-    Returns a list of (path, existing_output_cols) tuples -- one entry
-    only for local sources where at least one OUTPUT_COLUMN_TARGETS
+    Returns a list of (path_or_table, existing_output_cols) tuples --
+    one entry only for sources where at least one OUTPUT_COLUMN_TARGETS
     match was found. existing_output_cols is the dict returned by
     _detect_existing_output_columns() for that source (target name ->
     actual existing column name, original casing preserved).
+
+    source_type: "local" or "db" -- dispatches to gpd.read_file() or
+    read_postgis_clean() respectively.
     """
     conflicts = []
-    for path in local_paths:
+    engine = None
+    schema = None
+    if source_type == "db":
+        creds = load_db_credentials()
+        if not creds:
+            print("⚠️ Could not load DB credentials to check for existing "
+                  "output column(s).")
+            return conflicts
+        schema = creds["schema"]
+        engine = create_engine(
+            f"postgresql://{creds['username']}:{creds['password']}@"
+            f"{creds['host']}:{creds['port']}/{creds['database']}"
+        )
+    for path_or_table in sources:
         try:
-            gdf = gpd.read_file(path)
+            if source_type == "local":
+                gdf = gpd.read_file(path_or_table)
+            else:
+                gdf = read_postgis_clean(path_or_table, engine, schema)
         except Exception as e:
             print(f"⚠️ Could not read parcel layer to check for existing "
-                  f"output column(s): {path}: {e}")
+                  f"output column(s): {path_or_table}: {e}")
             continue
         existing_output_cols = _detect_existing_output_columns(gdf)
         if existing_output_cols:
-            conflicts.append((path, existing_output_cols))
+            conflicts.append((path_or_table, existing_output_cols))
     return conflicts
 
 
@@ -1210,43 +1228,40 @@ def open_main_window(root):
         # CAMA_NUM_OTHERS, CAMA_CHURCH). Shown before the file-conflict
         # dialog so the user can decide whether to proceed at all before
         # being asked about filename conflicts. Declining cancels the
-        # run entirely; main window stays open. LOCAL sources only --
-        # Database Land Parcel sources are explicitly out of scope.
+        # run entirely; main window stays open (this block runs before
+        # win.destroy() further below). Extended (Fix 3) to also cover
+        # Database Land Parcel sources -- previously LOCAL-only (see
+        # _check_parcel_poi_conflicts()'s own docstring). Matches
+        # lot_location.py/road_width.py/road_frontage.py's coverage.
+        # Reuses barangay_source, already built and validated just
+        # above.
         # ------------------------------------------------------------------
         global parcel_output_column_overrides
-        if parcel_source_type.get() == "local":
-            # parcel_local_path is guaranteed non-None here -- validation
-            # above already returned if it was falsy.
-            conflicts = _check_parcel_poi_conflicts([parcel_local_path])
-            if conflicts:
-                lines = "\n".join(
-                    f"- '{os.path.basename(path)}': found "
-                    + ", ".join(
-                        f"'{existing_name}' column (for {target})"
-                        for target, existing_name in existing_output_cols.items()
-                    )
-                    for path, existing_output_cols in conflicts
-                )
-                proceed = messagebox.askyesno(
-                    "Existing output column(s) found",
-                    f"{lines}\n\n"
-                    "Processing will overwrite the existing column(s) with the "
-                    "newly computed values. The column name(s) will not change.\n\n"
-                    "Proceed?"
-                )
-                if not proceed:
-                    print("Run cancelled by user (existing output column(s) found).")
-                    return
-                # Preserve each source's existing column name(s)/casing
-                # exactly -- e.g. a detected "caMA_NUM_POLICE" is
-                # written back to "caMA_NUM_POLICE", not a hardcoded
-                # "CAMA_NUM_POLICE" -- so no duplicate column is ever
-                # created regardless of the existing casing. A source
-                # with no entry here (no conflict was found) simply
-                # uses the default names in process_poi_counts() below.
-                parcel_output_column_overrides = dict(conflicts)
-            else:
-                parcel_output_column_overrides = {}
+        conflicts = _check_parcel_poi_conflicts(list(barangay_source[1]), barangay_source[0])
+        if conflicts:
+            lines = "\n\n".join(
+                f"'{os.path.basename(path)}' already has the following column(s):\n"
+                + "\n".join(f"  • {existing_name}" for existing_name in existing_output_cols.values())
+                for path, existing_output_cols in conflicts
+            )
+            proceed = messagebox.askyesno(
+                "Existing output column(s) found",
+                f"{lines}\n\n"
+                "Processing will overwrite the existing column(s) with the "
+                "newly computed values. The column name(s) will not change.\n\n"
+                "Proceed?"
+            )
+            if not proceed:
+                print("Run cancelled by user (existing output column(s) found).")
+                return
+            # Preserve each source's existing column name(s)/casing
+            # exactly -- e.g. a detected "caMA_NUM_POLICE" is
+            # written back to "caMA_NUM_POLICE", not a hardcoded
+            # "CAMA_NUM_POLICE" -- so no duplicate column is ever
+            # created regardless of the existing casing. A source
+            # with no entry here (no conflict was found) simply
+            # uses the default names in process_poi_counts() below.
+            parcel_output_column_overrides = dict(conflicts)
         else:
             parcel_output_column_overrides = {}
 
@@ -1272,8 +1287,45 @@ def open_main_window(root):
                     print("Run cancelled by user (existing output file(s) found).")
                     return
 
+        # ------------------------------------------------------------------
+        # PRIORITY 3: DB-output destination table resolution — mirrors
+        # PRIORITY 2 above. Resolved here on the main thread, before
+        # win.destroy(), so confirm_db_overwrite_dialog() /
+        # choose_db_overwrite_dialog() (invoked inside
+        # resolve_db_output_table()) still have a live parent window, and
+        # a Cancel here leaves the fully-configured win intact instead of
+        # forcing a from-scratch reopen. Previously this resolution
+        # happened inside run_processing(), which is only ever invoked
+        # AFTER win.destroy() -- see Fix 1 root cause. resolve_db_output_
+        # table()'s own matching/decision logic is untouched; only the
+        # call site moved here. resolved_table_name is passed into
+        # run_processing() as a parameter -- same approach already used
+        # in lot_location.py, road_surface.py, road_density.py,
+        # land_shape_compactness.py, road_frontage.py, and terrain.py.
+        # resolved_outcome is not threaded through (same as those files)
+        # because nothing downstream in this file's processing loop
+        # consumes it -- only resolved_table_name is read (see the
+        # output_table fallback near "Falls back to the old...").
+        # This block sits entirely before run_processing()'s own
+        # try/except/finally error-handling wrapper (added in a prior
+        # fix) -- removing it from run_processing() does not touch,
+        # shrink, or reorder that wrapper in any way.
+        # ------------------------------------------------------------------
+        resolved_table_name = None
+        if output_mode[0] == "db":
+            _resolve_creds = load_db_credentials()
+            if not _resolve_creds:
+                return
+            _resolve_schema = _resolve_creds["schema"]
+            resolved_table_name, _resolved_outcome = resolve_db_output_table(
+                win, _resolve_schema, barangay_source
+            )
+            if resolved_table_name is None:
+                print("Run cancelled by user (database output table not confirmed).")
+                return
+
         win.destroy()
-        run_processing(root, overwrite_mode)
+        run_processing(root, overwrite_mode, resolved_table_name)
 
     # Single source of truth for the Run button's enabled/disabled
     # colors -- used both at button creation and inside
@@ -1410,7 +1462,7 @@ def resolve_db_output_table(root, schema, barangay_source):
 
 
 # ---------------- RUN PROCESSING ----------------
-def run_processing(app_root, overwrite_mode=None):
+def run_processing(app_root, overwrite_mode=None, resolved_table_name=None):
     global barangay_source, poi_source, output_mode, radius_meters
 
     if not barangay_source or not poi_source or not output_mode:
@@ -1426,20 +1478,13 @@ def run_processing(app_root, overwrite_mode=None):
         f"postgresql://{creds['username']}:{creds['password']}@{creds['host']}:{creds['port']}/{creds['database']}"
     )
 
-    # resolved_table_name / resolved_outcome: the DB-output destination
-    # table, resolved ONCE, up front -- see resolve_db_output_table()'s
-    # own docstring. Only relevant when output_mode[0] == "db" -- stays
-    # None/None for local output, where the write logic below ignores
-    # them entirely.
-    resolved_table_name = None
-    resolved_outcome = None
-    if output_mode[0] == "db":
-        resolved_table_name, resolved_outcome = resolve_db_output_table(
-            app_root, schema, barangay_source
-        )
-        if resolved_table_name is None:
-            print("Run cancelled by user (database output table not confirmed).")
-            return
+    # resolved_table_name: the DB-output destination table. Resolution
+    # responsibility now belongs to on_run() (PRIORITY 3), on the main
+    # thread, BEFORE win.destroy() -- see Fix 1. By the time it reaches
+    # this function it is treated as an already-validated value: either
+    # None (local output, or output_mode[0] != "db") or a confirmed
+    # table name (DB output, user already had the chance to cancel in
+    # on_run()). No re-resolution or re-validation happens here.
 
     # ============================================================
     # Error handling -- newly added, previously missing entirely.
@@ -1526,16 +1571,26 @@ def run_processing(app_root, overwrite_mode=None):
                                           if_exists="replace", index=False)
                     print(f"✅ Saved to DB: {output_table}")
         else:
-            # Database Land Parcel sources: column-conflict check is out of
-            # scope (see _check_parcel_poi_conflicts()) -- always uses
-            # process_poi_counts()'s four default CAMA_-prefixed names.
+            # Database Land Parcel sources: extended (Fix 3) to respect
+            # parcel_output_column_overrides, same as the LOCAL branch
+            # above -- preserves the exact existing column casing(s)
+            # detected in on_run()'s PRIORITY 1 check instead of always
+            # defaulting to the four hardcoded CAMA_-prefixed names.
             for table in barangay_source[1]:
                 print(f"\n🔷 Processing DB table: {table}")
                 gdf = read_postgis_clean(table, engine, schema)
 
+                output_col_overrides = parcel_output_column_overrides.get(table, {})
+                num_police_col = output_col_overrides.get("CAMA_NUM_POLICE", "CAMA_NUM_POLICE")
+                num_park_col = output_col_overrides.get("CAMA_NUM_PARK", "CAMA_NUM_PARK")
+                num_mall_col = output_col_overrides.get("CAMA_NUM_MALL", "CAMA_NUM_MALL")
+                num_others_col = output_col_overrides.get("CAMA_NUM_OTHERS", "CAMA_NUM_OTHERS")
+
                 create_progress_window(app_root, len(gdf), title=f"Processing: {table}")
                 result = process_poi_counts(gdf, poi_gdf, radius_meters,
-                                            progress_cb=update_progress)
+                                            progress_cb=update_progress,
+                                            num_police_col=num_police_col, num_park_col=num_park_col,
+                                            num_mall_col=num_mall_col, num_others_col=num_others_col)
                 close_progress_window()
 
                 if output_mode[0] == "local":

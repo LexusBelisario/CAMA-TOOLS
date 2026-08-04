@@ -73,18 +73,17 @@ barangay_source = None
 road_source = None
 output_mode = None
 
-# surface_column_overrides: {path: existing_col_name} -- for any LOCAL
-# Land Parcel source where a pre-existing "cama_rd_surface"-like column
-# was detected (see _check_parcel_surface_conflicts() below) and the
-# user confirmed proceeding at Run time. Read by run_processing() and
-# passed into process_surface() as output_column_name, so the tool
-# writes back into the EXACT existing column (preserving its original
-# casing) instead of always writing a hardcoded "CAMA_RD_SURFACE" --
-# the latter would silently create a confusing duplicate column
-# whenever the existing one used different casing. A source with no
-# entry here uses the default "CAMA_RD_SURFACE" name. Scope: LOCAL
-# sources only -- Database Land Parcel sources are explicitly out of
-# scope for this check (see _check_parcel_surface_conflicts()).
+# surface_column_overrides: {path_or_table: existing_col_name} -- for
+# any Land Parcel source (Local file OR Database table) where a
+# pre-existing "cama_rd_surface"-like column was detected (see
+# _check_parcel_surface_conflicts() below) and the user confirmed
+# proceeding at Run time. Read by run_processing() and passed into
+# process_surface() as output_column_name, so the tool writes back
+# into the EXACT existing column (preserving its original casing)
+# instead of always writing a hardcoded "CAMA_RD_SURFACE" -- the
+# latter would silently create a confusing duplicate column whenever
+# the existing one used different casing. A source with no entry here
+# uses the default "CAMA_RD_SURFACE" name.
 surface_column_overrides = {}
 
 # ---------------- CRS Helper ----------------
@@ -180,47 +179,68 @@ def open_in_global_mapper(path):
 
 
 # ========================= PARCEL COLUMN-CONFLICT CHECK =========================
-# _check_parcel_surface_conflicts(): checks LOCAL Land Parcel source(s)
-# for an existing column matching "cama_rd_surface" (case-insensitive
-# exact match) -- this tool is about to write its computed road
-# surface(s) into that column, and on_run() below shows a combined
-# confirmation dialog before proceeding.
+# _check_parcel_surface_conflicts(): checks the selected Land Parcel
+# source -- Local file OR Database table (extended to cover both as
+# part of Fix 3; previously LOCAL-only) -- for an existing column
+# matching "cama_rd_surface" (case-insensitive exact match) -- this
+# tool is about to write its computed road surface(s) into that
+# column, and on_run() below shows a combined confirmation dialog
+# before proceeding, regardless of which source type was selected.
 #
-# Same pattern as road_density.py's _check_parcel_density_conflicts()
-# and road_width.py's canonical _read_gdf_worker(): runs synchronously
-# on the main thread (this tool has no background worker thread /
-# progress window / queue-polling architecture, and adding one is out
-# of scope for this task), reads via plain gpd.read_file(path) (no
-# partial/schema-only read trick), and a read failure here is NEVER
-# treated as a column-conflict failure -- it only skips the conflict
-# check for that one source (logged to console); the real read inside
-# run_processing() further below remains solely responsible for
-# surfacing any genuine read error to the user.
-#
-# Scope: LOCAL sources only. Database Land Parcel sources are
-# explicitly out of scope for this check per the project task
-# definition -- callers must not invoke this for "db"-mode sources.
-def _check_parcel_surface_conflicts(local_paths):
+# Runs synchronously on the main thread (this tool has no background
+# worker thread / progress window / queue-polling architecture, and
+# adding one is out of scope for this task): reads via plain
+# gpd.read_file(path) for a Local source, or read_postgis_clean() for
+# a Database source (loading its own creds/schema/engine, self-
+# contained). A read failure here is NEVER treated as a column-
+# conflict failure -- it only skips the conflict check for that one
+# source (logged to console); the real read inside run_processing()
+# further below remains solely responsible for surfacing any genuine
+# read error to the user.
+def _check_parcel_surface_conflicts(sources, source_type):
     """
-    Returns a list of (path, existing_col_name) tuples -- one entry
-    only for local sources where a column matching "cama_rd_surface"
+    Returns a list of (path_or_table, existing_col_name) tuples -- one
+    entry only for sources where a column matching "cama_rd_surface"
     (case-insensitive) was actually found. existing_col_name preserves
     the exact casing found in the source, so the confirmation dialog
     and the eventual write-back both show/use the real casing.
+
+    source_type: "local" or "db" -- dispatches to gpd.read_file() or
+    read_postgis_clean() respectively. Extended (Fix 3) to cover
+    Database Land Parcel sources -- previously LOCAL-only. Loads its
+    own creds/schema/engine for the "db" case, self-contained, matching
+    the pattern already used by on_run()'s PRIORITY 3 block and
+    lot_location.py's own dual-mode checker.
     """
     conflicts = []
-    for path in local_paths:
+    engine = None
+    schema = None
+    if source_type == "db":
+        creds = load_db_credentials()
+        if not creds:
+            print("⚠️ Could not load DB credentials to check for an "
+                  "existing CAMA_RD_SURFACE column.")
+            return conflicts
+        schema = creds["schema"]
+        engine = create_engine(
+            f"postgresql://{creds['username']}:{creds['password']}@"
+            f"{creds['host']}:{creds['port']}/{creds['database']}"
+        )
+    for path_or_table in sources:
         try:
-            gdf = gpd.read_file(path)
+            if source_type == "local":
+                gdf = gpd.read_file(path_or_table)
+            else:
+                gdf = read_postgis_clean(path_or_table, engine, schema)
         except Exception as e:
             print(f"⚠️ Could not read parcel layer to check for an "
-                  f"existing CAMA_RD_SURFACE column: {path}: {e}")
+                  f"existing CAMA_RD_SURFACE column: {path_or_table}: {e}")
             continue
         existing_col = next(
             (c for c in gdf.columns if c.lower() == "cama_rd_surface"), None
         )
         if existing_col:
-            conflicts.append((path, existing_col))
+            conflicts.append((path_or_table, existing_col))
     return conflicts
 
 
@@ -1025,38 +1045,38 @@ def open_main_window(root):
         # Parcel source already has a CAMA_RD_SURFACE column. Shown
         # before the file-conflict dialog so the user can decide whether
         # to proceed at all before being asked about filename conflicts.
-        # Declining cancels the run entirely; main window stays open.
-        # Database Land Parcel sources are explicitly out of scope for
-        # this check (see _check_parcel_surface_conflicts()).
+        # Declining cancels the run entirely; main window stays open
+        # (this block runs before win.destroy() further below).
+        # Extended (Fix 3) to also cover Database Land Parcel sources --
+        # previously LOCAL-only (see _check_parcel_surface_conflicts()'s
+        # own docstring). Matches lot_location.py/road_width.py/
+        # road_frontage.py's coverage. Reuses barangay_source, already
+        # built and validated just above.
         global surface_column_overrides
-        if parcel_source_type.get() == "local":
-            # parcel_local_path is guaranteed non-None here -- validation
-            # above already returned if it was falsy.
-            conflicts = _check_parcel_surface_conflicts([parcel_local_path])
-            if conflicts:
-                lines = "\n".join(
-                    f"- '{os.path.basename(path)}' already has a '{existing_col}' column"
-                    for path, existing_col in conflicts
-                )
-                proceed = messagebox.askyesno(
-                    "Existing CAMA_RD_SURFACE column found",
-                    f"{lines}\n\n"
-                    "Processing will overwrite the existing column(s) with the "
-                    "newly computed values.\n\nProceed?"
-                )
-                if not proceed:
-                    print("Run cancelled by user (existing CAMA_RD_SURFACE column(s) found).")
-                    return
-                # Preserve each source's existing column name/casing
-                # exactly -- e.g. a detected "caMA_rd_SURFACE" is
-                # written back to "caMA_rd_SURFACE", not a hardcoded
-                # "CAMA_RD_SURFACE" -- so no duplicate column is ever
-                # created regardless of the existing casing. A source
-                # with no entry here (no conflict was found) simply
-                # uses the default name in process_surface() below.
-                surface_column_overrides = dict(conflicts)
-            else:
-                surface_column_overrides = {}
+        conflicts = _check_parcel_surface_conflicts(list(barangay_source[1]), barangay_source[0])
+        if conflicts:
+            lines = "\n\n".join(
+                f"'{os.path.basename(path)}' already has the following column(s):\n"
+                f"  • {existing_col}"
+                for path, existing_col in conflicts
+            )
+            proceed = messagebox.askyesno(
+                "Existing CAMA_RD_SURFACE column found",
+                f"{lines}\n\n"
+                "Processing will overwrite the existing column(s) with the "
+                "newly computed values.\n\nProceed?"
+            )
+            if not proceed:
+                print("Run cancelled by user (existing CAMA_RD_SURFACE column(s) found).")
+                return
+            # Preserve each source's existing column name/casing exactly
+            # -- e.g. a detected "caMA_rd_SURFACE" is written back to
+            # "caMA_rd_SURFACE", not a hardcoded "CAMA_RD_SURFACE" -- so
+            # no duplicate column is ever created regardless of the
+            # existing casing. A source with no entry here (no conflict
+            # was found) simply uses the default name in
+            # process_surface() below.
+            surface_column_overrides = dict(conflicts)
         else:
             surface_column_overrides = {}
 
@@ -1083,8 +1103,38 @@ def open_main_window(root):
                     print("Run cancelled by user (existing output file(s) found).")
                     return
 
+        # PRIORITY 3: DB-output destination table resolution — mirrors
+        # PRIORITY 2 above. Resolved here on the main thread, before
+        # win.destroy(), so confirm_db_overwrite_dialog() /
+        # choose_db_overwrite_dialog() (invoked inside
+        # resolve_db_output_table()) still have a live parent window,
+        # and a Cancel here leaves the fully-configured win intact
+        # instead of forcing a from-scratch reopen. Previously this
+        # resolution happened inside run_processing(), which is only
+        # ever invoked AFTER win.destroy() -- see Fix 1 root cause.
+        # resolve_db_output_table()'s own matching/decision logic is
+        # untouched; only the call site moved here. resolved_table_name
+        # is handed to run_processing() as an already-validated value —
+        # run_processing() no longer re-resolves or re-validates it.
+        # resolved_outcome is not threaded through here (unlike
+        # road_width.py) because nothing downstream in this file's
+        # worker() consumes it -- only resolved_table_name is read (see
+        # the out_table fallback near "Falls back to the old...").
+        resolved_table_name = None
+        if output_mode[0] == "db":
+            _resolve_creds = load_db_credentials()
+            if not _resolve_creds:
+                return
+            _resolve_schema = _resolve_creds["schema"]
+            resolved_table_name, _resolved_outcome = resolve_db_output_table(
+                win, _resolve_schema, barangay_source
+            )
+            if resolved_table_name is None:
+                print("Run cancelled by user (database output table not confirmed).")
+                return
+
         win.destroy()
-        run_processing(root, overwrite_mode)
+        run_processing(root, overwrite_mode, resolved_table_name)
 
     # Single source of truth for the Run button's enabled/disabled
     # colors -- used both at button creation and inside
@@ -1289,7 +1339,7 @@ class ProgressWindow:
 
 
 # ---------------- Run ----------------
-def run_processing(root, overwrite_mode=None):
+def run_processing(root, overwrite_mode=None, resolved_table_name=None):
     # root: the live top-level window (passed from on_run(); NOT
     # `win`, which is destroyed before run_processing() is ever
     # called -- see on_run()'s win.destroy() immediately before this
@@ -1310,21 +1360,13 @@ def run_processing(root, overwrite_mode=None):
         f"postgresql://{creds['username']}:{creds['password']}@{creds['host']}:{creds['port']}/{creds['database']}"
     )
 
-    # resolved_table_name / resolved_outcome: the DB-output destination
-    # table, resolved ONCE, up front -- see resolve_db_output_table()'s
-    # own docstring for why this happens here even without a background
-    # thread. Only relevant when output_mode[0] == "db" -- stays
-    # None/None for local output, where the write logic below ignores
-    # them entirely.
-    resolved_table_name = None
-    resolved_outcome = None
-    if output_mode[0] == "db":
-        resolved_table_name, resolved_outcome = resolve_db_output_table(
-            root, schema, barangay_source
-        )
-        if resolved_table_name is None:
-            print("Run cancelled by user (database output table not confirmed).")
-            return
+    # resolved_table_name: the DB-output destination table. Resolution
+    # responsibility now belongs to on_run() (PRIORITY 3), on the main
+    # thread, BEFORE win.destroy() -- see Fix 1. By the time it reaches
+    # this function it is treated as an already-validated value: either
+    # None (local output, or output_mode[0] != "db") or a confirmed
+    # table name (DB output, user already had the chance to cancel in
+    # on_run()). No re-resolution or re-validation happens here.
 
     # ============================================================
     # Progress Event Protocol v9 -- this tool's migration.
@@ -1401,13 +1443,20 @@ def run_processing(root, overwrite_mode=None):
                                               if_exists="replace", index=False)
                         print(f"🔄 Saved to DB: {out_table}")
             else:
-                # Database Land Parcel sources: column-conflict check is out of
-                # scope (see _check_parcel_surface_conflicts()) -- always uses
-                # process_surface()'s default "CAMA_RD_SURFACE" name.
+                # Database Land Parcel sources: extended (Fix 3) to
+                # respect surface_column_overrides, same as the LOCAL
+                # branch above -- preserves the exact existing column
+                # casing detected in on_run()'s PRIORITY 1 check instead
+                # of always defaulting to "CAMA_RD_SURFACE".
                 for table in barangay_source[1]:
                     q.put(("update", f"Loading DB table {table}", None, None))
                     brgy_gdf = read_postgis_clean(table, engine, schema)
-                    result = process_surface(brgy_gdf, road_gdf, progress=progress_cb)
+                    output_column_name = surface_column_overrides.get(table, "CAMA_RD_SURFACE")
+                    result = process_surface(
+                        brgy_gdf, road_gdf,
+                        output_column_name=output_column_name,
+                        progress=progress_cb,
+                    )
                     if output_mode[0] == "local":
                         desired_base_name = table
                         candidate_path = os.path.join(output_mode[1], f"{desired_base_name}.gpkg")

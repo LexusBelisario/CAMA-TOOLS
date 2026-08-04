@@ -356,30 +356,50 @@ def _get_poi_types_for_check(poi_source, engine, schema):
         return []
 
 
-def _check_parcel_poi_distance_conflicts(local_paths, targets):
+def _check_parcel_poi_distance_conflicts(sources, source_type, targets):
     """
-    Checks LOCAL Land Parcel source(s) for pre-existing columns matching
-    any of `targets` (case-insensitive exact match). Same read approach
-    as every other tool's conflict check (plain gpd.read_file(), read
-    failure = skip-only, never a conflict-check failure).
+    Checks the selected Land Parcel source -- Local file OR Database
+    table (extended to cover both as part of Fix 3; previously
+    LOCAL-only) -- for pre-existing columns matching any of `targets`
+    (case-insensitive exact match). Same read approach as every other
+    tool's conflict check for a Local source (plain gpd.read_file(),
+    read failure = skip-only, never a conflict-check failure); for a
+    Database source, read_postgis_clean() is used instead, loading its
+    own creds/schema/engine (self-contained).
 
-    Returns a list of (path, existing_output_cols) tuples -- one entry
-    only for local sources where at least one target match was found.
-    existing_output_cols is {target_name: actual_existing_column_name},
-    original casing preserved (shown in the confirmation dialog only --
-    see _normalize_conflicting_columns() below for how the ACTUAL
-    write-back always converges to the canonical CAMA_ name instead of
-    preserving this casing, since this tool's output is a single
-    merged dataframe across possibly many sources, not one output per
-    source).
+    Returns a list of (path_or_table, existing_output_cols) tuples --
+    one entry only for sources where at least one target match was
+    found. existing_output_cols is {target_name: actual_existing_
+    column_name}, original casing preserved (shown in the confirmation
+    dialog only -- see _normalize_conflicting_columns() below for how
+    the ACTUAL write-back always converges to the canonical CAMA_ name
+    instead of preserving this casing, since this tool's output is a
+    single merged dataframe across possibly many sources, not one
+    output per source).
     """
     conflicts = []
-    for path in local_paths:
+    engine = None
+    schema = None
+    if source_type == "db":
+        creds = load_db_credentials()
+        if not creds:
+            print("⚠️ Could not load DB credentials to check for existing "
+                  "output column(s).")
+            return conflicts
+        schema = creds["schema"]
+        engine = create_engine(
+            f"postgresql://{creds['username']}:{creds['password']}@"
+            f"{creds['host']}:{creds['port']}/{creds['database']}"
+        )
+    for path_or_table in sources:
         try:
-            gdf = gpd.read_file(path)
+            if source_type == "local":
+                gdf = gpd.read_file(path_or_table)
+            else:
+                gdf = read_postgis_clean(path_or_table, engine, schema)
         except Exception as e:
             print(f"⚠️ Could not read parcel layer to check for existing "
-                  f"output column(s): {path}: {e}")
+                  f"output column(s): {path_or_table}: {e}")
             continue
         found = {}
         for target in targets:
@@ -387,7 +407,7 @@ def _check_parcel_poi_distance_conflicts(local_paths, targets):
             if match is not None:
                 found[target] = match
         if found:
-            conflicts.append((path, found))
+            conflicts.append((path_or_table, found))
     return conflicts
 
 
@@ -1211,11 +1231,12 @@ def open_main_window(app_root):
         # Existing OUTPUT-COLUMN conflict warning. This tool's output
         # columns are dynamic (see _realizable_targets()) -- only POI
         # types actually present in the selected POI source this run are
-        # checked. LOCAL Land Parcel sources only; Database sources are
-        # explicitly out of scope. Shown once, combined across every
-        # affected source, only here at Run time. Declining cancels the
-        # run entirely -- nothing is processed, including sources that
-        # had no conflict.
+        # checked. Extended (Fix 3) to cover both Local and Database
+        # Land Parcel sources -- previously LOCAL-only (see
+        # _check_parcel_poi_distance_conflicts()'s own docstring).
+        # Shown once, combined across every affected source, only here
+        # at Run time. Declining cancels the run entirely -- nothing is
+        # processed, including sources that had no conflict.
         #
         # Unlike every other tool's Task A, there is NO override map
         # threaded through to processing here: this tool's output is a
@@ -1225,50 +1246,48 @@ def open_main_window(app_root):
         # actual write-back always converges to the canonical CAMA_
         # name, handled unconditionally and safely inside task() by
         # _normalize_conflicting_columns() regardless of what happens
-        # here.
+        # here (and regardless of Local vs Database source, since that
+        # function already runs unconditionally on the merged
+        # dataframe).
         # ------------------------------------------------------------------
-        if parcel_source_type.get() == "local":
+        poi_types_for_check = []
+        try:
+            creds_for_check = load_db_credentials()
+            engine_for_check = None
+            schema_for_check = None
+            if poi_source[0] == "db" and creds_for_check:
+                schema_for_check = creds_for_check["schema"]
+                engine_for_check = create_engine(
+                    f"postgresql://{creds_for_check['username']}:{creds_for_check['password']}@"
+                    f"{creds_for_check['host']}:{creds_for_check['port']}/{creds_for_check['database']}"
+                )
+            poi_types_for_check = _get_poi_types_for_check(
+                poi_source, engine_for_check, schema_for_check)
+        except Exception as e:
+            print(f"⚠️ Could not prepare POI-type check for column "
+                  f"conflicts: {e}")
             poi_types_for_check = []
-            try:
-                creds_for_check = load_db_credentials()
-                engine_for_check = None
-                schema_for_check = None
-                if poi_source[0] == "db" and creds_for_check:
-                    schema_for_check = creds_for_check["schema"]
-                    engine_for_check = create_engine(
-                        f"postgresql://{creds_for_check['username']}:{creds_for_check['password']}@"
-                        f"{creds_for_check['host']}:{creds_for_check['port']}/{creds_for_check['database']}"
-                    )
-                poi_types_for_check = _get_poi_types_for_check(
-                    poi_source, engine_for_check, schema_for_check)
-            except Exception as e:
-                print(f"⚠️ Could not prepare POI-type check for column "
-                      f"conflicts: {e}")
-                poi_types_for_check = []
 
-            if poi_types_for_check:
-                targets_for_check = _realizable_targets(poi_types_for_check)
-                conflicts = _check_parcel_poi_distance_conflicts(
-                    [parcel_local_path], targets_for_check)
-                if conflicts:
-                    lines = "\n".join(
-                        f"- '{os.path.basename(path)}': found "
-                        + ", ".join(
-                            f"'{existing_name}' column (for {target})"
-                            for target, existing_name in existing_output_cols.items()
-                        )
-                        for path, existing_output_cols in conflicts
-                    )
-                    proceed = messagebox.askyesno(
-                        "Existing output column(s) found",
-                        f"{lines}\n\n"
-                        "Processing will overwrite the existing column(s) with the "
-                        "newly computed values. The column name(s) will not change.\n\n"
-                        "Proceed?"
-                    )
-                    if not proceed:
-                        print("Run cancelled by user (existing output column(s) found).")
-                        return
+        if poi_types_for_check:
+            targets_for_check = _realizable_targets(poi_types_for_check)
+            conflicts = _check_parcel_poi_distance_conflicts(
+                list(parcel_source[1]), parcel_source[0], targets_for_check)
+            if conflicts:
+                lines = "\n\n".join(
+                    f"'{os.path.basename(path)}' already has the following column(s):\n"
+                    + "\n".join(f"  • {existing_name}" for existing_name in existing_output_cols.values())
+                    for path, existing_output_cols in conflicts
+                )
+                proceed = messagebox.askyesno(
+                    "Existing output column(s) found",
+                    f"{lines}\n\n"
+                    "Processing will overwrite the existing column(s) with the "
+                    "newly computed values. The column name(s) will not change.\n\n"
+                    "Proceed?"
+                )
+                if not proceed:
+                    print("Run cancelled by user (existing output column(s) found).")
+                    return
 
 
         # OUTPUT-FILE conflict check (local output only) -- PRIORITY 2
@@ -1289,8 +1308,52 @@ def open_main_window(app_root):
                     print("Run cancelled by user (existing output file(s) found).")
                     return
 
+        # ------------------------------------------------------------------
+        # PRIORITY 3: DB-output destination table resolution — mirrors
+        # PRIORITY 2 above. MOVED here from run_with_progress() (where it
+        # already existed from a prior fix, see that function's own
+        # "DB-output resolution -- newly added, previously missing"
+        # comment) rather than added from scratch. Resolved here on the
+        # main thread, before win.destroy(), so confirm_db_overwrite_
+        # dialog()/choose_db_overwrite_dialog() (invoked inside
+        # resolve_db_output_table()) still have a live parent window, and
+        # a Cancel here leaves the fully-configured win intact instead of
+        # forcing a from-scratch reopen. Previously this resolution
+        # happened inside run_with_progress(), which is only ever invoked
+        # AFTER win.destroy() -- see Fix 1 root cause. resolve_db_output_
+        # table()'s own matching/decision logic is untouched; only the
+        # call site moved here. resolved_table_name is passed into
+        # run_with_progress() as a parameter -- same approach already
+        # used in every other migrated tool. resolved_outcome is not
+        # threaded through (same as those files) because nothing
+        # downstream in this file's task() consumes it -- table_action is
+        # independently recomputed there via fetch_tables().
+        #
+        # The two app_root._poi_progress_open = False resets that used to
+        # sit alongside this block inside run_with_progress() are dropped
+        # here -- the guard is never set True until run_with_progress()
+        # itself begins (see its own unchanged top), so there is nothing
+        # to reset at this point in the flow.
+        # ------------------------------------------------------------------
+        resolved_table_name = None
+        if output_mode[0] == "db":
+            _resolve_creds = load_db_credentials()
+            if not _resolve_creds:
+                return
+            _resolve_schema = _resolve_creds["schema"]
+            _resolve_engine = create_engine(
+                f"postgresql://{_resolve_creds['username']}:{_resolve_creds['password']}@"
+                f"{_resolve_creds['host']}:{_resolve_creds['port']}/{_resolve_creds['database']}"
+            )
+            resolved_table_name, _resolved_outcome = resolve_db_output_table(
+                win, _resolve_schema, parcel_source
+            )
+            if resolved_table_name is None:
+                print("Run cancelled by user (database output table not confirmed).")
+                return
+
         win.destroy()
-        run_with_progress(app_root, overwrite_mode)
+        run_with_progress(app_root, overwrite_mode, resolved_table_name)
 
     # Single source of truth for the Run button's enabled/disabled
     # colors -- used both at button creation and inside
@@ -1634,50 +1697,18 @@ def resolve_db_output_table(root, schema, parcel_source):
         return chosen, "overwritten"
 
 
-def run_with_progress(app_root, overwrite_mode=None):
+def run_with_progress(app_root, overwrite_mode=None, resolved_table_name=None):
     if hasattr(app_root, "_poi_progress_open") and app_root._poi_progress_open:
         return
     app_root._poi_progress_open = True
 
-    # ============================================================
-    # DB-output resolution -- newly added, previously missing.
-    # ============================================================
-    # This tool used to require output_mode[0]=="db" AND
-    # parcel_source[0]=="db" together, raising "Database output
-    # requires a Database parcel source." otherwise from deep inside
-    # task() -- see that removed line's replacement below. It never
-    # had the fuzzy-match + confirmation workflow the other migrated
-    # tools have (see resolve_db_output_table()'s own docstring above).
-    #
-    # Resolved HERE, before the progress window is created, same
-    # "resolve everything up front, main thread only" convention as
-    # every other tool -- if the user cancels the confirmation dialog,
-    # this returns before any progress window is ever shown.
-    #
-    # Option A (explicit project decision): this loads its own
-    # creds/schema/engine, separate from the ones task() further below
-    # loads for itself. task()'s existing internals are intentionally
-    # left completely untouched -- a second, short-lived DB connection
-    # here is a small, one-time cost, preferred over restructuring
-    # task()'s working logic for this fix.
-    resolved_table_name = None
-    if output_mode[0] == "db":
-        creds = load_db_credentials()
-        if not creds:
-            app_root._poi_progress_open = False
-            return
-        schema = creds["schema"]
-        engine = create_engine(
-            f"postgresql://{creds['username']}:{creds['password']}@"
-            f"{creds['host']}:{creds['port']}/{creds['database']}"
-        )
-        resolved_table_name, resolved_outcome = resolve_db_output_table(
-            app_root, schema, parcel_source
-        )
-        if resolved_table_name is None:
-            print("Run cancelled by user (database output table not confirmed).")
-            app_root._poi_progress_open = False
-            return
+    # resolved_table_name: the DB-output destination table. Resolution
+    # responsibility now belongs to on_run() (PRIORITY 3), on the main
+    # thread, BEFORE win.destroy() -- see Fix 1. By the time it reaches
+    # this function it is treated as an already-validated value: either
+    # None (local output, or output_mode[0] != "db") or a confirmed
+    # table name (DB output, user already had the chance to cancel in
+    # on_run()). No re-resolution or re-validation happens here.
 
     progress_win = tk.Toplevel(app_root)
     progress_win.title("Processing Parcels...")
