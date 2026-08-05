@@ -151,6 +151,7 @@ EXPORT_HARD_TIMEOUT_S = 900
 
 TOOL_MODULES = {
     "ANY MAP TO LAND PARCEL": "tools.influence_to_barangay",
+    "INFLUENCE TO MAP": "tools.influence_to_map",
     "ROAD WIDTH": "tools.road_width",
     "ROAD FRONTAGE & DEPTH-TO-WIDTH RATIO": "tools.road_frontage",
     "LOT LOCATION": "tools.lot_location",
@@ -3614,6 +3615,7 @@ button_frame.pack(padx=8, pady=(6, 6))
 # === Tooltip descriptions for icon buttons ===
 tooltip_descriptions = {
     "ANY MAP TO LAND PARCEL": "Any map source to Land Parcel",
+    "INFLUENCE TO MAP": "Distance to nearest Fault Line",
     "ROAD WIDTH": "Measure average road width",
     "ROAD FRONTAGE & DEPTH-TO-WIDTH RATIO": "Analyze parcel depth and frontage",
     "LOT LOCATION": "Classify lots based on proximity",
@@ -3636,18 +3638,19 @@ tooltip_descriptions = {
 # === BUTTON DEFINITIONS ===
 buttons_1st_row = [
     "ANY MAP TO LAND PARCEL",
+    "INFLUENCE TO MAP",
     "ROAD WIDTH",
     "ROAD FRONTAGE & DEPTH-TO-WIDTH RATIO",
     "LOT LOCATION",
     "LAND SHAPE",
-    "METERS FROM (SCHOOL, SHOP, TRANSPORT, CHURCH)",
 ]
 
 buttons_2nd_row = [
+    "METERS FROM (SCHOOL, SHOP, TRANSPORT, CHURCH)",
     "LANDMARKS WITHIN METERS",
     "PARCEL TERRAIN LEVEL",
     "ROAD DENSITY",
-    "ROAD SURFACE"
+    "ROAD SURFACE",
 ]
 
 popup_windows = {}
@@ -3669,7 +3672,21 @@ second_row.pack(side="top", anchor="w", padx=4, pady=(0, 6))
 for label in buttons_1st_row:
     canvas = tk.Canvas(first_row, width=48, height=48, highlightthickness=0, bg="#afd0f7")
     bg_img_id = canvas.create_image(3, 3, anchor="nw", image=None)
-    icon_img_id = canvas.create_image(2, 2, anchor="nw", image=icons[label])
+
+    if label in icons:
+        icon_img_id = canvas.create_image(2, 2, anchor="nw", image=icons[label])
+    else:
+        # Isolated fallback for a button with no bundled icon yet (e.g.
+        # "INFLUENCE TO MAP"): render plain text instead of fabricating
+        # a placeholder PNG. Guards on `icons` -- the runtime dict this
+        # loop actually indexes two lines above -- rather than
+        # `_icon_files`, its config-source dict, so this stays correct
+        # even if the two ever diverge for any reason. Dropping in a
+        # real icon later is then a clean, minimal change: add one
+        # `_icon_files` entry, and this branch simply stops triggering.
+        icon_img_id = canvas.create_text(
+            24, 24, text="ITM", font=("Segoe UI", 9, "bold"), fill="#1a1a1a"
+        )
 
     canvas_refs[label] = (canvas, bg_img_id)
     popup_windows[label] = 0
@@ -3687,8 +3704,12 @@ for label in buttons_1st_row:
 
     make_bindings(canvas, label, bg_img_id)
 
-    # ✅ Tooltip with icon and label
-    add_tooltip(canvas, icon_paths[label], label, tooltip_descriptions.get(label, "Launch tool"), canvas=canvas, bg_id=bg_img_id)
+    # ✅ Tooltip with icon and label. Falls back to the already-bundled
+    # BLGF.png (same resource apply_icon() already relies on
+    # everywhere) for any button with no entry in icon_paths yet --
+    # add_tooltip() always needs a real, openable image path.
+    tooltip_icon_path = icon_paths.get(label, resource_path("BLGF.png"))
+    add_tooltip(canvas, tooltip_icon_path, label, tooltip_descriptions.get(label, "Launch tool"), canvas=canvas, bg_id=bg_img_id)
     canvas.pack(side="left", padx=(2, 2), pady=(2, 2))
 
     # Per-button packing adjustments
