@@ -109,7 +109,17 @@ VECTOR_FILETYPES = [
 # Fixed output columns for this tool. NOT dynamic/per-layer -- see
 # Known Open Question #1 in the Task Prompt: this tool is permanently
 # fault-line-specific for the current implementation.
-OUTPUT_COLUMN_TARGETS = ("CAMA_FAULT_LINE_NAME", "NEAREST_FAULT_LINE")
+#
+# Renamed from CAMA_FAULT_LINE_NAME/NEAREST_FAULT_LINE: (1) the missing
+# CAMA_ prefix on the distance column was a bug -- every other output
+# column in this tool and across CAMA Tools is CAMA_-prefixed; (2) the
+# "_LINE" wording no longer fits now that Polygon and Point Fault Line
+# features are formally supported (see process_parcels()'s geometry-
+# type switch below) -- these column names describe the FAULT domain/
+# dataset the value came from, not a geometry shape, matching the
+# project's existing convention (e.g. ROAD_WIDTH doesn't imply roads
+# are always drawn a particular way either).
+OUTPUT_COLUMN_TARGETS = ("CAMA_FAULT_NAME", "CAMA_FAULT_DISTANCE")
 
 
 # -------------------- DB HELPERS --------------------
@@ -407,7 +417,7 @@ def ensure_geometry_column(gdf):
     return gdf
 
 
-def fix_geometry(geom):
+def fix_geometry(geom, context_label=None):
     """
     Ported verbatim from road_frontage.py. Geometry-type-aware repair:
     buffer(0) is a polygon-repair technique that can silently collapse
@@ -415,6 +425,15 @@ def fix_geometry(geom):
     make_valid() instead. Correct for this tool's LineString fault
     data today, and forward-compatible for Point/Polygon Fault Line
     layers per Section E's scoping.
+
+    context_label: optional identifier (e.g. "parcel PIN=123-45-6" or
+    "fault feature row 7") logged to the console whenever repair is
+    actually needed -- audit trail for which specific records trigger
+    shapely's make_valid() (the source of the
+    "RuntimeWarning: invalid value encountered in make_valid" GEOS
+    warning seen on some real-world shapefiles). Purely additive: when
+    omitted (the default), behavior is 100% unchanged from before --
+    no logging, same repair logic.
     """
     if geom is None or geom.is_empty:
         return None
@@ -423,11 +442,17 @@ def fix_geometry(geom):
             if geom.geom_type in {"Polygon", "MultiPolygon"}:
                 geom = geom.buffer(0)
             if not geom.is_valid:
+                if context_label:
+                    print(f"ℹ️ Repairing invalid geometry via make_valid() for {context_label}")
                 geom = make_valid(geom)
         if geom.is_empty:
+            if context_label:
+                print(f"⚠️ Geometry for {context_label} is empty after repair -- will be skipped.")
             return None
         return geom
-    except Exception:
+    except Exception as e:
+        if context_label:
+            print(f"⚠️ Geometry repair failed for {context_label}: {type(e).__name__}: {e}")
         return None
 
 
@@ -450,7 +475,7 @@ _FAULT_NAME_CANDIDATES = ("name", "fault_name", "fault", "feature_name")
 
 def detect_fault_name_field(gdf, name_guess: str):
     """
-    Returns the column name to use for CAMA_FAULT_LINE_NAME, or None if
+    Returns the column name to use for CAMA_FAULT_NAME, or None if
     no suitable column could be determined (caller must show an
     explicit error and abort -- see PRIORITY 1 conflict-check read and
     run_processing() below).
@@ -565,8 +590,8 @@ def _check_parcel_output_conflicts(sources, source_type, engine=None, schema=Non
     return conflicts
 
 
-# parcel_output_column_overrides: {path_or_table: {"CAMA_FAULT_LINE_NAME":
-# actual_name, "NEAREST_FAULT_LINE": actual_name}} -- populated at Run
+# parcel_output_column_overrides: {path_or_table: {"CAMA_FAULT_NAME":
+# actual_name, "CAMA_FAULT_DISTANCE": actual_name}} -- populated at Run
 # time when a Land Parcel source already has a pre-existing matching
 # column and the user confirms proceeding. Same convention as
 # influence_to_barangay.py's own override map.
@@ -579,34 +604,52 @@ def process_parcels(parcel_gdf, fault_gdf, name_field, source_name,
     """
     Core measurement engine. For each parcel: representative_point() ->
     single nearest-feature STRtree lookup against the Fault Line layer
-    -> CAMA_FAULT_LINE_NAME, NEAREST_FAULT_LINE, and the VM line all
+    -> CAMA_FAULT_NAME, CAMA_FAULT_DISTANCE, and the VM line all
     derived from that SAME lookup result (single-nearest-feature-query
     rule -- see Task Prompt / Instructions Section E; this is a hard
     architectural requirement, not a style preference).
 
-    The measurement engine is written generically over shapely geometry
-    types (Point/LineString/Polygon Fault Line features all work with
-    .distance()/nearest_points() the same way) -- forward-compatible
-    per Section E's scoping, even though the only validated production
-    input today is LineString fault data.
+    Selection metric vs. measurement metric (approved design):
+    The nearest feature is ALWAYS selected by true geometric proximity
+    -- shapely's STRtree.nearest() already ranks candidates by real
+    .distance() (point-to-point, point-to-line, or point-to-polygon,
+    whichever applies), never by a centroid/representative-point
+    approximation, and this holds even when Point, LineString, and
+    Polygon features are mixed within the same Fault Line layer. This
+    selection step is NEVER changed by geometry type -- "nearest
+    feature" means the same thing regardless of what wins.
 
-    Polygon Fault Line distance (if/when used) follows standard
-    Shapely .distance() boundary semantics -- 0 if the parcel's
-    representative_point() falls inside the polygon -- per Known Open
-    Question #2's stated default.
+    Only AFTER a winner is chosen does geometry type affect anything,
+    and only the REPORTED value / VM line, never which feature won:
+      - Point / LineString (and Multi- variants): CAMA_FAULT_DISTANCE
+        is the true geometric distance from parcel_point to the
+        feature, and the VM line runs to the exact nearest_points()
+        endpoint on that feature -- this is this tool's original,
+        LineString-validated behavior, unchanged.
+      - Polygon / MultiPolygon: CAMA_FAULT_DISTANCE is instead the
+        distance from parcel_point to the fault feature's OWN
+        representative_point() (center-to-center), and the VM line
+        runs to that same representative_point() -- NOT standard
+        boundary distance (which would read 0 whenever the parcel
+        falls inside a fault zone polygon, an unhelpful value for a
+        hazard-distance metric). This supersedes Known Open Question
+        #2's original boundary-distance default, per confirmed Team
+        Lead direction.
+    See the geometry-type switch in the per-parcel loop below for the
+    exact implementation.
 
     Duplicate feature names are acceptable and require no special
     handling: the nearest feature is selected purely by spatial
     proximity, never by uniqueness of its NAME attribute, and that
-    NAME is copied verbatim onto CAMA_FAULT_LINE_NAME.
+    NAME is copied verbatim onto CAMA_FAULT_NAME.
 
     Returns (parcel_gdf, vm_gdf) -- both still in the CALLER's current
     (projected) CRS; CRS restoration to the original CRS is the
     caller's responsibility (mirrors road_width.py's process()).
     """
     output_column_map = output_column_map or {}
-    name_col = output_column_map.get("CAMA_FAULT_LINE_NAME", "CAMA_FAULT_LINE_NAME")
-    dist_col = output_column_map.get("NEAREST_FAULT_LINE", "NEAREST_FAULT_LINE")
+    name_col = output_column_map.get("CAMA_FAULT_NAME", "CAMA_FAULT_NAME")
+    dist_col = output_column_map.get("CAMA_FAULT_DISTANCE", "CAMA_FAULT_DISTANCE")
 
     id_col = next(
         (c for c in parcel_gdf.columns
@@ -626,8 +669,10 @@ def process_parcels(parcel_gdf, fault_gdf, name_field, source_name,
     # ------------------------------------------------------------------
     fault_geoms = []
     fault_attrs = []  # parallel list -- fault_attrs[i] is the name value for fault_geoms[i]
-    for _, row in fault_gdf.iterrows():
-        g = fix_geometry(row.geometry)
+    for fault_idx, (_, row) in enumerate(fault_gdf.iterrows()):
+        fault_name_for_log = row.get(name_field) if name_field in fault_gdf.columns else None
+        fault_label = f"fault feature '{fault_name_for_log}' (row {fault_idx})" if fault_name_for_log else f"fault feature row {fault_idx}"
+        g = fix_geometry(row.geometry, context_label=fault_label)
         if g is None:
             continue
         fault_geoms.append(g)
@@ -654,7 +699,11 @@ def process_parcels(parcel_gdf, fault_gdf, name_field, source_name,
         if progress_cb:
             progress_cb(1)
 
-        poly = fix_geometry(poly)
+        parcel_label = (
+            f"parcel {id_col}={parcel_gdf.iloc[idx][id_col]}" if id_col
+            else f"parcel row {idx}"
+        )
+        poly = fix_geometry(poly, context_label=parcel_label)
         if poly is None:
             print(f"⚠️ [{source_name}] Skipping parcel at row {idx}: null/empty/unrepairable geometry.")
             names_out.append(None)
@@ -678,13 +727,27 @@ def process_parcels(parcel_gdf, fault_gdf, name_field, source_name,
             nearest_geom = res
             nearest_name = fault_attrs[nearest_idx] if nearest_idx is not None else None
 
-        distance = round(float(parcel_point.distance(nearest_geom)), 4)
-
-        # VM endpoint: the FAULT-side point from nearest_points(), never
-        # the fault feature's representative_point() -- this is the
-        # actual measured endpoint, matching the distance value exactly.
-        _, pt_on_fault = nearest_points(parcel_point, nearest_geom)
-        vm_line = LineString([parcel_point, pt_on_fault])
+        # ---- Measurement metric (decided AFTER the winner is chosen --
+        # see process_parcels()'s docstring for the full Option A
+        # rationale). The winning feature itself is never re-selected
+        # here; only how its distance/VM-line are computed changes. ----
+        if nearest_geom.geom_type in ("Polygon", "MultiPolygon"):
+            # Polygon Fault Line feature (e.g. a fault hazard zone):
+            # center-to-center, NOT boundary distance -- boundary
+            # distance would read 0 whenever the parcel falls inside
+            # the zone, which is not a useful hazard-distance value.
+            fault_ref_point = nearest_geom.representative_point()
+            distance = round(float(parcel_point.distance(fault_ref_point)), 4)
+            vm_line = LineString([parcel_point, fault_ref_point])
+        else:
+            # Point / LineString (and Multi- variants): unchanged --
+            # true geometric distance, VM endpoint is the exact
+            # nearest_points() point ON the feature, matching the
+            # distance value exactly. This is this tool's original,
+            # LineString-validated behavior.
+            distance = round(float(parcel_point.distance(nearest_geom)), 4)
+            _, pt_on_fault = nearest_points(parcel_point, nearest_geom)
+            vm_line = LineString([parcel_point, pt_on_fault])
 
         names_out.append(nearest_name)
         dists_out.append(distance)
@@ -713,12 +776,26 @@ def resolve_db_output_table(root, schema, parcel_src, desired_name):
     generalized to accept a single desired_name (this function is
     called once PER Land Parcel source in the batch, not once for the
     whole run -- see run_processing()). Same two cases:
-      - DB-source Land Parcel: always overwrites the exact same table.
+      - DB-source Land Parcel: always overwrites the exact same table
+        -- but the user must still explicitly confirm this, same as
+        every other DB-overwrite path in this tool.
       - Local-file Land Parcel: fuzzy match + user confirmation.
     Returns (resolved_table_name, resolved_outcome), or (None, None) if
-    the user cancelled.
+    the user cancelled. A (None, None) return here propagates straight
+    back through on_run()'s PRIORITY 3 loop, which returns immediately
+    without calling win.destroy() -- the configuration window stays
+    open and the user can reconfigure and try again, same as every
+    other cancellable step in this tool's Run flow.
     """
     if parcel_src[0] == "db":
+        # Land Parcel source IS a DB table -- output necessarily
+        # overwrites that exact same table. Previously this returned
+        # "overwritten" immediately with NO confirmation at all --
+        # confirmed gap, now fixed by reusing the same
+        # confirm_db_overwrite_dialog() used everywhere else in this
+        # tool for a DB-table overwrite decision.
+        if not confirm_db_overwrite_dialog(root, desired_name):
+            return None, None
         return desired_name, "overwritten"
 
     all_tables = fetch_tables(schema)
@@ -1224,47 +1301,64 @@ def _process_one_source(
         with engine.begin() as conn:
             parcel_gdf_out.to_postgis(table, conn, schema=schema, if_exists="replace", index=False)
 
-            conn.execute(text(f"""
-                CREATE TABLE IF NOT EXISTS "{schema}"."CAMA_Table" (
-                    id SERIAL PRIMARY KEY,
-                    PIN TEXT UNIQUE NOT NULL
-                );
-            """))
-            for col in ("cama_fault_line_name", "nearest_fault_line"):
-                col_type = "TEXT" if col == "cama_fault_line_name" else "NUMERIC"
-                conn.execute(text(f"""
-                    DO $$
-                    BEGIN
-                        IF NOT EXISTS (
-                            SELECT 1 FROM information_schema.columns
-                            WHERE table_schema='{schema}'
-                              AND table_name='CAMA_Table'
-                              AND column_name='{col}'
-                        ) THEN
-                            EXECUTE 'ALTER TABLE "{schema}"."CAMA_Table" ADD COLUMN "{col}" {col_type}';
-                        END IF;
-                    END $$;
-                """))
-
-            pin_field = next((c for c in parcel_gdf_out.columns if c.lower() == "pin"), None)
-            if pin_field:
-                name_col = output_column_map.get("CAMA_FAULT_LINE_NAME", "CAMA_FAULT_LINE_NAME")
-                dist_col = output_column_map.get("NEAREST_FAULT_LINE", "NEAREST_FAULT_LINE")
-                sql = text(f"""
-                    INSERT INTO "{schema}"."CAMA_Table" (PIN, cama_fault_line_name, nearest_fault_line)
-                    VALUES (:pin, :fname, :fdist)
-                    ON CONFLICT (PIN) DO UPDATE
-                    SET cama_fault_line_name = EXCLUDED.cama_fault_line_name,
-                        nearest_fault_line = EXCLUDED.nearest_fault_line;
-                """)
-                total_rows = len(parcel_gdf_out)
-                for row_i, (_, row) in enumerate(parcel_gdf_out.iterrows(), start=1):
-                    status_cb(f"Updating CAMA_Table: {row_i}/{total_rows}", row_i, total_rows)
-                    conn.execute(sql, {
-                        "pin": str(row[pin_field]),
-                        "fname": row.get(name_col),
-                        "fdist": float(row[dist_col]) if row.get(dist_col) is not None else None,
-                    })
+            # ------------------------------------------------------------
+            # CAMA_Table write -- TEMPORARILY DISABLED (commented out, not
+            # removed). CAMA_Table itself is a real, established cross-
+            # tool convention (also used by road_width.py and
+            # influence_to_barangay.py) -- this is NOT the same situation
+            # as CAMA_Transaction_Log, which road_width.py confirmed is
+            # genuinely unused and removed outright. This block is kept
+            # in place, disabled only, because:
+            #   1. It is not a required deliverable for this tool yet.
+            #   2. The row-by-row UPSERT loop below (one conn.execute()
+            #      per parcel, via total_rows = len(parcel_gdf_out)) is
+            #      the actual performance bottleneck on large Land Parcel
+            #      sources (e.g. LandParcel.shp's 11,911 features) -- NOT
+            #      the to_postgis() write above, which stays enabled.
+            #      A better batched/bulk-UPSERT algorithm for this loop
+            #      is still undecided; re-enable only once that's solved.
+            # ------------------------------------------------------------
+            # conn.execute(text(f"""
+            #     CREATE TABLE IF NOT EXISTS "{schema}"."CAMA_Table" (
+            #         id SERIAL PRIMARY KEY,
+            #         PIN TEXT UNIQUE NOT NULL
+            #     );
+            # """))
+            # for col in ("cama_fault_name", "cama_fault_distance"):
+            #     col_type = "TEXT" if col == "cama_fault_name" else "NUMERIC"
+            #     conn.execute(text(f"""
+            #         DO $$
+            #         BEGIN
+            #             IF NOT EXISTS (
+            #                 SELECT 1 FROM information_schema.columns
+            #                 WHERE table_schema='{schema}'
+            #                   AND table_name='CAMA_Table'
+            #                   AND column_name='{col}'
+            #             ) THEN
+            #                 EXECUTE 'ALTER TABLE "{schema}"."CAMA_Table" ADD COLUMN "{col}" {col_type}';
+            #             END IF;
+            #         END $$;
+            #     """))
+            #
+            # pin_field = next((c for c in parcel_gdf_out.columns if c.lower() == "pin"), None)
+            # if pin_field:
+            #     name_col = output_column_map.get("CAMA_FAULT_NAME", "CAMA_FAULT_NAME")
+            #     dist_col = output_column_map.get("CAMA_FAULT_DISTANCE", "CAMA_FAULT_DISTANCE")
+            #     sql = text(f"""
+            #         INSERT INTO "{schema}"."CAMA_Table" (PIN, cama_fault_name, cama_fault_distance)
+            #         VALUES (:pin, :fname, :fdist)
+            #         ON CONFLICT (PIN) DO UPDATE
+            #         SET cama_fault_name = EXCLUDED.cama_fault_name,
+            #             cama_fault_distance = EXCLUDED.cama_fault_distance;
+            #     """)
+            #     total_rows = len(parcel_gdf_out)
+            #     for row_i, (_, row) in enumerate(parcel_gdf_out.iterrows(), start=1):
+            #         status_cb(f"Updating CAMA_Table: {row_i}/{total_rows}", row_i, total_rows)
+            #         conn.execute(sql, {
+            #             "pin": str(row[pin_field]),
+            #             "fname": row.get(name_col),
+            #             "fdist": float(row[dist_col]) if row.get(dist_col) is not None else None,
+            #         })
 
         vm_table = None
         if not vm_gdf_out.empty:
