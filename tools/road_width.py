@@ -4300,103 +4300,129 @@ def _process_one_source(
             b_gdf.to_postgis(table, conn, schema=schema, if_exists="replace", index=False)
             print(f"⏱️ [{source_label}] to_postgis() (full table write): {time.perf_counter() - _t_topg_start:.2f}s")
 
-            conn.execute(text(f"""
-                CREATE TABLE IF NOT EXISTS "{schema}"."CAMA_Table" (
-                    id SERIAL PRIMARY KEY,
-                    PIN TEXT UNIQUE NOT NULL
-                );
-            """))
-            conn.execute(text(f"""
-                DO $$
-                BEGIN
-                    IF NOT EXISTS (
-                        SELECT 1 FROM information_schema.columns
-                        WHERE table_schema='{schema}'
-                          AND table_name='CAMA_Table'
-                          AND column_name='cama_road_width'
-                    ) THEN
-                        EXECUTE 'ALTER TABLE "{schema}"."CAMA_Table" ADD COLUMN "cama_road_width" NUMERIC';
-                    END IF;
-                END $$;
-            """))
-            pin_field = _detect_pin_column(b_gdf)
-            if pin_field:
-                _t_cama_start = time.perf_counter()
-                # Batched execution instead of one .execute() call per
-                # row (was: 11,911 individual round-trips for an
-                # 11,911-row source, confirmed via direct user testing
-                # to be the dominant cost of the whole DB-write phase --
-                # far more than to_postgis() itself). SQLAlchemy's
-                # Connection.execute() accepts a LIST of parameter
-                # dicts for the same statement and forwards it to the
-                # DBAPI's executemany-equivalent, which psycopg2 batches
-                # into far fewer network round-trips than issuing each
-                # one separately from a Python loop -- same SQL, same
-                # ON CONFLICT DO UPDATE semantics per row, same
-                # transaction, same rollback-on-failure guarantee
-                # (still inside the `with engine.begin() as conn:`
-                # block above) -- purely a performance change, no
-                # difference in what ends up in the table.
-                #
-                # Chunked (not one single call for all 11,911 rows) so
-                # progress can be reported incrementally instead of the
-                # progress window sitting on one static message for the
-                # DB write's entire duration -- and to keep each
-                # individual batch a reasonable size regardless of how
-                # large a given source is.
-                CAMA_BATCH_SIZE = 1000
-                sql = text(f"""
-                    INSERT INTO "{schema}"."CAMA_Table" (PIN, cama_road_width)
-                    VALUES (:pin, :rw)
-                    ON CONFLICT (PIN) DO UPDATE
-                    SET cama_road_width = EXCLUDED.cama_road_width;
-                """)
-                all_params = [
-                    {
-                        "pin": str(row[pin_field]),
-                        "rw": float(row[output_column_name]) if row[output_column_name] is not None else None,
-                    }
-                    for _, row in b_gdf.iterrows()
-                ]
-                total_rows = len(all_params)
-                for batch_start in range(0, total_rows, CAMA_BATCH_SIZE):
-                    batch = all_params[batch_start:batch_start + CAMA_BATCH_SIZE]
-                    # --- TEMPORARY DIAGNOSTIC INSTRUMENTATION ---
-                    # Not permanent telemetry -- added to confirm whether
-                    # the ~402s CAMA_Table update time (see profiling
-                    # below this loop) is consistently spent inside the
-                    # UPSERT execution itself (conn.execute(sql, batch))
-                    # or concentrated in specific batches, which would
-                    # point to a different cause (lock waits, connection
-                    # warm-up, autovacuum, etc.) instead. Confirmed via
-                    # the official SQLAlchemy 2.0 changelog that
-                    # insertmanyvalues -- the multi-row VALUES batching
-                    # optimization -- is disabled whenever the statement
-                    # has an ON CONFLICT clause (as this one does), so
-                    # conn.execute(sql, batch) here falls back to
-                    # SQLAlchemy's legacy per-row execution path. That
-                    # confirms batching is NOT happening, but does not by
-                    # itself confirm this loop is where the 402s actually
-                    # goes -- this print exists to check that directly
-                    # against a real production run before deciding
-                    # whether to change the UPSERT implementation. Remove
-                    # or replace with proper structured logging once a
-                    # decision is made from real profiling output -- do
-                    # not treat this as a finished/permanent addition.
-                    _t_batch_start = time.perf_counter()
-                    conn.execute(sql, batch)
-                    _batch_elapsed = time.perf_counter() - _t_batch_start
-                    _batch_num = batch_start // CAMA_BATCH_SIZE + 1
-                    print(
-                        f"⏱️🔎 [{source_label}] CAMA_Table UPSERT batch "
-                        f"#{_batch_num} ({len(batch)} rows): "
-                        f"{_batch_elapsed:.2f}s "
-                        f"({_batch_elapsed / len(batch) * 1000:.1f} ms/row)"
-                    )
-                    # --- END TEMPORARY DIAGNOSTIC INSTRUMENTATION ---
-                    done = min(batch_start + CAMA_BATCH_SIZE, total_rows)
-                    status_cb(f"Updating database records: {done} / {total_rows}...", done, total_rows)
-                print(f"⏱️ [{source_label}] CAMA_Table update ({total_rows} rows, batched): {time.perf_counter() - _t_cama_start:.2f}s")
+            # ------------------------------------------------------------------
+            # CAMA_Table write -- DISABLED (commented out, not removed).
+            #
+            # Confirmed (developer sign-off, August 2026) that no application --
+            # including BLGF-Web-App, iGeosys-LGU-Suite, or any other known system
+            # -- currently reads from CAMA_Table in the PostGIS database. This is
+            # NOT a statement that the implementation below is obsolete, broken,
+            # or wrong (including the batching/UPSERT performance work and its
+            # temporary diagnostic instrumentation, both left intact as-is) -- it
+            # is intentionally kept fully in place so it can be re-enabled later
+            # with no rework if a consumer for CAMA_Table appears (e.g. a future
+            # reporting/dashboard need).
+            #
+            # Same convention already used for this exact table in
+            # influence_to_map.py and influence_to_barangay.py (each disabled/
+            # documented independently -- see each file's own comment for its own
+            # specific reasoning) -- disabled here to match, comment-out-not-
+            # delete style.
+            #
+            # Untouched by this change: the to_postgis() main table write above,
+            # the Visual Measurement layer write below, and this function's
+            # docstring's own atomicity guarantees for both -- both still hold
+            # exactly as documented, since to_postgis() stays inside the same
+            # `with engine.begin() as conn:` transaction as before, just without
+            # the CAMA_Table statements that used to follow it in that block.
+            # ------------------------------------------------------------------
+            # conn.execute(text(f"""
+                # CREATE TABLE IF NOT EXISTS "{schema}"."CAMA_Table" (
+                    # id SERIAL PRIMARY KEY,
+                    # PIN TEXT UNIQUE NOT NULL
+                # );
+            # """))
+            # conn.execute(text(f"""
+                # DO $$
+                # BEGIN
+                    # IF NOT EXISTS (
+                        # SELECT 1 FROM information_schema.columns
+                        # WHERE table_schema='{schema}'
+                          # AND table_name='CAMA_Table'
+                          # AND column_name='cama_road_width'
+                    # ) THEN
+                        # EXECUTE 'ALTER TABLE "{schema}"."CAMA_Table" ADD COLUMN "cama_road_width" NUMERIC';
+                    # END IF;
+                # END $$;
+            # """))
+            # pin_field = _detect_pin_column(b_gdf)
+            # if pin_field:
+                # _t_cama_start = time.perf_counter()
+                # # Batched execution instead of one .execute() call per
+                # # row (was: 11,911 individual round-trips for an
+                # # 11,911-row source, confirmed via direct user testing
+                # # to be the dominant cost of the whole DB-write phase --
+                # # far more than to_postgis() itself). SQLAlchemy's
+                # # Connection.execute() accepts a LIST of parameter
+                # # dicts for the same statement and forwards it to the
+                # # DBAPI's executemany-equivalent, which psycopg2 batches
+                # # into far fewer network round-trips than issuing each
+                # # one separately from a Python loop -- same SQL, same
+                # # ON CONFLICT DO UPDATE semantics per row, same
+                # # transaction, same rollback-on-failure guarantee
+                # # (still inside the `with engine.begin() as conn:`
+                # # block above) -- purely a performance change, no
+                # # difference in what ends up in the table.
+                # #
+                # # Chunked (not one single call for all 11,911 rows) so
+                # # progress can be reported incrementally instead of the
+                # # progress window sitting on one static message for the
+                # # DB write's entire duration -- and to keep each
+                # # individual batch a reasonable size regardless of how
+                # # large a given source is.
+                # CAMA_BATCH_SIZE = 1000
+                # sql = text(f"""
+                    # INSERT INTO "{schema}"."CAMA_Table" (PIN, cama_road_width)
+                    # VALUES (:pin, :rw)
+                    # ON CONFLICT (PIN) DO UPDATE
+                    # SET cama_road_width = EXCLUDED.cama_road_width;
+                # """)
+                # all_params = [
+                    # {
+                        # "pin": str(row[pin_field]),
+                        # "rw": float(row[output_column_name]) if row[output_column_name] is not None else None,
+                    # }
+                    # for _, row in b_gdf.iterrows()
+                # ]
+                # total_rows = len(all_params)
+                # for batch_start in range(0, total_rows, CAMA_BATCH_SIZE):
+                    # batch = all_params[batch_start:batch_start + CAMA_BATCH_SIZE]
+                    # # --- TEMPORARY DIAGNOSTIC INSTRUMENTATION ---
+                    # # Not permanent telemetry -- added to confirm whether
+                    # # the ~402s CAMA_Table update time (see profiling
+                    # # below this loop) is consistently spent inside the
+                    # # UPSERT execution itself (conn.execute(sql, batch))
+                    # # or concentrated in specific batches, which would
+                    # # point to a different cause (lock waits, connection
+                    # # warm-up, autovacuum, etc.) instead. Confirmed via
+                    # # the official SQLAlchemy 2.0 changelog that
+                    # # insertmanyvalues -- the multi-row VALUES batching
+                    # # optimization -- is disabled whenever the statement
+                    # # has an ON CONFLICT clause (as this one does), so
+                    # # conn.execute(sql, batch) here falls back to
+                    # # SQLAlchemy's legacy per-row execution path. That
+                    # # confirms batching is NOT happening, but does not by
+                    # # itself confirm this loop is where the 402s actually
+                    # # goes -- this print exists to check that directly
+                    # # against a real production run before deciding
+                    # # whether to change the UPSERT implementation. Remove
+                    # # or replace with proper structured logging once a
+                    # # decision is made from real profiling output -- do
+                    # # not treat this as a finished/permanent addition.
+                    # _t_batch_start = time.perf_counter()
+                    # conn.execute(sql, batch)
+                    # _batch_elapsed = time.perf_counter() - _t_batch_start
+                    # _batch_num = batch_start // CAMA_BATCH_SIZE + 1
+                    # print(
+                        # f"⏱️🔎 [{source_label}] CAMA_Table UPSERT batch "
+                        # f"#{_batch_num} ({len(batch)} rows): "
+                        # f"{_batch_elapsed:.2f}s "
+                        # f"({_batch_elapsed / len(batch) * 1000:.1f} ms/row)"
+                    # )
+                    # # --- END TEMPORARY DIAGNOSTIC INSTRUMENTATION ---
+                    # done = min(batch_start + CAMA_BATCH_SIZE, total_rows)
+                    # status_cb(f"Updating database records: {done} / {total_rows}...", done, total_rows)
+                # print(f"⏱️ [{source_label}] CAMA_Table update ({total_rows} rows, batched): {time.perf_counter() - _t_cama_start:.2f}s")
 
         # Visual Measurement layer -- best-effort, own separate write,
         # deliberately NOT inside the transaction above (see this

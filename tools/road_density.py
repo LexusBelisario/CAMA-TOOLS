@@ -189,7 +189,14 @@ def get_prs92_zone(labeled_gdfs):
 # persist repaired parcel geometry to its output at all, vs. keeping
 # the original shape (matching the convention used elsewhere in this
 # project)? That's a data-management POLICY decision, not a computation
-# bug -- left as-is pending that decision, not modified here.
+# bug.
+#
+# RESOLVED: policy decision made -- keep the original, untouched shape.
+# Both call sites below no longer write fix_geometry()'s result back into
+# brgy_gdf["geometry"]; see each call site's own comment for the specific
+# rationale (point 2 above -- negligible centroid shift on invalid
+# geometry -- is what made this safe to resolve as a pure removal rather
+# than a local-scope-only repair).
 def fix_geometry(geom):
     if geom is None or geom.is_empty: 
         return None
@@ -1455,7 +1462,20 @@ def run_processing(root, overwrite_mode=None, resolved_table_name=None):
                 for path in barangay_source[1]:
                     q.put(("update", f"Loading {os.path.basename(path)}", None, None))
                     brgy_gdf = gpd.read_file(path)
-                    brgy_gdf["geometry"] = brgy_gdf["geometry"].apply(fix_geometry)
+                    # Deliberately NOT writing fix_geometry()'s repaired result
+                    # back into brgy_gdf["geometry"] here (previously:
+                    # brgy_gdf["geometry"] = brgy_gdf["geometry"].apply(fix_geometry)).
+                    # Resolves the policy question left open in the fix_geometry()
+                    # investigation note above (see that note's own final paragraph):
+                    # this tool only reads row.geometry.centroid inside
+                    # process_density() -- already confirmed there to be safe on
+                    # invalid geometry with a negligible (~0.09m) measurement shift --
+                    # so the repair brought no measurement benefit here, only a side
+                    # effect of silently altering the SAVED output geometry, which
+                    # broke from the documented convention followed elsewhere in this
+                    # project (road_width.py, land_shape_compactness.py,
+                    # lot_location.py, influence_to_map.py): output geometry must stay
+                    # the parcel's original, untouched shape, even if invalid.
                     # output_column_name: preserves the exact existing column
                     # name/casing this LOCAL source's parcel layer already had
                     # (if the user confirmed overwriting one at Run time -- see
@@ -1505,7 +1525,10 @@ def run_processing(root, overwrite_mode=None, resolved_table_name=None):
                 for table in barangay_source[1]:
                     q.put(("update", f"Loading DB table {table}", None, None))
                     brgy_gdf = read_postgis_clean(table, engine, schema)
-                    brgy_gdf["geometry"] = brgy_gdf["geometry"].apply(fix_geometry)
+                    # Same rationale as the local-source loop above -- see that
+                    # comment block for the full explanation. Not duplicating the
+                    # full note here per Rule of Three (Section G.5): both call
+                    # sites keep their own short pointer rather than sharing a helper.
                     output_column_name = density_column_overrides.get(table, "CAMA_DENS_ROAD")
                     result = process_density(
                         brgy_gdf, road_gdf, table,
