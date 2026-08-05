@@ -764,10 +764,31 @@ def run_processing(root, overwrite_mode=None, resolved_table_name=None, resolved
                         b_gdf = b_gdf.to_crs(epsg=4326)
                     print("🧭 CRS before save:", b_gdf.crs)
 
-                    # 3️⃣ Fix invalid geometries
+                    # 3️⃣ Geometry validity check (measurement/output note)
+                    #
+                    # Deliberately NOT writing a buffer(0) repair back into
+                    # b_gdf["geometry"] here. This tool's only geometry-dependent
+                    # computation, the centroid-based sjoin() inside
+                    # transfer_attributes() (see that function), already ran earlier
+                    # above (before this point) using the original, unrepaired
+                    # geometry -- this validity check runs strictly after that, with
+                    # no measurement step left downstream of it. This matches the
+                    # documented convention in influence_to_map.py ("Deliberately NOT
+                    # applying any geometry repair (e.g. buffer(0)) to parcel_gdf_out
+                    # here. This tool only MEASURES -- it must never alter a parcel's
+                    # digitized shape, even if that shape happens to be technically
+                    # invalid."), road_width.py, land_shape_compactness.py, and
+                    # lot_location.py -- the exported output keeps each parcel's
+                    # original, untouched shape, even if invalid.
+                    #
+                    # Previously (pre-fix) this block ran
+                    # b_gdf["geometry"] = b_gdf.geometry.buffer(0) here, which DID
+                    # silently alter the saved output geometry -- flagged and
+                    # confirmed as an inconsistency against the dominant convention
+                    # above (see influence_to_map.py's own inline NOTE, written at
+                    # the time this was first discovered), corrected here.
                     if not b_gdf.is_valid.all():
-                        print("⚠️ Fixing invalid geometries")
-                        b_gdf["geometry"] = b_gdf.geometry.buffer(0)
+                        print("⚠️ Invalid geometries detected -- kept as-is in output (not repaired), per project convention")
 
                     # 4️⃣ Write GeoPackage
                     _write_gpkg(b_gdf, out_path)
@@ -816,109 +837,129 @@ def run_processing(root, overwrite_mode=None, resolved_table_name=None, resolved
                             index=False
                         )
 
-                        # Ensure CAMA_Table exists
-                        conn.execute(
-                            text(
-                                f"""
-                            CREATE TABLE IF NOT EXISTS "{schema}"."CAMA_Table" (
-                                id SERIAL PRIMARY KEY,
-                                PIN TEXT UNIQUE NOT NULL
-                            );
-                        """
-                            )
-                        )
-
-                        # Add missing columns as NUMERIC
-                        for col in added_fields:
-                            conn.execute(
-                                text(
-                                    f"""
-                                DO $$
-                                BEGIN
-                                    IF NOT EXISTS (
-                                        SELECT 1 FROM information_schema.columns
-                                        WHERE table_schema='{schema}'
-                                          AND table_name='CAMA_Table'
-                                          AND column_name='{col.lower()}'
-                                    ) THEN
-                                        EXECUTE 'ALTER TABLE "{schema}"."CAMA_Table" ADD COLUMN "{col.lower()}" NUMERIC';
-                                    END IF;
-                                END $$;
-                            """
-                                )
-                            )
-
-                        # Insert or update PIN-based values using named parameters
-                        pin_field = next((c for c in b_gdf.columns if c.lower() == "pin"), None)
-                        if pin_field:
-                            # Instrumentation only (per explicit instruction):
-                            # total/enumerate(..., start=1) added purely to
-                            # report progress -- the SQL logic and transaction
-                            # flow inside this loop are completely unchanged.
-                            # This loop executes one SQL statement per parcel
-                            # row and can become the longest-running part of
-                            # the operation, so it gets its own progress
-                            # messages rather than leaving the dialog looking
-                            # stalled for its whole duration.
-                            total_rows = len(b_gdf)
-                            for row_i, (_, row) in enumerate(b_gdf.iterrows(), start=1):
-                                progress_cb(f"Updating CAMA_Table: {row_i}/{total_rows}", row_i, total_rows)
-                                insert_cols = ["PIN"] + [c.lower() for c in added_fields]
-                                insert_placeholders = [f":{c.lower()}" for c in insert_cols]
-                                update_assignments = [f'"{c.lower()}" = :{c.lower()}_upd' for c in added_fields]
-
-                                sql = f"""
-                                INSERT INTO "{schema}"."CAMA_Table" ({', '.join(insert_cols)})
-                                VALUES ({', '.join(insert_placeholders)})
-                                ON CONFLICT (PIN) DO UPDATE
-                                SET {', '.join(update_assignments)};
-                                """
-
-                                params = {}
-                                params["pin"] = str(row[pin_field])
-
-                                for c in added_fields:
-                                    # Source-side lookup only -- CAMA_Table's
-                                    # OWN column names (c.lower(), used for
-                                    # insert_cols/update_assignments/params keys
-                                    # above and below) are UNCHANGED by this
-                                    # fix. This only changes WHERE the value is
-                                    # read FROM in b_gdf: prefer the new
-                                    # CAMA_-prefixed column (the one
-                                    # transfer_attributes() actually wrote this
-                                    # run -- output_column_map already resolved
-                                    # any per-source override casing), falling
-                                    # back to the legacy unprefixed column name
-                                    # if the new one somehow isn't present (e.g.
-                                    # a barangay/parcel source that still has an
-                                    # old, pre-CAMA_-prefix column from before
-                                    # this change, and for whatever reason the
-                                    # new column wasn't created this run).
-                                    # Without this fallback-aware lookup, every
-                                    # CAMA_Table value would silently become
-                                    # NULL after the CAMA_ prefix rollout, since
-                                    # b_gdf no longer has a column literally
-                                    # named `c`.
-                                    resolved_col = output_column_map.get(c, f"CAMA_{c}")
-                                    if resolved_col in row:
-                                        source_val = row[resolved_col]
-                                    elif c in row:
-                                        source_val = row[c]
-                                    else:
-                                        source_val = None
-
-                                    if source_val is not None:
-                                        try:
-                                            params[c.lower()] = float(source_val)
-                                            params[f"{c.lower()}_upd"] = float(source_val)
-                                        except (ValueError, TypeError):
-                                            params[c.lower()] = None
-                                            params[f"{c.lower()}_upd"] = None
-                                    else:
-                                        params[c.lower()] = None
-                                        params[f"{c.lower()}_upd"] = None
-
-                                conn.execute(text(sql), params)
+                        # ------------------------------------------------------------------
+                        # CAMA_Table write -- DISABLED (commented out, not removed).
+                        #
+                        # Confirmed (developer sign-off, August 2026) that no application --
+                        # including BLGF-Web-App, iGeosys-LGU-Suite, or any other known
+                        # system -- currently reads from CAMA_Table in the PostGIS database.
+                        # This is NOT a statement that the implementation below is obsolete,
+                        # broken, or wrong -- it is intentionally left fully intact so it can
+                        # be re-enabled later with no rework if a consumer for CAMA_Table
+                        # appears (e.g. a future reporting/dashboard need).
+                        #
+                        # Same convention already used for this exact table in
+                        # influence_to_map.py (its own CAMA_Table block, disabled for a
+                        # different reason -- see that file's comment) -- disabled here
+                        # independently, matching the same comment-out-not-delete style.
+                        #
+                        # Untouched by this change: the b_gdf.to_postgis() main table write
+                        # above, and the CAMA_Transaction_Log block below -- both stay inside
+                        # the same `with engine.begin() as conn:` transaction as before.
+                        # ------------------------------------------------------------------
+                        # # Ensure CAMA_Table exists
+                        # conn.execute(
+                            # text(
+                                # f"""
+                            # CREATE TABLE IF NOT EXISTS "{schema}"."CAMA_Table" (
+                                # id SERIAL PRIMARY KEY,
+                                # PIN TEXT UNIQUE NOT NULL
+                            # );
+                        # """
+                            # )
+                        # )
+                        #
+                        # # Add missing columns as NUMERIC
+                        # for col in added_fields:
+                            # conn.execute(
+                                # text(
+                                    # f"""
+                                # DO $$
+                                # BEGIN
+                                    # IF NOT EXISTS (
+                                        # SELECT 1 FROM information_schema.columns
+                                        # WHERE table_schema='{schema}'
+                                          # AND table_name='CAMA_Table'
+                                          # AND column_name='{col.lower()}'
+                                    # ) THEN
+                                        # EXECUTE 'ALTER TABLE "{schema}"."CAMA_Table" ADD COLUMN "{col.lower()}" NUMERIC';
+                                    # END IF;
+                                # END $$;
+                            # """
+                                # )
+                            # )
+                        #
+                        # # Insert or update PIN-based values using named parameters
+                        # pin_field = next((c for c in b_gdf.columns if c.lower() == "pin"), None)
+                        # if pin_field:
+                            # # Instrumentation only (per explicit instruction):
+                            # # total/enumerate(..., start=1) added purely to
+                            # # report progress -- the SQL logic and transaction
+                            # # flow inside this loop are completely unchanged.
+                            # # This loop executes one SQL statement per parcel
+                            # # row and can become the longest-running part of
+                            # # the operation, so it gets its own progress
+                            # # messages rather than leaving the dialog looking
+                            # # stalled for its whole duration.
+                            # total_rows = len(b_gdf)
+                            # for row_i, (_, row) in enumerate(b_gdf.iterrows(), start=1):
+                                # progress_cb(f"Updating CAMA_Table: {row_i}/{total_rows}", row_i, total_rows)
+                                # insert_cols = ["PIN"] + [c.lower() for c in added_fields]
+                                # insert_placeholders = [f":{c.lower()}" for c in insert_cols]
+                                # update_assignments = [f'"{c.lower()}" = :{c.lower()}_upd' for c in added_fields]
+                        #
+                                # sql = f"""
+                                # INSERT INTO "{schema}"."CAMA_Table" ({', '.join(insert_cols)})
+                                # VALUES ({', '.join(insert_placeholders)})
+                                # ON CONFLICT (PIN) DO UPDATE
+                                # SET {', '.join(update_assignments)};
+                                # """
+                        #
+                                # params = {}
+                                # params["pin"] = str(row[pin_field])
+                        #
+                                # for c in added_fields:
+                                    # # Source-side lookup only -- CAMA_Table's
+                                    # # OWN column names (c.lower(), used for
+                                    # # insert_cols/update_assignments/params keys
+                                    # # above and below) are UNCHANGED by this
+                                    # # fix. This only changes WHERE the value is
+                                    # # read FROM in b_gdf: prefer the new
+                                    # # CAMA_-prefixed column (the one
+                                    # # transfer_attributes() actually wrote this
+                                    # # run -- output_column_map already resolved
+                                    # # any per-source override casing), falling
+                                    # # back to the legacy unprefixed column name
+                                    # # if the new one somehow isn't present (e.g.
+                                    # # a barangay/parcel source that still has an
+                                    # # old, pre-CAMA_-prefix column from before
+                                    # # this change, and for whatever reason the
+                                    # # new column wasn't created this run).
+                                    # # Without this fallback-aware lookup, every
+                                    # # CAMA_Table value would silently become
+                                    # # NULL after the CAMA_ prefix rollout, since
+                                    # # b_gdf no longer has a column literally
+                                    # # named `c`.
+                                    # resolved_col = output_column_map.get(c, f"CAMA_{c}")
+                                    # if resolved_col in row:
+                                        # source_val = row[resolved_col]
+                                    # elif c in row:
+                                        # source_val = row[c]
+                                    # else:
+                                        # source_val = None
+                        #
+                                    # if source_val is not None:
+                                        # try:
+                                            # params[c.lower()] = float(source_val)
+                                            # params[f"{c.lower()}_upd"] = float(source_val)
+                                        # except (ValueError, TypeError):
+                                            # params[c.lower()] = None
+                                            # params[f"{c.lower()}_upd"] = None
+                                    # else:
+                                        # params[c.lower()] = None
+                                        # params[f"{c.lower()}_upd"] = None
+                        #
+                                # conn.execute(text(sql), params)
 
                         # Ensure CAMA_Transaction_Log exists
                         conn.execute(
