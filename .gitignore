@@ -1,17 +1,65 @@
-# Python
-__pycache__/
-*.pyc
-tools/__pycache__
+# ==============================================================================
+# GEOSYS DEVELOPMENT INC. - CAMA-TOOLS PROJECT GITIGNORE
+# Description: Configured to prevent tracking of compiled bytecode, local build
+#              artifacts, environment logs, and developer-specific configurations.
+# ==============================================================================
 
-# Build outputs
+# ------------------------------------------------------------------------------
+# Python Bytecode and Caches
+# Prevents Python compiled files from clogging the repository and causing
+# binary merge conflicts during stash or branch merges.
+# ------------------------------------------------------------------------------
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+# ------------------------------------------------------------------------------
+# Virtual Environment
+# The venv/ folder is machine-specific (absolute interpreter paths baked in)
+# and can run into the hundreds of MB -- never committed. Every developer
+# recreates it locally via `python -m venv venv` + reinstalling requirements.
+# ------------------------------------------------------------------------------
+venv/
+.venv/
+
+# ------------------------------------------------------------------------------
+# PyInstaller and Build Outputs
+# Excludes local executable generation outputs. Note: The .spec file is kept
+# tracked if it contains project-wide deployment configurations.
+# ------------------------------------------------------------------------------
 build/
 dist/
 *.pkg
 *.exe
 *.toc
 
-# PyInstaller
-*.spec
-
-*.json
+# ------------------------------------------------------------------------------
+# Environment Profiles and Runtime Logs
+# Prevents local runtime activity and environment logs from being committed.
+# ------------------------------------------------------------------------------
 *.log
+cache/
+
+# ------------------------------------------------------------------------------
+# Local Configuration Files
+# Target specific application state settings or credentials to avoid overwriting
+# other developers' configurations. Generic *.json tracking is permitted
+# unless explicitly ignored here.
+# ------------------------------------------------------------------------------
+pg_credentials.json
+gm_exe_path.json
+
+# ------------------------------------------------------------------------------
+# Editor / IDE Settings
+# Developer-specific editor configuration -- not part of the project itself.
+# ------------------------------------------------------------------------------
+.vscode/
+.idea/
+
+# ------------------------------------------------------------------------------
+# OS-Generated Files
+# Filesystem metadata Windows/macOS create automatically -- never intentional.
+# ------------------------------------------------------------------------------
+Thumbs.db
+desktop.ini
+.DS_Store
