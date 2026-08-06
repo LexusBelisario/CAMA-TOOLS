@@ -20,6 +20,7 @@ from shapely.strtree import STRtree
 from shapely.validation import make_valid
 
 from utils.table_name_matching import normalize_name, find_matching_tables
+from utils.resource_path import resource_path
 
 # ============================
 # FORCE WINDOWS APP ICON
@@ -36,15 +37,6 @@ def set_app_user_model_id():
 
 
 set_app_user_model_id()
-
-
-def resource_path(relative_path):
-    """Get absolute path to resource (PyInstaller-safe)."""
-    try:
-        base_path = sys._MEIPASS
-    except Exception:
-        base_path = os.path.abspath(".")
-    return os.path.join(base_path, relative_path)
 
 
 def apply_icon(win):

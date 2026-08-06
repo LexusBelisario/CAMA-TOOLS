@@ -40,3 +40,6 @@ Pillow
 pygetwindow
 pyautogui
 rapidfuzz
+
+# Build
+pyinstaller

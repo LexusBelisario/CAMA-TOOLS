@@ -20,6 +20,7 @@ import threading
 import queue
 
 from utils.table_name_matching import normalize_name, find_matching_tables
+from utils.resource_path import resource_path
 
 # ----------------- CONFIG -----------------
 GM_EXE_PATH = r"C:\Program Files\GlobalMapper26.1_64bit\global_mapper.exe"
@@ -39,15 +40,6 @@ def _get_credentials_path():
         return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "pg_credentials.json")
 
 CREDENTIALS_FILE = _get_credentials_path()
-
-def resource_path(relative_path):
-    """PyInstaller-safe resource path. Ported from road_frontage.py."""
-    try:
-        base_path = _sys._MEIPASS
-    except Exception:
-        base_path = os.path.abspath(".")
-    return os.path.join(base_path, relative_path)
-
 
 def apply_icon(win):
     """
