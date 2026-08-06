@@ -12,6 +12,8 @@ from sqlalchemy import create_engine, inspect, text
 import threading
 import queue
 
+from utils.table_name_matching import normalize_name, find_matching_tables
+
 # ============================
 # FORCE WINDOWS APP ICON
 # ============================
@@ -384,18 +386,6 @@ def resolve_output_base_name(folder: str, desired_base_name: str, ext: str = "gp
     return f"{root}_{max_n + 1}"
 
 
-def normalize_name(name: str) -> str:
-    """
-    Lowercases name and strips everything that isn't a letter (digits,
-    underscores, spaces, hyphens, etc.) -- e.g. "LandParcel_2026" and
-    "Land Parcel Final" both normalize to "landparcelfinal"-style
-    strings with no separators left, so filenames and table names that
-    differ only by punctuation/casing/trailing numbers can still be
-    recognized as referring to the same logical table.
-    """
-    return re.sub(r'[^a-z]', '', name.lower())
-
-
 def fetch_tables(schema):
     creds = load_db_credentials()
     if not creds:
@@ -412,39 +402,6 @@ def fetch_tables(schema):
         return tables
     except:
         return []
-
-
-def find_matching_tables(desired_name, all_tables):
-    """
-    Returns the list of candidate table names from all_tables whose
-    normalized form is a substring of (or contains) the normalized
-    desired_name -- checked in both directions, so "landparcel" matches
-    "landparcel_final" and "landparcel_2026" matches "landparcel"
-    equally. This is intentionally permissive (fuzzy) matching: the
-    caller is responsible for confirming the match with the user
-    before treating it as a definite overwrite target (see
-    confirm_db_overwrite_dialog() / choose_db_overwrite_dialog() and
-    resolve_db_output_table()) -- this function only proposes
-    candidates, it never decides on its own.
-
-    Always excludes "CAMA_Table", "CAMA_Transaction_Log", and any table
-    ending in "_VM" (case-insensitive) from the candidate list, since
-    none of these are ever valid "main output" overwrite targets even
-    if their name happens to contain a substring match (e.g. a
-    Visual Measurement layer table like "landparcel_VM" would otherwise
-    also match a "landparcel" search).
-    """
-    lname = normalize_name(desired_name)
-    candidates = []
-    for t in all_tables:
-        if t.lower() in ("cama_table", "cama_transaction_log"):
-            continue
-        if t.lower().endswith("_vm"):
-            continue
-        tnorm = normalize_name(t)
-        if lname in tnorm or tnorm in lname:
-            candidates.append(t)
-    return candidates
 
 
 def _write_gpkg(gdf, path):

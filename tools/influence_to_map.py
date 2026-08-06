@@ -19,6 +19,8 @@ from shapely.ops import nearest_points
 from shapely.strtree import STRtree
 from shapely.validation import make_valid
 
+from utils.table_name_matching import normalize_name, find_matching_tables
+
 # ============================
 # FORCE WINDOWS APP ICON
 # ============================
@@ -207,36 +209,6 @@ def read_postgis_clean(table, engine, schema):
     if geom_col != "geometry":
         gdf = gdf.rename(columns={geom_col: "geometry"}).set_geometry("geometry")
     return gdf
-
-
-def normalize_name(name: str) -> str:
-    """Lowercases and strips everything that isn't a letter -- ported
-    verbatim from influence_to_barangay.py."""
-    return re.sub(r"[^a-z]", "", name.lower())
-
-
-def find_matching_tables(desired_name, all_tables):
-    """
-    Fuzzy candidate matcher for DB-output overwrite resolution. Ported
-    VERBATIM from influence_to_barangay.py -- including its exclusion
-    of "CAMA_Table", "CAMA_Transaction_Log", and any "_VM"-suffixed
-    table (case-insensitive) from the candidate list. This exclusion is
-    a hard requirement (Section E / Do-Not-Touch): the Visual
-    Measurement layer this tool produces must NEVER be treated as a
-    candidate "main output" match, even if its name happens to contain
-    a substring match.
-    """
-    lname = normalize_name(desired_name)
-    candidates = []
-    for t in all_tables:
-        if t.lower() in ("cama_table", "cama_transaction_log"):
-            continue
-        if t.lower().endswith("_vm"):
-            continue
-        tnorm = normalize_name(t)
-        if lname in tnorm or tnorm in lname:
-            candidates.append(t)
-    return candidates
 
 
 # -------------------- FILE READING (PARCEL) --------------------
