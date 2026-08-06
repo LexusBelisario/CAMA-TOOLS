@@ -15,19 +15,11 @@ import sys
 import psycopg2
 
 from utils.table_name_matching import normalize_name, find_matching_tables
+from utils.resource_path import resource_path
 
 # --- CONFIG ---
 ICON_PATH = r"D:/2025_PROJECTS/BLGF-GM_TEST/FOR TESTING/DCS_CODES/BLGF.ico"
 GM_EXE_PATH = r"C:\Program Files\GlobalMapper26.1_64bit\global_mapper.exe"
-
-
-def resource_path(relative_path):
-    """ PyInstaller-safe resource path """
-    try:
-        base_path = sys._MEIPASS
-    except Exception:
-        base_path = os.path.abspath(".")
-    return os.path.join(base_path, relative_path)
 
 
 def apply_icon(win):

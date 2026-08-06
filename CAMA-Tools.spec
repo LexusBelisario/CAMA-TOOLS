@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('BLGF.png', '.'), ('icons', 'icons'), ('tools', 'tools')]
+datas = [('BLGF.png', '.'), ('icons', 'icons'), ('tools', 'tools'), ('utils', 'utils')]
 binaries = []
 hiddenimports = []
 tmp_ret = collect_all('geopandas')
