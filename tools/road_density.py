@@ -15,6 +15,7 @@ import queue
 
 from utils.table_name_matching import normalize_name, find_matching_tables
 from utils.resource_path import resource_path
+from utils.db_discovery import load_db_credentials, fetch_tables
 
 # ============================
 # FORCE WINDOWS APP ICON
@@ -52,16 +53,6 @@ def apply_icon(win):
 
 # Paths to icon and Global Mapper EXE
 GM_EXE_PATH = r"C:\Program Files\GlobalMapper26.1_64bit\global_mapper.exe"
-def _get_credentials_path():
-    if getattr(sys, "frozen", False):
-        return os.path.join(os.path.dirname(sys.executable), "pg_credentials.json")
-    else:
-        return os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "pg_credentials.json"
-        )
-
-CREDENTIALS_FILE = _get_credentials_path()
 
 barangay_source = None
 road_source = None
@@ -204,14 +195,6 @@ def fix_geometry(geom):
         return None
 
 # ---------------- DB Helpers ----------------
-def load_db_credentials():
-    path = _get_credentials_path()
-    try:
-        with open(path, "r") as f:
-            return json.load(f)
-    except Exception:
-        return None
-
 def get_geometry_column(table_name, engine, schema):
     try:
         with engine.connect() as conn:
@@ -230,20 +213,6 @@ def read_postgis_clean(table, engine, schema):
     col_str = ", ".join([f'"{c}"' for c in cols]) if cols else ""
     q = f'SELECT {col_str+", " if col_str else ""}"{geom_col}" AS geometry FROM "{schema}"."{table}"'
     return gpd.read_postgis(q, engine, geom_col="geometry")
-
-def fetch_tables(schema):
-    creds=load_db_credentials()
-    if not creds: return []
-    try:
-        conn=psycopg2.connect(
-            host=creds["host"],port=creds["port"],dbname=creds["database"],
-            user=creds["username"],password=creds["password"]
-        )
-        cur=conn.cursor()
-        cur.execute("SELECT table_name FROM information_schema.tables WHERE table_schema=%s;",(schema,))
-        return [r[0] for r in cur.fetchall()]
-    except: 
-        return []
 
 # ---------------- Core Processing ----------------
 def process_density(brgy_gdf, road_gdf, source_name="", output_column_name="CAMA_DENS_ROAD", progress=None):

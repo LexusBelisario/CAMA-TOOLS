@@ -21,6 +21,7 @@ from shapely.validation import make_valid
 
 from utils.table_name_matching import normalize_name, find_matching_tables
 from utils.resource_path import resource_path
+from utils.db_discovery import load_db_credentials, fetch_tables
 
 # ============================
 # FORCE WINDOWS APP ICON
@@ -59,17 +60,6 @@ def apply_icon(win):
 
 
 # -------------------- CONFIG --------------------
-def _get_credentials_path():
-    if getattr(sys, "frozen", False):
-        return os.path.join(os.path.dirname(sys.executable), "pg_credentials.json")
-    else:
-        return os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "pg_credentials.json"
-        )
-
-
-CREDENTIALS_FILE = _get_credentials_path()
 GM_EXE_PATH = r"C:\Program Files\GlobalMapper26.1_64bit\global_mapper.exe"
 
 # ------------------------------------------------------------------
@@ -117,58 +107,6 @@ OUTPUT_COLUMN_TARGETS = ("CAMA_FAULT_NAME", "CAMA_FAULT_DISTANCE")
 
 
 # -------------------- DB HELPERS --------------------
-def load_db_credentials():
-    """Load pg_credentials.json safely."""
-    path = _get_credentials_path()
-    if not os.path.exists(path):
-        messagebox.showerror(
-            "Missing Credentials",
-            f"⚠️ File not found: {path}\n\n"
-            "Please create pg_credentials.json with host, port, database, username, password, and schema.",
-        )
-        return None
-    try:
-        with open(path, "r") as f:
-            creds = json.load(f)
-        required = ["host", "port", "database", "username", "password", "schema"]
-        for key in required:
-            if key not in creds:
-                messagebox.showerror("Invalid Credentials", f"Missing '{key}' in pg_credentials.json")
-                return None
-        return creds
-    except Exception as e:
-        messagebox.showerror("Credential Error", str(e))
-        return None
-
-
-def fetch_tables(schema):
-    creds = load_db_credentials()
-    if not creds:
-        return []
-    try:
-        conn = psycopg2.connect(
-            host=creds["host"],
-            port=creds["port"],
-            dbname=creds["database"],
-            user=creds["username"],
-            password=creds["password"],
-        )
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT table_name FROM information_schema.tables
-            WHERE table_schema=%s ORDER BY table_name;
-        """,
-            (schema,),
-        )
-        tables = [row[0] for row in cur.fetchall()]
-        conn.close()
-        return tables
-    except Exception as e:
-        messagebox.showerror("DB Error", str(e))
-        return []
-
-
 def get_geom_column(engine, schema, table):
     """Detect the geometry column name from PostGIS system catalogs."""
     try:

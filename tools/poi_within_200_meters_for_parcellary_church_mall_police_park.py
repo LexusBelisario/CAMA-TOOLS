@@ -16,6 +16,7 @@ import psycopg2
 
 from utils.table_name_matching import normalize_name, find_matching_tables
 from utils.resource_path import resource_path
+from utils.db_discovery import load_db_credentials, fetch_tables
 
 # --- CONFIG ---
 ICON_PATH = r"D:/2025_PROJECTS/BLGF-GM_TEST/FOR TESTING/DCS_CODES/BLGF.ico"
@@ -82,16 +83,6 @@ def _remove_close_button(win):
 
 GM_EXE_PATH = r"C:\Program Files\GlobalMapper26.1_64bit\global_mapper.exe"
 
-def _get_credentials_path():
-    if getattr(sys, "frozen", False):
-        return os.path.join(os.path.dirname(sys.executable), "pg_credentials.json")
-    else:
-        return os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "pg_credentials.json"
-        )
-
-CREDENTIALS_FILE = _get_credentials_path()
 
 # --- GLOBALS ---
 barangay_source = None
@@ -161,15 +152,6 @@ ox.settings.use_cache = True
 ox.settings.log_console = False
 
 # ---------------- DB HELPERS ----------------
-def load_db_credentials():
-    path = _get_credentials_path()
-    try:
-        with open(path, "r") as f:
-            return json.load(f)
-    except Exception:
-        messagebox.showerror("Error", "Database credentials not found.")
-        return None
-
 def get_geometry_column(table_name, engine, schema):
     try:
         with engine.connect() as conn:
@@ -193,31 +175,6 @@ def read_postgis_clean(table, engine, schema):
 def open_in_global_mapper(path):
     if os.path.exists(GM_EXE_PATH) and os.path.exists(path):
         subprocess.Popen([GM_EXE_PATH, path], shell=True)
-
-def fetch_tables(schema):
-    """Fetch all table names from the database schema."""
-    creds = load_db_credentials()
-    if not creds:
-        return []
-    try:
-        conn = psycopg2.connect(
-            host=creds["host"],
-            port=creds["port"],
-            dbname=creds["database"],
-            user=creds["username"],
-            password=creds["password"]
-        )
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT table_name FROM information_schema.tables WHERE table_schema=%s ORDER BY table_name;",
-            (schema,)
-        )
-        tables = [row[0] for row in cur.fetchall()]
-        conn.close()
-        return tables
-    except Exception as e:
-        print(f"⚠️ Error fetching tables: {e}")
-        return []
 
 def create_progress_window(root, total, title="Processing Parcels"):
     global PROG_WIN, PROG_BAR, PROG_LABEL, PROG_STOP_FLAG
