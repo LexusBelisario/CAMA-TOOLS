@@ -21,25 +21,12 @@ import queue
 
 from utils.table_name_matching import normalize_name, find_matching_tables
 from utils.resource_path import resource_path
+from utils.db_discovery import load_db_credentials, fetch_tables
 
 # ----------------- CONFIG -----------------
 GM_EXE_PATH = r"C:\Program Files\GlobalMapper26.1_64bit\global_mapper.exe"
 import sys as _sys
 
-def _get_credentials_path():
-    """
-    Always resolve pg_credentials.json next to the EXE (frozen)
-    or next to this script (dev). Never use CWD — it changes when
-    a subprocess is spawned by PyInstaller.
-    """
-    if getattr(_sys, "frozen", False):
-        # EXE: resolve next to the running executable
-        return os.path.join(os.path.dirname(_sys.executable), "pg_credentials.json")
-    else:
-        # Dev: resolve relative to this file (tools/road_width.py -> parent)
-        return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "pg_credentials.json")
-
-CREDENTIALS_FILE = _get_credentials_path()
 
 def apply_icon(win):
     """
@@ -296,36 +283,6 @@ _parcel_classification_cache = {
 }
 
 # ----------------- HELPERS -----------------
-def load_db_credentials():
-    path = _get_credentials_path()
-    try:
-        with open(path, "r") as f:
-            return json.load(f)
-    except Exception:
-        return None
-
-def fetch_tables(schema):
-    creds = load_db_credentials()
-    if not creds:
-        return []
-    try:
-        conn = psycopg2.connect(
-            host=creds["host"], port=creds["port"],
-            dbname=creds["database"],
-            user=creds["username"], password=creds["password"]
-        )
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT table_name FROM information_schema.tables
-            WHERE table_schema=%s ORDER BY table_name;
-        """, (schema,))
-        tables = [row[0] for row in cur.fetchall()]
-        conn.close()
-        return tables
-    except Exception as e:
-        messagebox.showerror("DB Error", str(e))
-        return []
-
 # NOTE: normalize_name() and find_matching_table() previously existed
 # here -- removed entirely. find_matching_table() used SUBSTRING
 # matching (normalize_name() strips non-letters, then checks "a in b or

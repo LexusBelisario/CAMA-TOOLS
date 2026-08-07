@@ -18,6 +18,7 @@ import psycopg2
 
 from utils.table_name_matching import normalize_name, find_matching_tables
 from utils.resource_path import resource_path
+from utils.db_discovery import load_db_credentials, fetch_tables
 
 # =========================
 # GeoPandas compatibility shim
@@ -67,7 +68,6 @@ def apply_icon(win):
 
 # ========================= CONFIG =========================
 GM_EXE_PATH = r"C:\Program Files\GlobalMapper26.1_64bit\global_mapper.exe"
-CREDENTIALS_FILE = "pg_credentials.json"
 
 barangay_source = None
 road_source = None
@@ -1170,14 +1170,6 @@ def calculate_depth_perpendicular(parcel_geom, road_buffer, max_depth=1000):
 
 
 # ========================= DB HELPERS =========================
-def load_db_credentials():
-    try:
-        with open(CREDENTIALS_FILE, "r") as f:
-            return json.load(f)
-    except:
-        return None
-
-
 def get_geometry_column(table_name, engine, schema):
     try:
         with engine.connect() as conn:
@@ -1201,27 +1193,6 @@ def read_postgis_clean(table, engine, schema):
     else:
         query = f'SELECT "{geom_col}" AS geometry FROM "{schema}"."{table}"'
     return gpd.read_postgis(query, engine, geom_col="geometry")
-
-
-def fetch_tables(schema):
-    creds = load_db_credentials()
-    if not creds:
-        return []
-    try:
-        conn = psycopg2.connect(
-            host=creds["host"],
-            port=creds["port"],
-            dbname=creds["database"],
-            user=creds["username"],
-            password=creds["password"]
-        )
-        cur = conn.cursor()
-        cur.execute("SELECT table_name FROM information_schema.tables WHERE table_schema=%s ORDER BY table_name;", (schema,))
-        tables = [row[0] for row in cur.fetchall()]
-        conn.close()
-        return tables
-    except:
-        return []
 
 
 # ========================= PROGRESS WINDOW =========================

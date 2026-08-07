@@ -14,6 +14,7 @@ import queue
 
 from utils.table_name_matching import normalize_name, find_matching_tables
 from utils.resource_path import resource_path
+from utils.db_discovery import load_db_credentials, fetch_tables
 
 # ============================
 # FORCE WINDOWS APP ICON
@@ -51,16 +52,6 @@ def apply_icon(win):
 
 # === Paths ===
 GM_EXE_PATH = r"C:\Program Files\GlobalMapper26.1_64bit\global_mapper.exe"
-def _get_credentials_path():
-    if getattr(sys, "frozen", False):
-        return os.path.join(os.path.dirname(sys.executable), "pg_credentials.json")
-    else:
-        return os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "pg_credentials.json"
-        )
-
-CREDENTIALS_FILE = _get_credentials_path()
 
 # Globals
 barangay_source = None
@@ -135,15 +126,6 @@ def get_prs92_zone(labeled_gdfs):
     else: return 3125
 
 # ---------------- DB Helpers ----------------
-def load_db_credentials():
-    path = _get_credentials_path()
-    try:
-        with open(path, "r") as f:
-            return json.load(f)
-    except Exception:
-        messagebox.showerror("Error", "Database credentials not found.")
-        return None
-
 def get_geometry_column(table_name, engine, schema):
     try:
         with engine.connect() as conn:
@@ -376,24 +358,6 @@ def resolve_output_base_name(folder: str, desired_base_name: str, ext: str = "gp
     except OSError:
         pass
     return f"{root}_{max_n + 1}"
-
-
-def fetch_tables(schema):
-    creds = load_db_credentials()
-    if not creds:
-        return []
-    try:
-        conn = psycopg2.connect(
-            host=creds["host"], port=creds["port"], dbname=creds["database"],
-            user=creds["username"], password=creds["password"]
-        )
-        cur = conn.cursor()
-        cur.execute("SELECT table_name FROM information_schema.tables WHERE table_schema=%s;", (schema,))
-        tables = [r[0] for r in cur.fetchall()]
-        conn.close()
-        return tables
-    except:
-        return []
 
 
 def _write_gpkg(gdf, path):
