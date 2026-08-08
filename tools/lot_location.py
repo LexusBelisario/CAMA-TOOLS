@@ -1043,18 +1043,20 @@ def open_main_window(root):
     road_read_ok = False        # True once the current road source has been read successfully
 
     # Land Parcel existing-CAMA_LOT_LOCATION-column check (Section 1). Mirrors
-    # the Road Network background-read shape above, and the dual-slot
-    # cache shape already proven in road_frontage.py/road_width.py's own
-    # _parcel_classification_cache -- adapted here for much lighter data
-    # (just a conflict list, not full GeoDataFrames or checklist
-    # BooleanVars, since this check's only job is a yes/no warning before
-    # Run, not building a UI checklist).
+    # the Road Network background-read shape above. Deliberately does NOT
+    # cache the detection result (see group-05-cache-removal-analysis.md):
+    # a cache keyed only on "which file/table was selected" cannot detect
+    # that the file/table's CONTENTS changed externally (e.g. another
+    # CAMA tool, QGIS, or Global Mapper modifying it) between one
+    # selection and the next -- serving a stale "no conflict" result would
+    # defeat the whole purpose of this check. Every selection AND every
+    # Local/Database toggle triggers a fresh read instead. What IS still
+    # remembered per mode is only WHICH file/table was last selected
+    # (parcel_local_path / parcel_db_table below) -- that's a completely
+    # separate concern from the detection result and is unaffected by
+    # this decision.
     parcel_is_reading = False
     parcel_existing_lot_location = []   # [(source_label, existing_col_name), ...]
-    _parcel_lot_location_cache = {
-        "local": {"key": None, "conflicts": None},
-        "db": {"key": None, "conflicts": None},
-    }
 
     PAD = dict(padx=8, pady=4)
 
@@ -1284,7 +1286,7 @@ def open_main_window(root):
             parcel_radio_db.config(state="normal")
         _update_run_button_state()
 
-    def _poll_parcel_lot_location_queue(result_queue, source_type, cache_key):
+    def _poll_parcel_lot_location_queue(result_queue, source_type):
         """
         Runs on the main thread via win.after() polling. Picks up the
         conflict list placed on the queue by the background worker.
@@ -1297,33 +1299,30 @@ def open_main_window(root):
             conflicts = result_queue.get_nowait()
         except queue.Empty:
             win.after(100, lambda: _poll_parcel_lot_location_queue(
-                result_queue, source_type, cache_key))
+                result_queue, source_type))
             return
 
-        _parcel_lot_location_cache[source_type] = {
-            "key": cache_key, "conflicts": conflicts
-        }
         parcel_existing_lot_location = conflicts
         _set_parcel_reading_state(False)
 
-    def _refresh_parcel_lot_location_check(force_refresh=False):
+    def _refresh_parcel_lot_location_check():
         """
         Background-checks every currently selected Land Parcel
         file/table for an existing column that would collide with the
-        CAMA_LOT_LOCATION column this tool is about to write — UNLESS the
-        dual-slot cache already has a still-valid entry for this exact
-        mode+selection (e.g. toggling Local <-> Database back to a
-        selection that hasn't changed), in which case the result is
-        restored instantly with no read at all.
+        CAMA_LOT_LOCATION column this tool is about to write.
 
-        force_refresh: when True, skips the cache-hit check entirely and
-        always re-reads, even if the cache key matches. Must be True
-        whenever this is called because the user just ACTIVELY selected
-        source(s) via Browse/Select — if they re-select the exact same
-        file(s) (e.g. after externally adding/removing a CAMA_LOT_LOCATION
-        column), a plain key match would otherwise silently serve a
-        stale result. Only safe to leave at the default False on the
-        _toggle_parcel() path, where the user didn't select anything new.
+        Deliberately does NOT cache the result across calls -- every
+        call, whether triggered by a fresh Browse/Select or by toggling
+        Local <-> Database, always performs a real read. A cache keyed
+        only on "which file/table was selected" cannot detect that the
+        file/table's CONTENTS changed externally (e.g. another CAMA
+        tool, QGIS, or Global Mapper modifying it) since it was last
+        read here -- serving a stale "no conflict" result would defeat
+        the purpose of this check. See group-05-cache-removal-
+        analysis.md for the full reasoning. What IS still remembered
+        across calls is only WHICH file/table is selected per mode
+        (parcel_local_path / parcel_db_table) -- a separate concern,
+        untouched by this function.
         """
         nonlocal parcel_existing_lot_location
         if parcel_is_reading:
@@ -1349,15 +1348,6 @@ def open_main_window(root):
             _update_run_button_state()
             return
 
-        cache_key = tuple(sources)
-        slot = _parcel_lot_location_cache[source_type]
-        if not force_refresh and slot["key"] == cache_key and slot["conflicts"] is not None:
-            # True cache hit: same mode, exact same set of selected
-            # sources, already checked — restore with no I/O.
-            parcel_existing_lot_location = slot["conflicts"]
-            _update_run_button_state()
-            return
-
         result_queue = queue.Queue()
 
         def worker():
@@ -1367,7 +1357,7 @@ def open_main_window(root):
         _set_parcel_reading_state(True)
         threading.Thread(target=worker, daemon=True).start()
         win.after(100, lambda: _poll_parcel_lot_location_queue(
-            result_queue, source_type, cache_key))
+            result_queue, source_type))
 
     def browse_parcel_files():
         file = filedialog.askopenfilename(filetypes=[
@@ -1377,11 +1367,9 @@ def open_main_window(root):
             nonlocal parcel_local_path
             parcel_local_path = file
             parcel_files_var.set(os.path.basename(file))
-            # A new Land Parcel selection invalidates any prior
-            # CAMA_LOT_LOCATION-conflict check — force_refresh=True: the user
-            # actively chose this selection just now, so it must be
-            # checked fresh, never served from a stale cache entry.
-            _refresh_parcel_lot_location_check(force_refresh=True)
+            # Always checks fresh -- see _refresh_parcel_lot_location_check()
+            # docstring: no result is ever cached across calls.
+            _refresh_parcel_lot_location_check()
         _update_run_button_state()
 
     def browse_parcel_db():
@@ -1401,7 +1389,7 @@ def open_main_window(root):
                 nonlocal parcel_db_table
                 parcel_db_table = sel[0]
                 parcel_db_label.set(sel[0])
-                _refresh_parcel_lot_location_check(force_refresh=True)
+                _refresh_parcel_lot_location_check()
             _update_run_button_state()
 
         _pick_db_tables(win, tables, multi=False, on_select=_on_parcel_tables_selected)
@@ -1425,8 +1413,9 @@ def open_main_window(root):
             )
         # Switching Local <-> Database does NOT clear the other mode's
         # remembered selection — that's pre-existing behavior, left
-        # untouched. Re-check (or instantly restore from cache) whichever
-        # of the three states applies to the newly active mode.
+        # untouched. Always re-checks fresh for whichever mode is now
+        # active -- no cached result is ever restored (see
+        # group-05-cache-removal-analysis.md).
         _refresh_parcel_lot_location_check()
         _update_run_button_state()
 
