@@ -1039,7 +1039,6 @@ def open_main_window(root):
     # `nonlocal` from the nested functions below.
     road_type_filter_check_var = tk.BooleanVar(master=win, value=False)
     road_type_value_vars = {}   # {str(value): tk.BooleanVar(value=True)}
-    road_read_status_var = tk.StringVar(master=win, value="")
     road_is_reading = False     # True while the background read thread is active
     road_read_ok = False        # True once the current road source has been read successfully
 
@@ -1182,12 +1181,6 @@ def open_main_window(root):
     parcel_btn = tk.Button(parcel_action_row, text="Browse…", width=10, cursor="hand2")
     parcel_btn.pack(side="left", **PAD)
 
-    parcel_read_status_var = tk.StringVar(master=win, value="")
-    parcel_read_status_lbl = tk.Label(
-        parcel_frame, textvariable=parcel_read_status_var,
-        fg="#b36b00", font=("Segoe UI", 8, "italic"), anchor="w")
-    # packed/unpacked by _set_parcel_reading_state()
-
     def _check_parcel_lot_location_worker(sources_list, source_type):
         """
         Runs on a background thread. Reads each currently selected Land
@@ -1244,17 +1237,48 @@ def open_main_window(root):
         Browse/Select button and the Local/Database radio buttons for
         the duration of the read, preventing a second, concurrent read
         of the same selection.
+
+        The "Reading..." indicator reuses the EXISTING label
+        (parcel_lbl) in place -- via whichever StringVar is currently
+        bound to it (parcel_files_var for Local, parcel_db_label for
+        Database, per _toggle_parcel()'s textvariable swap below) --
+        rather than packing/unpacking a separate status widget. This
+        replaces an earlier design that used a second, separate label
+        (packed/unpacked via pack()/pack_forget()) to show the reading
+        message: that caused a real, reported layout-distortion bug --
+        every widget below it (Road Network, DTM Source, Output
+        Destination, Run button) visibly shifted position each time the
+        status label appeared or disappeared, since packing/forgetting
+        a widget reflows all subsequently-packed siblings. Reusing the
+        existing label in place adds no new row to the layout, so
+        nothing below it ever moves. Matches the pattern already used
+        correctly by road_width.py / road_frontage.py.
         """
         nonlocal parcel_is_reading
         parcel_is_reading = is_reading
         if is_reading:
-            parcel_read_status_var.set("⏳ Reading Land Parcel…")
-            parcel_read_status_lbl.pack(fill="x", pady=(2, 0))
+            if parcel_source_type.get() == "local":
+                parcel_files_var.set("⏳ Reading Land Parcel…")
+            else:
+                parcel_db_label.set("⏳ Reading Land Parcel…")
+            parcel_lbl.config(fg="#b36b00")
             parcel_btn.config(state="disabled")
             parcel_radio_local.config(state="disabled")
             parcel_radio_db.config(state="disabled")
         else:
-            parcel_read_status_lbl.pack_forget()
+            # Restore from authority variables -- never from StringVar
+            # state -- same pattern _toggle_parcel() already uses below.
+            if parcel_source_type.get() == "local":
+                parcel_files_var.set(
+                    os.path.basename(parcel_local_path) if parcel_local_path
+                    else "No file selected"
+                )
+            else:
+                parcel_db_label.set(
+                    parcel_db_table if parcel_db_table
+                    else "No table selected"
+                )
+            parcel_lbl.config(fg="gray")
             parcel_btn.config(state="normal")
             parcel_radio_local.config(state="normal")
             parcel_radio_db.config(state="normal")
@@ -1455,11 +1479,6 @@ def open_main_window(root):
     # road_type_filter_check_var is True.
     road_type_checklist_container = tk.Frame(road_filter_frame)
 
-    road_read_status_lbl = tk.Label(
-        road_frame, textvariable=road_read_status_var,
-        fg="#b36b00", font=("Segoe UI", 8, "italic"), anchor="w")
-    # packed/unpacked by _set_road_reading_state()
-
     def _read_road_layer_worker(source_type, path_or_table):
         """
         Runs on a background thread. Reads the road layer for the given
@@ -1494,17 +1513,45 @@ def open_main_window(root):
         user re-triggering a read through this UI), not every
         conceivable race; the window itself (e.g. its close button)
         is intentionally left interactive.
+
+        The "Reading..." indicator reuses the EXISTING label (road_lbl)
+        in place -- via whichever display StringVar is currently bound
+        to it (road_file_var for Local, road_db_var for Database, per
+        _toggle_road()'s textvariable swap below) -- rather than
+        packing/unpacking a separate status widget. Matches the
+        corrected pattern already applied to the Land Parcel section's
+        _set_parcel_reading_state() above -- see that function's
+        docstring for the full rationale on why the earlier two-widget
+        design caused a real, reported layout-distortion bug (every
+        widget below it visibly shifting position each time the status
+        label appeared/disappeared).
         """
         nonlocal road_is_reading
         road_is_reading = is_reading
         if is_reading:
-            road_read_status_var.set("⏳ Reading road network…")
-            road_read_status_lbl.pack(fill="x", pady=(2, 0))
+            if road_source_type.get() == "local":
+                road_file_var.set("⏳ Reading road network…")
+            else:
+                road_db_var.set("⏳ Reading road network…")
+            road_lbl.config(fg="#b36b00")
             road_btn.config(state="disabled")
             road_radio_local.config(state="disabled")
             road_radio_db.config(state="disabled")
         else:
-            road_read_status_lbl.pack_forget()
+            # Restore from authority StringVars (road_local_path /
+            # road_db_table) -- never from the display StringVar's
+            # mid-read state -- same pattern _toggle_road() uses below.
+            if road_source_type.get() == "local":
+                road_file_var.set(
+                    os.path.basename(road_local_path.get()) if road_local_path.get()
+                    else "No file selected"
+                )
+            else:
+                road_db_var.set(
+                    road_db_table.get() if road_db_table.get()
+                    else "No table selected"
+                )
+            road_lbl.config(fg="gray")
             road_btn.config(state="normal")
             road_radio_local.config(state="normal")
             road_radio_db.config(state="normal")
