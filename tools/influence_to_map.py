@@ -22,6 +22,7 @@ from shapely.validation import make_valid
 from utils.table_name_matching import normalize_name, find_matching_tables
 from utils.resource_path import resource_path
 from utils.db_discovery import load_db_credentials, fetch_tables
+from utils.column_detection import detect_existing_output_columns
 
 # ============================
 # FORCE WINDOWS APP ICON
@@ -458,24 +459,36 @@ def detect_prs92_zone(labeled_gdfs):
 # influence_to_barangay.py's dynamic per-source target list (that
 # tool's targets vary per Influence Map layer; ours are fixed by
 # explicit direction -- Section E).
-def _detect_existing_output_columns(gdf):
-    """Returns {target: actual_existing_column_name} for any
-    OUTPUT_COLUMN_TARGETS already present on gdf (case-insensitive
-    match, original casing preserved)."""
-    found = {}
-    for target in OUTPUT_COLUMN_TARGETS:
-        match = next((c for c in gdf.columns if c.lower() == target.lower()), None)
-        if match is not None:
-            found[target] = match
-    return found
-
-
-def _check_parcel_output_conflicts(sources, source_type, engine=None, schema=None):
-    """Checks each selected Land Parcel source for pre-existing
+def _check_parcel_output_conflicts(sources, source_type):
+    """
+    Checks each selected Land Parcel source for pre-existing
     OUTPUT_COLUMN_TARGETS columns. Read failure = skip-only, never a
     conflict-check failure (mirrors influence_to_barangay.py's own
-    _check_parcel_influence_conflicts())."""
+    _check_parcel_influence_conflicts()).
+
+    Self-contained: loads its own DB credentials/engine internally for
+    the "db" case, rather than requiring the caller to pre-load and pass
+    them in (as this function's signature originally required). Changed
+    (Phase A, Group 5 detect-on-select generalization) because this is
+    now called from a background thread triggered by Land Parcel
+    selection/toggle, independent of on_run() -- matches the
+    self-contained pattern already used by every other tool's equivalent
+    worker (e.g. road_density.py's _check_parcel_density_conflicts()).
+    """
     conflicts = []
+    engine = None
+    schema = None
+    if source_type == "db":
+        creds = load_db_credentials()
+        if not creds:
+            print("⚠️ Could not load DB credentials to check for existing "
+                  "output column(s).")
+            return conflicts
+        schema = creds["schema"]
+        engine = create_engine(
+            f"postgresql://{creds['username']}:{creds['password']}@"
+            f"{creds['host']}:{creds['port']}/{creds['database']}"
+        )
     for path_or_table in sources:
         try:
             if source_type == "local":
@@ -486,7 +499,7 @@ def _check_parcel_output_conflicts(sources, source_type, engine=None, schema=Non
             print(f"⚠️ Could not read parcel layer to check for existing "
                   f"output column(s): {path_or_table}: {e}")
             continue
-        found = _detect_existing_output_columns(gdf)
+        found = detect_existing_output_columns(gdf, OUTPUT_COLUMN_TARGETS)
         if found:
             conflicts.append((path_or_table, found))
     return conflicts
@@ -1506,6 +1519,20 @@ def open_main_window(root):
     fault_db_table = None       # authority: single DB table name
     output_local_dir = tk.StringVar(master=win)
 
+    # Land Parcel existing-output-column check: detect-on-select,
+    # matching the pattern established in lot_location.py/road_width.py/
+    # road_frontage.py/road_density.py/road_surface.py. Deliberately does
+    # NOT cache the result across calls -- every selection AND every
+    # Local/Database toggle triggers a fresh read (see
+    # group-05-cache-removal-analysis.md). What IS still remembered per
+    # mode is only WHICH file/table is selected (parcel_local_path /
+    # parcel_db_table above), a separate concern. Multi-target (2
+    # targets, OUTPUT_COLUMN_TARGETS): each conflict entry is
+    # (path_or_table, {target: existing_col_name}), a dict, not a single
+    # column name -- see _detect_existing_output_columns()'s docstring.
+    parcel_is_reading = False
+    parcel_existing_output_conflicts = []   # [(path_or_table, {target: col}), ...]
+
     # run_status_var: drives the always-visible status label under the
     # Run button, same as influence_to_barangay.py's own pattern.
     run_status_var = tk.StringVar(master=win, value="Preparing…")
@@ -1528,12 +1555,14 @@ def open_main_window(root):
 
     parcel_radio_row = tk.Frame(parcel_frame)
     parcel_radio_row.pack(fill="x")
-    tk.Radiobutton(parcel_radio_row, text="Local File",
+    parcel_radio_local = tk.Radiobutton(parcel_radio_row, text="Local File",
                    variable=parcel_source_type, value="local",
-                   command=lambda: _toggle_parcel()).pack(side="left")
-    tk.Radiobutton(parcel_radio_row, text="Database Table",
+                   command=lambda: _toggle_parcel())
+    parcel_radio_local.pack(side="left")
+    parcel_radio_db = tk.Radiobutton(parcel_radio_row, text="Database Table",
                    variable=parcel_source_type, value="db",
-                   command=lambda: _toggle_parcel()).pack(side="left", padx=(12, 0))
+                   command=lambda: _toggle_parcel())
+    parcel_radio_db.pack(side="left", padx=(12, 0))
 
     parcel_files_var = tk.StringVar(master=win, value="No file selected")
     parcel_db_label = tk.StringVar(master=win, value="No table selected")
@@ -1548,6 +1577,120 @@ def open_main_window(root):
     parcel_btn = tk.Button(parcel_action_row, text="Browse…", width=10)
     parcel_btn.pack(side="left", **PAD)
 
+    def _set_parcel_reading_state(is_reading):
+        """
+        Toggle GUI responsiveness while the Land Parcel existing-output-
+        column check is in progress. Disables the parcel Browse/Select
+        button and the Local/Database radio buttons for the duration of
+        the read, preventing a second, concurrent read of the same
+        selection.
+
+        The "Reading..." indicator reuses the EXISTING label (parcel_lbl)
+        in place -- via whichever StringVar is currently bound to it
+        (parcel_files_var for Local, parcel_db_label for Database, per
+        _toggle_parcel()'s textvariable swap below) -- rather than
+        packing/unpacking a separate status widget, which would reflow
+        every widget below it and cause a visible layout jump. Matches
+        the corrected pattern already used by lot_location.py/
+        road_width.py/road_frontage.py/road_density.py/road_surface.py.
+        """
+        nonlocal parcel_is_reading
+        parcel_is_reading = is_reading
+        if is_reading:
+            if parcel_source_type.get() == "local":
+                parcel_files_var.set("⏳ Reading Land Parcel…")
+            else:
+                parcel_db_label.set("⏳ Reading Land Parcel…")
+            parcel_lbl.config(fg="#b36b00")
+            parcel_btn.config(state="disabled")
+            parcel_radio_local.config(state="disabled")
+            parcel_radio_db.config(state="disabled")
+        else:
+            # Restore from authority variables -- never from StringVar
+            # state -- same pattern _toggle_parcel() already uses below.
+            if parcel_source_type.get() == "local":
+                parcel_files_var.set(
+                    os.path.basename(parcel_local_path) if parcel_local_path
+                    else "No file selected"
+                )
+            else:
+                parcel_db_label.set(
+                    parcel_db_table if parcel_db_table
+                    else "No table selected"
+                )
+            parcel_lbl.config(fg="gray")
+            parcel_btn.config(state="normal")
+            parcel_radio_local.config(state="normal")
+            parcel_radio_db.config(state="normal")
+
+    def _poll_parcel_output_queue(result_queue, source_type):
+        """
+        Runs on the main thread via win.after() polling. Picks up the
+        conflict list placed on the queue by the background worker.
+        """
+        nonlocal parcel_existing_output_conflicts
+        if not win.winfo_exists():
+            return
+        try:
+            conflicts = result_queue.get_nowait()
+        except queue.Empty:
+            win.after(100, lambda: _poll_parcel_output_queue(
+                result_queue, source_type))
+            return
+
+        parcel_existing_output_conflicts = conflicts
+        _set_parcel_reading_state(False)
+
+    def _refresh_parcel_output_check():
+        """
+        Background-checks the currently selected Land Parcel file/table
+        for existing OUTPUT_COLUMN_TARGETS columns -- moved here from
+        on_run() (Phase A of Group 5's detect-on-select generalization)
+        so the check happens immediately on selection/toggle, not only
+        when Run Processing is clicked. Reuses
+        _check_parcel_output_conflicts() (defined above, now
+        self-contained) as the actual worker logic, just now called on a
+        background thread.
+
+        Deliberately does NOT cache the result across calls -- every
+        call, whether triggered by a fresh Browse/Select or by toggling
+        Local <-> Database, always performs a real read. See
+        group-05-cache-removal-analysis.md for the full reasoning. What
+        IS still remembered across calls is only WHICH file/table is
+        selected per mode (parcel_local_path / parcel_db_table) -- a
+        separate concern, untouched by this function.
+        """
+        nonlocal parcel_existing_output_conflicts
+        if parcel_is_reading:
+            # A check is already in flight — do not start a second,
+            # overlapping one (controls are disabled while reading, but
+            # this guard is the actual enforcement).
+            return
+
+        source_type = parcel_source_type.get()
+        sources = (
+            [parcel_local_path] if source_type == "local" and parcel_local_path
+            else [parcel_db_table] if source_type == "db" and parcel_db_table
+            else []
+        )
+
+        if not sources:
+            # Nothing selected for this mode — nothing to check.
+            parcel_existing_output_conflicts = []
+            _update_run_button_state()
+            return
+
+        result_queue = queue.Queue()
+
+        def worker():
+            conflicts = _check_parcel_output_conflicts(sources, source_type)
+            result_queue.put(conflicts)
+
+        _set_parcel_reading_state(True)
+        threading.Thread(target=worker, daemon=True).start()
+        win.after(100, lambda: _poll_parcel_output_queue(
+            result_queue, source_type))
+
     def browse_parcel_files():
         nonlocal parcel_local_path
         file = filedialog.askopenfilename(
@@ -1557,12 +1700,16 @@ def open_main_window(root):
         if file:
             parcel_local_path = file
             parcel_files_var.set(os.path.basename(file))
+            # Always checks fresh -- see _refresh_parcel_output_check()
+            # docstring: no result is ever cached across calls.
+            _refresh_parcel_output_check()
         _update_run_button_state()
 
     def _on_parcel_db_selected(sel):
         nonlocal parcel_db_table
         parcel_db_table = sel[0]
         parcel_db_label.set(sel[0])
+        _refresh_parcel_output_check()
         _update_run_button_state()
 
     def browse_parcel_db():
@@ -1591,6 +1738,12 @@ def open_main_window(root):
                 parcel_db_table if parcel_db_table
                 else "No table selected"
             )
+        # Switching Local <-> Database does NOT clear the other mode's
+        # remembered selection -- that's pre-existing behavior, left
+        # untouched. Always re-checks fresh for whichever mode is now
+        # active -- no cached result is ever restored (see
+        # group-05-cache-removal-analysis.md).
+        _refresh_parcel_output_check()
         _update_run_button_state()
 
     # ── SECTION 2: FAULT LINE MAP ────────────────────────────────
@@ -1760,20 +1913,25 @@ def open_main_window(root):
             messagebox.showerror("Error", "Please select an output folder.", parent=win)
             return
 
-        creds_for_check = load_db_credentials()
-        engine_for_check = None
-        schema_for_check = None
-        if parcel_source[0] == "db" and creds_for_check:
-            schema_for_check = creds_for_check["schema"]
-            engine_for_check = create_engine(
-                f"postgresql://{creds_for_check['username']}:{creds_for_check['password']}@"
-                f"{creds_for_check['host']}:{creds_for_check['port']}/{creds_for_check['database']}"
-            )
-
-        # ---------------- PRIORITY 1: existing output-column conflict ----------------
-        conflicts = _check_parcel_output_conflicts(
-            list(parcel_source[1]), parcel_source[0], engine_for_check, schema_for_check
-        )
+        # PRIORITY 1: column conflict check -- warn if the selected Land
+        # Parcel source already has any of OUTPUT_COLUMN_TARGETS. Shown
+        # before the file-conflict dialog so the user can decide whether
+        # to proceed at all before being asked about filename conflicts.
+        # Declining cancels the run entirely; main window stays open.
+        #
+        # Phase A (Group 5 detect-on-select generalization): this no
+        # longer calls _check_parcel_output_conflicts() synchronously
+        # here (and no longer needs to pre-load DB credentials/engine
+        # for that call, either -- the check function is now
+        # self-contained) -- the check already ran in the background the
+        # moment the Land Parcel source was selected/toggled (see
+        # _refresh_parcel_output_check()). This just consults the
+        # already-known result, parcel_existing_output_conflicts.
+        # _update_run_button_state() already guarantees Run cannot be
+        # reached while parcel_is_reading is True, so this value is
+        # guaranteed current for the actively selected source at this
+        # point.
+        conflicts = parcel_existing_output_conflicts
         if conflicts:
             lines = "\n\n".join(
                 f"'{os.path.basename(path)}' already has the following column(s):\n"
@@ -1845,7 +2003,15 @@ def open_main_window(root):
         has_fault = bool(fault_local_path) if fault_source_type.get() == "local" else bool(fault_db_table)
         has_output = bool(output_local_dir.get()) if output_dest_type.get() == "local" else True
 
-        if not has_parcel:
+        if parcel_is_reading:
+            # Land Parcel existing-column check is still in flight --
+            # never allow Run while its result is not yet known (see
+            # Section 6's read-outcome invariant, group-05-FINAL-PLAN.md
+            # -- an in-progress check must never be silently treated as
+            # "no conflict").
+            run_status_var.set("Checking Land Parcel source for existing columns…")
+            ready = False
+        elif not has_parcel:
             run_status_var.set("Please select a Land Parcel source.")
             ready = False
         elif not has_fault:

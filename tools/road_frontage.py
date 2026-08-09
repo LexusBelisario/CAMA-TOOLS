@@ -19,6 +19,7 @@ import psycopg2
 from utils.table_name_matching import normalize_name, find_matching_tables
 from utils.resource_path import resource_path
 from utils.db_discovery import load_db_credentials, fetch_tables
+from utils.column_detection import detect_existing_output_columns
 
 # =========================
 # GeoPandas compatibility shim
@@ -139,46 +140,42 @@ overwrite_mode = None
 # covering all three, not three separate prompts.
 parcel_output_column_overrides = {}
 
-# _road_gdf_cache: TRUE dual-slot cache -- one independent slot for
-# "local" and one for "db", so switching the Road Network Source radio
-# back and forth between Local File and Database Table never re-reads a
-# selection that's still valid, and never mixes up which selection
-# belongs to which mode. Each slot holds:
-#   "key"       : the exact path_or_table string this slot's data is for
-#                 (None if nothing has been read for that mode yet)
-#   "gdf"       : the actual read GeoDataFrame (safe to hold in full --
-#                 Road Network only ever has ONE selected source at a
-#                 time, unlike Land Parcel which can have many)
-#   "value_vars": the built Road Type checklist's {display_text:
-#                 (real_value, tk.BooleanVar)} dict, INCLUDING each
-#                 BooleanVar's current checked state -- so toggling away
-#                 and back restores not just the list of values but
-#                 exactly which ones were checked/unchecked.
+# _road_gdf_cache: last-successful-read snapshot, one independent slot
+# for "local" and one for "db". Scope narrowed (2026-08, see
+# group-05-cache-removal-analysis.md): this NO LONGER skips a fresh
+# read on toggle/selection -- _refresh_road_classification() always
+# performs a real background read every time it's called, so the UI-
+# facing checklist is never served a stale result. What THIS cache
+# still exists for: run_processing() re-reading the same source at Run
+# time would otherwise be a redundant second full file/DB read of data
+# already read moments earlier during selection/toggle -- this slot
+# lets it reuse that already-fresh GeoDataFrame instead, saving that
+# second read, while remaining explicitly scoped to "reuse ONLY if it's
+# the freshest available read for the currently active source" (see
+# _refresh_road_classification()'s docstring for how freshness is kept
+# guaranteed). Each slot holds:
+#   "key" : the exact path_or_table string this slot's data is for
+#           (None if nothing has been read for that mode yet)
+#   "gdf" : the actual read GeoDataFrame (safe to hold in full -- Road
+#           Network only ever has ONE selected source at a time, unlike
+#           Land Parcel which can have many)
 # A slot is only ever replaced by a fresh read of that SAME mode; the
-# other mode's slot is untouched, which is what makes the two "isolated"
-# from each other.
+# other mode's slot is untouched, which is what makes the two
+# "isolated" from each other. (Previously also held "value_vars" and
+# "filter_active" for a cache-hit UI-restore path -- removed along with
+# that path, since both fields had no other consumer.)
 _road_gdf_cache = {
-    "local": {"key": None, "gdf": None, "value_vars": {}, "filter_active": False},
-    "db": {"key": None, "gdf": None, "value_vars": {}, "filter_active": False},
+    "local": {"key": None, "gdf": None},
+    "db": {"key": None, "gdf": None},
 }
 
-# _parcel_classification_cache: same dual-slot idea, adapted for Land
-# Parcel Source. Deliberately does NOT cache the GeoDataFrames themselves
-# (unlike _road_gdf_cache above) -- Land Parcel can have MANY selected
-# sources at once, and holding every one of their full GeoDataFrames in
-# memory just to make radio-toggling instant would be a real memory cost
-# for a large batch. Instead, each slot caches only the lightweight
-# per-source DETECTION RESULTS (tiny tuples: path/table, state, column
-# name, kind -- see _detect_lot_classification()) plus the per-source
-# checkbox BooleanVars (also tiny), keyed by the exact tuple of currently
-# selected sources for that mode. Toggling back to a selection that
-# hasn't changed restores the checklist instantly with no re-read; any
-# change to which files/tables are selected invalidates that slot's key
-# and forces a fresh read, exactly like the road side.
-_parcel_classification_cache = {
-    "local": {"key": None, "details": None, "vars": {}},
-    "db": {"key": None, "details": None, "vars": {}},
-}
+# Land Parcel Source: deliberately does NOT cache detection results
+# across selections/toggles (see group-05-cache-removal-analysis.md) --
+# a cache keyed only on "which file/table was selected" cannot detect
+# that the file/table's CONTENTS changed externally (e.g. another CAMA
+# tool, QGIS, or Global Mapper modifying it) between one selection and
+# the next. Every selection AND every Local/Database toggle triggers a
+# fresh read instead -- see _refresh_parcel_classification() below.
 
 
 # ========================= CRS UTILITY =========================
@@ -644,33 +641,6 @@ def _detect_lot_classification(gdf):
         return (LOT_STATE_FOUND, loc_col, "numeric", numeric == 0)
 
     return (LOT_STATE_UNUSABLE, loc_col, None, None)
-
-
-def _detect_existing_output_columns(gdf):
-    """
-    Checks a parcel GeoDataFrame for pre-existing columns matching any of
-    OUTPUT_COLUMN_TARGETS (ROAD_FRONTAGE, DEPTH, DEPTH_WIDTH_RATIO),
-    exact match (case-insensitive) -- "road_frontage" matches
-    "ROAD_FRONTAGE", but a column like "ROAD_FRONTAGE_OLD" or
-    "ROAD_TYPE" does NOT match (no substring/partial matching).
-
-    Returns a dict {target_name: actual_existing_column_name}, containing
-    ONLY the targets that actually have a match -- e.g. {"DEPTH": "dePTH"}
-    if only a differently-cased DEPTH column exists and the other two
-    targets have no match at all. Empty dict if none of the three targets
-    have any existing column. The actual column's ORIGINAL casing is
-    preserved in the returned value (e.g. "dePTH", not "DEPTH") -- this
-    is what gets shown to the user in the confirmation dialog and what
-    process_frontage_single() writes back into, so an existing
-    differently-cased column is reused exactly as found rather than
-    renamed or duplicated.
-    """
-    found = {}
-    for target in OUTPUT_COLUMN_TARGETS:
-        match = next((c for c in gdf.columns if c.lower() == target.lower()), None)
-        if match is not None:
-            found[target] = match
-    return found
 
 
 def resolve_classification(brgy_gdf, use_lot_classification, filter_by_road_type_active, excluded_road_types):
@@ -2897,12 +2867,12 @@ def open_main_window(root):
         callbacks stay easy to compare and don't drift into inconsistent
         behavior as either one changes later):
           1. Guarded mutual-exclusion mutation
-          2. Cache synchronization (no-op here -- parcel_classification_vars
-             and _parcel_classification_cache[...]["vars"] already share
-             the same BooleanVar objects by reference, so a checkbox
-             toggle is automatically visible through the cache with no
-             explicit sync step needed; kept as an explicit "nothing to
-             do" step only for structural symmetry with the other callback)
+          2. (No cache synchronization step -- detection results are no
+             longer cached at all, see group-05-cache-removal-
+             analysis.md; parcel_classification_vars is simply the
+             live, current set of BooleanVars for whatever was most
+             recently read; kept as an explicit "nothing to do" step
+             only for structural symmetry with the other callback)
           3. Visibility refresh
           4. Run button update
 
@@ -2935,7 +2905,7 @@ def open_main_window(root):
         # Step 4: run button update.
         _update_run_button_state()
 
-    def _rebuild_lot_classification_checklist(reuse_vars=None):
+    def _rebuild_lot_classification_checklist():
         """
         Rebuilds the per-source classification checklist from
         parcel_read_details: one checkbox per selected parcel source that
@@ -2957,12 +2927,11 @@ def open_main_window(root):
         guaranteed unique among the currently selected sources -- no
         separate "full path" popup is needed.
 
-        reuse_vars: optional {path_or_table: tk.BooleanVar} to reuse
-        instead of creating fresh ones -- used by the cache-hit path in
-        _refresh_parcel_classification() so toggling Local <-> Database
-        back to an unchanged selection restores each checkbox's
-        checked/unchecked state exactly as the user left it, instead of
-        resetting everything back to unchecked.
+        Always creates fresh BooleanVars -- no reuse-across-calls
+        mechanism (that existed only to preserve checkbox state across a
+        cache hit; detection results are no longer cached at all, see
+        group-05-cache-removal-analysis.md, so every rebuild reflects a
+        genuinely fresh read and starts each checkbox unchecked).
 
         Plain destroy-and-repopulate, called directly by the CALLER
         before _update_parcel_classification_visibility() (never by that
@@ -2984,11 +2953,8 @@ def open_main_window(root):
         for path_or_table, state, col_name, kind, _existing_output_cols in parcel_read_details:
             if state != LOT_STATE_FOUND:
                 continue
-            if reuse_vars is not None and path_or_table in reuse_vars:
-                var = reuse_vars[path_or_table]
-            else:
-                var = tk.BooleanVar(master=win, value=False)
-                var.trace_add("write", _on_parcel_classification_checkbox_changed)
+            var = tk.BooleanVar(master=win, value=False)
+            var.trace_add("write", _on_parcel_classification_checkbox_changed)
             new_vars[path_or_table] = var
 
             # os.path.basename() is safe to call unconditionally here even
@@ -3040,11 +3006,9 @@ def open_main_window(root):
 
         Assumes the caller already populated
         lot_classification_list_container via
-        _rebuild_lot_classification_checklist() (with the correct
-        reuse_vars, if applicable) before calling this function -- kept
-        as the caller's responsibility rather than threaded through here,
-        so the cache-hit "restore checked state" behavior keeps working
-        without extra parameters.
+        _rebuild_lot_classification_checklist() before calling this
+        function -- kept as the caller's responsibility rather than
+        threaded through here.
         """
         has_any_parcel_source = (
             bool(parcel_local_path) if parcel_source_type.get() == "local"
@@ -3073,12 +3037,18 @@ def open_main_window(root):
     def _update_road_classification_visibility():
         """
         Shows the "Filter by Road Type" checkbox plus (if checked) its
-        per-value checklist, and, ADDITIVELY, a "⏳ Reading road
-        network…" indicator while a background read is in flight -- the
-        indicator appears alongside whatever was already on screen (old
-        data, about to be replaced) without ever hiding or clearing it.
-        No usable ROAD_TYPE-like column found shows neither -- matches
-        lot_location.py exactly.
+        per-value checklist. No usable ROAD_TYPE-like column found shows
+        neither -- matches lot_location.py exactly.
+
+        While a background read is in flight (road_is_reading), this
+        function does nothing at all -- no widget touched, no resize.
+        The "⏳ Reading road network…" indication is handled entirely by
+        _set_road_reading_state()'s in-place label text-swap (see its
+        docstring), not by anything here. This is a change from the
+        tool's earlier design, where this function additionally packed
+        a separate road_reading_lbl widget while reading -- removed
+        along with that widget (see _set_road_reading_state()'s
+        docstring for why).
 
         Invariant this preserves: the GUI never passes through an empty
         intermediate state just because a background refresh is in
@@ -3090,10 +3060,7 @@ def open_main_window(root):
         exactly as they were.
         """
         if road_is_reading:
-            road_reading_lbl.pack(anchor="w", pady=(2, 0))
-            _reflow_window()
             return
-        road_reading_lbl.pack_forget()
         if road_type_value_vars:
             road_filter_checkbox.pack(anchor="w", pady=(2, 0))
             if filter_road_type_var.get():
@@ -3115,14 +3082,11 @@ def open_main_window(root):
         Operation order identical to
         _on_parcel_classification_checkbox_changed() above, deliberately:
           1. Guarded mutual-exclusion mutation
-          2. Cache synchronization -- mirrors the live checked-state into
-             the currently active Road Network mode's cache slot
-             (_road_gdf_cache), if that slot already has cached data, so
-             a later toggle away and back (via
-             _refresh_road_classification()'s cache-hit path) restores
-             not just which Road Type values were checked, but whether
-             Filter by Road Type itself was on, exactly as the user left
-             it.
+          2. (No cache synchronization step -- Road Network's checklist
+             state is no longer restorable from cache at all, see
+             group-05-cache-removal-analysis.md; kept as an explicit
+             "nothing to do" step only for structural symmetry with the
+             other callback)
           3. Visibility refresh
           4. Run button update
 
@@ -3147,10 +3111,6 @@ def open_main_window(root):
                         var.set(False)
             finally:
                 _suppress_mutual_exclusion = False
-        # Step 2: cache sync.
-        current_type = road_source_type.get()
-        if _road_gdf_cache[current_type]["gdf"] is not None:
-            _road_gdf_cache[current_type]["filter_active"] = filter_road_type_var.get()
         # Step 3: visibility refresh.
         _update_road_classification_visibility()
         # Step 4: run button update.
@@ -3214,24 +3174,57 @@ def open_main_window(root):
             parcel_lbl.config(fg="gray")
 
     def _set_road_reading_state(reading):
-        """Disable Road Network Browse/radio controls while its background
-        classification read is in progress -- prevents starting a second,
-        overlapping read of the same source.
+        """
+        Disables Road Network Browse/radio controls while its background
+        classification read is in progress -- prevents starting a
+        second, overlapping read of the same source.
 
-        NOTE: unlike _set_parcel_reading_state() above, the Road Network
-        side deliberately keeps its ORIGINAL separate-widget "Reading…"
-        indicator (road_reading_lbl, shown/hidden via
-        _update_road_classification_visibility()) -- per project-lead
-        decision, the Canvas/reused-label treatment was scoped to Land
-        Parcel only. Road Network's checklist is typically 5-15 ROAD_TYPE
-        values (vs. potentially dozens/hundreds of Land Parcel sources),
-        a much smaller unbounded-growth risk that didn't justify the
-        added complexity here too.
+        Also drives the "Reading road network…" indicator itself -- but
+        NOT via a separate widget or any pack()/pack_forget() call.
+        Reuses the EXISTING "No file selected" / filename / "No table
+        selected" label (road_lbl, bound to road_file_var / road_db_var
+        per _toggle_road()'s textvariable swap) that's already
+        permanently present in road_action_row, temporarily overwriting
+        its text via the currently-bound StringVar and restoring it once
+        done -- exact same principle as _set_parcel_reading_state()
+        above. Since this label's own row never changes shape from a
+        text-length change, this transition needs -- and gets -- ZERO
+        _reflow_window() calls.
+
+        UPDATE: this REPLACES the tool's earlier separate-widget design
+        (road_reading_lbl, packed/unpacked via
+        _update_road_classification_visibility()) -- that design was a
+        deliberate prior decision (see project history), reasoned that
+        Road Network's checklist (typically 5-15 ROAD_TYPE values) was a
+        smaller layout-distortion risk than Land Parcel's, not worth the
+        added complexity of matching the reused-label treatment. Revisited
+        and overridden: the same layout-jump symptom (every widget below
+        the Road Network section visibly shifting when the indicator
+        appeared/disappeared) was confirmed to occur here too, regardless
+        of the checklist's smaller typical size -- the distortion comes
+        from adding/removing a widget row at all, not from how large the
+        checklist happens to be. Matches lot_location.py's own Road
+        Network fix, applied for the same reason.
         """
         state = "disabled" if reading else "normal"
         road_btn.config(state=state)
         road_radio_local.config(state=state)
         road_radio_db.config(state=state)
+
+        if reading:
+            if road_source_type.get() == "local":
+                road_file_var.set("⏳ Reading road network…")
+            else:
+                road_db_var.set("⏳ Reading road network…")
+            road_lbl.config(fg="#b36b00")
+        else:
+            if road_source_type.get() == "local":
+                road_path = road_local_path.get()
+                road_file_var.set(os.path.basename(road_path) if road_path else "No file selected")
+            else:
+                road_table = road_db_table.get()
+                road_db_var.set(road_table if road_table else "No table selected")
+            road_lbl.config(fg="gray")
 
     def _update_run_button_state():
         """
@@ -3303,37 +3296,28 @@ def open_main_window(root):
             if existing_output_cols
         ]
 
-    def _refresh_parcel_classification(force_refresh=False):
+    def _refresh_parcel_classification():
         """
         Background-reads EVERY currently selected Land Parcel file/table
         (not just the first) so the per-source checklist can offer a
         checkbox for every source that actually has a usable
-        LOT_LOCATION/LOT_LABEL column -- UNLESS the dual-slot
-        _parcel_classification_cache already has a still-valid entry for
-        this exact mode+selection (e.g. toggling Local <-> Database back
-        to a selection that hasn't changed), in which case the checklist
-        -- including each checkbox's checked state -- is restored
-        instantly with no read at all. Each source is still resolved
+        LOT_LOCATION/LOT_LABEL column. Each source is still resolved
         independently at run time regardless of what's checked here;
         this background read only decides which checkboxes to SHOW.
-        GeoDataFrames are discarded immediately after inspection, not
-        cached -- only the tiny per-source detection tuples and the
-        BooleanVars are kept in the cache, and run_processing() re-reads
-        each source itself when the run actually starts.
 
-        force_refresh: when True, skips the cache-hit check entirely and
-        always does a fresh read, even if the cache key matches. Must be
-        True whenever this is called because the user just ACTIVELY
-        selected source(s) via Browse (browse_parcel_files() /
-        browse_parcel_db()) -- if they re-select the exact same file(s)
-        (e.g. after editing one externally in QGIS to add/change
-        LOT_LOCATION values), a plain key match would otherwise silently
-        serve the old, now-stale cached checklist instead of re-reading
-        what's actually on disk/in the DB right now. The cache-hit
-        shortcut is only safe to take on the _toggle_parcel() path (the
-        user didn't select anything new, just switched which already-made
-        selection is active), which calls this with the default
-        force_refresh=False.
+        Deliberately does NOT cache the result across calls -- every
+        call, whether triggered by a fresh Browse/Select or by toggling
+        Local <-> Database, always performs a real read. A cache keyed
+        only on "which file/table was selected" cannot detect that the
+        file/table's CONTENTS changed externally (e.g. another CAMA
+        tool, QGIS, or Global Mapper modifying it) since it was last
+        read here -- serving a stale result would defeat the purpose of
+        the existing-output-column check this same read also performs
+        (see below). See group-05-cache-removal-analysis.md for the
+        full reasoning. What IS still remembered across calls is only
+        WHICH file/table is selected per mode (parcel_local_path /
+        parcel_db_table) -- a separate concern, untouched by this
+        function.
         """
         nonlocal parcel_is_reading, parcel_read_details, parcel_output_column_conflicts
         if parcel_is_reading:
@@ -3357,7 +3341,7 @@ def open_main_window(root):
 
         if not sources:
             # Nothing selected for this mode -- nothing to show, nothing
-            # to read. The OTHER mode's cache slot is left untouched.
+            # to read.
             parcel_read_details = []
             parcel_output_column_conflicts = []
             _rebuild_lot_classification_checklist()
@@ -3365,21 +3349,7 @@ def open_main_window(root):
             _update_run_button_state()
             return
 
-        cache_key = tuple(sources)
-        slot = _parcel_classification_cache[source_type]
-        if not force_refresh and slot["key"] == cache_key and slot["details"] is not None:
-            # True cache hit: same mode, exact same set of selected
-            # sources, already inspected -- restore the checklist
-            # (including each checkbox's checked state) with no I/O.
-            parcel_read_details = slot["details"]
-            parcel_output_column_conflicts = _check_parcel_frontage_conflicts(parcel_read_details)
-            _rebuild_lot_classification_checklist(reuse_vars=slot["vars"])
-            _update_parcel_classification_visibility()
-            _update_run_button_state()
-            return
-
-        # Cache miss: selection changed for this mode, or first time
-        # selecting these sources -- do the actual background read. Per
+        # Always a real background read -- no cache-hit shortcut. Per
         # the "never pass through an empty intermediate state" invariant,
         # the EXISTING checklist (if any) is left completely untouched
         # here -- it stays fully visible throughout the read, and is
@@ -3404,7 +3374,7 @@ def open_main_window(root):
                     per_source_results.append((path_or_table, None, None, None, {}))
                     continue
                 state, col_name, kind, _mask = _detect_lot_classification(gdf)
-                existing_output_cols = _detect_existing_output_columns(gdf)
+                existing_output_cols = detect_existing_output_columns(gdf, OUTPUT_COLUMN_TARGETS)
                 per_source_results.append((path_or_table, state, col_name, kind, existing_output_cols))
                 del gdf
             result_queue.put(per_source_results)
@@ -3414,16 +3384,16 @@ def open_main_window(root):
         _update_parcel_classification_visibility()
         _update_run_button_state()
         threading.Thread(target=worker, daemon=True).start()
-        win.after(100, lambda: _poll_parcel_classification_queue(result_queue, source_type, cache_key))
+        win.after(100, lambda: _poll_parcel_classification_queue(result_queue, source_type))
 
-    def _poll_parcel_classification_queue(result_queue, source_type, cache_key):
+    def _poll_parcel_classification_queue(result_queue, source_type):
         nonlocal parcel_is_reading, parcel_read_details, parcel_output_column_conflicts
         if not win.winfo_exists():
             return
         try:
             per_source_results = result_queue.get_nowait()
         except queue.Empty:
-            win.after(100, lambda: _poll_parcel_classification_queue(result_queue, source_type, cache_key))
+            win.after(100, lambda: _poll_parcel_classification_queue(result_queue, source_type))
             return
 
         parcel_is_reading = False
@@ -3438,48 +3408,38 @@ def open_main_window(root):
         # Builds one checkbox per source with state == LOT_STATE_FOUND;
         # sources without a usable column are simply omitted (no "not
         # found" line), matching lot_location.py's own
-        # auto-hide-when-nothing-usable convention. Fresh BooleanVars are
-        # created here (reuse_vars not passed) since this is a genuinely
-        # new read, not a cache restore.
+        # auto-hide-when-nothing-usable convention. Always fresh
+        # BooleanVars -- this is always a genuinely new read now, never
+        # a cache restore.
         _rebuild_lot_classification_checklist()
-
-        # This slot now holds the definitive, up-to-date data for this
-        # exact mode+selection -- the other mode's slot (and any
-        # differently-selected entry for THIS mode) is left untouched.
-        _parcel_classification_cache[source_type] = {
-            "key": cache_key,
-            "details": per_source_results,
-            "vars": dict(parcel_classification_vars),
-        }
 
         _update_parcel_classification_visibility()
         _update_run_button_state()
 
-    def _refresh_road_classification(force_refresh=False):
+    def _refresh_road_classification():
         """
         Background-reads the currently selected Road Network source (a
         single file/table -- Road Network, unlike Land Parcel, only ever
-        supports one selection) -- UNLESS the dual-slot cache already has
-        a still-valid entry for this exact mode+selection (e.g. the user
-        just toggled Local <-> Database back to a selection that hasn't
-        changed), in which case the checklist is restored instantly from
-        cache with no read and no background thread at all. Populates
-        road_type_value_vars for the Filter by Road Type checklist and
-        caches the read gdf in _road_gdf_cache so run_processing() can
-        reuse it instead of reading the same file/table a second time.
+        supports one selection). Populates road_type_value_vars for the
+        Filter by Road Type checklist.
 
-        force_refresh: when True, skips the cache-hit check entirely and
-        always does a fresh read, even if the cache key matches. Must be
-        True whenever this is called because the user just ACTIVELY
-        selected a source via Browse (browse_road_file() /
-        browse_road_db()) -- if they re-select the exact same file/table
-        (e.g. after editing it externally to add/change ROAD_TYPE
-        values), a plain key match would otherwise silently serve the
-        old, now-stale cached checklist instead of re-reading what's
-        actually on disk/in the DB right now. The cache-hit shortcut is
-        only safe to take on the _toggle_road() path (the user didn't
-        select anything new, just switched which already-made selection
-        is active), which calls this with the default force_refresh=False.
+        Deliberately does NOT skip this read based on any prior cached
+        state -- every call, whether triggered by a fresh Browse
+        selection or by toggling Local <-> Database, always performs a
+        real background read. This extends the same reasoning already
+        applied to Land Parcel's existing-output-column detection (see
+        group-05-cache-removal-analysis.md) to Road Network's road-type
+        filter too: a cache keyed only on "which file/table was
+        selected" cannot detect that the file/table's CONTENTS changed
+        externally since it was last read here.
+
+        After a successful read, the result IS still written into
+        _road_gdf_cache (see _poll_road_classification_queue() below) --
+        but only so run_processing() can reuse this same, now-guaranteed-
+        fresh GeoDataFrame at Run time instead of reading the source a
+        second time; that cache entry is never itself consulted to skip
+        a read here. See _road_gdf_cache's own module-level comment for
+        the full scope of what it's still used for.
         """
         nonlocal road_is_reading
         if road_is_reading:
@@ -3504,24 +3464,9 @@ def open_main_window(root):
             _update_run_button_state()
             return
 
-        slot = _road_gdf_cache[source_type]
-        if not force_refresh and slot["key"] == path_or_table and slot["gdf"] is not None:
-            # True cache hit: same mode, same selection, already read --
-            # restore the checklist (including each value's checked
-            # state) with no I/O at all. Immediate, synchronous swap --
-            # not the "reading" transient state.
-            road_type_value_vars.clear()
-            road_type_value_vars.update(slot["value_vars"])
-            _rebuild_road_type_checklist()
-            filter_road_type_var.set(slot.get("filter_active", False))
-            _update_road_classification_visibility()
-            _update_run_button_state()
-            return
-
-        # Cache miss: new file/table for this mode, or first time
-        # selecting it -- do the actual background read. Per the "never
-        # pass through an empty intermediate state" invariant, the
-        # EXISTING checkbox/checklist (if any) is left completely
+        # Always a real background read -- no cache-hit shortcut. Per
+        # the "never pass through an empty intermediate state" invariant,
+        # the EXISTING checkbox/checklist (if any) is left completely
         # untouched here -- it stays fully visible throughout the read,
         # and is only ever replaced in one atomic swap once the new data
         # is ready (see _poll_road_classification_queue()). This
@@ -3557,9 +3502,7 @@ def open_main_window(root):
         _set_road_reading_state(False)
         if error is not None or gdf is None:
             print(f"⚠️ Could not read road layer for classification check: {error}")
-            _road_gdf_cache[source_type] = {
-                "key": None, "gdf": None, "value_vars": {}, "filter_active": False
-            }
+            _road_gdf_cache[source_type] = {"key": None, "gdf": None}
             road_type_value_vars.clear()
             _rebuild_road_type_checklist()
             filter_road_type_var.set(False)
@@ -3596,12 +3539,11 @@ def open_main_window(root):
             # nothing meaningful to filter on; checkbox stays hidden.
         # else: no ROAD_TYPE-like column found -- checkbox stays hidden.
 
-        # This slot now holds the definitive, up-to-date data for this
-        # mode -- the other mode's slot is completely untouched.
-        _road_gdf_cache[source_type] = {
-            "key": path_or_table, "gdf": gdf, "value_vars": new_value_vars,
-            "filter_active": False
-        }
+        # This slot now holds the definitive, freshly-read GeoDataFrame
+        # for this mode -- kept ONLY for run_processing()'s Run-time
+        # reuse (see _road_gdf_cache's module-level comment); the other
+        # mode's slot is completely untouched.
+        _road_gdf_cache[source_type] = {"key": path_or_table, "gdf": gdf}
         road_type_value_vars.clear()
         road_type_value_vars.update(new_value_vars)
         _rebuild_road_type_checklist()
@@ -3738,11 +3680,8 @@ def open_main_window(root):
             # A new Land Parcel selection invalidates any prior
             # LOT_LOCATION/LOT_LABEL detection -- re-inspect the (new)
             # selected file. Canceling the dialog (the `if file:`
-            # guard) does NOT trigger a re-read. force_refresh=True: the
-            # user actively chose this selection just now via Browse --
-            # even if it's identical to a previously cached one (e.g.
-            # re-selecting after editing the file externally), it must
-            # be read fresh, never served from cache.
+            # Always checks fresh -- see _refresh_parcel_classification()
+            # docstring: no result is ever cached across calls.
             #
             # No manual reflow/freeze needed here: under the swap-based
             # checklist lifecycle, the OLD checklist (if any) simply
@@ -3751,7 +3690,7 @@ def open_main_window(root):
             # is no intermediate "cleared" state to protect against. The
             # window only ever resizes once, at the very end, when the
             # new checklist actually replaces the old one.
-            _refresh_parcel_classification(force_refresh=True)
+            _refresh_parcel_classification()
 
     def browse_parcel_db():
         creds = load_db_credentials()
@@ -3771,8 +3710,8 @@ def open_main_window(root):
                 parcel_db_table = sel[0]
                 parcel_db_label.set(sel[0])
                 # No _reflow_window() here -- same reasoning as
-                # browse_parcel_files() above.
-                _refresh_parcel_classification(force_refresh=True)
+                # browse_parcel_files() above. Always checks fresh.
+                _refresh_parcel_classification()
 
         _pick_db_tables(win, tables, multi=False, on_select=_on_parcel_tables_selected)
 
@@ -3794,11 +3733,10 @@ def open_main_window(root):
                 else "No table selected"
             )
         # Switching Local <-> Database does NOT clear the other mode's
-        # remembered selection or cached checklist state -- that's the
-        # whole point of the dual-slot _parcel_classification_cache. This
-        # call shows whichever of the three states actually applies to
-        # the newly active mode: instantly restored from cache, freshly
-        # read, or hidden (nothing selected for this mode yet).
+        # remembered selection -- that's pre-existing behavior, left
+        # untouched. Always re-checks fresh for whichever mode is now
+        # active -- no cached result is ever restored (see
+        # group-05-cache-removal-analysis.md).
         _refresh_parcel_classification()
 
     # ── SECTION 2: ROAD NETWORK ──────────────────────────────────
@@ -3842,9 +3780,6 @@ def open_main_window(root):
     # is checked AND a usable ROAD_TYPE-like column was found (see
     # _update_road_classification_visibility()).
     road_type_checklist_container = tk.Frame(road_frame)
-    road_reading_lbl = tk.Label(
-        road_frame, text="⏳ Reading road network…",
-        fg="#b36b00", font=("Segoe UI", 8, "italic"), anchor="w")
     # All three start unpacked; _update_road_classification_visibility()
     # (via _refresh_road_classification()) decides what to show.
 
@@ -3855,19 +3790,16 @@ def open_main_window(root):
             road_local_path.set(f)
             road_file_var.set(os.path.basename(f))
             # A new Road Network selection invalidates any prior Road
-            # Type detection -- re-inspect the new road layer.
-            # force_refresh=True: the user actively chose this selection
-            # just now via Browse -- even if it's identical to a
-            # previously cached one (e.g. re-selecting after editing the
-            # file externally), it must be read fresh, never served from
-            # cache.
+            # Type detection -- re-inspect the new road layer. Always
+            # checks fresh -- see _refresh_road_classification()
+            # docstring: no read is ever skipped based on prior state.
             #
             # No manual reflow/freeze needed here -- same reasoning as
             # browse_parcel_files(): under the swap-based checklist
             # lifecycle, the OLD checkbox/checklist (if any) simply stays
             # fully visible and untouched throughout the read that
             # _refresh_road_classification() is about to start.
-            _refresh_road_classification(force_refresh=True)
+            _refresh_road_classification()
 
     def browse_road_db():
         creds = load_db_credentials()
@@ -3884,8 +3816,8 @@ def open_main_window(root):
                 road_db_table.set(sel[0])
                 road_db_var.set(sel[0])
                 # No _reflow_window() here -- same reasoning as
-                # browse_road_file() above.
-                _refresh_road_classification(force_refresh=True)
+                # browse_road_file() above. Always checks fresh.
+                _refresh_road_classification()
 
         _pick_db_tables(win, tables, multi=False, on_select=_on_road_table_selected)
 
@@ -3897,11 +3829,10 @@ def open_main_window(root):
             road_lbl.config(textvariable=road_db_var)
             road_btn.config(text="Select…", command=browse_road_db)
         # Switching Local <-> Database does NOT clear the other mode's
-        # remembered selection or cached checklist state -- that's the
-        # whole point of the dual-slot _road_gdf_cache. This call shows
-        # whichever of the three states actually applies to the newly
-        # active mode: instantly restored from cache, freshly read, or
-        # hidden (nothing selected for this mode yet).
+        # remembered selection -- that's pre-existing behavior, left
+        # untouched. Always re-checks fresh for whichever mode is now
+        # active -- no cached checklist state is ever restored (see
+        # group-05-cache-removal-analysis.md).
         _refresh_road_classification()
 
     # ── SECTION 3: OUTPUT ────────────────────────────────────────
