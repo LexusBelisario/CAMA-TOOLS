@@ -18,6 +18,7 @@ from sqlalchemy import create_engine, inspect, text
 from utils.table_name_matching import normalize_name, find_matching_tables
 from utils.resource_path import resource_path
 from utils.db_discovery import load_db_credentials, fetch_tables
+from utils.column_detection import detect_existing_output_columns
 
 # ============================
 # FORCE WINDOWS APP ICON
@@ -1224,9 +1225,8 @@ def open_main_window(root):
                 print(f"⚠️ Could not read parcel layer to check for an "
                       f"existing CAMA_LOT_LOCATION column: {path_or_table}: {error}")
                 continue
-            existing_col = next(
-                (c for c in gdf.columns if c.lower() == "cama_lot_location"), None
-            )
+            found = detect_existing_output_columns(gdf, ("CAMA_LOT_LOCATION",))
+            existing_col = found.get("CAMA_LOT_LOCATION")
             if existing_col:
                 conflicts.append((path_or_table, existing_col))
         return conflicts
