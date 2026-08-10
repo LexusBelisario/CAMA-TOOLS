@@ -23,39 +23,11 @@ from utils.table_name_matching import normalize_name, find_matching_tables
 from utils.resource_path import resource_path
 from utils.db_discovery import load_db_credentials, fetch_tables
 from utils.column_detection import detect_existing_output_columns
+from utils.window_icon import apply_icon
 
 # ----------------- CONFIG -----------------
 GM_EXE_PATH = r"C:\Program Files\GlobalMapper26.1_64bit\global_mapper.exe"
 import sys as _sys
-
-
-def apply_icon(win):
-    """
-    Sets both the Windows taskbar/Alt-Tab icon (.ico) and the Tk titlebar
-    icon (.png fallback, needed since iconbitmap() alone doesn't reliably
-    set the titlebar icon on every Windows/Tk combination) for a single
-    window. Ported verbatim from road_frontage.py so the new
-    ProgressWindow and show_success_dialog() in this file show the same
-    BLGF logo as every other tool -- previously relied entirely on
-    Toplevel windows inheriting the (permanently withdrawn) root's icon,
-    which happens to work but isn't an explicit guarantee the way calling
-    this directly is.
-    """
-    ico = resource_path("BLGF.ico")
-    png = resource_path("BLGF.png")
-
-    if os.path.exists(ico):
-        try:
-            win.iconbitmap(ico)
-        except Exception:
-            pass
-
-    if os.path.exists(png):
-        try:
-            img = tk.PhotoImage(file=png)
-            win.iconphoto(True, img)
-        except Exception:
-            pass
 
 
 def _get_dialog_center_position(dialog_widget, req_w, req_h):
@@ -458,7 +430,7 @@ def ask_db_overwrite_dialog(parent, conflicting_pairs):
     result = {"choice": "cancel"}
 
     dialog = tk.Toplevel(parent)
-    apply_icon(dialog)
+    apply_icon(dialog, "roadwidth.ico")
     dialog.title("ROAD WIDTH TOOL")
     dialog.resizable(False, False)
     dialog.grab_set()
@@ -570,7 +542,7 @@ def confirm_db_overwrite_dialog(parent, table_name):
     result = {"confirmed": False}
 
     dialog = tk.Toplevel(parent)
-    apply_icon(dialog)
+    apply_icon(dialog, "roadwidth.ico")
     dialog.title("ROAD WIDTH TOOL")
     dialog.resizable(False, False)
     dialog.grab_set()
@@ -653,7 +625,7 @@ def choose_db_overwrite_dialog(parent, candidates):
     selected = tk.StringVar(value=candidates[0])
 
     dialog = tk.Toplevel(parent)
-    apply_icon(dialog)
+    apply_icon(dialog, "roadwidth.ico")
     dialog.title("ROAD WIDTH TOOL")
     dialog.resizable(False, False)
     dialog.grab_set()
@@ -1662,6 +1634,7 @@ def process(barangay_gdf, road_gdf, source_name="", progress_cb=None, classifica
 def open_main_window(root):
 
     win = tk.Toplevel(root)
+    apply_icon(win, "roadwidth.ico")
     win.title("Road Width Tool")
     win.resizable(False, False)
     win.update_idletasks()
@@ -3467,7 +3440,7 @@ def show_success_dialog(parent, total_sources, failed_sources, single_success_de
     single_failure = (total_sources == 1 and failed_count == 1)
 
     dialog = tk.Toplevel(parent)
-    apply_icon(dialog)
+    apply_icon(dialog, "roadwidth.ico")
     dialog.title("ROAD WIDTH TOOL")
     dialog.resizable(False, False)
     # Deliberately NOT calling dialog.transient(parent) here. This app's
@@ -3928,7 +3901,7 @@ class ProgressWindow:
     def __init__(self, root, title="Processing"):
         self.win = tk.Toplevel(root)
         self._closed = False
-        apply_icon(self.win)
+        apply_icon(self.win, "roadwidth.ico")
         self.win.title(title)
         self.win.minsize(420, 140)
         self.win.resizable(False, False)

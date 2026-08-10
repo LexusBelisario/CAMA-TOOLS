@@ -23,6 +23,7 @@ from utils.table_name_matching import normalize_name, find_matching_tables
 from utils.resource_path import resource_path
 from utils.db_discovery import load_db_credentials, fetch_tables
 from utils.column_detection import detect_existing_output_columns
+from utils.window_icon import apply_icon
 
 # ============================
 # FORCE WINDOWS APP ICON
@@ -39,25 +40,6 @@ def set_app_user_model_id():
 
 
 set_app_user_model_id()
-
-
-def apply_icon(win):
-    ico = resource_path("BLGF.ico")
-    png = resource_path("BLGF.png")
-
-    if os.path.exists(ico):
-        try:
-            win.iconbitmap(ico)
-        except Exception:
-            pass
-
-    if os.path.exists(png):
-        try:
-            img = tk.PhotoImage(file=png)
-            win.iconphoto(True, img)
-            win._icon_ref = img  # prevent GC
-        except Exception:
-            pass
 
 
 # -------------------- CONFIG --------------------
@@ -209,7 +191,7 @@ def _prompt_select_layer(parent, path, layers):
     result = {"layer": None}
 
     dlg = tk.Toplevel(parent)
-    apply_icon(dlg)
+    apply_icon(dlg, "influencetomap.ico")
     dlg.title("Select Fault Line Layer")
     dlg.resizable(False, False)
     dlg.grab_set()
@@ -753,7 +735,7 @@ class ProgressWindow:
     """Same shape as every other migrated tool's ProgressWindow."""
     def __init__(self, root, title="Processing"):
         self.win = tk.Toplevel(root)
-        apply_icon(self.win)
+        apply_icon(self.win, "influencetomap.ico")
         self.win.title(title)
         self.win.minsize(400, 120)
         self.win.resizable(False, False)
@@ -835,7 +817,7 @@ def ask_overwrite_dialog(parent, conflicting_names):
     result = {"choice": "cancel"}
 
     dialog = tk.Toplevel(parent)
-    apply_icon(dialog)
+    apply_icon(dialog, "influencetomap.ico")
     dialog.title("INFLUENCE TO MAP TOOL")
     dialog.resizable(False, False)
     dialog.grab_set()
@@ -939,7 +921,7 @@ def confirm_db_overwrite_dialog(parent, table_name):
     result = {"confirmed": False}
 
     dialog = tk.Toplevel(parent)
-    apply_icon(dialog)
+    apply_icon(dialog, "influencetomap.ico")
     dialog.title("INFLUENCE TO MAP TOOL")
     dialog.resizable(False, False)
     dialog.grab_set()
@@ -1008,7 +990,7 @@ def choose_db_overwrite_dialog(parent, candidates):
     selected = tk.StringVar(value=candidates[0])
 
     dialog = tk.Toplevel(parent)
-    apply_icon(dialog)
+    apply_icon(dialog, "influencetomap.ico")
     dialog.title("INFLUENCE TO MAP TOOL")
     dialog.resizable(False, False)
     dialog.grab_set()
@@ -1469,7 +1451,7 @@ def _pick_db_tables(parent, tables, multi, on_select):
     taller than influence_to_barangay.py's "Influence to Parcel Tool".
     """
     picker = tk.Toplevel(parent)
-    apply_icon(picker)
+    apply_icon(picker, "influencetomap.ico")
     picker.title("Select Table(s)")
     picker.resizable(False, False)
     picker.grab_set()
@@ -1494,8 +1476,8 @@ def open_main_window(root):
     from tkinter import ttk
 
     win = tk.Toplevel(root)
-    apply_icon(win)
-    win.title("Influence to Map — Fault Line Distance")
+    apply_icon(win, "influencetomap.ico")
+    win.title("Influence to Map")
     win.resizable(False, False)
     win.update_idletasks()
     win.deiconify()
@@ -2155,7 +2137,7 @@ def main(parent=None):
         open_main_window(parent)
     else:
         root = tk.Tk()
-        apply_icon(root)
+        apply_icon(root, "influencetomap.ico")
         root.withdraw()
         open_main_window(root)
         root.mainloop()
