@@ -3584,7 +3584,7 @@ clicked_bg = round_image(str(ICONS_DIR / "click.png"), size=(38, 38), radius=7)
 # Map labels to icon filenames (short & clean):
 _icon_files = {
     "ANY MAP TO LAND PARCEL": "influencemap.png",
-    "INFLUENCE TO MAP": "influencetomap.png",
+    "INFLUENCE TO MAP": "distancefactor.png",
     "ROAD WIDTH": "roadwidth.png",
     "ROAD FRONTAGE & DEPTH-TO-WIDTH RATIO": "roadfrontage.png",
     "LOT LOCATION": "lotlocation.png",

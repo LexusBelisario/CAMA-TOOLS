@@ -191,7 +191,7 @@ def _prompt_select_layer(parent, path, layers):
     result = {"layer": None}
 
     dlg = tk.Toplevel(parent)
-    apply_icon(dlg, "influencetomap.ico")
+    apply_icon(dlg, "distancefactor.ico")
     dlg.title("Select Fault Line Layer")
     dlg.resizable(False, False)
     dlg.grab_set()
@@ -735,7 +735,7 @@ class ProgressWindow:
     """Same shape as every other migrated tool's ProgressWindow."""
     def __init__(self, root, title="Processing"):
         self.win = tk.Toplevel(root)
-        apply_icon(self.win, "influencetomap.ico")
+        apply_icon(self.win, "distancefactor.ico")
         self.win.title(title)
         self.win.minsize(400, 120)
         self.win.resizable(False, False)
@@ -817,7 +817,7 @@ def ask_overwrite_dialog(parent, conflicting_names):
     result = {"choice": "cancel"}
 
     dialog = tk.Toplevel(parent)
-    apply_icon(dialog, "influencetomap.ico")
+    apply_icon(dialog, "distancefactor.ico")
     dialog.title("INFLUENCE TO MAP TOOL")
     dialog.resizable(False, False)
     dialog.grab_set()
@@ -921,7 +921,7 @@ def confirm_db_overwrite_dialog(parent, table_name):
     result = {"confirmed": False}
 
     dialog = tk.Toplevel(parent)
-    apply_icon(dialog, "influencetomap.ico")
+    apply_icon(dialog, "distancefactor.ico")
     dialog.title("INFLUENCE TO MAP TOOL")
     dialog.resizable(False, False)
     dialog.grab_set()
@@ -990,7 +990,7 @@ def choose_db_overwrite_dialog(parent, candidates):
     selected = tk.StringVar(value=candidates[0])
 
     dialog = tk.Toplevel(parent)
-    apply_icon(dialog, "influencetomap.ico")
+    apply_icon(dialog, "distancefactor.ico")
     dialog.title("INFLUENCE TO MAP TOOL")
     dialog.resizable(False, False)
     dialog.grab_set()
@@ -1451,7 +1451,7 @@ def _pick_db_tables(parent, tables, multi, on_select):
     taller than influence_to_barangay.py's "Influence to Parcel Tool".
     """
     picker = tk.Toplevel(parent)
-    apply_icon(picker, "influencetomap.ico")
+    apply_icon(picker, "distancefactor.ico")
     picker.title("Select Table(s)")
     picker.resizable(False, False)
     picker.grab_set()
@@ -1476,7 +1476,7 @@ def open_main_window(root):
     from tkinter import ttk
 
     win = tk.Toplevel(root)
-    apply_icon(win, "influencetomap.ico")
+    apply_icon(win, "distancefactor.ico")
     win.title("Influence to Map")
     win.resizable(False, False)
     win.update_idletasks()
@@ -2137,7 +2137,7 @@ def main(parent=None):
         open_main_window(parent)
     else:
         root = tk.Tk()
-        apply_icon(root, "influencetomap.ico")
+        apply_icon(root, "distancefactor.ico")
         root.withdraw()
         open_main_window(root)
         root.mainloop()
