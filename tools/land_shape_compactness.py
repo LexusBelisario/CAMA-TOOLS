@@ -19,6 +19,7 @@ from utils.table_name_matching import normalize_name, find_matching_tables
 from utils.resource_path import resource_path
 from utils.db_discovery import load_db_credentials, fetch_tables
 from utils.column_detection import detect_existing_output_columns
+from utils.window_icon import apply_icon
 
 # ============================
 # FORCE WINDOWS APP ICON
@@ -31,27 +32,6 @@ def set_app_user_model_id():
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(appid)
 
 set_app_user_model_id()
-
-
-def apply_icon(win):
-    ico = resource_path("BLGF.ico")
-    png = resource_path("BLGF.png")
-
-    # Taskbar / Alt-Tab icon
-    if os.path.exists(ico):
-        try:
-            win.iconbitmap(ico)
-        except Exception:
-            pass
-
-    # Tk titlebar fallback
-    if os.path.exists(png):
-        try:
-            img = tk.PhotoImage(file=png)
-            win.iconphoto(True, img)
-            win._icon_ref = img  # prevent garbage collection
-        except Exception:
-            pass
 
 
 # === Global Mapper EXE and Icon Paths
@@ -365,7 +345,7 @@ def _write_gpkg(gdf, path):
 def ask_overwrite_dialog(parent, conflicting_names):
     result = {"choice": "cancel"}
     dialog = tk.Toplevel(parent)
-    apply_icon(dialog)
+    apply_icon(dialog, "landshape.ico")
     dialog.title("File(s) Already Exist")
     dialog.resizable(False, False)
     dialog.grab_set()
@@ -451,7 +431,7 @@ def confirm_db_overwrite_dialog(parent, table_name):
     result = {"confirmed": False}
 
     dialog = tk.Toplevel(parent)
-    apply_icon(dialog)
+    apply_icon(dialog, "landshape.ico")
     dialog.title("LAND SHAPE COMPACTNESS TOOL")
     dialog.resizable(False, False)
     dialog.grab_set()
@@ -516,7 +496,7 @@ def choose_db_overwrite_dialog(parent, candidates):
     selected = tk.StringVar(value=candidates[0])
 
     dialog = tk.Toplevel(parent)
-    apply_icon(dialog)
+    apply_icon(dialog, "landshape.ico")
     dialog.title("LAND SHAPE COMPACTNESS TOOL")
     dialog.resizable(False, False)
     dialog.grab_set()
@@ -736,7 +716,7 @@ def read_postgis_clean(table,engine,schema):
 def _pick_db_tables(parent, tables, multi, on_select):
     from tkinter import ttk
     picker = tk.Toplevel(parent)
-    apply_icon(picker)
+    apply_icon(picker, "landshape.ico")
     picker.title("Select Table(s)")
     picker.resizable(False, False)
     picker.grab_set()
@@ -787,7 +767,7 @@ def load_in_global_mapper(filepath):
 def open_main_window(root):
     from tkinter import ttk
     win = tk.Toplevel(root)
-    apply_icon(win)
+    apply_icon(win, "landshape.ico")
     win.title("Lot Shape Tool")
     win.resizable(False, False)
     win.update_idletasks()
@@ -1484,7 +1464,7 @@ class ProgressWindow:
     def __init__(self, root, title="Processing"):
         from tkinter import ttk
         self.win = tk.Toplevel(root)
-        apply_icon(self.win)
+        apply_icon(self.win, "landshape.ico")
         self.win.title(title)
         self.win.minsize(400, 120)
         self.win.resizable(False, False)
@@ -1722,7 +1702,7 @@ def main(parent=None):
         open_main_window(parent)
     else:
         root = tk.Tk()
-        apply_icon(root)
+        apply_icon(root, "landshape.ico")
         root.withdraw()
         open_main_window(root)
         root.mainloop()
