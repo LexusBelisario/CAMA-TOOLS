@@ -310,6 +310,7 @@ def fix_geometry(geom):
 
 import threading
 import queue
+import time
 from shapely.prepared import prep
 
 
@@ -3172,6 +3173,7 @@ def open_main_window(root):
                 else "No table selected"
             )
             parcel_lbl.config(fg="gray")
+        _update_run_button_state()
 
     def _set_road_reading_state(reading):
         """
@@ -3225,6 +3227,7 @@ def open_main_window(root):
                 road_table = road_db_table.get()
                 road_db_var.set(road_table if road_table else "No table selected")
             road_lbl.config(fg="gray")
+        _update_run_button_state()
 
     def _update_run_button_state():
         """
@@ -3264,10 +3267,18 @@ def open_main_window(root):
             run_status_var.set("Please select an Output destination.")
             ready = False
         elif parcel_is_reading:
-            run_status_var.set("Reading parcel source for classification…")
+            checking_name = (
+                os.path.basename(parcel_local_path) if parcel_source_type.get() == "local"
+                else parcel_db_table
+            ) or "source"
+            run_status_var.set(f'Checking "{checking_name}" columns…')
             ready = False
         elif road_is_reading:
-            run_status_var.set("Reading road network for classification…")
+            checking_name = (
+                os.path.basename(road_local_path.get()) if road_source_type.get() == "local"
+                else road_db_table.get()
+            ) or "source"
+            run_status_var.set(f'Checking "{checking_name}" columns…')
             ready = False
         else:
             run_status_var.set("Ready to run.")
@@ -3279,6 +3290,93 @@ def open_main_window(root):
         else:
             run_btn.config(state="disabled", cursor="no",
                             bg="#e0e0e0", fg="#888888", disabledforeground="#888888")
+
+    def _handle_parcel_check_failure(source_type, reason):
+        """
+        Shared cleanup for both outcomes of a FAILED Land Parcel
+        background read: a read that never completed within 60 seconds
+        ("timeout"), or one that completed but the single selected
+        source's read itself failed ("failure" -- signaled by
+        per_source_results containing a (path_or_table, None, None,
+        None, {}) tuple, i.e. state is None -- see worker()'s docstring
+        inside _refresh_parcel_classification()).
+
+        Captures the failed source's display name BEFORE clearing the
+        authority variable (needed for the dialog text below), then
+        clears ONLY the authority variable for source_type (the mode
+        that was actually being read) -- parcel_local_path if source_type
+        is "local", parcel_db_table if "db". Also resets
+        parcel_read_details/parcel_output_column_conflicts and rebuilds
+        the (now-empty) classification checklist -- there is no valid
+        checklist data to show when the read that would have produced it
+        never succeeded.
+
+        Clearing the authority variable is the entire recovery
+        mechanism -- no new "check failed" state is introduced. This
+        forces the EXISTING "no source selected -> Run disabled" path
+        (_update_run_button_state()) to handle recovery: the display
+        reverts to "No file selected" / "No table selected", and the
+        user must select a source again.
+
+        CRITICAL: unlike the simpler single-worker tools (e.g.
+        road_density.py), where _set_parcel_reading_state() itself
+        resets parcel_is_reading internally, THIS tool's
+        _set_parcel_reading_state() only manages widget state --
+        parcel_is_reading here is owned directly by
+        _refresh_parcel_classification()/_poll_parcel_classification_
+        queue()'s own piggyback structure. It must be explicitly reset
+        to False here too, or every subsequent
+        _refresh_parcel_classification() call (including one triggered
+        by toggling back to a source that still has a valid selection)
+        would silently no-op forever against its own
+        "if parcel_is_reading: return" guard. (This exact gap was found
+        and fixed in road_width.py first -- see that file's identical
+        function for the bug this avoids from the start here.)
+
+        _set_parcel_reading_state(False) is called BEFORE the dialog is
+        shown, not after -- messagebox.showerror() is modal and blocks
+        here until dismissed, so showing it first would leave the
+        "⏳ Reading Land Parcel…" indicator frozen on screen for the
+        entire time the dialog is up.
+        """
+        nonlocal parcel_is_reading, parcel_local_path, parcel_db_table, parcel_read_details, parcel_output_column_conflicts
+
+        parcel_is_reading = False
+
+        if source_type == "local":
+            failed_name = (os.path.basename(parcel_local_path)
+                           if parcel_local_path else "the selected file")
+            parcel_local_path = None
+        else:
+            failed_name = parcel_db_table if parcel_db_table else "the selected table"
+            parcel_db_table = None
+
+        parcel_read_details = []
+        parcel_output_column_conflicts = []
+        _rebuild_lot_classification_checklist()
+        _update_parcel_classification_visibility()
+
+        if reason == "timeout":
+            title = "Read Timeout"
+            if source_type == "local":
+                message = (f'Could not read the selected file "{failed_name}" '
+                           f'within 60 seconds.\n\n'
+                           f'Please try again or choose a different file.')
+            else:
+                message = (f'Could not read the selected table "{failed_name}" '
+                           f'within 60 seconds.\n\n'
+                           f'Please check your database connection and try again.')
+        else:  # "failure"
+            title = "Read Error"
+            if source_type == "local":
+                message = (f'Could not read the selected file "{failed_name}".\n\n'
+                           f'Please try again or choose a different file.')
+            else:
+                message = (f'Could not read the selected table "{failed_name}".\n\n'
+                           f'Please check your database connection and try again.')
+
+        _set_parcel_reading_state(False)
+        messagebox.showerror(title, message, parent=win)
 
     def _check_parcel_frontage_conflicts(details):
         """
@@ -3379,31 +3477,50 @@ def open_main_window(root):
                 del gdf
             result_queue.put(per_source_results)
 
+        deadline = time.time() + 60  # see _poll_parcel_classification_queue()
         parcel_is_reading = True
         _set_parcel_reading_state(True)
         _update_parcel_classification_visibility()
         _update_run_button_state()
         threading.Thread(target=worker, daemon=True).start()
-        win.after(100, lambda: _poll_parcel_classification_queue(result_queue, source_type))
+        win.after(100, lambda: _poll_parcel_classification_queue(result_queue, source_type, deadline))
 
-    def _poll_parcel_classification_queue(result_queue, source_type):
+    def _poll_parcel_classification_queue(result_queue, source_type, deadline):
+        """
+        Runs on the main thread via win.after() polling. Picks up the
+        per-source result list placed on the queue by the background
+        worker, or detects a timeout if 60 seconds have elapsed with no
+        result. Ordering matters: the queue is ALWAYS checked before the
+        deadline -- see road_density.py's identical function for the
+        full reasoning (single-threaded Tkinter main loop, fresh
+        queue.Queue() per call, no generation counter needed).
+        """
         nonlocal parcel_is_reading, parcel_read_details, parcel_output_column_conflicts
         if not win.winfo_exists():
             return
         try:
             per_source_results = result_queue.get_nowait()
         except queue.Empty:
-            win.after(100, lambda: _poll_parcel_classification_queue(result_queue, source_type))
+            if time.time() >= deadline:
+                _handle_parcel_check_failure(source_type, "timeout")
+            else:
+                win.after(100, lambda: _poll_parcel_classification_queue(
+                    result_queue, source_type, deadline))
+            return
+
+        # Single-selection: per_source_results has exactly one entry.
+        # state is None signals that source's own read failed (see
+        # worker()'s error branch above) -- distinct from a successful
+        # read that simply found no usable LOT_LOCATION/output column,
+        # which has a real (non-None) state.
+        if per_source_results and per_source_results[0][1] is None:
+            _handle_parcel_check_failure(source_type, "failure")
             return
 
         parcel_is_reading = False
         _set_parcel_reading_state(False)
         parcel_read_details = per_source_results
         parcel_output_column_conflicts = _check_parcel_frontage_conflicts(per_source_results)
-
-        failed = [src for (src, state, _c, _k, _rw) in per_source_results if state is None]
-        for src in failed:
-            print(f"⚠️ Could not read parcel layer for classification check: {src}")
 
         # Builds one checkbox per source with state == LOT_STATE_FOUND;
         # sources without a usable column are simply omitted (no "not
@@ -3416,12 +3533,83 @@ def open_main_window(root):
         _update_parcel_classification_visibility()
         _update_run_button_state()
 
+    def _handle_road_check_failure(source_type, reason):
+        """
+        Shared cleanup for both outcomes of a FAILED Road Network read:
+        one that never completed within 60 seconds ("timeout"), or one
+        that completed with an actual read error ("failure").
+
+        Entirely independent from _handle_parcel_check_failure() above
+        -- no shared queue, worker, deadline, or state between the two.
+        A Road Network failure must never clear or affect the Land
+        Parcel selection, and vice versa.
+
+        Captures the failed source's display name BEFORE clearing the
+        authority variable, then clears ONLY road_local_path or
+        road_db_table (whichever source_type was actually being read).
+        Also clears that mode's _road_gdf_cache slot -- there is no
+        valid GeoDataFrame for run_processing() to reuse when the read
+        that would have produced it never succeeded.
+
+        CRITICAL: this tool's _set_road_reading_state() only manages
+        widget state, not road_is_reading itself (owned directly by
+        _refresh_road_classification()/_poll_road_classification_
+        queue()). Must be explicitly reset here or every subsequent
+        _refresh_road_classification() call would silently no-op (this
+        exact gap was found and fixed in road_width.py first).
+
+        _set_road_reading_state(False) is called BEFORE the dialog is
+        shown, not after -- same reasoning as
+        _handle_parcel_check_failure() above.
+        """
+        nonlocal road_is_reading
+
+        road_is_reading = False
+
+        if source_type == "local":
+            failed_name = (os.path.basename(road_local_path.get())
+                           if road_local_path.get() else "the selected file")
+            road_local_path.set("")
+        else:
+            failed_name = road_db_table.get() if road_db_table.get() else "the selected table"
+            road_db_table.set("")
+
+        _road_gdf_cache[source_type] = {"key": None, "gdf": None}
+        road_type_value_vars.clear()
+        _rebuild_road_type_checklist()
+        filter_road_type_var.set(False)
+        _update_road_classification_visibility()
+
+        if reason == "timeout":
+            title = "Read Timeout"
+            if source_type == "local":
+                message = (f'Could not read the selected file "{failed_name}" '
+                           f'within 60 seconds.\n\n'
+                           f'Please try again or choose a different file.')
+            else:
+                message = (f'Could not read the selected table "{failed_name}" '
+                           f'within 60 seconds.\n\n'
+                           f'Please check your database connection and try again.')
+        else:  # "failure"
+            title = "Read Error"
+            if source_type == "local":
+                message = (f'Could not read the selected file "{failed_name}".\n\n'
+                           f'Please try again or choose a different file.')
+            else:
+                message = (f'Could not read the selected table "{failed_name}".\n\n'
+                           f'Please check your database connection and try again.')
+
+        _set_road_reading_state(False)
+        messagebox.showerror(title, message, parent=win)
+
     def _refresh_road_classification():
         """
         Background-reads the currently selected Road Network source (a
         single file/table -- Road Network, unlike Land Parcel, only ever
         supports one selection). Populates road_type_value_vars for the
-        Filter by Road Type checklist.
+        Filter by Road Type checklist. Gives up after 60 seconds with no
+        result (see _poll_road_classification_queue()) -- a hung read
+        must not leave the tool waiting indefinitely.
 
         Deliberately does NOT skip this read based on any prior cached
         state -- every call, whether triggered by a fresh Browse
@@ -3480,34 +3668,41 @@ def open_main_window(root):
             gdf, error = _read_gdf_worker(source_type, path_or_table)
             result_queue.put((gdf, error))
 
+        deadline = time.time() + 60  # see _poll_road_classification_queue()
         road_is_reading = True
         _set_road_reading_state(True)
         _update_road_classification_visibility()
         _update_run_button_state()
         threading.Thread(target=worker, daemon=True).start()
-        win.after(100, lambda: _poll_road_classification_queue(result_queue, source_key))
+        win.after(100, lambda: _poll_road_classification_queue(result_queue, source_key, deadline))
 
-    def _poll_road_classification_queue(result_queue, source_key):
+    def _poll_road_classification_queue(result_queue, source_key, deadline):
+        """
+        Ordering matters: the queue is ALWAYS checked before the
+        deadline -- see road_density.py's identical function for the
+        full reasoning (single-threaded Tkinter main loop, fresh
+        queue.Queue() per call, no generation counter needed).
+        """
         nonlocal road_is_reading
         if not win.winfo_exists():
             return
+
+        source_type, path_or_table = source_key
+
         try:
             gdf, error = result_queue.get_nowait()
         except queue.Empty:
-            win.after(100, lambda: _poll_road_classification_queue(result_queue, source_key))
+            if time.time() >= deadline:
+                _handle_road_check_failure(source_type, "timeout")
+            else:
+                win.after(100, lambda: _poll_road_classification_queue(
+                    result_queue, source_key, deadline))
             return
 
-        source_type, path_or_table = source_key
         road_is_reading = False
         _set_road_reading_state(False)
         if error is not None or gdf is None:
-            print(f"⚠️ Could not read road layer for classification check: {error}")
-            _road_gdf_cache[source_type] = {"key": None, "gdf": None}
-            road_type_value_vars.clear()
-            _rebuild_road_type_checklist()
-            filter_road_type_var.set(False)
-            _update_road_classification_visibility()
-            _update_run_button_state()
+            _handle_road_check_failure(source_type, "failure")
             return
 
         col = _detect_road_type_column(gdf)

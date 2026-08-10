@@ -15,6 +15,7 @@ import sys
 import psycopg2
 import threading
 import queue
+import time
 
 from utils.table_name_matching import normalize_name, find_matching_tables
 from utils.resource_path import resource_path
@@ -293,11 +294,16 @@ def close_progress_window():
 # solely responsible for surfacing any genuine read error to the user.
 def _check_parcel_poi_conflicts(sources, source_type):
     """
-    Returns a list of (path_or_table, existing_output_cols) tuples --
-    one entry only for sources where at least one OUTPUT_COLUMN_TARGETS
-    match was found. existing_output_cols is the dict returned by
-    _detect_existing_output_columns() for that source (target name ->
-    actual existing column name, original casing preserved).
+    Returns a list of (path_or_table, existing_output_cols) tuples on a
+    SUCCESSFUL read/check -- one entry only for sources where at least
+    one OUTPUT_COLUMN_TARGETS match was found; an empty list means the
+    check succeeded and found no conflict. existing_output_cols is the
+    dict returned by detect_existing_output_columns() for that source
+    (target name -> actual existing column name, original casing
+    preserved). Returns None if credentials could not be loaded, or if
+    ANY source failed to read -- this is a REQUIRED distinction, not
+    cosmetic: an empty list means "verified, no conflict", while None
+    means "could not verify at all".
 
     source_type: "local" or "db" -- dispatches to gpd.read_file() or
     read_postgis_clean() respectively.
@@ -310,7 +316,7 @@ def _check_parcel_poi_conflicts(sources, source_type):
         if not creds:
             print("⚠️ Could not load DB credentials to check for existing "
                   "output column(s).")
-            return conflicts
+            return None
         schema = creds["schema"]
         engine = create_engine(
             f"postgresql://{creds['username']}:{creds['password']}@"
@@ -325,7 +331,7 @@ def _check_parcel_poi_conflicts(sources, source_type):
         except Exception as e:
             print(f"⚠️ Could not read parcel layer to check for existing "
                   f"output column(s): {path_or_table}: {e}")
-            continue
+            return None
         existing_output_cols = detect_existing_output_columns(gdf, OUTPUT_COLUMN_TARGETS)
         if existing_output_cols:
             conflicts.append((path_or_table, existing_output_cols))
@@ -943,11 +949,81 @@ def open_main_window(root):
             parcel_btn.config(state="normal")
             parcel_radio_local.config(state="normal")
             parcel_radio_db.config(state="normal")
+        _update_run_button_state()
 
-    def _poll_parcel_output_queue(result_queue, source_type):
+    def _handle_parcel_check_failure(source_type, reason):
+        """
+        Shared cleanup for both outcomes of a FAILED Land Parcel
+        existing-output-column check: a read that never completed
+        within 60 seconds ("timeout"), or one that completed with an
+        actual read error ("failure" -- see
+        _check_parcel_poi_conflicts()'s docstring on why this is
+        signaled as None, not an empty list).
+
+        Captures the failed source's display name BEFORE clearing the
+        authority variable (needed for the dialog text below), then
+        clears ONLY the authority variable for source_type (the mode
+        that was actually being read) -- parcel_local_path if source_type
+        is "local", parcel_db_table if "db".
+
+        Clearing the authority variable is the entire recovery
+        mechanism -- no new "check failed" state is introduced. This
+        forces the EXISTING "no source selected -> Run disabled" path
+        (_update_run_button_state(), invoked via
+        _set_parcel_reading_state(False) below) to handle recovery: the
+        display reverts to "No file selected" / "No table selected",
+        and the user must select a source again.
+
+        _set_parcel_reading_state(False) is called BEFORE the dialog is
+        shown, not after -- messagebox.showerror() is modal and blocks
+        here until dismissed, so showing it first would leave the
+        "⏳ Reading Land Parcel…" indicator frozen on screen for the
+        entire time the dialog is up.
+        """
+        nonlocal parcel_local_path, parcel_db_table, parcel_existing_output_conflicts
+
+        if source_type == "local":
+            failed_name = (os.path.basename(parcel_local_path)
+                           if parcel_local_path else "the selected file")
+            parcel_local_path = None
+        else:
+            failed_name = parcel_db_table if parcel_db_table else "the selected table"
+            parcel_db_table = None
+
+        parcel_existing_output_conflicts = []
+
+        if reason == "timeout":
+            title = "Read Timeout"
+            if source_type == "local":
+                message = (f'Could not read the selected file "{failed_name}" '
+                           f'within 60 seconds.\n\n'
+                           f'Please try again or choose a different file.')
+            else:
+                message = (f'Could not read the selected table "{failed_name}" '
+                           f'within 60 seconds.\n\n'
+                           f'Please check your database connection and try again.')
+        else:  # "failure"
+            title = "Read Error"
+            if source_type == "local":
+                message = (f'Could not read the selected file "{failed_name}".\n\n'
+                           f'Please try again or choose a different file.')
+            else:
+                message = (f'Could not read the selected table "{failed_name}".\n\n'
+                           f'Please check your database connection and try again.')
+
+        _set_parcel_reading_state(False)
+        messagebox.showerror(title, message, parent=win)
+
+    def _poll_parcel_output_queue(result_queue, source_type, deadline):
         """
         Runs on the main thread via win.after() polling. Picks up the
-        conflict list placed on the queue by the background worker.
+        conflict list placed on the queue by the background worker, or
+        detects a timeout if 60 seconds have elapsed with no result.
+
+        Ordering matters: the queue is ALWAYS checked before the
+        deadline -- see road_density.py's identical function for the
+        full reasoning (single-threaded Tkinter main loop, fresh
+        queue.Queue() per call, no generation counter needed).
         """
         nonlocal parcel_existing_output_conflicts
         if not win.winfo_exists():
@@ -955,8 +1031,18 @@ def open_main_window(root):
         try:
             conflicts = result_queue.get_nowait()
         except queue.Empty:
-            win.after(100, lambda: _poll_parcel_output_queue(
-                result_queue, source_type))
+            if time.time() >= deadline:
+                _handle_parcel_check_failure(source_type, "timeout")
+            else:
+                win.after(100, lambda: _poll_parcel_output_queue(
+                    result_queue, source_type, deadline))
+            return
+
+        if conflicts is None:
+            # Worker signaled a read failure (see
+            # _check_parcel_poi_conflicts()'s docstring) -- distinct
+            # from an empty list, which means "verified, no conflict".
+            _handle_parcel_check_failure(source_type, "failure")
             return
 
         parcel_existing_output_conflicts = conflicts
@@ -972,6 +1058,9 @@ def open_main_window(root):
         _check_parcel_poi_conflicts() (defined above, already
         self-contained -- loads its own DB credentials internally) as
         the actual worker logic, just now called on a background thread.
+        Gives up after 60 seconds with no result (see
+        _poll_parcel_output_queue()) -- a hung read must not leave the
+        tool waiting indefinitely.
 
         Deliberately does NOT cache the result across calls -- every
         call, whether triggered by a fresh Browse/Select or by toggling
@@ -1007,10 +1096,11 @@ def open_main_window(root):
             conflicts = _check_parcel_poi_conflicts(sources, source_type)
             result_queue.put(conflicts)
 
+        deadline = time.time() + 60  # see _poll_parcel_output_queue()
         _set_parcel_reading_state(True)
         threading.Thread(target=worker, daemon=True).start()
         win.after(100, lambda: _poll_parcel_output_queue(
-            result_queue, source_type))
+            result_queue, source_type, deadline))
 
     def browse_parcel_files():
         file = filedialog.askopenfilename(filetypes=[
@@ -1406,7 +1496,11 @@ def open_main_window(root):
             # Section 6's read-outcome invariant, group-05-FINAL-PLAN.md
             # -- an in-progress check must never be silently treated as
             # "no conflict").
-            run_status_var.set("Checking Land Parcel source for existing columns…")
+            checking_name = (
+                os.path.basename(parcel_local_path) if parcel_source_type.get() == "local"
+                else parcel_db_table
+            ) or "source"
+            run_status_var.set(f'Checking "{checking_name}" columns…')
             ready = False
         elif not has_parcel:
             run_status_var.set("Please select a Land Parcel source.")
