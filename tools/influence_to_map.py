@@ -1179,15 +1179,29 @@ def _process_one_source(
         _write_gpkg(parcel_gdf_out, out)
 
         vm_out = None
-        if not vm_gdf_out.empty:
-            try:
-                status_cb("Writing Visual Measurement layer...")
-                vm_base_name = with_vm_suffix(base_name)
-                vm_path = os.path.join(output_mode[1], f"{vm_base_name}.gpkg")
-                _write_gpkg(vm_gdf_out, vm_path)
-                vm_out = vm_path
-            except Exception as e:
-                print(f"⚠️ Could not write Visual Measurement layer for '{source_label}': {type(e).__name__}: {e}")
+        # ------------------------------------------------------------------
+        # Visual Measurement (VM) layer write -- DISABLED (commented out, not
+        # removed). Per-task decision to suppress the secondary/diagnostic
+        # output so a successful Run Processing always produces exactly ONE
+        # main output file per parcel source. vm_gdf is still computed inside
+        # process_parcels() (unchanged) since vm_line is a byproduct of the
+        # same tree.nearest() lookup that produces the main CAMA_FAULT_NAME/
+        # CAMA_FAULT_DISTANCE values -- only this write (and the DB-output
+        # equivalent below, in the `else:` branch of this same function) is
+        # disabled. vm_out stays initialized to None above, so the return
+        # tuple's shape is unchanged and the existing `if vm_ref:` guard in
+        # run_processing()'s worker() continues to work exactly as before,
+        # just always taking the "no VM layer" path.
+        # ------------------------------------------------------------------
+        # if not vm_gdf_out.empty:
+            # try:
+                # status_cb("Writing Visual Measurement layer...")
+                # vm_base_name = with_vm_suffix(base_name)
+                # vm_path = os.path.join(output_mode[1], f"{vm_base_name}.gpkg")
+                # _write_gpkg(vm_gdf_out, vm_path)
+                # vm_out = vm_path
+            # except Exception as e:
+                # print(f"⚠️ Could not write Visual Measurement layer for '{source_label}': {type(e).__name__}: {e}")
 
         return source_label, out, vm_out, outcome
 
@@ -1270,13 +1284,29 @@ def _process_one_source(
             #         })
 
         vm_table = None
-        if not vm_gdf_out.empty:
-            try:
-                status_cb("Writing Visual Measurement layer...")
-                vm_table = f"{table}_VM"
-                vm_gdf_out.to_postgis(vm_table, engine, schema=schema, if_exists="replace", index=False)
-            except Exception as e:
-                print(f"⚠️ Could not write Visual Measurement layer to DB for '{source_label}': {type(e).__name__}: {e}")
+        # ------------------------------------------------------------------
+        # Visual Measurement (VM) layer write -- DISABLED (commented out, not
+        # removed). Same per-task decision as the local-output equivalent
+        # above (see that block's comment for full reasoning): a successful
+        # Run Processing should always produce exactly ONE main output per
+        # parcel source. vm_gdf itself is still computed inside
+        # process_parcels() (unchanged) -- only this write is disabled.
+        # vm_table stays initialized to None above, so the return tuple's
+        # shape is unchanged and the existing `if vm_ref:` guard in
+        # run_processing()'s worker() continues to work exactly as before,
+        # just always taking the "no VM layer" path. This block was, and
+        # remains, deliberately AFTER the `with engine.begin() as conn:`
+        # transaction above (best-effort, own separate write) -- untouched
+        # by this change; nothing about the CAMA_Table block immediately
+        # above this one is modified.
+        # ------------------------------------------------------------------
+        # if not vm_gdf_out.empty:
+            # try:
+                # status_cb("Writing Visual Measurement layer...")
+                # vm_table = f"{table}_VM"
+                # vm_gdf_out.to_postgis(vm_table, engine, schema=schema, if_exists="replace", index=False)
+            # except Exception as e:
+                # print(f"⚠️ Could not write Visual Measurement layer to DB for '{source_label}': {type(e).__name__}: {e}")
 
         return source_label, table, vm_table, outcome
 

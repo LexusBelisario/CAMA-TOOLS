@@ -2132,31 +2132,53 @@ def run_processing(app_root, resolved_table_name=None):
                         _write_gpkg(brgy_gdf, out)
                         q.put(("open_gm", out, None, None))
 
-                        # QA layer: {base_name}_VM.gpkg (Visual Measurement)
-                        # — written alongside the main output so QA can
-                        # load both in the same GM session. Only written
-                        # for local output (DB mode has no output_dir).
-                        if not lines_gdf.empty:
-                            lines_base_name = with_output_suffix(base_name, "VM")
-                            lines_out = os.path.join(
-                                output_mode[1],
-                                f"{lines_base_name}.gpkg"
-                            )
-                            _write_gpkg(lines_gdf, lines_out)
-                            q.put(("open_gm", lines_out, None, None))
+                        # ------------------------------------------------------------------
+                        # frontage_lines QA layer write ({base_name}_VM.gpkg) -- DISABLED
+                        # (commented out, not removed). Per-task decision: this is a
+                        # secondary/diagnostic-only output (confirmed via the comment
+                        # immediately below the DB branch further down: "frontage_lines is
+                        # a QA-only artifact -- not written to DB"), unconditional in the
+                        # ORIGINAL code (no flag gated this write) -- discovered during this
+                        # file's own Phase 1 analysis as a second, independent secondary
+                        # output alongside the checkbox-gated segment_buffers layer below.
+                        # Disabling it is required to satisfy the same goal as the other 3
+                        # files in this task: a successful Run Processing always produces
+                        # exactly ONE output file per tool. lines_gdf itself is still
+                        # computed above (unchanged) -- only this write (and the
+                        # accompanying Global Mapper auto-load) is disabled.
+                        # ------------------------------------------------------------------
+                        # if not lines_gdf.empty:
+                            # lines_base_name = with_output_suffix(base_name, "VM")
+                            # lines_out = os.path.join(
+                                # output_mode[1],
+                                # f"{lines_base_name}.gpkg"
+                            # )
+                            # _write_gpkg(lines_gdf, lines_out)
+                            # q.put(("open_gm", lines_out, None, None))
 
-                        # Optional third QA layer: the exact per-segment
-                        # buffer zones used by _edge_covered_portion() --
-                        # only written when the user opted in via the
-                        # "Generate buffer diagnostic layer" checkbox.
-                        if emit_buffer_qa and not buffers_gdf.empty:
-                            buffers_base_name = with_output_suffix(base_name, "segment_buffers")
-                            buffers_out = os.path.join(
-                                output_mode[1],
-                                f"{buffers_base_name}.gpkg"
-                            )
-                            _write_gpkg(buffers_gdf, buffers_out)
-                            q.put(("open_gm", buffers_out, None, None))
+                        # ------------------------------------------------------------------
+                        # segment_buffers QA layer write ({base_name}_segment_buffers.gpkg)
+                        # -- DISABLED (commented out, not removed). This is the write/
+                        # persistence boundary for the buffer-diagnostic feature; the
+                        # checkbox that used to let a user opt into this (see the disabled
+                        # Checkbutton/BooleanVar and Run-time assignment further up in this
+                        # file) is also disabled, so emit_buffer_qa is now permanently
+                        # False and this `if` condition can never be True regardless -- this
+                        # write is commented out as well, as the actual persistence
+                        # boundary, per task requirement. buffers_gdf itself is still
+                        # computed above (unchanged, always a valid GeoDataFrame -- empty
+                        # whenever emit_buffer_qa is False, which is now always) -- only
+                        # this write (and the accompanying Global Mapper auto-load) is
+                        # disabled.
+                        # ------------------------------------------------------------------
+                        # if emit_buffer_qa and not buffers_gdf.empty:
+                            # buffers_base_name = with_output_suffix(base_name, "segment_buffers")
+                            # buffers_out = os.path.join(
+                                # output_mode[1],
+                                # f"{buffers_base_name}.gpkg"
+                            # )
+                            # _write_gpkg(buffers_gdf, buffers_out)
+                            # q.put(("open_gm", buffers_out, None, None))
                     else:
                         # The actual destination table was already
                         # decided by resolve_db_output_table(), BEFORE
@@ -4061,17 +4083,27 @@ def open_main_window(root):
 
     out_btn.config(command=browse_output_dir)
 
-    # Opt-in diagnostic: writes a THIRD .gpkg (alongside the main output
-    # and the frontage_lines QA layer) containing the exact per-segment
-    # buffer zones _edge_covered_portion() uses internally, for visually
-    # auditing whether a segment's buffer genuinely reaches an adjacent
-    # road or is bleeding across a thin parcel / grazing a crossing road.
-    # Off by default -- purely a debugging aid, not part of normal output.
-    emit_buffer_qa_var = tk.BooleanVar(master=win, value=False)
-    tk.Checkbutton(
-        output_frame, text="Generate buffer diagnostic layer (Visual Measurement)",
-        variable=emit_buffer_qa_var
-    ).pack(anchor="w", pady=(4, 0))
+    # ------------------------------------------------------------------
+    # Buffer diagnostic checkbox -- DISABLED (commented out, not removed).
+    # Per-task decision: the "Generate buffer diagnostic layer (Visual
+    # Measurement)" opt-in and everything it could produce (segment_buffers,
+    # see process_frontage_single()'s return dict) is a secondary/diagnostic
+    # output, out of scope for a normal Run Processing result. Removing
+    # this widget entirely (not just disabling it) means it no longer
+    # occupies layout space -- the window's existing dynamic sizing
+    # (_reflow_window() / the initial update_idletasks() pass) already
+    # measures whatever is actually packed, so no separate window-size
+    # adjustment is needed here. emit_buffer_qa (module-level global,
+    # declared above, still active/False) can no longer be set to True by
+    # any code path now that this is the only widget that ever read from
+    # it via emit_buffer_qa_var -- see the Run-time assignment below,
+    # also disabled.
+    # ------------------------------------------------------------------
+    # emit_buffer_qa_var = tk.BooleanVar(master=win, value=False)
+    # tk.Checkbutton(
+        # output_frame, text="Generate buffer diagnostic layer (Visual Measurement)",
+        # variable=emit_buffer_qa_var
+    # ).pack(anchor="w", pady=(4, 0))
 
     # ── RUN BUTTON ───────────────────────────────────────────────
     ttk.Separator(win, orient="horizontal").pack(
@@ -4117,7 +4149,22 @@ def open_main_window(root):
         else:
             output_mode = ("db", None)
 
-        emit_buffer_qa = emit_buffer_qa_var.get()
+        # ------------------------------------------------------------------
+        # emit_buffer_qa Run-time assignment -- DISABLED (commented out, not
+        # removed). Previously read the buffer-diagnostic checkbox's
+        # BooleanVar (see the now-disabled Checkbutton above) into the
+        # module-level emit_buffer_qa global. With this line inert, that
+        # global (declared active/False at module level) is never
+        # reassigned by anything in this file, so it stays permanently
+        # False -- guaranteeing every `if emit_buffer_qa:` check downstream
+        # (inside process_frontage_single(), and the segment_buffers write
+        # block below) never activates. Left permanently `= False` at its
+        # own declaration site rather than also commenting that line out,
+        # since this call's `emit_buffer_qa=emit_buffer_qa` keyword
+        # argument to process_frontage_single() still reads that name --
+        # commenting the declaration too would raise NameError there.
+        # ------------------------------------------------------------------
+        # emit_buffer_qa = emit_buffer_qa_var.get()
 
         # Road Classification: resolved mode + excluded values are read
         # here and stored as module globals, same pattern as
