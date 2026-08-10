@@ -4284,15 +4284,29 @@ def _process_one_source(
         _write_gpkg(b_gdf, out)
 
         vm_out = None
-        if not qa_gdf.empty:
-            try:
-                status_cb("Writing Visual Measurement layer...")
-                qa_base_name = with_qa_suffix(base_name)
-                qa_out = os.path.join(output_mode[1], f"{qa_base_name}.gpkg")
-                _write_gpkg(qa_gdf, qa_out)
-                vm_out = qa_out
-            except Exception as e:
-                print(f"⚠️ Could not write Visual Measurement layer for '{source_label}': {type(e).__name__}: {e}")
+        # ------------------------------------------------------------------
+        # Visual Measurement (VM) layer write -- DISABLED (commented out, not
+        # removed). Per-task decision to suppress the secondary/diagnostic
+        # output so a successful Run Processing always produces exactly ONE
+        # main output file per parcel source. qa_gdf is still computed inside
+        # process() (unchanged) since qa_line is a byproduct of the same
+        # _measure_width() call that produces the main ROAD_WIDTH value --
+        # only this write (and the DB-output equivalent below, in the
+        # `else:` branch of this same function) is disabled. vm_out stays
+        # initialized to None above, so the return tuple's shape is
+        # unchanged and the existing `if vm_ref:` guard in run_processing()'s
+        # worker() continues to work exactly as before, just always taking
+        # the "no VM layer" path.
+        # ------------------------------------------------------------------
+        # if not qa_gdf.empty:
+            # try:
+                # status_cb("Writing Visual Measurement layer...")
+                # qa_base_name = with_qa_suffix(base_name)
+                # qa_out = os.path.join(output_mode[1], f"{qa_base_name}.gpkg")
+                # _write_gpkg(qa_gdf, qa_out)
+                # vm_out = qa_out
+            # except Exception as e:
+                # print(f"⚠️ Could not write Visual Measurement layer for '{source_label}': {type(e).__name__}: {e}")
 
         return source_label, out, vm_out, outcome
 
@@ -4472,20 +4486,32 @@ def _process_one_source(
                     # status_cb(f"Updating database records: {done} / {total_rows}...", done, total_rows)
                 # print(f"⏱️ [{source_label}] CAMA_Table update ({total_rows} rows, batched): {time.perf_counter() - _t_cama_start:.2f}s")
 
-        # Visual Measurement layer -- best-effort, own separate write,
-        # deliberately NOT inside the transaction above (see this
-        # function's own docstring for why).
         vm_table = None
-        if not qa_gdf.empty:
-            try:
-                status_cb("Writing Visual Measurement layer...")
-                _t_vm_start = time.perf_counter()
-                qa_table = f"{table}_VM"
-                qa_gdf.to_postgis(qa_table, engine, schema=schema, if_exists="replace", index=False)
-                vm_table = qa_table
-                print(f"⏱️ [{source_label}] Visual Measurement layer write: {time.perf_counter() - _t_vm_start:.2f}s")
-            except Exception as e:
-                print(f"⚠️ Could not write Visual Measurement layer to DB for '{source_label}': {type(e).__name__}: {e}")
+        # ------------------------------------------------------------------
+        # Visual Measurement (VM) layer write -- DISABLED (commented out, not
+        # removed). Same per-task decision as the local-output equivalent
+        # above (see that block's comment for full reasoning): a successful
+        # Run Processing should always produce exactly ONE main output per
+        # parcel source. qa_gdf itself is still computed inside process()
+        # (unchanged) -- only this write is disabled. vm_table stays
+        # initialized to None above, so the return tuple's shape is
+        # unchanged and the existing `if vm_ref:` guard in run_processing()'s
+        # worker() continues to work exactly as before, just always taking
+        # the "no VM layer" path. This block was, and remains, deliberately
+        # OUTSIDE the `with engine.begin() as conn:` transaction above (best-
+        # effort, own separate write) -- untouched by this change; nothing
+        # about the CAMA_Table block immediately above this one is modified.
+        # ------------------------------------------------------------------
+        # if not qa_gdf.empty:
+            # try:
+                # status_cb("Writing Visual Measurement layer...")
+                # _t_vm_start = time.perf_counter()
+                # qa_table = f"{table}_VM"
+                # qa_gdf.to_postgis(qa_table, engine, schema=schema, if_exists="replace", index=False)
+                # vm_table = qa_table
+                # print(f"⏱️ [{source_label}] Visual Measurement layer write: {time.perf_counter() - _t_vm_start:.2f}s")
+            # except Exception as e:
+                # print(f"⚠️ Could not write Visual Measurement layer to DB for '{source_label}': {type(e).__name__}: {e}")
 
         return source_label, table, vm_table, outcome
 

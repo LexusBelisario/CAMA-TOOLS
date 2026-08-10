@@ -597,14 +597,34 @@ def run_cpu_parallel_with_progress(
             gdf = gdf.to_crs(original_crs)
         _write_gpkg(gdf, output_path)
 
-        if all_route_records:
-            routes_gdf = gpd.GeoDataFrame(all_route_records, crs=projected_crs)
-            routes_path = os.path.join(os.path.dirname(output_path), "poi_routes.gpkg")
-            if original_crs is not None:
-                routes_gdf = routes_gdf.to_crs(original_crs)
-            _write_gpkg(routes_gdf, routes_path)
-            print(f"ℹ️ Exported {len(routes_gdf)} route(s) with Road/Straight labels: {routes_path}")
-            return routes_path
+        # ------------------------------------------------------------------
+        # poi_routes.gpkg write -- DISABLED (commented out, not removed).
+        # Per-task decision to suppress this secondary/diagnostic-only
+        # routes/audit output so a successful Run Processing always
+        # produces exactly ONE output file per tool. all_route_records
+        # itself is still computed above (line 569's initialization, line
+        # 587's per-parcel .extend()) -- route_records is a byproduct of
+        # the same worker_process() loop that produces the main
+        # CAMA_{TYPE}{N}/CAMA_{TYPE}{N}_METHOD output columns -- only this
+        # write (and its own early `return routes_path`) is disabled.
+        # This function's existing `return None` immediately below (kept
+        # active, untouched) already covers every resulting code path: it
+        # was already the fallback whenever output_path was falsy (DB-
+        # output mode) or all_route_records was empty, and now it is the
+        # ONLY reachable return, since nothing above it can early-return
+        # anymore. The caller's existing `if routes_path:` guard (see
+        # run_cpu_parallel_with_progress()'s single call site) continues
+        # to work exactly as before, just always taking the "no routes
+        # layer" path.
+        # ------------------------------------------------------------------
+        # if all_route_records:
+            # routes_gdf = gpd.GeoDataFrame(all_route_records, crs=projected_crs)
+            # routes_path = os.path.join(os.path.dirname(output_path), "poi_routes.gpkg")
+            # if original_crs is not None:
+                # routes_gdf = routes_gdf.to_crs(original_crs)
+            # _write_gpkg(routes_gdf, routes_path)
+            # print(f"ℹ️ Exported {len(routes_gdf)} route(s) with Road/Straight labels: {routes_path}")
+            # return routes_path
     return None
 
 
