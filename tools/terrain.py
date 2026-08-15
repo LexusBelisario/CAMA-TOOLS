@@ -3,6 +3,7 @@ import re
 import math
 import pyproj
 os.environ["PROJ_LIB"] = pyproj.datadir.get_data_dir()
+os.environ["PROJ_DATA"] = pyproj.datadir.get_data_dir()
 
 import geopandas as gpd
 import rasterio
