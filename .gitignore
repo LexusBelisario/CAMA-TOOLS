@@ -41,13 +41,26 @@ dist/
 cache/
 
 # ------------------------------------------------------------------------------
-# Local Configuration Files
+# Local Configuration Files / Credentials
 # Target specific application state settings or credentials to avoid overwriting
 # other developers' configurations. Generic *.json tracking is permitted
 # unless explicitly ignored here.
+#
+# NOTE: patterns below with no leading/embedded slash already match at any
+# depth (e.g. also covers "other tools/pg_credentials.json",
+# "archive/other tools/pg_credentials.json", etc.). The explicit "**/" forms
+# are kept anyway for readability -- so nobody has to know gitignore's
+# no-slash-matches-anywhere rule to trust that nested copies are covered too.
+#
+# IMPORTANT: this rule only blocks *new* files from being tracked. If a copy
+# was already committed before this rule existed (or was force-added), it must
+# be explicitly untracked once with `git rm --cached <path>` -- .gitignore
+# alone will not remove something already in the index/history.
 # ------------------------------------------------------------------------------
 pg_credentials.json
+**/pg_credentials.json
 gm_exe_path.json
+**/gm_exe_path.json
 
 # ------------------------------------------------------------------------------
 # Editor / IDE Settings
