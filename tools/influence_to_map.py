@@ -1,3 +1,90 @@
+"""
+tools/influence_to_map.py
+
+PURPOSE:
+    CAMA Tools tool ("INFLUENCE TO MAP" in MAIN.py's dispatch table):
+    for each Land Parcel, finds the single nearest feature in a Fault
+    Line Map layer (Point, LineString, or Polygon geometry all
+    supported) and writes CAMA_FAULT_NAME and CAMA_FAULT_DISTANCE. The
+    nearest feature is always selected by true geometric proximity
+    (never a centroid/representative-point approximation); only the
+    reported distance's measurement method varies by the winning
+    feature's geometry type -- see process_parcels()'s own docstring
+    for the full Point/LineString-vs-Polygon distinction.
+
+DISPATCH:
+    Run as an isolated subprocess by MAIN.py via its `--tool` dispatch
+    mechanism (see system context). Entry point is main(), triggered via
+    the `if __name__ == "__main__":` guard at the bottom of this file.
+
+INPUTS:
+    Land Parcel source: one or more local vector files or PostGIS
+    tables.
+    Fault Line Map source: a single local vector file (with explicit
+    layer disambiguation for an ambiguous multi-layer GeoPackage -- see
+    resolve_local_fault_layer()) or a single PostGIS table.
+    pg_credentials.json (via load_db_credentials(), from
+    utils/db_discovery.py) -- always loaded up front by
+    run_processing(), even for an all-local run.
+
+OUTPUTS:
+    Local output mode: writes one atomically-written .gpkg per
+    processed Land Parcel source (_write_gpkg()), then attempts to open
+    it in Global Mapper (load_in_global_mapper()). A companion Visual
+    Measurement (VM) layer is computed but its write is currently
+    disabled -- see the "Visual Measurement (VM) layer write --
+    DISABLED" comment inside _process_one_source() for the full,
+    deliberately-preserved reasoning.
+    DB output mode: writes/replaces one PostGIS table per source,
+    resolved via resolve_db_output_table(). A companion CAMA_Table
+    write is also computed but currently disabled -- see the
+    "CAMA_Table write -- TEMPORARILY DISABLED" comment in the same
+    function.
+
+DEPENDENCIES:
+    stdlib: os, re, sys, time, json, threading, queue, subprocess,
+    ctypes, tkinter (+ ttk).
+    third-party: geopandas, numpy, psycopg2, sqlalchemy, shapely
+    (geometry, ops, strtree, validation), fiona (imported locally,
+    only where GeoPackage layer inspection is needed).
+    local: utils.table_name_matching, utils.resource_path,
+    utils.db_discovery, utils.column_detection, utils.window_icon,
+    tools.progress_framework.
+
+SIDE EFFECTS:
+    File reads/writes (.shp/.gpkg). PostGIS reads/writes. A live
+    PostgreSQL connection (loaded unconditionally by run_processing(),
+    even for an all-local run -- see that function's own docstring).
+    Tkinter GUI windows throughout, including a background thread +
+    queue.Queue-based polling loop for the main processing run. A
+    subprocess launch to Global Mapper (load_in_global_mapper()) on
+    local-output saves.
+
+    IMPORTANT -- this module has a genuine import-time side effect: the
+    module-level call to set_app_user_model_id() (see the "FORCE
+    WINDOWS APP ICON" section below) invokes the Win32
+    SetCurrentProcessExplicitAppUserModelID API the moment this file is
+    imported or run -- not lazily, not inside main(). This affects how
+    Windows groups/identifies this process's taskbar icon. Preserved
+    exactly as found -- not moved, deferred, or wrapped in a function --
+    since doing so would change when this Windows-level identification
+    happens, which is out of scope for a documentation/reorganization
+    task (see Section C of the governing instructions: no behavior
+    changes). Note this file's version wraps the API call in its own
+    try/except (unlike the bare call used in some other tool files) --
+    an existing, harmless difference, not something this pass changes.
+
+    KNOWN FOLLOW-UP (documented, not implemented here): GM_EXE_PATH
+    below is currently a hardcoded absolute path
+    ("C:\\Program Files\\GlobalMapper26.1_64bit\\global_mapper.exe").
+    The planned improvement is dynamic Global Mapper executable-path
+    discovery instead of a hardcoded constant. That discovery logic
+    (search locations, missing-executable handling, installation-
+    variant handling, fallback behavior) is a separate, deliberately-
+    scoped future task -- not implemented as part of this
+    documentation/reorganization pass, since it would change runtime
+    behavior.
+"""
 from __future__ import annotations
 import os
 import re
@@ -31,6 +118,9 @@ from utils.window_icon import apply_icon
 import ctypes
 
 
+# NOTE: import-time side effect -- this call executes the moment this
+# module is loaded, before main() runs (see module docstring SIDE
+# EFFECTS). Not moved or deferred; see module docstring for why.
 def set_app_user_model_id():
     appid = u"BLGF.CAMA.Tools.2025"
     try:
@@ -42,9 +132,17 @@ def set_app_user_model_id():
 set_app_user_model_id()
 
 
-# -------------------- CONFIG --------------------
+# ========================================
+# CONFIGURATION
+# ========================================
+# Hardcoded (current behavior). Planned improvement: dynamic Global
+# Mapper executable discovery. Actual implementation: separate future
+# task -- see module docstring SIDE EFFECTS for the full note.
 GM_EXE_PATH = r"C:\Program Files\GlobalMapper26.1_64bit\global_mapper.exe"
 
+# ========================================
+# RUNTIME STATE
+# ========================================
 # ------------------------------------------------------------------
 # Module-level selection state.
 #
@@ -89,7 +187,9 @@ VECTOR_FILETYPES = [
 OUTPUT_COLUMN_TARGETS = ("CAMA_FAULT_NAME", "CAMA_FAULT_DISTANCE")
 
 
-# -------------------- DB HELPERS --------------------
+# ========================================
+# DB HELPERS
+# ========================================
 def get_geom_column(engine, schema, table):
     """Detect the geometry column name from PostGIS system catalogs."""
     try:
@@ -124,7 +224,9 @@ def read_postgis_clean(table, engine, schema):
     return gdf
 
 
-# -------------------- FILE READING (PARCEL) --------------------
+# ========================================
+# FILE READING (PARCEL)
+# ========================================
 def read_vector_file(path: str) -> gpd.GeoDataFrame:
     """
     Reads a Land Parcel vector file (SHP or GPKG). Ported verbatim from
@@ -169,7 +271,9 @@ def get_local_name(path: str) -> str:
     return stem
 
 
-# -------------------- FILE READING (FAULT LINE MAP) --------------------
+# ========================================
+# FILE READING (FAULT LINE MAP)
+# ========================================
 def _list_gpkg_layers(path):
     import fiona
     return fiona.listlayers(path)
@@ -292,8 +396,14 @@ def read_fault_line_source(fault_source_tuple, engine=None, schema=None) -> gpd.
         return read_postgis_clean(table, engine, schema)
 
 
-# -------------------- GEOMETRY --------------------
+# ========================================
+# GEOMETRY
+# ========================================
 def ensure_geometry_column(gdf):
+    """Renames gdf's geometry column to "geometry" if it isn't already
+    (handles a "geom"-named column, or any other active geometry column
+    name), so downstream code can always assume the column is literally
+    called "geometry"."""
     if "geometry" not in gdf.columns and "geom" in gdf.columns:
         gdf = gdf.rename(columns={"geom": "geometry"}).set_geometry("geometry")
     elif gdf.geometry.name != "geometry":
@@ -341,7 +451,9 @@ def fix_geometry(geom, context_label=None):
         return None
 
 
-# -------------------- FAULT LINE NAME-FIELD DETECTION --------------------
+# ========================================
+# FAULT LINE NAME-FIELD DETECTION
+# ========================================
 # Deliberately NOT a call into influence_to_barangay.py's
 # detect_attr_name() -- that function's fallback chain ends in an
 # "ELEVATION" rule (designed for terrain/elevation influence layers)
@@ -381,7 +493,9 @@ def detect_fault_name_field(gdf, name_guess: str):
     return None
 
 
-# -------------------- PRS92 CRS ZONE DETECTION --------------------
+# ========================================
+# PRS92 CRS ZONE DETECTION
+# ========================================
 # Ported verbatim (table + function) from road_width.py.
 PRS92_ZONE_BOUNDS = [
     (-180.0, 118.0, 3121, "Zone I"),
@@ -435,7 +549,9 @@ def detect_prs92_zone(labeled_gdfs):
     raise ValueError(f"Could not determine PRS92 zone for longitude {center_lon}")
 
 
-# -------------------- OUTPUT-COLUMN CONFLICT DETECTION --------------------
+# ========================================
+# OUTPUT-COLUMN CONFLICT DETECTION
+# ========================================
 # Fixed target list -- OUTPUT_COLUMN_TARGETS -- same static-tuple
 # pattern as terrain.py's own OUTPUT_COLUMN_TARGETS, NOT
 # influence_to_barangay.py's dynamic per-source target list (that
@@ -465,9 +581,8 @@ def _check_parcel_output_conflicts(sources, source_type):
     influence_to_barangay.py's own... never a conflict-check failure")
     -- no longer safe now that the check runs at selection time,
     potentially long before Run is ever clicked (see the timeout/
-    failure-handling design notes for this change, and
-    group-05-cache-removal-analysis.md for the same reasoning already
-    applied to stale caching).
+    failure-handling design notes for this change -- the check must
+    always reflect a fresh read, never a cached result).
     """
     conflicts = []
     engine = None
@@ -507,7 +622,9 @@ def _check_parcel_output_conflicts(sources, source_type):
 parcel_output_column_overrides = {}
 
 
-# -------------------- MEASUREMENT ENGINE --------------------
+# ========================================
+# MEASUREMENT ENGINE
+# ========================================
 def process_parcels(parcel_gdf, fault_gdf, name_field, source_name,
                      progress_cb=None, output_column_map=None):
     """
@@ -678,7 +795,9 @@ def process_parcels(parcel_gdf, fault_gdf, name_field, source_name,
     return parcel_gdf, vm_gdf
 
 
-# -------------------- DB OUTPUT TABLE RESOLUTION --------------------
+# ========================================
+# DB OUTPUT TABLE RESOLUTION
+# ========================================
 def resolve_db_output_table(root, schema, parcel_src, desired_name):
     """
     Ported from influence_to_barangay.py's resolve_db_output_table(),
@@ -723,7 +842,9 @@ def resolve_db_output_table(root, schema, parcel_src, desired_name):
         return chosen, "overwritten"
 
 
-# -------------------- PROGRESS (Progress Event Protocol v9) --------------------
+# ========================================
+# PROGRESS WINDOW
+# ========================================
 from tools.progress_framework import (
     PresentationState,
     ProgressPresentationPolicy,
@@ -734,6 +855,13 @@ from tools.progress_framework import (
 class ProgressWindow:
     """Same shape as every other migrated tool's ProgressWindow."""
     def __init__(self, root, title="Processing"):
+        """
+        Creates and immediately shows the progress dialog.
+
+        Args:
+            root: the parent Tk/Toplevel window.
+            title (str): window title. Defaults to "Processing".
+        """
         self.win = tk.Toplevel(root)
         apply_icon(self.win, "distancefactor.ico")
         self.win.title(title)
@@ -757,17 +885,25 @@ class ProgressWindow:
         self._view = TkinterProgressView(self.win, self.status_var, self.progress)
 
     def switch_to_determinate(self, maximum):
+        """Switches the progress bar to determinate mode with the given
+        maximum, resetting its current value to 0."""
         self.progress.config(mode="determinate", maximum=maximum, value=0)
 
     def update(self, message, value=None, maximum=None):
+        """Updates the progress display via the shared
+        ProgressPresentationPolicy/TkinterProgressView (see class
+        docstring)."""
         state = self._policy.compute(message, value, maximum)
         self._view.render(state)
 
     def close(self):
+        """Closes the progress window."""
         self._view.destroy()
 
 
-# -------------------- LOCAL FILE WRITE HELPERS --------------------
+# ========================================
+# LOCAL FILE WRITE HELPERS
+# ========================================
 def _write_gpkg(gdf, out_path):
     """Atomic write: temp file, verified readable, then os.replace()."""
     tmp_path = out_path + ".tmp"
@@ -798,7 +934,9 @@ def with_vm_suffix(main_base_name: str) -> str:
     return f"{main_base_name}_VM"
 
 
-# -------------------- DIALOGS --------------------
+# ========================================
+# DIALOGS
+# ========================================
 def ask_overwrite_dialog(parent, conflicting_names):
     """
     Combined dialog shown ONCE, before any processing starts, when the
@@ -1051,6 +1189,24 @@ def choose_db_overwrite_dialog(parent, candidates):
 
 
 def show_success_dialog(root, total, failed_sources, single_success_detail):
+    """
+    Shows the final outcome dialog after all Land Parcel sources have
+    been processed: a warning listing per-source failures if any
+    occurred, otherwise a plain success message (using
+    single_success_detail's more specific text when exactly one source
+    was processed, or a generic "all N processed" message otherwise).
+
+    Args:
+        root: unused directly (messagebox calls use no explicit parent
+        here); kept for signature consistency with this file's other
+        dialog functions.
+        total (int): total number of sources attempted.
+        failed_sources (list[tuple[str, str]]): (source_label, reason)
+        pairs for any source that raised during processing.
+        single_success_detail (str | None): a more specific success
+        message to show when total == 1 and it succeeded; ignored
+        otherwise.
+    """
     if failed_sources:
         lines = "\n".join(f"  • {name}: {reason}" for name, reason in failed_sources)
         messagebox.showwarning(
@@ -1064,9 +1220,22 @@ def show_success_dialog(root, total, failed_sources, single_success_detail):
         messagebox.showinfo("Success", f"All {total} source(s) processed successfully.")
 
 
+# ========================================
+# GLOBAL MAPPER
+# ========================================
 def load_in_global_mapper(path):
     """Best-effort launch. Never blocks or raises -- a failure here
-    must never be treated as a processing failure."""
+    must never be treated as a processing failure.
+
+    Notes:
+        GM_EXE_PATH is currently a hardcoded absolute path (see
+        CONFIGURATION section above and the module docstring's SIDE
+        EFFECTS note) -- dynamic executable discovery is a planned,
+        separately-scoped future improvement, not implemented here.
+        Unlike other tool files' load_in_global_mapper(), this version
+        does not attempt to find/focus an already-open Global Mapper
+        window first -- it always launches a new subprocess.
+    """
     try:
         if os.path.exists(GM_EXE_PATH):
             subprocess.Popen([GM_EXE_PATH, path], shell=False)
@@ -1077,10 +1246,15 @@ def load_in_global_mapper(path):
 
 
 def _translate_exception(e, source_label):
+    """Formats an exception as "ExceptionType: message" for display in
+    the failed-sources list (source_label is accepted for signature
+    consistency but not currently used in the formatted text)."""
     return f"{type(e).__name__}: {e}"
 
 
-# -------------------- SINGLE-SOURCE PROCESSING --------------------
+# ========================================
+# SINGLE-SOURCE PROCESSING
+# ========================================
 def _process_one_source(
     source_id, is_db_source, fault_gdf, name_field, engine, schema,
     output_mode, overwrite_mode, output_column_overrides,
@@ -1311,12 +1485,37 @@ def _process_one_source(
         return source_label, table, vm_table, outcome
 
 
-# -------------------- RUN_PROCESSING (background thread) --------------------
+# ========================================
+# RUN PROCESSING
+# ========================================
 def run_processing(app_root, overwrite_mode=None, per_source_resolution=None):
     """
-    per_source_resolution: {source_id: (resolved_table_name, resolved_outcome)}
-    -- resolved once, up front, per Land Parcel source, on the main
-    thread, BEFORE win.destroy() -- see on_run()'s PRIORITY 3.
+    Orchestrates the full run on a background thread (worker(), defined
+    below): loads DB credentials unconditionally (even for an all-local
+    run -- see Args), loads the Fault Line Map once, then for each
+    selected Land Parcel source runs process_parcels() (via
+    _process_one_source()) and saves the result either locally (.gpkg,
+    optionally opened in Global Mapper) or to PostGIS.
+
+    Args:
+        app_root: parent Tk window for the ProgressWindow and any
+        dialogs.
+        overwrite_mode (str | None): "overwrite" or "new", from
+        ask_overwrite_dialog() in on_run() -- only relevant for local
+        output mode.
+        per_source_resolution: {source_id: (resolved_table_name, resolved_outcome)}
+        -- resolved once, up front, per Land Parcel source, on the main
+        thread, BEFORE win.destroy() -- see on_run()'s PRIORITY 3.
+
+    Notes:
+        DB credentials are loaded and an engine created unconditionally
+        at the top of this function, even when output_mode is "local"
+        -- this appears to be because read_postgis_clean() and a
+        DB-sourced parcel/fault read both need a live engine regardless
+        of where output ultimately goes. If credentials are missing,
+        this function returns early (showing whatever error
+        load_db_credentials() itself raises) even for an otherwise
+        all-local run.
     """
     global parcel_source, fault_source, output_mode, parcel_output_column_overrides
 
@@ -1343,6 +1542,14 @@ def run_processing(app_root, overwrite_mode=None, per_source_resolution=None):
     q = queue.Queue()
 
     def worker():
+        """
+        Background-thread body: loads the Fault Line Map once, then for
+        each selected Land Parcel source calls _process_one_source()
+        (which itself calls process_parcels() and writes output),
+        posting progress/status/completion/error events onto q for the
+        main thread's queue-polling loop to consume. Never touches
+        Tkinter widgets directly.
+        """
         try:
             q.put(("update", "Loading Fault Line Map...", None, None))
             try:
@@ -1439,6 +1646,13 @@ def run_processing(app_root, overwrite_mode=None, per_source_resolution=None):
                 print(f"⚠️ Could not cleanly dispose of the database engine: {e}")
 
     def poll_queue():
+        """
+        Main-thread poller (scheduled via app_root.after(100, ...)):
+        drains q and updates the progress dialog, opens the result in
+        Global Mapper, or shows the final success/error dialog and
+        stops polling, depending on the event kind. All Tkinter calls
+        happen here, never inside worker() itself.
+        """
         try:
             while True:
                 msg = q.get_nowait()
@@ -1469,7 +1683,9 @@ def run_processing(app_root, overwrite_mode=None, per_source_resolution=None):
     poll_queue()
 
 
-# -------------------- GUI --------------------
+# ========================================
+# MAIN WINDOW
+# ========================================
 def _pick_db_tables(parent, tables, multi, on_select):
     """
     Modal single/multi table picker, ported verbatim (structure and
@@ -1503,6 +1719,22 @@ def _pick_db_tables(parent, tables, multi, on_select):
 
 
 def open_main_window(root):
+    """
+    Builds and shows the tool's single unified configuration window:
+    Land Parcel and Fault Line Map source pickers (each with a
+    Local-file/Database-table radio toggle), an Output destination
+    picker, and a Run button gated by _update_run_button_state().
+
+    The Land Parcel picker additionally runs a background,
+    detect-on-select check (_refresh_parcel_output_check(), via a
+    daemon thread + win.after()-polled queue.Queue) for existing
+    OUTPUT_COLUMN_TARGETS columns, the moment a file/table is selected
+    or the Local/Database toggle changes -- not only when Run is
+    clicked.
+
+    Args:
+        root: the parent Tk root this window is opened under.
+    """
     from tkinter import ttk
 
     win = tk.Toplevel(root)
@@ -1547,8 +1779,8 @@ def open_main_window(root):
     # matching the pattern established in lot_location.py/road_width.py/
     # road_frontage.py/road_density.py/road_surface.py. Deliberately does
     # NOT cache the result across calls -- every selection AND every
-    # Local/Database toggle triggers a fresh read (see
-    # group-05-cache-removal-analysis.md). What IS still remembered per
+    # Local/Database toggle triggers a fresh read -- never a cached
+    # result. What IS still remembered per
     # mode is only WHICH file/table is selected (parcel_local_path /
     # parcel_db_table above), a separate concern. Multi-target (2
     # targets, OUTPUT_COLUMN_TARGETS): each conflict entry is
@@ -1760,8 +1992,8 @@ def open_main_window(root):
 
         Deliberately does NOT cache the result across calls -- every
         call, whether triggered by a fresh Browse/Select or by toggling
-        Local <-> Database, always performs a real read. See
-        group-05-cache-removal-analysis.md for the full reasoning. What
+        Local <-> Database, always performs a real read, never a
+        cached result. What
         IS still remembered across calls is only WHICH file/table is
         selected per mode (parcel_local_path / parcel_db_table) -- a
         separate concern, untouched by this function.
@@ -1848,8 +2080,7 @@ def open_main_window(root):
         # Switching Local <-> Database does NOT clear the other mode's
         # remembered selection -- that's pre-existing behavior, left
         # untouched. Always re-checks fresh for whichever mode is now
-        # active -- no cached result is ever restored (see
-        # group-05-cache-removal-analysis.md).
+        # active -- no cached result is ever restored.
         _refresh_parcel_output_check()
         _update_run_button_state()
 
@@ -1986,6 +2217,17 @@ def open_main_window(root):
 
     # ---------------- Run ----------------
     def on_run():
+        """
+        Run button handler: validates Land Parcel + Fault Line Map +
+        Output selections are present, consults the already-known
+        background column-conflict result (PRIORITY 1 -- see
+        _refresh_parcel_output_check()), runs the local output-file
+        conflict check (PRIORITY 2), and per-source DB-output table
+        resolution (PRIORITY 3) -- each able to cancel the whole run --
+        then destroys this window and hands off to run_processing().
+        Sets the module-level parcel_source, fault_source, output_mode,
+        and parcel_output_column_overrides globals on success.
+        """
         nonlocal parcel_local_path, parcel_db_table, fault_local_path, fault_local_layer, fault_db_table
         global parcel_source, fault_source, output_mode, parcel_output_column_overrides
 
@@ -2112,10 +2354,9 @@ def open_main_window(root):
 
         if parcel_is_reading:
             # Land Parcel existing-column check is still in flight --
-            # never allow Run while its result is not yet known (see
-            # Section 6's read-outcome invariant, group-05-FINAL-PLAN.md
-            # -- an in-progress check must never be silently treated as
-            # "no conflict").
+            # never allow Run while its result is not yet known -- an
+            # in-progress check must never be silently treated as
+            # "no conflict".
             checking_name = (
                 os.path.basename(parcel_local_path) if parcel_source_type.get() == "local"
                 else parcel_db_table
@@ -2161,8 +2402,20 @@ def open_main_window(root):
     _update_run_button_state()
 
 
-# -------------------- MAIN --------------------
+# ========================================
+# MAIN / ENTRYPOINT
+# ========================================
 def main(parent=None):
+    """
+    Tool entry point. If parent is given (invoked from within another
+    running Tk app), reuses it and just opens this tool's window.
+    Otherwise creates and hides a new Tk root, applies this tool's icon,
+    and enters its own mainloop -- the standalone-subprocess dispatch
+    path.
+
+    Args:
+        parent: an existing Tk root to reuse, or None to create one.
+    """
     if parent is not None:
         open_main_window(parent)
     else:

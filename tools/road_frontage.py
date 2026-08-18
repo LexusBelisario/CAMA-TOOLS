@@ -1,19 +1,117 @@
+"""
+tools/road_frontage.py
+
+PURPOSE:
+    CAMA Tools tool ("ROAD FRONTAGE & DEPTH-TO-WIDTH RATIO" in
+    MAIN.py's dispatch table): for each Land Parcel, measures the
+    parcel's road frontage (the length of parcel boundary running
+    along an adjacent Road Network segment), depth (a derived measure
+    perpendicular to that frontage), and depth-to-width ratio, writing
+    CAMA_ROAD_FRONTAGE, CAMA_DEPTH, and CAMA_DEPTH_WIDTH_RATIO (or
+    existing differently-cased columns, if detected and confirmed at
+    Run time -- see parcel_output_column_overrides below). Supports an
+    optional Road Type exclusion filter and an optional per-source Lot
+    Location/Lot Label classification pass (see the "Road
+    Classification" runtime-state block below), which are mutually
+    exclusive with each other at the GUI level.
+
+DISPATCH:
+    Run as an isolated subprocess by MAIN.py via its `--tool` dispatch
+    mechanism (see system context). Entry point is main(), triggered via
+    the `if __name__ == "__main__":` guard at the bottom of this file.
+
+INPUTS:
+    Land Parcel source: one or more local files or PostGIS tables.
+    Road Network source: a single local file or PostGIS table.
+    pg_credentials.json (via load_db_credentials(), from
+    utils/db_discovery.py) for any DB source or DB output.
+
+OUTPUTS:
+    Local output mode: writes one atomically-written .gpkg per
+    processed Land Parcel source, then attempts to open it in Global
+    Mapper (via load_in_global_mapper()-equivalent logic in this
+    file's GPKG overwrite safety / Global Mapper handling). An optional
+    QA layer (emit_buffer_qa) can additionally write diagnostic buffer
+    geometry for visual debugging of the frontage measurement
+    algorithm.
+    DB output mode: writes/replaces one PostGIS table per source,
+    resolved via resolve_db_output_table() -- an exact-match replace for
+    a DB Land Parcel source, or a fuzzy-match-with-confirmation flow
+    (confirm_db_overwrite_dialog() / choose_db_overwrite_dialog()) for a
+    local-file Land Parcel source.
+
+DEPENDENCIES:
+    stdlib: os, re, math, subprocess, json, ctypes, sys, tkinter (+
+    ttk).
+    third-party: geopandas, pandas, numpy, shapely (geometry, ops,
+    strtree, validation), sqlalchemy, psycopg2.
+    local: utils.table_name_matching, utils.resource_path,
+    utils.db_discovery, utils.column_detection, utils.window_icon,
+    tools.progress_framework (imported mid-file, directly above the
+    class/function that uses it -- see the Progress Event Protocol v9
+    comment block further below).
+
+SIDE EFFECTS:
+    File reads/writes (.shp/.gpkg). PostGIS reads/writes. A live
+    PostgreSQL connection. Tkinter GUI windows throughout, including
+    TWO independent background-thread + queue.Queue-based detect-on-
+    select systems in open_main_window() -- one for Land Parcel
+    existing-output-column detection, one for Road Network road-type/
+    classification reading (cached in _road_gdf_cache and reused by
+    run_processing() if the same source is still selected) -- plus a
+    third background thread + queue.Queue for the main processing run.
+    A subprocess launch to Global Mapper on local-output saves.
+
+    IMPORTANT -- this module has TWO separate, genuine import-time side
+    effects:
+
+    1. The "GeoPandas compatibility shim" (see that section below):
+       if the installed geopandas version's GeoSeries class lacks
+       from_bbox, this module monkey-patches one onto it at import
+       time. This mutates a third-party library class, not just this
+       module's own state -- order-dependent only on `import geopandas
+       as gpd` already having executed. Preserved exactly as found.
+
+    2. The module-level call to set_app_user_model_id() (see "FORCE
+       WINDOWS APP ICON" below) invokes the Win32
+       SetCurrentProcessExplicitAppUserModelID API the moment this
+       file is imported or run -- not lazily, not inside main(). This
+       affects how Windows groups/identifies this process's taskbar
+       icon.
+
+    Both are preserved exactly as found -- not moved, deferred, or
+    wrapped in a function -- since doing so would change when these
+    effects happen, which is out of scope for a documentation/
+    reorganization task (see Section C of the governing instructions:
+    no behavior changes).
+
+    KNOWN FOLLOW-UP (documented, not implemented here): GM_EXE_PATH
+    below is currently a hardcoded absolute path
+    ("C:\\Program Files\\GlobalMapper26.1_64bit\\global_mapper.exe").
+    The planned improvement is dynamic Global Mapper executable-path
+    discovery instead of a hardcoded constant. That discovery logic
+    (search locations, missing-executable handling, installation-
+    variant handling, fallback behavior) is a separate, deliberately-
+    scoped future task -- not implemented as part of this
+    documentation/reorganization pass, since it would change runtime
+    behavior.
+"""
 import os
 import re
-import tkinter as tk
-from tkinter import filedialog, messagebox, Listbox, ttk, StringVar
-import geopandas as gpd
-import pandas as pd
-import numpy as np
-from shapely.geometry import LineString, MultiLineString, Point
-from shapely.ops import unary_union, nearest_points, linemerge
-from shapely.strtree import STRtree
 import math
 import subprocess
 import json
-from sqlalchemy import create_engine, inspect, text
+import tkinter as tk
+from tkinter import filedialog, messagebox, Listbox, ttk, StringVar
+
+import geopandas as gpd
+import pandas as pd
+import numpy as np
+from shapely.geometry import LineString, MultiLineString, Point, box
+from shapely.ops import unary_union, nearest_points, linemerge
+from shapely.strtree import STRtree
 from shapely.validation import make_valid
-from shapely.geometry import box
+from sqlalchemy import create_engine, inspect, text
 import psycopg2
 
 from utils.table_name_matching import normalize_name, find_matching_tables
@@ -25,6 +123,10 @@ from utils.window_icon import apply_icon
 # =========================
 # GeoPandas compatibility shim
 # =========================
+# NOTE: import-time side effect -- monkey-patches geopandas.GeoSeries
+# the moment this module is loaded, if the installed version lacks
+# from_bbox (see module docstring SIDE EFFECTS). Not moved or
+# deferred; see module docstring for why.
 if not hasattr(gpd.GeoSeries, "from_bbox"):
     from shapely.geometry import box
 
@@ -40,6 +142,9 @@ if not hasattr(gpd.GeoSeries, "from_bbox"):
 import ctypes
 import sys
 
+# NOTE: import-time side effect -- this call executes the moment this
+# module is loaded, before main() runs (see module docstring SIDE
+# EFFECTS). Not moved or deferred; see module docstring for why.
 def set_app_user_model_id():
     appid = u"BLGF.CAMA.Tools.2025"
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(appid)
@@ -47,9 +152,17 @@ def set_app_user_model_id():
 set_app_user_model_id()
 
 
-# ========================= CONFIG =========================
+# ========================================
+# CONFIGURATION
+# ========================================
+# Hardcoded (current behavior). Planned improvement: dynamic Global
+# Mapper executable discovery. Actual implementation: separate future
+# task -- see module docstring SIDE EFFECTS for the full note.
 GM_EXE_PATH = r"C:\Program Files\GlobalMapper26.1_64bit\global_mapper.exe"
 
+# ========================================
+# RUNTIME STATE
+# ========================================
 barangay_source = None
 road_source = None
 output_mode = None
@@ -121,9 +234,8 @@ overwrite_mode = None
 parcel_output_column_overrides = {}
 
 # _road_gdf_cache: last-successful-read snapshot, one independent slot
-# for "local" and one for "db". Scope narrowed (2026-08, see
-# group-05-cache-removal-analysis.md): this NO LONGER skips a fresh
-# read on toggle/selection -- _refresh_road_classification() always
+# for "local" and one for "db". Scope narrowed (2026-08): this NO
+# LONGER skips a fresh read on toggle/selection -- _refresh_road_classification() always
 # performs a real background read every time it's called, so the UI-
 # facing checklist is never served a stale result. What THIS cache
 # still exists for: run_processing() re-reading the same source at Run
@@ -150,7 +262,7 @@ _road_gdf_cache = {
 }
 
 # Land Parcel Source: deliberately does NOT cache detection results
-# across selections/toggles (see group-05-cache-removal-analysis.md) --
+# across selections/toggles --
 # a cache keyed only on "which file/table was selected" cannot detect
 # that the file/table's CONTENTS changed externally (e.g. another CAMA
 # tool, QGIS, or Global Mapper modifying it) between one selection and
@@ -158,7 +270,9 @@ _road_gdf_cache = {
 # fresh read instead -- see _refresh_parcel_classification() below.
 
 
-# ========================= CRS UTILITY =========================
+# ========================================
+# CRS UTILITY
+# ========================================
 # PRS92 zones are non-overlapping 2-degree longitude bands (EPSG registry):
 #   Zone I   (3121): west of 118°E
 #   Zone II  (3122): 118°E – 120°E  (Palawan, Calamian Islands)
@@ -267,6 +381,9 @@ def detect_prs92_zone(labeled_gdfs):
 
 
 def fix_geometry(geom):
+    """Repairs an invalid geometry via buffer(0), falling back to
+    make_valid() if that isn't enough. Returns None for a None, empty,
+    or unrepairable geometry."""
     if geom is None or geom.is_empty:
         return None
     try:
@@ -294,7 +411,9 @@ import time
 from shapely.prepared import prep
 
 
-# ========================= MINIMUM FRONTAGE THRESHOLD =========================
+# ========================================
+# MINIMUM FRONTAGE THRESHOLD
+# ========================================
 # MIN_FRONTAGE_THRESHOLD: a computed ROAD_FRONTAGE of this many meters or less
 # is NOT treated as genuine road frontage. This is a separate, deliberate
 # task from the Road Classification feature above/below it in this file --
@@ -327,7 +446,9 @@ from shapely.prepared import prep
 MIN_FRONTAGE_THRESHOLD = 0.9
 
 
-# ========================= FRONTAGE BUFFER TOLERANCE (EXPERIMENT) =========================
+# ========================================
+# FRONTAGE BUFFER TOLERANCE (EXPERIMENT)
+# ========================================
 # FRONTAGE_BUFFER_TOLERANCE: the buffer distance (in meters) _edge_covered_portion()
 # uses around each boundary segment when deciding whether a road counts as
 # "near" that segment at all. This is the SAME "tol" parameter that was
@@ -351,7 +472,9 @@ MIN_FRONTAGE_THRESHOLD = 0.9
 FRONTAGE_BUFFER_TOLERANCE = 9
 
 
-# ========================= PARALLEL-VALIDATION ALGORITHM =========================
+# ========================================
+# PARALLEL-VALIDATION ALGORITHM
+# ========================================
 # This replaces the earlier proximity-only frontage detection
 # (_edge_covered_portion(), now removed) with a three-stage pipeline:
 # candidate detection (buffer, unchanged) -> parallel validation (NEW) ->
@@ -388,7 +511,9 @@ PARALLEL_ANGLE_THRESHOLD = 25  # degrees
 ROAD_DENSIFY_INTERVAL = 1.0  # meters
 
 
-# ========================= TWO-STAGE GATE+MEASURE (EXPERIMENT, NOT VALIDATED) =========================
+# ========================================
+# TWO-STAGE GATE+MEASURE (EXPERIMENT, NOT VALIDATED)
+# ========================================
 # TWO_STAGE_FRONTAGE_ENABLED: when True, process_frontage_single() uses a
 # two-stage tolerance instead of a single FRONTAGE_BUFFER_TOLERANCE:
 #   Stage 1 (TWO_STAGE_GATE_TOLERANCE): a strict, narrow gate -- if NO
@@ -429,7 +554,9 @@ TWO_STAGE_GATE_TOLERANCE = 5
 TWO_STAGE_MEASURE_TOLERANCE = 9
 
 
-# ========================= CROSS-PARCEL CONFLICT RESOLUTION =========================
+# ========================================
+# CROSS-PARCEL CONFLICT RESOLUTION
+# ========================================
 # CROSS_PARCEL_CONFLICT_RESOLUTION_ENABLED: the existing per-segment
 # frontage algorithm (above) is entirely PER-PARCEL -- it has zero
 # awareness of any OTHER parcel's boundary or its own frontage claim.
@@ -487,7 +614,9 @@ CROSS_PARCEL_CONFLICT_RESOLUTION_ENABLED = True
 CROSS_PARCEL_CONFLICT_TOLERANCE = FRONTAGE_BUFFER_TOLERANCE
 
 
-# ========================= ROAD TYPE FILTER UTILITIES =========================
+# ========================================
+# ROAD TYPE FILTER UTILITIES
+# ========================================
 # ROAD_TYPE_COLUMN_CANDIDATES: case-insensitive column-name aliases used to
 # locate a road-classification column in a user-supplied road layer.
 # Copied verbatim from lot_location.py (the canonical implementation of
@@ -509,7 +638,9 @@ def _detect_road_type_column(gdf):
     )
 
 
-# ========================= LOT CLASSIFICATION UTILITIES =========================
+# ========================================
+# LOT CLASSIFICATION UTILITIES
+# ========================================
 # LOT_LOCATION_COLUMN_CANDIDATES: case-insensitive column-name alias for
 # lot_location.py's single output column.
 #
@@ -540,7 +671,9 @@ LOT_STATE_UNUSABLE = "unusable"     # column present but no usable values
 LOT_STATE_FOUND = "found"           # a usable column was found
 
 
-# ========================= EXISTING OUTPUT-COLUMN CONFLICT DETECTION =========================
+# ========================================
+# EXISTING OUTPUT-COLUMN CONFLICT DETECTION
+# ========================================
 # OUTPUT_COLUMN_TARGETS: this tool's three output column names, checked
 # for pre-existing conflicts in a selected Land Parcel source (see the
 # merged background read in _refresh_parcel_classification() below, and
@@ -757,7 +890,9 @@ def _all_linestrings(geom):
     return []
 
 
-# ========================= OUTPUT FILENAME CONFLICT HANDLING =========================
+# ========================================
+# OUTPUT FILENAME CONFLICT HANDLING
+# ========================================
 # Ported directly from road_width.py's canonical pattern (see that file's
 # resolve_output_base_name() / with_qa_suffix() for the original,
 # validated implementation this is copied from). Business decisions
@@ -841,7 +976,9 @@ def with_output_suffix(main_base_name: str, suffix: str) -> str:
     return f"{main_base_name}_{suffix}"
 
 
-# ========================= GPKG OVERWRITE SAFETY =========================
+# ========================================
+# GPKG OVERWRITE SAFETY
+# ========================================
 def _write_gpkg(gdf, path):
     """
     Writes a GeoDataFrame to a .gpkg file, atomically.
@@ -902,11 +1039,20 @@ def _write_gpkg(gdf, path):
 
 
 def open_in_global_mapper(output_path):
+    """Opens output_path in Global Mapper (subprocess), if both
+    GM_EXE_PATH and output_path exist. Simpler than other tool files'
+    load_in_global_mapper() (no EnumWindows focus-existing-window
+    step). GM_EXE_PATH is currently hardcoded -- see CONFIGURATION
+    section above and the module docstring's SIDE EFFECTS note for the
+    planned dynamic-discovery follow-up."""
     if os.path.exists(GM_EXE_PATH) and os.path.exists(output_path):
         subprocess.Popen([GM_EXE_PATH, output_path], shell=True)
 
 
 def split_boundary_to_segments(boundary):
+    """Splits a LineString or MultiLineString boundary into individual
+    2-point LineString segments (one per consecutive coordinate pair),
+    for per-segment frontage testing against the road network."""
     segments = []
     if boundary.geom_type == 'LineString':
         coords = list(boundary.coords)
@@ -1073,6 +1219,8 @@ def _edge_covered_pieces(seg, road_union, tol=FRONTAGE_BUFFER_TOLERANCE,
 
 
 def calculate_centroid_to_road_depth(parcel_geom, road_gdf):
+    """Fallback depth measure: straight-line distance from the
+    parcel's centroid to the nearest point on any road in road_gdf."""
     centroid = parcel_geom.centroid
     min_distance = float("inf")
     for road in road_gdf.geometry:
@@ -1084,6 +1232,24 @@ def calculate_centroid_to_road_depth(parcel_geom, road_gdf):
 
 
 def calculate_depth_perpendicular(parcel_geom, road_buffer, max_depth=1000):
+    """
+    Primary depth measure: finds the parcel boundary's longest segment
+    that falls within road_buffer (the frontage segment), then casts a
+    perpendicular line from its midpoint into the parcel (in both
+    directions, keeping whichever intersects the parcel more) up to
+    max_depth, and returns the length of that line's intersection with
+    the parcel -- an approximation of "how deep" the parcel extends
+    back from its road frontage.
+
+    Args:
+        parcel_geom: the parcel polygon.
+        road_buffer: buffered road geometry defining the frontage zone.
+        max_depth (float): maximum perpendicular probe length.
+
+    Returns:
+        float: the perpendicular depth, or 0 if no frontage segment is
+        found or the probe line doesn't intersect the parcel.
+    """
     boundary = parcel_geom.boundary
     segments = split_boundary_to_segments(boundary)
     frontage_segments = [seg for seg in segments if seg.within(road_buffer)]
@@ -1120,8 +1286,22 @@ def calculate_depth_perpendicular(parcel_geom, road_buffer, max_depth=1000):
         return 0
 
 
-# ========================= DB HELPERS =========================
+# ========================================
+# DB HELPERS
+# ========================================
 def get_geometry_column(table_name, engine, schema):
+    """
+    Looks up the geometry column name for a PostGIS table via the
+    geometry_columns system view.
+
+    Args:
+        table_name (str): the table to look up.
+        engine: a SQLAlchemy engine.
+        schema (str): the schema the table lives in.
+
+    Returns:
+        str | None: the geometry column name, or None if not found.
+    """
     try:
         with engine.connect() as conn:
             result = conn.execute(text("""
@@ -1135,6 +1315,20 @@ def get_geometry_column(table_name, engine, schema):
 
 
 def read_postgis_clean(table, engine, schema):
+    """
+    Reads a PostGIS table into a GeoDataFrame with a single, consistently
+    named "geometry" column, regardless of what the table's actual
+    geometry column is called.
+
+    Args:
+        table (str): table name to read.
+        engine: a SQLAlchemy engine.
+        schema (str): the schema the table lives in.
+
+    Returns:
+        geopandas.GeoDataFrame: the table's contents, with the geometry
+        column renamed to "geometry".
+    """
     geom_col = get_geometry_column(table, engine, schema)
     insp = inspect(engine)
     cols = [c['name'] for c in insp.get_columns(table, schema=schema) if c['name'] != geom_col]
@@ -1146,7 +1340,9 @@ def read_postgis_clean(table, engine, schema):
     return gpd.read_postgis(query, engine, geom_col="geometry")
 
 
-# ========================= PROGRESS WINDOW =========================
+# ========================================
+# PROGRESS WINDOW
+# ========================================
 # ============================================================
 # Progress Event Protocol v9 — Phase 4 migration (road_frontage.py)
 # ============================================================
@@ -1236,11 +1432,44 @@ def clip_roads_to_parcels(road_gdf, parcel_gdf, pad=50):
 
 
 
-# ========================= FRONTAGE PROCESSING =========================
+# ========================================
+# FRONTAGE PROCESSING
+# ========================================
 def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, classification=None,
                              emit_buffer_qa=False,
                              road_frontage_col="CAMA_ROAD_FRONTAGE", depth_col="CAMA_DEPTH",
                              dwr_col="CAMA_DEPTH_WIDTH_RATIO"):
+    """
+    Core measurement engine: for each parcel, computes road frontage
+    (via split_boundary_to_segments() + buffer-intersection against
+    the road network), depth (calculate_depth_perpendicular(), falling
+    back to calculate_centroid_to_road_depth() when no frontage segment
+    is found), and depth-to-width ratio, writing the three results into
+    road_frontage_col/depth_col/dwr_col.
+
+    Args:
+        brgy_gdf (geopandas.GeoDataFrame): parcels to process.
+        road_gdf (geopandas.GeoDataFrame): road network layer.
+        source_name (str): label used in progress/log messages only.
+        progress (callable, optional): progress(message, value=None,
+        maximum=None), called during the per-parcel loop.
+        classification (dict, optional): per-parcel Lot Location/Lot
+        Label classification values, if the optional Road
+        Classification feature is active for this source (see the
+        module docstring and the RUNTIME STATE section above).
+        emit_buffer_qa (bool): if True, also returns diagnostic buffer
+        geometry layers for visual debugging of the measurement itself
+        -- a separate, unrelated concern from Road Classification.
+        road_frontage_col, depth_col, dwr_col (str): exact output
+        column names to write into -- see the preserved comment below
+        for why these default to the standard CAMA_-prefixed names but
+        can be overridden per-source.
+
+    Returns:
+        dict with the processed GeoDataFrame and, if emit_buffer_qa is
+        True, additional QA layer GeoDataFrames -- see the "qa_layers"
+        key in the return statement below for the exact shape.
+    """
     # road_frontage_col / depth_col / dwr_col: the exact column names to
     # write the three computed outputs into. Default to the standard
     # CAMA_-prefixed names -- cross-tool standard (see
@@ -1934,6 +2163,9 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
     }
 
 
+# ========================================
+# DB OUTPUT RESOLUTION
+# ========================================
 def resolve_db_output_table(root, schema, barangay_source):
     """
     Determines the DB-output destination table for the Land Parcel
@@ -1984,8 +2216,27 @@ def resolve_db_output_table(root, schema, barangay_source):
         return chosen, "overwritten"
 
 
-# ========================= MAIN PROCESS =========================
+# ========================================
+# MAIN PROCESS
+# ========================================
 def run_processing(app_root, resolved_table_name=None):
+    """
+    Orchestrates the full run on a background thread with progress
+    reported via a queue.Queue: loads the Road Network layer once,
+    then for each selected Land Parcel source runs
+    process_frontage_single() (with the module-level overwrite_mode,
+    emit_buffer_qa, and parcel_output_column_overrides settings
+    already resolved by on_run() before this was called) and saves the
+    result either locally (.gpkg, optionally opened in Global Mapper,
+    with optional QA layers) or to PostGIS.
+
+    Args:
+        app_root: the live top-level window, used as the parent for
+        the ProgressWindow and any dialogs.
+        resolved_table_name (str | None): the already-confirmed DB
+        output table name from resolve_db_output_table() in on_run() --
+        only relevant for DB output mode.
+    """
     global barangay_source, road_source, output_mode, overwrite_mode, parcel_output_column_overrides
     if not barangay_source or not road_source or not output_mode:
         messagebox.showerror("Error", "Selections incomplete (Barangay, Road, Output required).")
@@ -2252,8 +2503,21 @@ def run_processing(app_root, resolved_table_name=None):
     poll_queue()
 
 
-# ========================= MAIN APP =========================
+# ========================================
+# DB TABLE PICKER
+# ========================================
 def _pick_db_tables(parent, tables, multi, on_select):
+    """
+    Simple modal listbox dialog for picking one (multi=False) or more
+    (multi=True) table names from `tables`. Calls on_select(selection)
+    and closes itself once the user confirms a non-empty selection.
+
+    Args:
+        parent: parent Tk window.
+        tables (list[str]): table names to list.
+        multi (bool): whether multiple selection is allowed.
+        on_select (callable): called with the list of selected names.
+    """
     picker = tk.Toplevel(parent)
     apply_icon(picker, "roadfrontage.ico")
     picker.title("Select Table(s)")
@@ -2276,6 +2540,9 @@ def _pick_db_tables(parent, tables, multi, on_select):
               width=20).pack(pady=(0, 10))
 
 
+# ========================================
+# OVERWRITE DIALOGS
+# ========================================
 def ask_overwrite_dialog(parent, conflicting_names):
     """
     Combined dialog shown ONCE, before any processing starts, when one or
@@ -2628,7 +2895,31 @@ def choose_db_overwrite_dialog(parent, candidates):
     return result["chosen"]
 
 
+# ========================================
+# MAIN WINDOW
+# ========================================
 def open_main_window(root):
+    """
+    Builds and shows the tool's single unified configuration window:
+    Land Parcel and Road Network source pickers (each with a
+    Local-file/Database-table radio toggle), a Road Classification
+    section (per-source Lot Location/Lot Label checkboxes, mutually
+    exclusive with the Road Type exclusion filter -- see the module
+    docstring and the RUNTIME STATE section), a QA-layer checkbox
+    (emit_buffer_qa), an Output destination picker, and a Run button
+    gated by _update_run_button_state().
+
+    Runs TWO independent background detect-on-select systems (each its
+    own daemon thread + win.after()-polled queue.Queue): one for Land
+    Parcel existing-output-column detection
+    (_refresh_parcel_classification()), one for Road Network road-type/
+    classification reading (_refresh_road_classification(), whose
+    result is cached in _road_gdf_cache for run_processing() to reuse).
+    Both are independent of Run being clicked.
+
+    Args:
+        root: the parent Tk root this window is opened under.
+    """
     win = tk.Toplevel(root)
     apply_icon(win, "roadfrontage.ico")
     win.title("Road Frontage & Depth-To-Width Ratio Tool")
@@ -2871,8 +3162,7 @@ def open_main_window(root):
         behavior as either one changes later):
           1. Guarded mutual-exclusion mutation
           2. (No cache synchronization step -- detection results are no
-             longer cached at all, see group-05-cache-removal-
-             analysis.md; parcel_classification_vars is simply the
+             longer cached at all; parcel_classification_vars is simply the
              live, current set of BooleanVars for whatever was most
              recently read; kept as an explicit "nothing to do" step
              only for structural symmetry with the other callback)
@@ -2932,8 +3222,8 @@ def open_main_window(root):
 
         Always creates fresh BooleanVars -- no reuse-across-calls
         mechanism (that existed only to preserve checkbox state across a
-        cache hit; detection results are no longer cached at all, see
-        group-05-cache-removal-analysis.md, so every rebuild reflects a
+        cache hit; detection results are no longer cached at all, so
+        every rebuild reflects a
         genuinely fresh read and starts each checkbox unchecked).
 
         Plain destroy-and-repopulate, called directly by the CALLER
@@ -3086,8 +3376,7 @@ def open_main_window(root):
         _on_parcel_classification_checkbox_changed() above, deliberately:
           1. Guarded mutual-exclusion mutation
           2. (No cache synchronization step -- Road Network's checklist
-             state is no longer restorable from cache at all, see
-             group-05-cache-removal-analysis.md; kept as an explicit
+             state is no longer restorable from cache at all; kept as an explicit
              "nothing to do" step only for structural symmetry with the
              other callback)
           3. Visibility refresh
@@ -3413,8 +3702,8 @@ def open_main_window(root):
         tool, QGIS, or Global Mapper modifying it) since it was last
         read here -- serving a stale result would defeat the purpose of
         the existing-output-column check this same read also performs
-        (see below). See group-05-cache-removal-analysis.md for the
-        full reasoning. What IS still remembered across calls is only
+        (see below) -- the check must always reflect a fresh read,
+        never a cached result. What IS still remembered across calls is only
         WHICH file/table is selected per mode (parcel_local_path /
         parcel_db_table) -- a separate concern, untouched by this
         function.
@@ -3617,8 +3906,8 @@ def open_main_window(root):
         state -- every call, whether triggered by a fresh Browse
         selection or by toggling Local <-> Database, always performs a
         real background read. This extends the same reasoning already
-        applied to Land Parcel's existing-output-column detection (see
-        group-05-cache-removal-analysis.md) to Road Network's road-type
+        applied to Land Parcel's existing-output-column detection to
+        Road Network's road-type
         filter too: a cache keyed only on "which file/table was
         selected" cannot detect that the file/table's CONTENTS changed
         externally since it was last read here.
@@ -3932,8 +4221,7 @@ def open_main_window(root):
         # Switching Local <-> Database does NOT clear the other mode's
         # remembered selection -- that's pre-existing behavior, left
         # untouched. Always re-checks fresh for whichever mode is now
-        # active -- no cached result is ever restored (see
-        # group-05-cache-removal-analysis.md).
+        # active -- no cached result is ever restored.
         _refresh_parcel_classification()
 
     # ── SECTION 2: ROAD NETWORK ──────────────────────────────────
@@ -4028,8 +4316,7 @@ def open_main_window(root):
         # Switching Local <-> Database does NOT clear the other mode's
         # remembered selection -- that's pre-existing behavior, left
         # untouched. Always re-checks fresh for whichever mode is now
-        # active -- no cached checklist state is ever restored (see
-        # group-05-cache-removal-analysis.md).
+        # active -- no cached checklist state is ever restored.
         _refresh_road_classification()
 
     # ── SECTION 3: OUTPUT ────────────────────────────────────────
@@ -4342,7 +4629,20 @@ def open_main_window(root):
 
 
 
+# ========================================
+# MAIN / ENTRYPOINT
+# ========================================
 def main(parent=None):
+    """
+    Tool entry point. If parent is given (invoked from within another
+    running Tk app), reuses it as _app_root and just opens this tool's
+    window. Otherwise creates and hides a new Tk root, sets it as
+    _app_root, applies this tool's icon, and enters its own mainloop --
+    the standalone-subprocess dispatch path.
+
+    Args:
+        parent: an existing Tk root to reuse, or None to create one.
+    """
     global _app_root
     if parent is not None:
         _app_root = parent

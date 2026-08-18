@@ -33,7 +33,9 @@
 #     evidence (a third or fourth tool with road_width's specific
 #     shape) to justify sharing any of it.
 #
-# Used by: lot_location.py, road_frontage.py (each still owns its own
+# Used by: lot_location.py, road_frontage.py, road_surface.py,
+# land_shape_compactness.py, influence_to_barangay.py, terrain.py,
+# road_density.py, influence_to_map.py (each still owns its own
 # ProgressWindow class -- see that class's docstring in each file for
 # how it wires these three pieces together).
 # ============================================================
@@ -78,6 +80,8 @@ class ProgressPresentationPolicy:
     top-of-file comment.
     """
     def compute(self, message, value=None, maximum=None):
+        """Passes message/value/maximum through unchanged into a
+        PresentationState -- see class docstring for why."""
         return PresentationState(message=message, value=value, maximum=maximum)
 
 
@@ -96,11 +100,21 @@ class TkinterProgressView:
     behavior, not incidental code.
     """
     def __init__(self, win, status_var, progressbar):
+        """Stores already-constructed widget references. Does not
+        create any widgets itself -- see class docstring."""
         self.win = win
         self.status_var = status_var
         self.progress = progressbar
 
     def render(self, state: PresentationState):
+        """
+        Applies a PresentationState to the widgets: always updates the
+        status text; updates the progress bar's maximum/value only if
+        each is not None (independently -- see class docstring's OR-
+        semantics note), then forces an immediate GUI refresh via the
+        preserved update_idletasks() -> geometry("") -> update()
+        sequence.
+        """
         self.status_var.set(state.message)
         if state.maximum is not None:
             self.progress["maximum"] = state.maximum
@@ -111,4 +125,5 @@ class TkinterProgressView:
         self.win.update()
 
     def destroy(self):
+        """Destroys the progress window."""
         self.win.destroy()

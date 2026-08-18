@@ -1,19 +1,108 @@
+"""
+tools/lot_location.py
+
+PURPOSE:
+    CAMA Tools tool ("LOT LOCATION" in MAIN.py's dispatch table): for
+    each Land Parcel, classifies its road-frontage situation as
+    "Inner Lot" (no road contact), "Road Lot" (touches exactly one
+    road, or 2+ roads that don't form a corner), or "Corner Lot"
+    (touches 2+ roads whose intersection is physically at/near the
+    parcel, via an Intersection Buffer Test -- see _is_corner_lot()'s
+    docstring), writing the result into CAMA_LOT_LOCATION (or an
+    existing differently-cased column, if one was detected and
+    confirmed at Run time -- see lot_location_column_overrides below).
+    A user-optional Road Type filter (Section 2 of the main window) can
+    exclude specific ROAD_TYPE values from consideration entirely.
+
+DISPATCH:
+    Run as an isolated subprocess by MAIN.py via its `--tool` dispatch
+    mechanism (see system context). Entry point is main(), triggered via
+    the `if __name__ == "__main__":` guard at the bottom of this file.
+
+INPUTS:
+    Land Parcel source: one or more local files or PostGIS tables.
+    Road Network source: a single local file or PostGIS table,
+    optionally with a ROAD_TYPE-like column (see
+    ROAD_TYPE_COLUMN_CANDIDATES) for the optional exclusion filter.
+    pg_credentials.json (via load_db_credentials(), from
+    utils/db_discovery.py) for any DB source or DB output.
+
+OUTPUTS:
+    Local output mode: writes one atomically-written .gpkg per
+    processed Land Parcel source (_write_gpkg()), then attempts to open
+    it in Global Mapper (load_in_global_mapper()).
+    DB output mode: writes/replaces one PostGIS table per source,
+    resolved via resolve_db_output_table() -- an exact-match replace for
+    a DB Land Parcel source, or a fuzzy-match-with-confirmation flow
+    (confirm_db_overwrite_dialog() / choose_db_overwrite_dialog()) for a
+    local-file Land Parcel source.
+
+DEPENDENCIES:
+    stdlib: os, re, subprocess, json, threading, queue, time, itertools
+    (combinations), ctypes, sys, tkinter (+ ttk).
+    third-party: geopandas, pandas, numpy, psycopg2, shapely (geometry +
+    validation), sqlalchemy.
+    local: utils.table_name_matching, utils.resource_path,
+    utils.db_discovery, utils.column_detection, utils.window_icon,
+    tools.progress_framework (imported mid-file, directly above the
+    class/function that uses it -- see the Progress Event Protocol v9
+    comment block further below for why this file's progress dialog was
+    migrated to that shared framework).
+
+SIDE EFFECTS:
+    File reads/writes (.shp/.gpkg). PostGIS reads/writes. A live
+    PostgreSQL connection. Tkinter GUI windows throughout, including
+    TWO independent background-thread + queue.Queue-based detect-on-
+    select systems in open_main_window() -- one for the Land Parcel
+    existing-output-column check, one for reading the Road Network
+    layer to populate the Road Type filter checklist (whose result is
+    cached in _road_gdf_cache and reused by run_processing() if the
+    same source is still selected) -- plus a third background thread +
+    queue.Queue for the main processing run itself. A subprocess launch
+    to Global Mapper (load_in_global_mapper()) on local-output saves,
+    plus a Win32 EnumWindows call to find/focus an already-open Global
+    Mapper window first.
+
+    IMPORTANT -- this module has a genuine import-time side effect: the
+    module-level call to set_app_user_model_id() (see the "FORCE
+    WINDOWS APP ICON" section below) invokes the Win32
+    SetCurrentProcessExplicitAppUserModelID API the moment this file is
+    imported or run -- not lazily, not inside main(). This affects how
+    Windows groups/identifies this process's taskbar icon. Preserved
+    exactly as found -- not moved, deferred, or wrapped in a function --
+    since doing so would change when this Windows-level identification
+    happens, which is out of scope for a documentation/reorganization
+    task (see Section C of the governing instructions: no behavior
+    changes).
+
+    KNOWN FOLLOW-UP (documented, not implemented here): GM_EXE_PATH
+    below is currently a hardcoded absolute path
+    ("C:\\Program Files\\GlobalMapper26.1_64bit\\global_mapper.exe").
+    The planned improvement is dynamic Global Mapper executable-path
+    discovery instead of a hardcoded constant. That discovery logic
+    (search locations, missing-executable handling, installation-
+    variant handling, fallback behavior) is a separate, deliberately-
+    scoped future task -- not implemented as part of this
+    documentation/reorganization pass, since it would change runtime
+    behavior.
+"""
 import os
 import re
-import tkinter as tk
-from tkinter import filedialog, messagebox, Listbox, ttk
-import geopandas as gpd
-import pandas as pd
-import numpy as np
 import subprocess
 import json
-import psycopg2
 import threading
 import queue
 import time
+from itertools import combinations
+import tkinter as tk
+from tkinter import filedialog, messagebox, Listbox, ttk
+
+import geopandas as gpd
+import pandas as pd
+import numpy as np
+import psycopg2
 from shapely.validation import make_valid
 from shapely.geometry import Point
-from itertools import combinations
 from sqlalchemy import create_engine, inspect, text
 
 from utils.table_name_matching import normalize_name, find_matching_tables
@@ -28,6 +117,9 @@ from utils.window_icon import apply_icon
 import ctypes
 import sys
 
+# NOTE: import-time side effect -- this call executes the moment this
+# module is loaded, before main() runs (see module docstring SIDE
+# EFFECTS). Not moved or deferred; see module docstring for why.
 def set_app_user_model_id():
     appid = u"BLGF.CAMA.Tools.2025"
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(appid)
@@ -36,40 +128,18 @@ set_app_user_model_id()
 
 
 
+# ========================================
+# CONFIGURATION
+# ========================================
+# Hardcoded (current behavior). Planned improvement: dynamic Global
+# Mapper executable discovery. Actual implementation: separate future
+# task -- see module docstring SIDE EFFECTS for the full note.
 GM_EXE_PATH = r"C:\Program Files\GlobalMapper26.1_64bit\global_mapper.exe"
 
+# ========================================
+# RUNTIME STATE
+# ========================================
 barangay_source = None
-
-
-def load_in_global_mapper(filepath):
-    try:
-        import ctypes
-        import ctypes.wintypes
-
-        gm_hwnd = None
-
-        def enum_callback(hwnd, _):
-            nonlocal gm_hwnd
-            length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
-            if length == 0:
-                return True
-            buf = ctypes.create_unicode_buffer(length + 1)
-            ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
-            if "Global Mapper" in buf.value:
-                gm_hwnd = hwnd
-                return False
-            return True
-
-        EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
-        ctypes.windll.user32.EnumWindows(EnumWindowsProc(enum_callback), 0)
-
-        subprocess.Popen([GM_EXE_PATH, filepath])
-        print(f"🗺️ Sent to Global Mapper: {filepath}")
-
-    except Exception as e:
-        print(f"⚠️ Could not open in Global Mapper: {e}")
-
-
 road_source = None
 output_mode = None
 
@@ -106,7 +176,9 @@ lot_location_column_overrides = {}
 # _poll_road_read_queue() inside open_main_window() for the write side.
 _road_gdf_cache = {"key": None, "gdf": None}
 
-# ----------------- CRS UTILITY -----------------
+# ========================================
+# CRS UTILITY
+# ========================================
 # PRS92 zones are non-overlapping 2-degree longitude bands (EPSG registry):
 #   Zone I   (3121): west of 118°E
 #   Zone II  (3122): 118°E – 120°E  (Palawan, Calamian Islands)
@@ -203,8 +275,13 @@ def detect_prs92_zone(labeled_gdfs):
     raise ValueError(f"Could not determine PRS92 zone for longitude {center_lon}")
 
 
-# ----------------- Geometry Fix -----------------
+# ========================================
+# GEOMETRY FIX
+# ========================================
 def fix_geometry(geom):
+    """Repairs an invalid geometry via buffer(0), falling back to
+    make_valid() if that isn't enough. Returns None for a None, empty,
+    or unrepairable geometry."""
     if geom is None or geom.is_empty: return None
     try:
         if not geom.is_valid: geom = geom.buffer(0)
@@ -212,7 +289,9 @@ def fix_geometry(geom):
         return geom if not geom.is_empty else None
     except: return None
 
-# ----------------- Lot Location Logic -----------------
+# ========================================
+# LOT LOCATION LOGIC
+# ========================================
 
 # CORNER_TOLERANCE_METERS: radius of the buffer applied to the road intersection
 # point. Must be >= half the typical ROW width plus a digitization margin.
@@ -342,6 +421,9 @@ def _detect_road_type_column(gdf):
 
 
 def label_lot_location(val):
+    """Maps the internal classification code (0/1/2) to its
+    human-readable label ("Inner Lot"/"Road Lot"/"Corner Lot"),
+    defaulting to "Unknown" for any other value."""
     return {0: "Inner Lot", 1: "Road Lot", 2: "Corner Lot"}.get(val, "Unknown")
 
 
@@ -594,8 +676,22 @@ def process_lot_location(barangay_gdf, road_gdf, source_name="", excluded_road_t
         result = result.to_crs(orig_crs)
     return result
 
-# ----------------- DB Helpers -----------------
+# ========================================
+# DB HELPERS
+# ========================================
 def get_geometry_column(table_name, engine, schema):
+    """
+    Looks up the geometry column name for a PostGIS table via the
+    geometry_columns system view.
+
+    Args:
+        table_name (str): the table to look up.
+        engine: a SQLAlchemy engine.
+        schema (str): the schema the table lives in.
+
+    Returns:
+        str | None: the geometry column name, or None if not found.
+    """
     try:
         with engine.connect() as conn:
             row = conn.execute(text("""
@@ -606,6 +702,20 @@ def get_geometry_column(table_name, engine, schema):
     except: return None
 
 def read_postgis_clean(table, engine, schema):
+    """
+    Reads a PostGIS table into a GeoDataFrame with a single, consistently
+    named "geometry" column, regardless of what the table's actual
+    geometry column is called.
+
+    Args:
+        table (str): table name to read.
+        engine: a SQLAlchemy engine.
+        schema (str): the schema the table lives in.
+
+    Returns:
+        geopandas.GeoDataFrame: the table's contents, with the geometry
+        column renamed to "geometry".
+    """
     geom_col = get_geometry_column(table,engine,schema)
     insp = inspect(engine)
     cols = [c["name"] for c in insp.get_columns(table,schema=schema) if c["name"]!=geom_col]
@@ -613,8 +723,12 @@ def read_postgis_clean(table, engine, schema):
     q = f'SELECT {col_str+", " if col_str else ""}"{geom_col}" AS geometry FROM "{schema}"."{table}"'
     return gpd.read_postgis(q, engine, geom_col="geometry")
 
-# ---------------- Output filename helpers ----------------
+# ========================================
+# OUTPUT FILENAME HELPERS
+# ========================================
 def _split_trailing_number(base_name: str):
+    """Splits a trailing '_N' suffix off base_name, if present. Returns
+    (root, N) or (base_name, None) if there's no trailing number."""
     m = re.match(r'^(.*)_(\d+)$', base_name)
     if m:
         return m.group(1), int(m.group(2))
@@ -622,6 +736,22 @@ def _split_trailing_number(base_name: str):
 
 
 def resolve_output_base_name(folder: str, desired_base_name: str, ext: str = "gpkg") -> str:
+    """
+    Returns desired_base_name unchanged if no file of that name already
+    exists in folder. Otherwise, finds the highest existing "_N" suffix
+    among files matching the same root name in folder and returns the
+    root with N+1 appended, so a "Create New File" choice never
+    collides with an existing file.
+
+    Args:
+        folder (str): directory to check.
+        desired_base_name (str): the name that would ideally be used.
+        ext (str): file extension to check for (without the dot).
+
+    Returns:
+        str: a base name (no extension) guaranteed not to collide with
+        an existing file in folder at the time of the call.
+    """
     candidate_path = os.path.join(folder, f"{desired_base_name}.{ext}")
     if not os.path.exists(candidate_path):
         return desired_base_name
@@ -697,7 +827,25 @@ def _write_gpkg(gdf, path):
     os.replace(tmp_path, path)
 
 
+# ========================================
+# OVERWRITE DIALOGS
+# ========================================
 def ask_overwrite_dialog(parent, conflicting_names):
+    """
+    Modal dialog shown when one or more local output files already
+    exist. Lets the user choose to overwrite all of them, save all
+    under new (non-colliding) names instead, or cancel the run
+    entirely -- one choice applies to every listed file.
+
+    Args:
+        parent: parent Tk window.
+        conflicting_names (list[str]): filenames (with extension)
+        already present in the output folder.
+
+    Returns:
+        str: "overwrite", "new", or "cancel" (also returned if the
+        dialog is closed via the window's X button).
+    """
     result = {"choice": "cancel"}
     dialog = tk.Toplevel(parent)
     apply_icon(dialog, "lotlocation.ico")
@@ -965,9 +1113,70 @@ def choose_db_overwrite_dialog(parent, candidates):
     return result["chosen"]
 
 
+# ========================================
+# GLOBAL MAPPER
+# ========================================
+def load_in_global_mapper(filepath):
+    """
+    Opens filepath in Global Mapper. First tries to find an already-open
+    Global Mapper window (via a Win32 EnumWindows title-text scan) so a
+    running instance can pick up the new file, then launches
+    GM_EXE_PATH as a subprocess regardless of whether an existing
+    window was found. Any failure is caught and only printed, never
+    raised or shown to the user.
 
-# ----------------- Single Main Window -----------------
+    Args:
+        filepath (str): path to open in Global Mapper.
+
+    Notes:
+        GM_EXE_PATH is currently a hardcoded absolute path (see
+        CONFIGURATION section above and the module docstring's SIDE
+        EFFECTS note) -- dynamic executable discovery is a planned,
+        separately-scoped future improvement, not implemented here.
+    """
+    try:
+        import ctypes
+        import ctypes.wintypes
+
+        gm_hwnd = None
+
+        def enum_callback(hwnd, _):
+            nonlocal gm_hwnd
+            length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+            if length == 0:
+                return True
+            buf = ctypes.create_unicode_buffer(length + 1)
+            ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
+            if "Global Mapper" in buf.value:
+                gm_hwnd = hwnd
+                return False
+            return True
+
+        EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+        ctypes.windll.user32.EnumWindows(EnumWindowsProc(enum_callback), 0)
+
+        subprocess.Popen([GM_EXE_PATH, filepath])
+        print(f"🗺️ Sent to Global Mapper: {filepath}")
+
+    except Exception as e:
+        print(f"⚠️ Could not open in Global Mapper: {e}")
+
+
+# ========================================
+# DB TABLE PICKER
+# ========================================
 def _pick_db_tables(parent, tables, multi, on_select):
+    """
+    Simple modal listbox dialog for picking one (multi=False) or more
+    (multi=True) table names from `tables`. Calls on_select(selection)
+    and closes itself once the user confirms a non-empty selection.
+
+    Args:
+        parent: parent Tk window.
+        tables (list[str]): table names to list.
+        multi (bool): whether multiple selection is allowed.
+        on_select (callable): called with the list of selected names.
+    """
     picker = tk.Toplevel(parent)
     apply_icon(picker, "lotlocation.ico")
     picker.title("Select Table(s)")
@@ -990,7 +1199,34 @@ def _pick_db_tables(parent, tables, multi, on_select):
               width=20).pack(pady=(0, 10))
 
 
+# ========================================
+# MAIN WINDOW
+# ========================================
 def open_main_window(root):
+    """
+    Builds and shows the tool's single unified configuration window:
+    Land Parcel and Road Network source pickers (each with a
+    Local-file/Database-table radio toggle), a Road Type exclusion
+    checklist (Section 2, populated after the Road Network is read), an
+    Output destination picker, and a Run button gated by
+    _update_run_button_state().
+
+    Runs TWO independent background detect-on-select systems (each its
+    own daemon thread + win.after()-polled queue.Queue):
+      - Land Parcel: checks for an existing CAMA_LOT_LOCATION-like
+        column the moment a file/table is selected or toggled -- see
+        _refresh_parcel_lot_location_check(), _set_parcel_reading_state(),
+        _handle_parcel_check_failure().
+      - Road Network: reads the road layer to populate the Road Type
+        checklist, and caches the result in the module-level
+        _road_gdf_cache so run_processing() can reuse it instead of
+        reading the same source twice -- see _refresh_road_type_filter(),
+        _set_road_reading_state(), _handle_road_check_failure().
+    Both systems are independent of each other and of Run being clicked.
+
+    Args:
+        root: the parent Tk root this window is opened under.
+    """
     from tkinter import ttk
     win = tk.Toplevel(root)
     apply_icon(win, "lotlocation.ico")
@@ -1981,6 +2217,17 @@ def open_main_window(root):
         fill="x", padx=10, pady=(12, 4))
 
     def on_run():
+        """
+        Run button handler: validates Land Parcel + Road Network +
+        Output selections are present, consults the already-known
+        background column-conflict result (PRIORITY 1), runs the local
+        output-file conflict check (PRIORITY 2), and DB-output table
+        resolution (PRIORITY 3) -- each able to cancel the whole run --
+        then destroys this window and hands off to run_processing().
+        Sets the module-level barangay_source, road_source, output_mode,
+        road_type_excluded_values, and lot_location_column_overrides
+        globals on success.
+        """
         global barangay_source, road_source, output_mode, road_type_excluded_values, lot_location_column_overrides
 
         if parcel_source_type.get() == "local":
@@ -2144,7 +2391,6 @@ def open_main_window(root):
     _update_run_button_state()
 
 
-# ----------------- Processing -----------------
 # ============================================================
 # Progress Event Protocol v9 — Phase 3 migration (lot_location.py)
 # ============================================================
@@ -2201,6 +2447,13 @@ class ProgressWindow:
     instead of deciding/mutating inline.
     """
     def __init__(self, root, title="Processing"):
+        """
+        Creates and immediately shows the progress dialog.
+
+        Args:
+            root: the parent Tk/Toplevel window.
+            title (str): window title. Defaults to "Processing".
+        """
         self.win = tk.Toplevel(root)
         apply_icon(self.win, "lotlocation.ico")
         self.win.title(title)
@@ -2231,13 +2484,20 @@ class ProgressWindow:
         self._view = TkinterProgressView(self.win, self.status_var, self.progress)
 
     def update(self, message, value=None, maximum=None):
+        """Updates the progress display via the shared
+        ProgressPresentationPolicy/TkinterProgressView (see class
+        docstring)."""
         state = self._policy.compute(message, value, maximum)
         self._view.render(state)
 
     def close(self):
+        """Closes the progress window."""
         self._view.destroy()
 
 
+# ========================================
+# DB OUTPUT RESOLUTION
+# ========================================
 def resolve_db_output_table(root, schema, barangay_source):
     """
     Determines the DB-output destination table for the Land Parcel
@@ -2288,6 +2548,9 @@ def resolve_db_output_table(root, schema, barangay_source):
         return chosen, "overwritten"
 
 
+# ========================================
+# RUN
+# ========================================
 def run_processing(app_root, overwrite_mode=None, resolved_table_name=None):
     """
     Runs the full batch (all selected parcel sources) on a background
@@ -2326,6 +2589,17 @@ def run_processing(app_root, overwrite_mode=None, resolved_table_name=None):
     q = queue.Queue()
 
     def worker():
+        """
+        Background-thread body: loads the Road Network layer (reusing
+        _road_gdf_cache if it matches the currently selected source),
+        then for each selected Land Parcel source runs
+        process_lot_location() and saves the result (local .gpkg or
+        PostGIS), with per-source failure isolation -- a failing source
+        is skipped and logged, the rest of the batch continues. Posts
+        progress/completion/error events onto q for poll_queue() to
+        consume on the main thread. Never touches Tkinter widgets
+        directly.
+        """
         try:
             def progress_cb(msg, val=None, maxv=None):
                 q.put(("update", msg, val, maxv))
@@ -2439,6 +2713,13 @@ def run_processing(app_root, overwrite_mode=None, resolved_table_name=None):
             q.put(("error", str(e), None, None))
 
     def poll_queue():
+        """
+        Main-thread poller (scheduled via app_root.after(100, ...)):
+        drains q and updates the progress dialog, opens the result in
+        Global Mapper, or shows the final success/error dialog and
+        stops polling, depending on the event kind. All Tkinter calls
+        happen here, never inside worker() itself.
+        """
         if not app_root.winfo_exists():
             return
         try:
@@ -2464,8 +2745,20 @@ def run_processing(app_root, overwrite_mode=None, resolved_table_name=None):
     poll_queue()
 
 
-# ----------------- MAIN -----------------
+# ========================================
+# MAIN / ENTRYPOINT
+# ========================================
 def main(parent=None):
+    """
+    Tool entry point. If parent is given (invoked from within another
+    running Tk app), reuses it and just opens this tool's window.
+    Otherwise creates and hides a new Tk root, applies this tool's icon,
+    and enters its own mainloop -- the standalone-subprocess dispatch
+    path.
+
+    Args:
+        parent: an existing Tk root to reuse, or None to create one.
+    """
     if parent is not None:
         open_main_window(parent)
     else:

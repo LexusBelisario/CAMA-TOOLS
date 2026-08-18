@@ -1,24 +1,38 @@
-# utils/table_name_matching.py
 """
-Shared table-name-matching helpers, extracted from all 11 registered
-CAMA Tools tool modules (POI_All_Distance.py, influence_to_barangay.py,
-influence_to_map.py, land_shape_compactness.py, lot_location.py,
-poi_within_200_meters_for_parcellary_church_mall_police_park.py,
-road_density.py, road_frontage.py, road_surface.py, road_width.py,
-terrain.py).
+utils/table_name_matching.py
 
-Confirmed Category A (see Shared Utilities Refactor, function group:
-normalize_name() + find_matching_tables()): a line-by-line body diff
-across all 11 source copies found zero executable-code differences --
-only docstring wording and single/double-quote style varied. This
-module is the single canonical implementation; the 11 tool files now
-import from here instead of each carrying their own copy.
+PURPOSE:
+    Shared table-name-matching helpers, originally duplicated across all
+    11 registered CAMA Tools tool modules (POI_All_Distance.py,
+    influence_to_barangay.py, influence_to_map.py, land_shape_compactness.py,
+    lot_location.py,
+    poi_within_200_meters_for_parcellary_church_mall_police_park.py,
+    road_density.py, road_frontage.py, road_surface.py, road_width.py,
+    terrain.py) and consolidated here. A line-by-line body diff across all
+    11 source copies found zero executable-code differences -- only
+    docstring wording and single/double-quote style varied. This module is
+    the single canonical implementation; the 11 tool files import from
+    here instead of each carrying their own copy.
 
-Both functions are used together to resolve the DB-output overwrite
-target inside each tool's own resolve_db_output_table(): a local-file
-Land Parcel source's filename is fuzzy-matched against existing DB
-tables so the user can be asked to confirm (or reject) an overwrite,
-rather than the tool guessing silently.
+    Both functions are used together to resolve the DB-output overwrite
+    target inside each tool's own resolve_db_output_table(): a local-file
+    Land Parcel source's filename is fuzzy-matched against existing DB
+    tables so the user can be asked to confirm (or reject) an overwrite,
+    rather than the tool guessing silently.
+
+INPUTS:
+    normalize_name(name): name (str) -- a filename or table name.
+    find_matching_tables(desired_name, all_tables): desired_name (str) --
+    the name to match against; all_tables (iterable of str) -- candidate
+    table names to search.
+
+OUTPUTS:
+    normalize_name(name) -> str: lowercased, letters-only form of name.
+    find_matching_tables(desired_name, all_tables) -> list[str]: candidate
+    table names whose normalized form fuzzily matches desired_name.
+
+DEPENDENCIES:
+    re (stdlib only).
 """
 import re
 

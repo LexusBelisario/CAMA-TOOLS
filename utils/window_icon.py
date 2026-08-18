@@ -1,35 +1,54 @@
-# utils/window_icon.py
 """
-Shared window-icon application, extracted from 10 of the 11 registered
-CAMA Tools tool modules (all except influence_to_map.py -- see below).
+utils/window_icon.py
 
-Confirmed via literal body diff (see
-docs/refactor-log/group-icon-application-FINAL-analysis.md): 10 of 11
-tools had byte-identical executable logic in their own local
-apply_icon(win) function -- sets a .ico for the taskbar/titlebar via
-iconbitmap(), then a .png as a fallback via iconphoto() (needed since
-iconbitmap() alone doesn't reliably set the titlebar icon on every
-Windows/Tk combination), holding a reference on the window
-(window._icon_ref) to prevent the PhotoImage from being garbage-
-collected while the window is still open. road_width.py had the same
-logic but was MISSING that reference -- a real, minor bug, fixed here
-for good by centralizing the logic in one place.
+PURPOSE:
+    Shared window-icon application, originally duplicated across 10 of
+    the 11 registered CAMA Tools tool modules (all except
+    influence_to_map.py -- see below) and consolidated here.
 
-This module also supersedes an earlier, unused, orphaned attempt at the
-same idea (tools/utils_icon.py's set_window_icon()) -- confirmed that
-file was never imported or called by any tool, MAIN.py, or
-MAIN_refactored.py. That file had its own version of the same missing-
-reference bug, a hardcoded developer-machine-only absolute-path
-fallback, and its own re-implementation of resource_path() (this module
-uses the already-shared utils/resource_path.py instead). Deleted as part
-of this same change -- see the refactor log for the approval trail.
+    A literal body diff found 10 of 11 tools had byte-identical
+    executable logic in their own local apply_icon(win) function -- sets
+    a .ico for the taskbar/titlebar via iconbitmap(), then a .png as a
+    fallback via iconphoto() (needed since iconbitmap() alone doesn't
+    reliably set the titlebar icon on every Windows/Tk combination),
+    holding a reference on the window (window._icon_ref) to prevent the
+    PhotoImage from being garbage-collected while the window is still
+    open. road_width.py had the same logic but was MISSING that
+    reference -- a real, minor bug, fixed here for good by centralizing
+    the logic in one place.
 
-influence_to_map.py is deliberately NOT migrated here -- it has no
-dedicated icon file in icons/ico/ yet (unlike influence_to_barangay.py,
-which does: influencemap.ico -- the two tools' similar names caused this
-to be mixed up once during analysis, corrected before implementation).
-influence_to_map.py keeps its own local, untouched apply_icon() showing
-the generic BLGF icon until a dedicated icon exists for it.
+    This module also supersedes an earlier, unused, orphaned attempt at
+    the same idea (tools/utils_icon.py's set_window_icon()) -- confirmed
+    that file was never imported or called by any tool, MAIN.py, or
+    MAIN_refactored.py. That file had its own version of the same
+    missing-reference bug, a hardcoded developer-machine-only
+    absolute-path fallback, and its own re-implementation of
+    resource_path() (this module uses the already-shared
+    utils/resource_path.py instead). It was deleted as part of this same
+    consolidation.
+
+    influence_to_map.py is deliberately NOT migrated here -- it has no
+    dedicated icon file in icons/ico/ yet (unlike influence_to_barangay.py,
+    which does: influencemap.ico). influence_to_map.py keeps its own
+    local, untouched apply_icon() showing the generic BLGF icon until a
+    dedicated icon exists for it.
+
+INPUTS:
+    window: a Tkinter window/Toplevel instance to set the icon on.
+    icon_filename (str): the tool-specific .ico filename (looked up under
+    icons/ico/).
+
+OUTPUTS:
+    None. Mutates `window` in place (sets its taskbar/titlebar icon) and
+    attaches window._icon_ref to keep the PhotoImage alive.
+
+DEPENDENCIES:
+    os, tkinter (stdlib). utils.resource_path.resource_path (local).
+
+SIDE EFFECTS:
+    Sets the icon on the passed-in Tkinter window and creates a
+    tk.PhotoImage held via window._icon_ref. No side effects occur at
+    import time -- all GUI interaction happens inside apply_icon().
 """
 import os
 import tkinter as tk
