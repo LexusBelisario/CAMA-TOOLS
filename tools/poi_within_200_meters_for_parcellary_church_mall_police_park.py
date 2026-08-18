@@ -1,7 +1,88 @@
+"""
+tools/poi_within_200_meters_for_parcellary_church_mall_police_park.py
+
+PURPOSE:
+    CAMA Tools tool ("LANDMARKS WITHIN METERS" in MAIN.py's dispatch
+    table): for each Land Parcel, counts how many POIs of each type
+    (police, park, mall, and a catch-all "others" for any other fclass)
+    are within a network-routed distance of a user-specified radius
+    (default 200 meters) of the parcel centroid. Writes four
+    CAMA_-prefixed count columns: CAMA_NUM_POLICE, CAMA_NUM_PARK,
+    CAMA_NUM_MALL, CAMA_NUM_OTHERS.
+
+DISPATCH:
+    Run as an isolated subprocess by MAIN.py via its `--tool` dispatch
+    mechanism (see system context). Entry point is main(), triggered via
+    the `if __name__ == "__main__":` guard at the bottom of this file.
+
+INPUTS:
+    Land Parcel source: one or more local .shp files, or one or more
+    PostGIS tables.
+    POI source: a single local .shp file or PostGIS table, with an
+    `fclass` column categorizing each point.
+    Search radius (meters): user-entered, must be a positive number.
+    pg_credentials.json (via load_db_credentials(), from
+    utils/db_discovery.py) for any DB source or DB output.
+
+OUTPUTS:
+    Local output mode: writes one atomically-written .gpkg per
+    processed Land Parcel source (_write_gpkg()), then attempts to open
+    it in Global Mapper (load_in_global_mapper()).
+    DB output mode: writes/replaces one PostGIS table per source,
+    resolved via resolve_db_output_table() -- an exact-match replace for
+    a DB Land Parcel source, or a fuzzy-match-with-confirmation flow
+    (confirm_db_overwrite_dialog() / choose_db_overwrite_dialog()) for a
+    local-file Land Parcel source.
+
+DEPENDENCIES:
+    stdlib: os, re, subprocess, json, sys, threading, queue, time,
+    tkinter (+ ttk).
+    third-party: geopandas, pandas, osmnx, networkx, shapely, geopy,
+    sqlalchemy, psycopg2.
+    local: utils.table_name_matching, utils.resource_path,
+    utils.db_discovery, utils.column_detection, utils.window_icon.
+
+SIDE EFFECTS:
+    Network calls to the OpenStreetMap Overpass API (via osmnx, to
+    download the drive-network road graph for each parcel source's
+    bounding box). File reads/writes (.shp/.gpkg). PostGIS reads/writes.
+    A live PostgreSQL connection. Tkinter GUI windows throughout,
+    including a synchronous, module-global-driven progress window
+    (PROG_WIN/PROG_BAR/PROG_LABEL/PROG_STOP_FLAG -- see RUNTIME STATE
+    below) rather than a background-thread/queue pattern. A subprocess
+    launch to Global Mapper (load_in_global_mapper()) on local-output
+    saves, plus a Win32 EnumWindows call to find/focus an already-open
+    Global Mapper window first.
+
+    IMPORTANT -- this module has an import-time side effect:
+    `ox.settings.use_cache = True` / `ox.settings.log_console = False`
+    (see the RUNTIME STATE section below) configure the osmnx library's
+    global state the moment this module is loaded. Preserved exactly as
+    found -- not moved or deferred.
+
+    KNOWN FOLLOW-UP (documented, not implemented here): GM_EXE_PATH
+    below is currently hardcoded to a developer/machine-specific
+    absolute path
+    ("C:\\Program Files\\GlobalMapper26.1_64bit\\global_mapper.exe").
+    The planned improvement is dynamic Global Mapper executable-path
+    discovery instead of a hardcoded constant. That discovery logic
+    (search locations, missing-executable handling, installation-
+    variant handling, fallback behavior) is a separate, deliberately-
+    scoped future task -- not implemented as part of this
+    documentation/reorganization pass, since it would change runtime
+    behavior.
+"""
 import os
 import re
+import subprocess
+import json
+import sys
+import threading
+import queue
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, Listbox, ttk
+
 import geopandas as gpd
 import pandas as pd
 import osmnx as ox
@@ -9,13 +90,7 @@ import networkx as nx
 from shapely.geometry import Point, LineString, box
 from geopy.distance import geodesic
 from sqlalchemy import create_engine, inspect, text
-import subprocess
-import json
-import sys
 import psycopg2
-import threading
-import queue
-import time
 
 from utils.table_name_matching import normalize_name, find_matching_tables
 from utils.resource_path import resource_path
@@ -23,11 +98,19 @@ from utils.db_discovery import load_db_credentials, fetch_tables
 from utils.column_detection import detect_existing_output_columns
 from utils.window_icon import apply_icon
 
-# --- CONFIG ---
+# ========================================
+# CONFIGURATION
+# ========================================
 ICON_PATH = r"D:/2025_PROJECTS/BLGF-GM_TEST/FOR TESTING/DCS_CODES/BLGF.ico"
+# Hardcoded (current behavior). Planned improvement: dynamic Global
+# Mapper executable discovery. Actual implementation: separate future
+# task -- see module docstring SIDE EFFECTS for the full note.
 GM_EXE_PATH = r"C:\Program Files\GlobalMapper26.1_64bit\global_mapper.exe"
 
 
+# ========================================
+# WINDOW CHROME HELPERS
+# ========================================
 def _remove_close_button(win):
     """
     Strips the titlebar's close (X) button (and system menu) via the
@@ -65,10 +148,9 @@ def _remove_close_button(win):
         pass
 
 
-GM_EXE_PATH = r"C:\Program Files\GlobalMapper26.1_64bit\global_mapper.exe"
-
-
-# --- GLOBALS ---
+# ========================================
+# RUNTIME STATE
+# ========================================
 barangay_source = None
 poi_source = None
 output_mode = None
@@ -79,7 +161,9 @@ PROG_BAR = None
 PROG_LABEL = None
 PROG_STOP_FLAG = {"stop": False}
 
-# ========================= EXISTING OUTPUT-COLUMN CONFLICT DETECTION =========================
+# ========================================
+# OUTPUT-COLUMN CONFLICT DETECTION
+# ========================================
 # OUTPUT_COLUMN_TARGETS: this tool's four output column names, checked
 # for pre-existing conflicts in a selected LOCAL Land Parcel source (see
 # _check_parcel_poi_conflicts() below, and the combined dialog in
@@ -132,11 +216,28 @@ OUTPUT_COLUMN_TARGETS = (
 parcel_output_column_overrides = {}
 
 
+# NOTE: import-time side effect -- configures osmnx global settings the
+# moment this module is loaded (see module docstring SIDE EFFECTS). Not
+# moved or deferred; see module docstring for why.
 ox.settings.use_cache = True
 ox.settings.log_console = False
 
-# ---------------- DB HELPERS ----------------
+# ========================================
+# DB HELPERS
+# ========================================
 def get_geometry_column(table_name, engine, schema):
+    """
+    Looks up the geometry column name for a PostGIS table via the
+    geometry_columns system view.
+
+    Args:
+        table_name (str): the table to look up.
+        engine: a SQLAlchemy engine.
+        schema (str): the schema the table lives in.
+
+    Returns:
+        str | None: the geometry column name, or None if not found.
+    """
     try:
         with engine.connect() as conn:
             result = conn.execute(text("""
@@ -149,6 +250,20 @@ def get_geometry_column(table_name, engine, schema):
         return None
 
 def read_postgis_clean(table, engine, schema):
+    """
+    Reads a PostGIS table into a GeoDataFrame with a single, consistently
+    named "geometry" column, regardless of what the table's actual
+    geometry column is called.
+
+    Args:
+        table (str): table name to read.
+        engine: a SQLAlchemy engine.
+        schema (str): the schema the table lives in.
+
+    Returns:
+        geopandas.GeoDataFrame: the table's contents, with the geometry
+        column renamed to "geometry".
+    """
     geom_col = get_geometry_column(table, engine, schema)
     insp = inspect(engine)
     cols = [c['name'] for c in insp.get_columns(table, schema=schema) if c['name'] != geom_col]
@@ -157,10 +272,33 @@ def read_postgis_clean(table, engine, schema):
     return gpd.read_postgis(query, engine, geom_col="geometry")
 
 def open_in_global_mapper(path):
+    """Opens path in Global Mapper (subprocess), if both GM_EXE_PATH and
+    path exist. Simpler than load_in_global_mapper() further below (no
+    EnumWindows focus-existing-window step) -- appears unused by
+    run_processing(), which calls load_in_global_mapper() instead; kept
+    as-is, not removed or consolidated (see Section 3.E.7 of the
+    governing instructions)."""
     if os.path.exists(GM_EXE_PATH) and os.path.exists(path):
         subprocess.Popen([GM_EXE_PATH, path], shell=True)
 
+# ========================================
+# PROGRESS WINDOW HELPERS
+# ========================================
 def create_progress_window(root, total, title="Processing Parcels"):
+    """
+    Creates (destroying any previous instance first) the synchronous,
+    module-global progress window used by run_processing()'s per-source
+    processing loop. Sets the module-level PROG_WIN/PROG_BAR/PROG_LABEL/
+    PROG_STOP_FLAG globals -- unlike this project's other, newer tools
+    (which use a background-thread/queue.Queue pattern instead), this
+    tool updates the progress dialog via direct update_progress() calls
+    inside a synchronous loop.
+
+    Args:
+        root: parent Tk window.
+        total (int): total item count, used as the progress bar maximum.
+        title (str): window title.
+    """
     global PROG_WIN, PROG_BAR, PROG_LABEL, PROG_STOP_FLAG
 
     try:
@@ -210,6 +348,19 @@ def create_progress_window(root, total, title="Processing Parcels"):
 
 
 def update_progress(current, total, msg=None):
+    """
+    Updates the progress window created by create_progress_window().
+
+    Args:
+        current (int): items completed so far.
+        total (int): total items expected.
+        msg (str, optional): extra status text appended to the label.
+
+    Returns:
+        bool: False if the window no longer exists or PROG_STOP_FLAG
+        has been set (signaling the caller to stop early), True
+        otherwise (continue).
+    """
     global PROG_WIN, PROG_BAR, PROG_LABEL, PROG_STOP_FLAG
     if not PROG_WIN or not PROG_WIN.winfo_exists():
         return False
@@ -230,6 +381,8 @@ def update_progress(current, total, msg=None):
 
 
 def close_progress_window():
+    """Destroys the current progress window, if any, and clears
+    PROG_WIN. Safe to call even if no window is currently open."""
     global PROG_WIN
     try:
         if PROG_WIN and PROG_WIN.winfo_exists():
@@ -240,7 +393,9 @@ def close_progress_window():
     PROG_WIN = None
 
 
-# ========================= PARCEL COLUMN-CONFLICT CHECK =========================
+# ========================================
+# PARCEL COLUMN-CONFLICT CHECK
+# ========================================
 # _check_parcel_poi_conflicts(): checks the selected Land Parcel
 # source -- Local file OR Database table (extended to cover both as
 # part of Fix 3; previously LOCAL-only) -- for pre-existing columns
@@ -318,8 +473,12 @@ def _check_parcel_poi_conflicts(sources, source_type):
     return conflicts
 
 
-# ---------------- Output filename helpers ----------------
+# ========================================
+# OUTPUT FILENAME HELPERS
+# ========================================
 def _split_trailing_number(base_name: str):
+    """Splits a trailing '_N' suffix off base_name, if present. Returns
+    (root, N) or (base_name, None) if there's no trailing number."""
     m = re.match(r'^(.*)_(\d+)$', base_name)
     if m:
         return m.group(1), int(m.group(2))
@@ -327,6 +486,22 @@ def _split_trailing_number(base_name: str):
 
 
 def resolve_output_base_name(folder: str, desired_base_name: str, ext: str = "gpkg") -> str:
+    """
+    Returns desired_base_name unchanged if no file of that name already
+    exists in folder. Otherwise, finds the highest existing "_N" suffix
+    among files matching the same root name in folder and returns the
+    root with N+1 appended, so a "Create New File" choice never
+    collides with an existing file.
+
+    Args:
+        folder (str): directory to check.
+        desired_base_name (str): the name that would ideally be used.
+        ext (str): file extension to check for (without the dot).
+
+    Returns:
+        str: a base name (no extension) guaranteed not to collide with
+        an existing file in folder at the time of the call.
+    """
     candidate_path = os.path.join(folder, f"{desired_base_name}.{ext}")
     if not os.path.exists(candidate_path):
         return desired_base_name
@@ -386,7 +561,25 @@ def _write_gpkg(gdf, path):
     os.replace(tmp_path, path)
 
 
+# ========================================
+# OVERWRITE DIALOGS
+# ========================================
 def ask_overwrite_dialog(parent, conflicting_names):
+    """
+    Modal dialog shown when one or more local output files already
+    exist. Lets the user choose to overwrite all of them, save all
+    under new (non-colliding) names instead, or cancel the run
+    entirely -- one choice applies to every listed file.
+
+    Args:
+        parent: parent Tk window.
+        conflicting_names (list[str]): filenames (with extension)
+        already present in the output folder.
+
+    Returns:
+        str: "overwrite", "new", or "cancel" (also returned if the
+        dialog is closed via the window's X button).
+    """
     result = {"choice": "cancel"}
     dialog = tk.Toplevel(parent)
     apply_icon(dialog, "landmarks200.ico")
@@ -594,7 +787,9 @@ def choose_db_overwrite_dialog(parent, candidates):
 
 
 
-# ---------------- MAIN PROCESSING ----------------
+# ========================================
+# MAIN PROCESSING
+# ========================================
 def process_poi_counts(gdf, poi_gdf, radius_m, progress_cb=None,
                         num_police_col="CAMA_NUM_POLICE", num_park_col="CAMA_NUM_PARK",
                         num_mall_col="CAMA_NUM_MALL", num_others_col="CAMA_NUM_OTHERS"):
@@ -646,6 +841,22 @@ def process_poi_counts(gdf, poi_gdf, radius_m, progress_cb=None,
         return gdf
 
     def add_virtual_node(G, point, node_id):
+        """
+        Projects point onto its nearest edge in G and adds it as a new
+        node (node_id), connected to that edge's two endpoints with
+        geodesic-distance-weighted edges, so shortest-path routing can
+        start/end at an arbitrary point rather than only at existing
+        graph nodes.
+
+        Args:
+            G: the osmnx/networkx road graph to mutate in place.
+            point: (lat, lon) tuple of the point to project.
+            node_id: identifier to assign to the new node.
+
+        Returns:
+            The node_id on success, or None if projection/routing setup
+            fails for this point (error is silently swallowed).
+        """
         try:
             u, v, key = ox.distance.nearest_edges(G, point[1], point[0])
             edge_data = G.get_edge_data(u, v)[key]
@@ -741,10 +952,28 @@ def process_poi_counts(gdf, poi_gdf, radius_m, progress_cb=None,
         gdf = gdf.to_crs(original_crs)
     return gdf
 
-# REPLACE WITH
-
-# ---------------- LOAD IN GLOBAL MAPPER ----------------
+# ========================================
+# GLOBAL MAPPER
+# ========================================
 def load_in_global_mapper(filepath):
+    """
+    Opens filepath in Global Mapper. First tries to find an already-open
+    Global Mapper window (via a Win32 EnumWindows title-text scan) so a
+    running instance can pick up the new file, then launches
+    GM_EXE_PATH as a subprocess regardless of whether an existing
+    window was found. Any failure is caught and only printed, never
+    raised or shown to the user.
+
+    Args:
+        filepath (str): path to open in Global Mapper.
+
+    Notes:
+        GM_EXE_PATH is currently hardcoded to a developer/machine-
+        specific absolute path (see CONFIGURATION section above and the
+        module docstring's SIDE EFFECTS note) -- dynamic executable
+        discovery is a planned, separately-scoped future improvement,
+        not implemented here.
+    """
     try:
         import ctypes
         import ctypes.wintypes
@@ -773,8 +1002,21 @@ def load_in_global_mapper(filepath):
         print(f"⚠️ Could not open in Global Mapper: {e}")
 
 
-# ---------------- DB TABLE PICKER ----------------
+# ========================================
+# DB TABLE PICKER
+# ========================================
 def _pick_db_tables(parent, tables, multi, on_select):
+    """
+    Simple modal listbox dialog for picking one (multi=False) or more
+    (multi=True) table names from `tables`. Calls on_select(selection)
+    and closes itself once the user confirms a non-empty selection.
+
+    Args:
+        parent: parent Tk window.
+        tables (list[str]): table names to list.
+        multi (bool): whether multiple selection is allowed.
+        on_select (callable): called with the list of selected names.
+    """
     picker = tk.Toplevel(parent)
     picker.title("Select Table(s)")
     picker.resizable(False, False)
@@ -796,8 +1038,20 @@ def _pick_db_tables(parent, tables, multi, on_select):
               width=20).pack(pady=(0, 10))
 
 
-# ---------------- MAIN WINDOW ----------------
+# ========================================
+# MAIN WINDOW
+# ========================================
 def open_main_window(root):
+    """
+    Builds and shows the tool's single unified configuration window:
+    Land Parcel and POI source pickers (each with a Local-file/
+    Database-table radio toggle), a search-radius entry, an Output
+    destination picker, and a Run button gated by
+    _update_run_button_state().
+
+    Args:
+        root: the parent Tk root this window is opened under.
+    """
     win = tk.Toplevel(root)
     apply_icon(win, "landmarks200.ico")
     win.title("POI Count Tool")
@@ -1268,6 +1522,17 @@ def open_main_window(root):
         fill="x", padx=10, pady=(12, 4))
 
     def on_run():
+        """
+        Run button handler: validates Land Parcel + POI + radius +
+        Output selections are present, checks for existing output-
+        column conflicts (PRIORITY 1), runs the local output-file
+        conflict check (PRIORITY 2), and DB-output table resolution
+        (PRIORITY 3) -- each able to cancel the whole run -- then
+        destroys this window and hands off to run_processing(). Sets
+        the module-level barangay_source, poi_source, output_mode,
+        radius_meters, and parcel_output_column_overrides globals on
+        success.
+        """
         global barangay_source, poi_source, output_mode, radius_meters
 
         # validate parcel
@@ -1529,6 +1794,9 @@ def open_main_window(root):
     _update_run_button_state()
 
 
+# ========================================
+# DB OUTPUT RESOLUTION
+# ========================================
 def resolve_db_output_table(root, schema, barangay_source):
     """
     Determines the DB-output destination table for the Land Parcel
@@ -1578,8 +1846,34 @@ def resolve_db_output_table(root, schema, barangay_source):
         return chosen, "overwritten"
 
 
-# ---------------- RUN PROCESSING ----------------
+# ========================================
+# RUN PROCESSING
+# ========================================
 def run_processing(app_root, overwrite_mode=None, resolved_table_name=None):
+    """
+    Orchestrates the full run synchronously on the main thread (no
+    background worker/queue.Queue -- see create_progress_window()'s
+    docstring): loads the POI data once, then for each Land Parcel
+    file/table, opens a fresh progress window
+    (create_progress_window()), runs process_poi_counts(), and saves
+    the result either locally (.gpkg, optionally opened in Global
+    Mapper) or to PostGIS (matched to an existing table by name for
+    local sources, or replaced in place for DB sources).
+
+    Wraps all processing in a try/except/finally so any exception shows
+    a graceful error dialog (instead of propagating silently) and the
+    progress window is always closed regardless of outcome.
+
+    Args:
+        app_root: the parent Tk root, used to open progress/error
+        dialogs.
+        overwrite_mode (str | None): "overwrite" or "new", from
+        ask_overwrite_dialog() in on_run() -- only relevant for local
+        output mode.
+        resolved_table_name (str | None): the already-confirmed DB
+        output table name from resolve_db_output_table() in on_run() --
+        only relevant for DB output mode.
+    """
     global barangay_source, poi_source, output_mode, radius_meters
 
     if not barangay_source or not poi_source or not output_mode:
@@ -1739,8 +2033,20 @@ def run_processing(app_root, overwrite_mode=None, resolved_table_name=None):
         messagebox.showinfo("Success", "Processing complete!")
 
 
-# ---------------- MAIN ----------------
+# ========================================
+# MAIN / ENTRYPOINT
+# ========================================
 def main(parent=None):
+    """
+    Tool entry point. If parent is given (invoked from within another
+    running Tk app), reuses it as APP_ROOT and just opens this tool's
+    window. Otherwise creates and hides a new Tk root, sets it as
+    APP_ROOT, and enters its own mainloop -- the standalone-subprocess
+    dispatch path.
+
+    Args:
+        parent: an existing Tk root to reuse, or None to create one.
+    """
     global APP_ROOT
     if parent is not None:
         APP_ROOT = parent

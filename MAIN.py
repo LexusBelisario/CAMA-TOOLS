@@ -1,3 +1,107 @@
+"""
+MAIN.py
+
+PURPOSE:
+    CAMA Tools entry point and dispatcher. This file has TWO distinct
+    roles depending on how it's invoked:
+
+    1. As the main CAMA Tools launcher (no `--tool` argument): connects
+       to PostGIS, prompts for a Global Mapper Workspace (.gmw) file,
+       launches Global Mapper, and shows the floating CAMA Tools panel
+       that stays pinned to/synced with the Global Mapper window --
+       this is the bulk of this file (GM window tracking, drag/
+       position syncing, tooltip system, GM export/import automation,
+       the button grid, etc.).
+    2. As a subprocess dispatcher (`--tool <NAME>` argument, from
+       another CAMA Tools instance's "Run Tool" button click): resolves
+       NAME via TOOL_MODULES, imports and runs that tool's own main(),
+       then exits -- see dispatch_tool_if_requested().
+
+DISPATCH:
+    This IS the dispatch mechanism every tool file's own docstring
+    refers to. See dispatch_tool_if_requested() and TOOL_MODULES.
+
+INPUTS:
+    Command-line: `--tool <NAME>` and `--icon <FILENAME>` (subprocess
+    dispatch mode only). A user-selected .gmw (Global Mapper Workspace)
+    file (launcher mode, via startup_sequence()). PostGIS credentials
+    via the login dialog (show_login_and_connect()) or
+    pg_credentials.json.
+
+OUTPUTS:
+    Launches the selected tool's own main() (dispatch mode). Launches
+    Global Mapper and creates/writes pg_credentials.json (launcher
+    mode). Various GM-automation side effects -- see
+    update_database_from_geopackage()/update_map_and_select_recorded().
+
+DEPENDENCIES:
+    stdlib: atexit, signal, datetime, ctypes (+ ctypes.wintypes), sys,
+    tkinter, subprocess, os, json, pathlib, importlib, argparse,
+    threading, shutil, re, tempfile (mid-file imports, kept at their
+    original locations -- see SIDE EFFECTS below).
+    third-party: psycopg2, rapidfuzz, PIL, geoalchemy2, pygetwindow
+    (imported mid-file as `gw`).
+    local: utils_paths (resource_path).
+
+SIDE EFFECTS:
+    IMPORTANT -- this file is a genuinely sequential SCRIPT, not just a
+    collection of importable definitions. Its module-level statements
+    execute in a required order, interleaved with function definitions
+    throughout. This is fundamentally different from every tool file's
+    single side effect -- Pass 1 of this documentation/reorganization
+    pass deliberately did NOT add section headers across the deeply
+    interleaved regions (roughly lines 3215-3294 and 3467-3801) where
+    executable GUI-construction code (window title/resize calls,
+    bind_drag_to_all(root), the button-grid-building loops) sits
+    directly alongside function definitions -- doing so would have
+    misrepresented genuinely sequential code as an independent function
+    group. See that Pass 1 gate's own verification (full module-level
+    statement sequence compared before/after, not just AST equivalence)
+    for the full reasoning.
+
+    In actual execution order, the key side effects are:
+
+    1. set_app_user_model_id() (see "FORCE WINDOWS APP ICON" section
+       below) -- Win32 taskbar icon identity, same pattern as every
+       tool file.
+    2. os.makedirs(TEMP_DIR, exist_ok=True) -- creates a real directory
+       on disk at import time; on failure, shows an error dialog and
+       calls sys.exit(1), aborting the entire process before anything
+       else runs.
+    3. IS_TOOL_RUN = dispatch_tool_if_requested() -- THE actual --tool
+       dispatch mechanism. If `--tool` was passed with a valid name,
+       this resolves and runs that tool's main(), then calls
+       sys.exit(0) (or sys.exit(1)/sys.exit(2) on crash/unknown tool)
+       from INSIDE this call -- meaning the module never continues
+       past this line in that case. Only when no `--tool` argument was
+       given does this return False and let the module continue as
+       the launcher.
+    4. `if not IS_TOOL_RUN: root = tk.Tk() ...` -- since IS_TOOL_RUN is
+       only ever False when this module continues loading (see #3),
+       this block always executes when reached, creating the real
+       application root window. `root` is a genuine module-level
+       global from this point on (if/else blocks don't introduce a new
+       scope in Python) -- every later function reads it without a
+       `global root` declaration; none reassign it.
+    5. Everything from here to the end of the file is straight-line
+       script execution interleaved with function definitions: GM
+       window tracking setup, tooltip system, the button grid
+       (existing `# === BUTTON DEFINITIONS ===` comments mark this),
+       window drag/position hook installation
+       (bind_drag_to_all(root), install_wm_moving_hook()), ending in
+       `root.after(0, startup_sequence)` and `root.mainloop()` -- the
+       last two statements in the file, which hand control to
+       startup_sequence() (prompts for the .gmw file) and then block
+       in the Tkinter event loop for the rest of the application's
+       life.
+
+    Beyond the above: PostGIS reads/writes, a live PostgreSQL
+    connection, file reads/writes (including patching/rewriting a
+    temporary .gmw file), a subprocess launch to Global Mapper, and
+    extensive Win32 API usage (window enumeration, position/size
+    queries, window-procedure hooking) for tracking and following the
+    Global Mapper window.
+"""
 import atexit
 import signal
 from datetime import datetime
@@ -11,6 +115,9 @@ import ctypes
 import ctypes.wintypes
 import sys
 
+# NOTE: import-time side effect -- this call executes the moment this
+# module is loaded (see module docstring SIDE EFFECTS). Not moved or
+# deferred; see module docstring for why.
 def set_app_user_model_id():
     appid = u"BLGF.CAMA.Tools.2025"
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(appid)
@@ -23,14 +130,20 @@ from tkinter import filedialog, messagebox, Listbox
 import subprocess
 import os
 import json
+from pathlib import Path
+
 import psycopg2
 from rapidfuzz import process, fuzz
 from PIL import Image, ImageTk, ImageDraw
 
-from pathlib import Path
 from utils_paths import resource_path
 
+# ========================================
+# ICON HELPERS
+# ========================================
 def force_png_icon(win):
+    """Sets win's taskbar/titlebar icon from BLGF.png via iconphoto(),
+    holding a reference on the window to prevent garbage collection."""
     png = resource_path("BLGF.png")
     if os.path.exists(png):
         img = tk.PhotoImage(file=png)
@@ -38,6 +151,8 @@ def force_png_icon(win):
         win._icon_ref = img  # prevent garbage collection
 
 def apply_icon(win):
+    """Sets win's icon from BLGF.ico (iconbitmap), falling back to
+    force_png_icon() for the taskbar/titlebar icon."""
     ico = resource_path("BLGF.ico")
     if os.path.exists(ico):
         try:
@@ -50,6 +165,10 @@ def apply_icon(win):
 import sys, importlib, argparse
 
 
+# NOTE: import-time side effect -- creates a real directory on disk the
+# moment this module is loaded, and can call sys.exit(1) on failure
+# (see module docstring SIDE EFFECTS). Not deferred; see module
+# docstring for why.
 TEMP_DIR = r"C:\Global Mapper Temp"
 try:
     os.makedirs(TEMP_DIR, exist_ok=True)
@@ -59,7 +178,9 @@ except Exception as e:
     sys.exit(1)
 
 
-# ── Diagnostic logging for GM export automation ──────────────────────
+# ========================================
+# DIAGNOSTIC LOGGING
+# ========================================
 # Persistent breadcrumb trail for update_database_from_geopackage() and
 # update_map_and_select_recorded(), so a failed run can be reconstructed
 # after the fact instead of relying on console output that scrolls away
@@ -122,7 +243,9 @@ def _dump_windows(context):
         _log(f"WINDOW DUMP ({context}) failed: {e}")
 
 
-# ── GM export automation timeouts (seconds) ─────────────────────────
+# ========================================
+# GM EXPORT AUTOMATION TIMEOUTS
+# ========================================
 # These bound the _wait_for_gpkg_export() poll that replaces the old
 # unbounded `while True:` file-stability loops. Tuned against observed
 # production exports of 11,000+ parcel features — see analysis notes.
@@ -149,6 +272,9 @@ EXPORT_STALL_TIMEOUT_S = 180
 EXPORT_HARD_TIMEOUT_S = 900
 
 
+# ========================================
+# TOOL DISPATCH TABLE
+# ========================================
 TOOL_MODULES = {
     "ANY MAP TO LAND PARCEL": "tools.influence_to_barangay",
     "INFLUENCE TO MAP": "tools.influence_to_map",
@@ -164,6 +290,19 @@ TOOL_MODULES = {
 }
 
 def dispatch_tool_if_requested():
+    """
+    Checks for a `--tool <NAME>` command-line argument and, if present,
+    dispatches to that tool's own main() and exits the process --
+    otherwise returns False to let this module continue as the normal
+    launcher (see module docstring SIDE EFFECTS for the full call-site
+    behavior).
+
+    Returns:
+        bool: False if no `--tool` argument was given (normal launcher
+        flow should proceed). Never returns True -- a successful,
+        crashed, or unknown-tool dispatch all call sys.exit() instead
+        of returning.
+    """
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("--tool", default=None)
     ap.add_argument("--icon", default=None)
@@ -231,6 +370,11 @@ def dispatch_tool_if_requested():
         sys.exit(1)
 
 # run BEFORE any GUI is created
+# NOTE: import-time side effect -- this is THE --tool dispatch
+# mechanism itself. If a valid --tool was passed, this call runs that
+# tool's main() and calls sys.exit() from INSIDE itself -- the module
+# never continues past this line in that case (see module docstring
+# SIDE EFFECTS for the full explanation).
 IS_TOOL_RUN = dispatch_tool_if_requested()
 
 
@@ -255,6 +399,11 @@ selected_gmw_file = None
 stored_username = DEFAULT_DB_USERNAME
 stored_password = DEFAULT_DB_PASSWORD
 
+# NOTE: import-time side effect -- creates the application's real root
+# window at module level. Always executes when reached (IS_TOOL_RUN is
+# only ever False here -- see the comment above dispatch_tool_if_
+# requested()'s call site). `root` becomes a genuine module-level
+# global from this point on -- see module docstring SIDE EFFECTS.
 if not IS_TOOL_RUN:
     root = tk.Tk()
     root.withdraw()
@@ -269,12 +418,19 @@ if not IS_TOOL_RUN:
 
 from geoalchemy2 import Geometry
 
+# ========================================
+# DB / GEOMETRY HELPERS
+# ========================================
 def ensure_postgis(psycopg_conn):
+    """Ensures the PostGIS extension is enabled on the connected
+    database (CREATE EXTENSION IF NOT EXISTS postgis)."""
     with psycopg_conn.cursor() as cur:
         cur.execute("CREATE EXTENSION IF NOT EXISTS postgis;")
     psycopg_conn.commit()
 
 def to_wgs84(gdf):
+    """Reprojects gdf to EPSG:4326, assuming WGS84 if it has no CRS
+    set at all."""
     if gdf.crs is None:
         gdf = gdf.set_crs(epsg=4326)
     elif getattr(gdf.crs, "to_epsg", lambda: None)() != 4326:
@@ -302,6 +458,8 @@ _NOISY_SUFFIXES = (
 )
 
 def _strip_noisy_suffixes(s: str) -> str:
+    """Lowercases s and strips known noisy suffixes (see
+    _NOISY_SUFFIXES) for fuzzy table-name comparison."""
     s = s.lower()
     for suf in _NOISY_SUFFIXES:
         if s.endswith(suf):
@@ -344,6 +502,7 @@ def _name_tokens(name: str) -> list[str]:
     return tokens
 
 def _tokens_subset(a_tokens: list[str], b_tokens: list[str]) -> bool:
+    """True if a_tokens is a non-empty subset of b_tokens."""
     return bool(a_tokens and b_tokens) and set(a_tokens).issubset(set(b_tokens))
 
 def _find_best_table(layer_name: str, existing_tables: list, schema_prefix: str) -> str | None:
@@ -397,6 +556,9 @@ def _find_best_table(layer_name: str, existing_tables: list, schema_prefix: str)
 _active_tooltips = set()
 
 
+# ========================================
+# TOOLTIP SYSTEM
+# ========================================
 def _repin_active_tooltips():
     """
     Z-order fix (independent of the tooltip lifecycle fix above): restores
@@ -432,6 +594,13 @@ def _repin_active_tooltips():
 
 
 def add_tooltip(widget, icon_path, title, subtitle="", canvas=None, bg_id=None):
+    """
+    Attaches a custom hover tooltip (icon + title + optional subtitle,
+    in its own borderless Toplevel) to widget, tracked in
+    _active_tooltips so it can be withdrawn/re-pinned alongside the
+    main CAMA Tools window (see monitor_gm_state(),
+    _repin_active_tooltips()).
+    """
     tooltip = tk.Toplevel(widget)
     tooltip.withdraw()
     tooltip.overrideredirect(True)        # overrideredirect BEFORE apply_icon
@@ -529,7 +698,12 @@ def add_tooltip(widget, icon_path, title, subtitle="", canvas=None, bg_id=None):
     widget.bind("<Leave>", leave)
 
 
+# ========================================
+# GM EXPORT / IMPORT AUTOMATION
+# ========================================
 def extract_actual_name(layer_name: str) -> str:
+    """Strips a trailing '(...)' suffix that Global Mapper sometimes
+    appends to an exported layer name, returning the underlying name."""
     # remove anything after " (" which GM sometimes adds
     if "(" in layer_name:
         layer_name = layer_name.split("(")[0]
@@ -991,6 +1165,16 @@ def _gm_export_guard(func):
 
 @_gm_export_guard
 def update_database_from_geopackage():
+    """
+    GM export automation entry point: drives Global Mapper's keyboard/
+    UI shortcuts (via pyautogui, targeting the locked GM window) to
+    export the currently-active layer as a .gpkg, waits for that
+    export to complete (_wait_for_gpkg_export()), then reads the
+    result and writes/updates the corresponding PostGIS table.
+    Extensively logged via _log() (see DIAGNOSTIC LOGGING section) so a
+    failed run can be reconstructed after the fact. Wrapped by
+    _gm_export_guard to prevent overlapping concurrent runs.
+    """
     import pygetwindow as gw
     import pyautogui
     import time
@@ -1969,6 +2153,15 @@ def update_database_from_geopackage():
 
 @_gm_export_guard
 def update_map_and_select_recorded():
+    """
+    GM import automation entry point: the inverse of
+    update_database_from_geopackage() -- reads the current PostGIS
+    table for the active layer, exports/refreshes it back into Global
+    Mapper via its UI automation, and re-selects the previously
+    recorded feature(s) so the user's map selection survives the
+    round-trip. Extensively logged via _log(). Wrapped by
+    _gm_export_guard.
+    """
     import os, re, time
     import traceback
     import pygetwindow as gw
@@ -2968,6 +3161,14 @@ _base_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
 GM_PATH_FILE = os.path.join(_base_dir, "gm_exe_path.json")
 
 def get_global_mapper_path() -> str:
+    """
+    Resolves the Global Mapper executable path: reuses a previously
+    saved path (GM_PATH_FILE) if it still exists on disk, otherwise
+    prompts the user to locate it and saves that choice for next time.
+
+    Returns:
+        str: absolute path to the Global Mapper executable.
+    """
     # 1) previously saved?
     if os.path.exists(GM_PATH_FILE):
         try:
@@ -3000,11 +3201,20 @@ GM_EXE_PATH = ""  # Will be resolved after login
 
 LAST_EDITED_FILE = "last_edit_source.json"
 
+# ========================================
+# TOOL LAUNCHING
+# ========================================
 def record_edit_source(source_name):
+    """Persists source_name as the last-edited layer/table
+    (LAST_EDITED_FILE), so a later GM automation run knows what to
+    target."""
     with open(LAST_EDITED_FILE, "w") as f:
         json.dump({"source": source_name}, f)
 
 def track_popup_close(popup, label):
+    """Wires popup's close event to decrement popup_windows[label],
+    so run_tool_by_label() knows when no instances of that tool are
+    still open."""
     def on_close():
         popup_windows[label] -= 1
         if popup_windows[label] <= 0:
@@ -3017,6 +3227,17 @@ def track_popup_close(popup, label):
 
 # Launcher: re-run this same EXE with --tool "<LABEL>"
 def run_tool_by_label(label: str):
+    """
+    Launches the tool named by label as a subprocess: re-invokes this
+    same executable/script with `--tool <label>` (resolved via
+    TOOL_MODULES), in dev mode via `python MAIN.py --tool ...` or in a
+    frozen build via the compiled exe itself. Tracks the child process
+    in TOOL_PROCESSES for cleanup at exit.
+
+    Args:
+        label (str): a key in TOOL_MODULES (the button label the user
+        clicked).
+    """
     import sys, os, threading
 
     IS_FROZEN = getattr(sys, 'frozen', False)
@@ -3094,6 +3315,8 @@ def run_tool_by_label(label: str):
         return fake
 
 def on_button_click(label):
+    """Tool-grid button handler: increments popup_windows[label] and
+    calls run_tool_by_label() to launch that tool as a subprocess."""
     print(f"▶ Launching tool: {label}", flush=True)  # debug line
     if label in TOOL_MODULES:
         popup_windows[label] += 1
@@ -3103,7 +3326,18 @@ def on_button_click(label):
 
 
 
+# ========================================
+# LOGIN / DB CONNECTION
+# ========================================
 def show_login_and_connect():
+    """
+    Shows the PostGIS database login dialog (host/port/database/schema/
+    username/password, pre-filled from stored_username/stored_password
+    where available), validates the connection on submit, ensures
+    PostGIS is enabled (ensure_postgis()), and on success proceeds to
+    get_global_mapper_path() + launch_global_mapper(). Blocks
+    (grab_set()) until the user connects or cancels.
+    """
     login_win = tk.Toplevel()
     apply_icon(login_win)
     login_win.title("Database Login")
@@ -3228,6 +3462,8 @@ SWP_NOMOVE     = 0x0002
 SWP_NOACTIVATE = 0x0010
 
 def hide_from_taskbar():
+    """Clears WS_EX_APPWINDOW / sets WS_EX_TOOLWINDOW on root's Win32
+    window style, so the CAMA Tools window has no taskbar entry."""
     hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
     style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
     style = (style | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW
@@ -3237,6 +3473,8 @@ root.after(100, hide_from_taskbar)
 
 # Disable the close button functionality
 def do_nothing():
+    """No-op, used as the WM_DELETE_WINDOW handler to disable the
+    window's close button/Alt+F4."""
     pass
 root.protocol("WM_DELETE_WINDOW", do_nothing)
 
@@ -3246,6 +3484,8 @@ GM_LEFT_PANEL_W = 240
 
 # ── Get CAMA and GM sizes via Win32 (always accurate) ────────────────
 def get_cama_size():
+    """Returns the CAMA Tools window's (width, height) via its Win32
+    window rect, or None if the window can't be found."""
     cama_hwnd = ctypes.windll.user32.FindWindowW(None, "CAMA Tools")
     if cama_hwnd:
         r = ctypes.wintypes.RECT()
@@ -3292,6 +3532,9 @@ _locked_gm_hwnd = [None]
 _locked_gm_pid = [None]
 
 
+# ========================================
+# GM WINDOW TRACKING
+# ========================================
 def _extract_hwnd(win32window):
     """
     Pulls the raw Win32 HWND out of a pygetwindow Win32Window object.
@@ -3335,6 +3578,8 @@ def _locked_gm_snapshot():
 
 
 def get_gm_rect():
+    """Returns the locked Global Mapper window's (left, top, width,
+    height), or None if it can't be determined."""
     try:
         snap = _locked_gm_snapshot()
         if snap and snap[4]:  # snap[4] = visible - preserves old .visible filter
@@ -3345,6 +3590,8 @@ def get_gm_rect():
     return None
 
 def get_hwnd_by_title(partial_title):
+    """Returns HWNDs of all visible top-level windows whose title
+    contains partial_title, via a Win32 EnumWindows scan."""
     found = []
     WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
     def cb(hwnd, _):
@@ -3358,9 +3605,12 @@ def get_hwnd_by_title(partial_title):
 
 # ── Foreground-window focus tracking ──────────────────────────────
 def get_foreground_hwnd():
+    """Returns the HWND of the current foreground (focused) window."""
     return ctypes.windll.user32.GetForegroundWindow()
 
 def hwnd_title(hwnd):
+    """Returns hwnd's window title text, or "" if hwnd is falsy or has
+    no title."""
     if not hwnd:
         return ""
     buf = ctypes.create_unicode_buffer(256)
@@ -3368,6 +3618,7 @@ def hwnd_title(hwnd):
     return buf.value
 
 def get_foreground_pid():
+    """Returns the process ID owning the current foreground window."""
     hwnd = get_foreground_hwnd()
     pid = ctypes.wintypes.DWORD()
     ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
@@ -3418,6 +3669,9 @@ def is_relevant_window_focused():
 
     return False
 
+# ========================================
+# WINDOW DRAG / POSITIONING
+# ========================================
 def clamp_position(new_x, new_y):
     """Clamp CAMA position strictly inside GM's map canvas area."""
     gm = get_gm_rect()
@@ -3444,16 +3698,24 @@ def clamp_position(new_x, new_y):
 _drag_origin = [0, 0]   # screen coords of click minus root origin
 
 def start_move(event):
+    """Mouse-down handler: records the click offset within the window,
+    for do_move() to use during dragging."""
     _drag_origin[0] = event.x_root - root.winfo_x()
     _drag_origin[1] = event.y_root - root.winfo_y()
 
 def do_move(event):
+    """Mouse-drag handler: repositions root, keeping it clamped inside
+    the Global Mapper window's bounds (see clamp_position())."""
     new_x = event.x_root - _drag_origin[0]
     new_y = event.y_root - _drag_origin[1]
     new_x, new_y = clamp_position(new_x, new_y)
     root.geometry(f"+{new_x}+{new_y}")
 
 def bind_drag_to_all(widget):
+    """Recursively binds start_move()/do_move() to widget and all its
+    children (except Canvas widgets, which have their own tool
+    bindings), so the whole CAMA Tools panel is draggable by clicking
+    anywhere on its chrome."""
     # Only bind to frames/labels/root — skip canvases (they have tool bindings)
     if not isinstance(widget, tk.Canvas):
         widget.bind("<Button-1>", start_move, add="+")
@@ -3517,6 +3779,13 @@ ctypes.windll.user32.SetWindowPos.argtypes = [
 _old_wnd_proc = None
 
 def _new_wnd_proc(hwnd, msg, wparam, lparam):
+    """
+    Replacement window procedure installed on the CAMA Tools window
+    (see install_wm_moving_hook()): intercepts WM_MOVING to clamp the
+    window's position inside Global Mapper's bounds while the user is
+    actively dragging it, then delegates every other message to the
+    original window procedure.
+    """
     try:
         if msg == WM_MOVING:
             proposed = ctypes.cast(lparam, ctypes.POINTER(ctypes.wintypes.RECT)).contents
@@ -3534,6 +3803,13 @@ def _new_wnd_proc(hwnd, msg, wparam, lparam):
     )
 
 def install_wm_moving_hook():
+    """
+    Replaces the CAMA Tools window's Win32 window procedure with
+    _new_wnd_proc(), so WM_MOVING can be intercepted to clamp dragging
+    in real time (native window-drag clamping isn't otherwise possible
+    from pure Tkinter). Saves the original procedure in _old_wnd_proc
+    for _new_wnd_proc() to delegate to.
+    """
     global _old_wnd_proc
     cama_hwnd = ctypes.windll.user32.FindWindowW(None, "CAMA Tools")
     if not cama_hwnd:
@@ -3555,6 +3831,18 @@ root.resizable(False, False)
 
 # === IMAGE HANDLING ===
 def round_image(img_path, size=(38, 38), radius=7):
+    """
+    Loads img_path, resizes it to size, and applies a rounded-corner
+    mask, returning a PhotoImage ready for use as a button background.
+
+    Args:
+        img_path (str): path to the source image.
+        size (tuple[int, int]): target (width, height).
+        radius (int): corner radius in pixels.
+
+    Returns:
+        PIL.ImageTk.PhotoImage: the rounded, resized image.
+    """
     img = Image.open(img_path).convert("RGBA")
 
     original_ratio = img.width / img.height
@@ -3798,7 +4086,17 @@ update_btn.pack(side="left", padx=5)  # Add horizontal spacing
 
 
 
+# ========================================
+# MAIN WINDOW LAUNCH
+# ========================================
 def launch_main_window():
+    """
+    Positions and shows the CAMA Tools panel relative to the just-
+    confirmed Global Mapper window (sized/positioned via
+    get_cama_size()/_locked_gm_snapshot()), then installs the taskbar-
+    hiding and window-drag-clamping hooks (hide_from_taskbar(),
+    install_wm_moving_hook()) and binds dragging to the whole panel.
+    """
     snap = _locked_gm_snapshot()
     root.update_idletasks()  # ensure actual size is computed first
     cama_w = root.winfo_reqwidth()
@@ -3853,6 +4151,14 @@ import pygetwindow as gw
 import time
 
 def launch_global_mapper():
+    """
+    Patches the selected .gmw workspace file's stored PostGIS
+    connection details (host/port/database/schema/username/password)
+    to match the just-confirmed login credentials (writing the patched
+    copy to a temp file, leaving the original untouched), launches
+    Global Mapper with that patched workspace, then calls
+    wait_for_global_mapper() to poll until it's ready.
+    """
     import re
     import shutil
     import tempfile
@@ -3918,6 +4224,9 @@ def launch_global_mapper():
     subprocess.Popen([GM_EXE_PATH, patched_path], shell=False)
     wait_for_global_mapper()
 
+# ========================================
+# GLOBAL MAPPER MONITORING
+# ========================================
 prev_position  = [None, None]
 prev_gm_rect   = [None, None, None, None]  # left, top, width, height
 cama_offset    = [None, None]              # CAMA's offset relative to GM
@@ -3925,6 +4234,13 @@ _topmost_recheck_counter = [0]             # throttles repeated SetWindowPos cal
 _active_tool_titles = set()               # tracks open tool window titles in dev mode
 
 def monitor_gm_state():
+    """
+    Recurring poller (self-reschedules via root.after()): keeps the
+    CAMA Tools panel synced to the Global Mapper window's current
+    position/size, re-pins tooltips, and enforces topmost/focus
+    ordering between the two windows. Calls monitor_gm_closure() to
+    detect when Global Mapper itself has closed.
+    """
     try:
         snap = _locked_gm_snapshot()
         if snap and snap[4]:  # snap[4] = visible - preserves old .visible filter
@@ -4018,6 +4334,9 @@ def monitor_gm_state():
     root.after(200, monitor_gm_state)
 
 def monitor_gm_closure():
+    """Checks whether the locked Global Mapper window still exists and
+    is visible; if not, prints a message and exits the CAMA Tools
+    process (Global Mapper closing ends the whole session)."""
     snap = _locked_gm_snapshot()
     if not snap or not snap[4]:  # not found, or found but not visible - preserves old .visible filter
         print("❌ Global Mapper closed. Exiting tools.")
@@ -4029,6 +4348,13 @@ def monitor_gm_closure():
 _gm_stable_count = [0]  # needs to be visible twice before we consider it ready
 
 def wait_for_global_mapper():
+    """
+    Polls (self-reschedules via root.after()) until a visible, non-
+    minimized, real-sized Global Mapper window is found, then proceeds
+    to launch_main_window() -- the handoff point between "Global
+    Mapper is starting up" and "the CAMA Tools panel can now be shown
+    and positioned relative to it."
+    """
     gm_windows = [w for w in gw.getWindowsWithTitle('Global Mapper Pro') if w.visible]
     # Require GM window to be visible AND non-minimized AND have a real size
     ready = (
@@ -4060,10 +4386,17 @@ def wait_for_global_mapper():
     print("⏳ Waiting for Global Mapper...")
     root.after(1000, wait_for_global_mapper)
 
+# ========================================
+# STARTUP SEQUENCE
+# ========================================
 # Step 1: Resize native dialog to medium centered via ctypes
 import threading
 
 def resize_file_dialog():
+    """Runs on a background thread (see startup_sequence()): waits for
+    the native "Select Global Mapper Workspace File" dialog to appear,
+    then resizes/centers it via Win32 calls (the native dialog defaults
+    to an inconveniently small size)."""
     import time
     time.sleep(0.25)
     hwnd = ctypes.windll.user32.FindWindowW(None, "Select Global Mapper Workspace File")
@@ -4076,6 +4409,13 @@ def resize_file_dialog():
         ctypes.windll.user32.MoveWindow(hwnd, x, y, win_w, win_h, True)
 
 def startup_sequence():
+    """
+    First thing that runs once the Tkinter event loop starts (scheduled
+    via root.after(0, startup_sequence) at the very end of this file):
+    starts the resize_file_dialog() background thread, then prompts the
+    user to select a .gmw workspace file. On selection, proceeds to
+    show_login_and_connect() -- the next step in the launcher flow.
+    """
     global selected_gmw_file
 
     threading.Thread(target=resize_file_dialog, daemon=True).start()

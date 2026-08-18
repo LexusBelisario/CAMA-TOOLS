@@ -1,43 +1,55 @@
-# utils/column_detection.py
 """
-Shared existing-output-column detection, extracted from the 9 CAMA
-Tools tool modules in scope for Group 5 Phase B (influence_to_map.py,
-land_shape_compactness.py, lot_location.py,
-poi_within_200_meters_for_parcellary_church_mall_police_park.py,
-road_density.py, road_frontage.py, road_surface.py, road_width.py,
-terrain.py).
+utils/column_detection.py
 
-Confirmed via literal body diff (see
-docs/refactor-log/group-05-phaseb-FINAL-analysis.md) across all 9
-tools' CURRENT, post-Phase-A implementations:
-- 5 tools (multi-target) had a byte-identical standalone
-  `_detect_existing_output_columns(gdf)`, differing only in each tool's
-  own module-level `OUTPUT_COLUMN_TARGETS` constant.
-- 4 tools (single-target) had a structurally identical inline
-  `next((c for c in gdf.columns if c.lower() == "<target>"), None)`
-  expression -- the N=1 case of the exact same matching algorithm,
-  differing only in the target column name literal.
+PURPOSE:
+    Shared existing-output-column detection, originally duplicated across
+    9 of the 11 CAMA Tools tool modules (influence_to_map.py,
+    land_shape_compactness.py, lot_location.py,
+    poi_within_200_meters_for_parcellary_church_mall_police_park.py,
+    road_density.py, road_frontage.py, road_surface.py, road_width.py,
+    terrain.py) and consolidated here.
 
-This module owns ONLY the generic matching algorithm. `targets` remains
-an explicit parameter, never hardcoded here -- each tool retains
-ownership of what it considers its own output column(s) via its own
-module-level constant (or, for single-target tools, a one-element tuple
-built at the call site). This module does not know or care how many
-targets a caller passes, or what they're named.
+    A literal body diff across all 9 tools' implementations found:
+    - 5 tools (multi-target) had a byte-identical standalone
+      `_detect_existing_output_columns(gdf)`, differing only in each
+      tool's own module-level `OUTPUT_COLUMN_TARGETS` constant.
+    - 4 tools (single-target) had a structurally identical inline
+      `next((c for c in gdf.columns if c.lower() == "<target>"), None)`
+      expression -- the N=1 case of the exact same matching algorithm,
+      differing only in the target column name literal.
 
-IMPORTANT -- what this module does NOT include, by design: none of
-Phase A's detect-on-select async infrastructure
-(`_set_parcel_reading_state()`, `_refresh_parcel_X_check()`,
-`_poll_parcel_X_queue()`, the disable/enable-while-reading logic, the
-in-place widget-reuse "Reading..." pattern, the `parcel_is_reading`
-Run-button gate, or any detection-result caching) lives here or is
-intended to move here. That infrastructure differs in real, necessary
-ways per tool (different widget variable names, different
-single-vs-multi-source shapes, different piggyback arrangements with
-other per-tool background reads) and stays local to each tool -- see
-group-05-FINAL-PLAN.md's "reference architecture, not reference
-implementation" principle. This module is a narrow, single-purpose
-extraction of the matching logic only.
+    This module owns ONLY the generic matching algorithm. `targets`
+    remains an explicit parameter, never hardcoded here -- each tool
+    retains ownership of what it considers its own output column(s) via
+    its own module-level constant (or, for single-target tools, a
+    one-element tuple built at the call site). This module does not know
+    or care how many targets a caller passes, or what they're named.
+
+    IMPORTANT -- what this module deliberately does NOT include: none of
+    the detect-on-select async infrastructure
+    (`_set_parcel_reading_state()`, `_refresh_parcel_X_check()`,
+    `_poll_parcel_X_queue()`, the disable/enable-while-reading logic, the
+    in-place widget-reuse "Reading..." pattern, the `parcel_is_reading`
+    Run-button gate, or any detection-result caching) lives here or is
+    intended to move here. That infrastructure differs in real, necessary
+    ways per tool (different widget variable names, different
+    single-vs-multi-source shapes, different piggyback arrangements with
+    other per-tool background reads) and stays local to each tool. This
+    module is a narrow, single-purpose extraction of the matching logic
+    only.
+
+INPUTS:
+    gdf: a GeoDataFrame (or any object exposing a `.columns` iterable of
+    strings) to search.
+    targets: an iterable of target column name strings to look for.
+
+OUTPUTS:
+    dict: {target: actual_existing_column_name}, containing only the
+    targets that were actually found on `gdf` (case-insensitive exact
+    match). A target with no match is simply absent from the result.
+
+DEPENDENCIES:
+    None (no imports; pure Python using only builtins).
 """
 
 

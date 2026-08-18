@@ -1,23 +1,109 @@
-root = None
+"""
+tools/road_width.py
 
+PURPOSE:
+    CAMA Tools tool ("ROAD WIDTH" in MAIN.py's dispatch table): for
+    each Land Parcel, measures the width of its adjacent road via a
+    frontage-first algorithm (find the parcel boundary segment that is
+    genuinely road-adjacent within ROAD_FRONT_TOLERANCE, then measure
+    across the road at that frontage), writing CAMA_ROAD_WIDTH (or an
+    existing differently-cased column, if detected and confirmed at
+    Run time -- see parcel_road_width_column_overrides below). A
+    MAX_ROAD_DISTANCE sanity cutoff guards against a physically
+    implausible result. Supports an optional Road Type exclusion
+    filter and an optional per-source Lot Location/Lot Label
+    classification pass, mutually exclusive with each other at the GUI
+    level (ported from road_frontage.py's Road Classification feature
+    -- see the RUNTIME STATE section below).
+
+DISPATCH:
+    Run as an isolated subprocess by MAIN.py via its `--tool` dispatch
+    mechanism (see system context). Entry point is main(), triggered via
+    the `if __name__ == "__main__":` guard at the bottom of this file.
+
+INPUTS:
+    Land Parcel source: one or more local files or PostGIS tables.
+    Road Network source: a single local file or PostGIS table.
+    pg_credentials.json (via load_db_credentials(), from
+    utils/db_discovery.py) for any DB source or DB output.
+
+OUTPUTS:
+    Local output mode: writes one .gpkg per processed Land Parcel
+    source, then attempts to open it in Global Mapper.
+    DB output mode: writes/replaces one PostGIS table per source,
+    resolved via a fuzzy-match-with-confirmation flow for local-file
+    sources, or an exact-match replace for DB sources.
+
+DEPENDENCIES:
+    stdlib: os, re, time, threading, queue, subprocess, json, ctypes,
+    sys (both plain `import sys` where used, and a separate
+    `import sys as _sys` -- see CONFIGURATION section below, kept
+    exactly as found, not normalized), tkinter (+ ttk).
+    third-party: geopandas, pandas, numpy, shapely (geometry, ops,
+    validation), sqlalchemy, psycopg2.
+    local: utils.table_name_matching, utils.resource_path,
+    utils.db_discovery, utils.column_detection, utils.window_icon.
+
+    NOTE: unlike every other CAMA Tools tool file, this module does
+    NOT import from tools/progress_framework.py -- it has its own,
+    fully standalone progress-presentation implementation (UpdateState,
+    SwitchState, RoadWidthPresentationPolicy, RoadWidthTkinterView,
+    ProgressWindow -- see the "PROGRESS WINDOW (thread-safe)" section
+    further below). This file was deliberately not migrated to the
+    shared framework.
+
+SIDE EFFECTS:
+    File reads/writes (.shp/.gpkg). PostGIS reads/writes. A live
+    PostgreSQL connection. Tkinter GUI windows throughout, including
+    TWO independent background-thread + queue.Queue-based detect-on-
+    select systems (Land Parcel existing-output-column detection, and
+    Road Network road-type/classification reading, the latter cached
+    in _road_gdf_cache for run_processing() to reuse) plus a third
+    background thread + queue.Queue for the main processing run. A
+    subprocess launch to Global Mapper on local-output saves.
+    Direct Win32 window-style manipulation (WS_EX_TOOLWINDOW) inside
+    main() itself, to hide this tool's hidden root window from the
+    taskbar -- unlike other CAMA Tools files, this happens inside a
+    function, not as a module-level import-time side effect, so it is
+    NOT flagged the way FORCE WINDOWS APP ICON is in other files.
+
+    KNOWN FOLLOW-UP (documented, not implemented here): GM_EXE_PATH
+    below is currently a hardcoded absolute path
+    ("C:\\Program Files\\GlobalMapper26.1_64bit\\global_mapper.exe").
+    The planned improvement is dynamic Global Mapper executable-path
+    discovery instead of a hardcoded constant. That discovery logic
+    (search locations, missing-executable handling, installation-
+    variant handling, fallback behavior) is a separate, deliberately-
+    scoped future task -- not implemented as part of this
+    documentation/reorganization pass, since it would change runtime
+    behavior.
+
+    Also preserved, not fixed: an old, unused progress-window
+    implementation (create_progress_window()/update_progress(), in the
+    "PROGRESS WINDOW (OLD -- kept temporarily, unused)" section) --
+    explicitly kept in place as the first phase of a two-phase
+    migration per its own existing comment; not called anywhere in
+    this file.
+"""
 import os
 import re
 import time
+import threading
+import queue
+import subprocess
+import json
 import tkinter as tk
 from tkinter import ttk
 from tkinter import filedialog, messagebox, Listbox
+
 import geopandas as gpd
 import pandas as pd
 import numpy as np
 from shapely.geometry import Point, LineString
 from shapely.ops import unary_union, nearest_points
 from shapely.validation import make_valid
-import subprocess
-import json
 from sqlalchemy import create_engine, text, inspect
 import psycopg2
-import threading
-import queue
 
 from utils.table_name_matching import normalize_name, find_matching_tables
 from utils.resource_path import resource_path
@@ -25,11 +111,59 @@ from utils.db_discovery import load_db_credentials, fetch_tables
 from utils.column_detection import detect_existing_output_columns
 from utils.window_icon import apply_icon
 
-# ----------------- CONFIG -----------------
+# ========================================
+# CONFIGURATION
+# ========================================
+# Hardcoded (current behavior). Planned improvement: dynamic Global
+# Mapper executable discovery. Actual implementation: separate future
+# task -- see module docstring SIDE EFFECTS for the full note.
 GM_EXE_PATH = r"C:\Program Files\GlobalMapper26.1_64bit\global_mapper.exe"
 import sys as _sys
 
+# MAX_ROAD_DISTANCE: sanity cutoff (meters, in the PRS92 projected CRS
+# used internally by process()) applied to every width candidate in the
+# frontage-first _measure_width() algorithm (see ROAD_FRONT_TOLERANCE
+# below for the frontage-detection stage itself). Originally added when
+# the measurement algorithm did an unbounded nearest-road search with no
+# built-in distance limit -- a parcel with no real nearby road (layer
+# misalignment, wrong CRS, a road type just excluded via Filter by Road
+# Type, or a genuine data gap) could silently receive a large,
+# meaningless ROAD_WIDTH instead of being flagged as unmeasurable (None),
+# unlike every other bail-out case in process(). Kept as a defensive
+# safeguard under the current frontage-first algorithm even though every
+# width candidate there is already confined to ROAD_FRONT_TOLERANCE (so
+# this check should not be structurally reachable in practice) -- not
+# removed without evidence it's genuinely unnecessary.
+#
+# 50m is a starting point, not a fixed law -- distinct in purpose from
+# the smaller (10-15m) proximity tolerances used elsewhere in this
+# codebase for "is this touching/adjacent" classification decisions
+# (e.g. the 10m road-touch buffer referenced in this file's own history,
+# and lot_location.py's own tolerances). MAX_ROAD_DISTANCE instead
+# answers "is this measurement still physically plausible at all" --
+# it needs to comfortably cover genuine local/barangay road corridor
+# widths, sidewalk/drainage/easement space between a parcel boundary and
+# a road centerline, and typical misalignment between separately
+# digitized parcel and road layers, while still catching real error
+# cases (hundreds of meters off, or no nearby road at all). Adjust here
+# if production data shows it's too strict or too loose.
+MAX_ROAD_DISTANCE = 50
 
+# ROAD_FRONT_TOLERANCE: adjacency tolerance (meters, same projected CRS)
+# used by the frontage-first measurement algorithm to decide whether a
+# parcel boundary segment is genuinely road-adjacent at all ("is this
+# the road front"). Distinct business rule from MAX_ROAD_DISTANCE above
+# -- that one answers "is this measurement still physically plausible,"
+# this one answers "is this edge actually touching a road." Matches the
+# established codebase convention for this kind of adjacency test (the
+# same 10m used by road_frontage.py's _edge_covered_portion() default,
+# and by lot_location.py's own tolerances).
+ROAD_FRONT_TOLERANCE = 10
+
+
+# ========================================
+# WINDOW CHROME HELPERS
+# ========================================
 def _get_dialog_center_position(dialog_widget, req_w, req_h):
     """
     Returns (x, y) screen coordinates to center a dialog of the given
@@ -154,46 +288,10 @@ def _remove_close_button(win):
     except Exception as e:
         print(f"⚠️ Could not remove the titlebar close button (non-Windows platform, or unexpected Win32 API issue): {e}")
 
-# MAX_ROAD_DISTANCE: sanity cutoff (meters, in the PRS92 projected CRS
-# used internally by process()) applied to every width candidate in the
-# frontage-first _measure_width() algorithm (see ROAD_FRONT_TOLERANCE
-# below for the frontage-detection stage itself). Originally added when
-# the measurement algorithm did an unbounded nearest-road search with no
-# built-in distance limit -- a parcel with no real nearby road (layer
-# misalignment, wrong CRS, a road type just excluded via Filter by Road
-# Type, or a genuine data gap) could silently receive a large,
-# meaningless ROAD_WIDTH instead of being flagged as unmeasurable (None),
-# unlike every other bail-out case in process(). Kept as a defensive
-# safeguard under the current frontage-first algorithm even though every
-# width candidate there is already confined to ROAD_FRONT_TOLERANCE (so
-# this check should not be structurally reachable in practice) -- not
-# removed without evidence it's genuinely unnecessary.
-#
-# 50m is a starting point, not a fixed law -- distinct in purpose from
-# the smaller (10-15m) proximity tolerances used elsewhere in this
-# codebase for "is this touching/adjacent" classification decisions
-# (e.g. the 10m road-touch buffer referenced in this file's own history,
-# and lot_location.py's own tolerances). MAX_ROAD_DISTANCE instead
-# answers "is this measurement still physically plausible at all" --
-# it needs to comfortably cover genuine local/barangay road corridor
-# widths, sidewalk/drainage/easement space between a parcel boundary and
-# a road centerline, and typical misalignment between separately
-# digitized parcel and road layers, while still catching real error
-# cases (hundreds of meters off, or no nearby road at all). Adjust here
-# if production data shows it's too strict or too loose.
-MAX_ROAD_DISTANCE = 50
-
-# ROAD_FRONT_TOLERANCE: adjacency tolerance (meters, same projected CRS)
-# used by the frontage-first measurement algorithm to decide whether a
-# parcel boundary segment is genuinely road-adjacent at all ("is this
-# the road front"). Distinct business rule from MAX_ROAD_DISTANCE above
-# -- that one answers "is this measurement still physically plausible,"
-# this one answers "is this edge actually touching a road." Matches the
-# established codebase convention for this kind of adjacency test (the
-# same 10m used by road_frontage.py's _edge_covered_portion() default,
-# and by lot_location.py's own tolerances).
-ROAD_FRONT_TOLERANCE = 10
-
+# ========================================
+# RUNTIME STATE
+# ========================================
+root = None
 barangay_source = None
 road_source = None
 output_mode = None
@@ -232,8 +330,8 @@ road_type_excluded_values = []
 parcel_road_width_column_overrides = {}
 
 # Road Network Source: does NOT skip a fresh read on selection/toggle
-# (scope of the Group 5 cache-removal decision extended here on 2026-08
-# -- see group-05-cache-removal-analysis.md) -- external changes to the
+# (scope of the Group 5 cache-removal decision extended here on
+# 2026-08) -- external changes to the
 # road layer between one selection and the next should always be
 # picked up by a fresh read, same reasoning as the Land Parcel side,
 # even though this specific check (ROAD_TYPE filter checklist) isn't
@@ -257,14 +355,16 @@ _road_gdf_cache = {
 }
 
 # Land Parcel Source: deliberately does NOT cache detection results
-# across selections/toggles (see group-05-cache-removal-analysis.md) --
+# across selections/toggles --
 # a cache keyed only on "which file/table was selected" cannot detect
 # that the file/table's CONTENTS changed externally (e.g. another CAMA
 # tool, QGIS, or Global Mapper modifying it) between one selection and
 # the next. Every selection AND every Local/Database toggle triggers a
 # fresh read instead -- see _refresh_parcel_classification() below.
 
-# ----------------- HELPERS -----------------
+# ========================================
+# HELPERS
+# ========================================
 # NOTE: normalize_name() and find_matching_table() previously existed
 # here -- removed entirely. find_matching_table() used SUBSTRING
 # matching (normalize_name() strips non-letters, then checks "a in b or
@@ -715,6 +815,18 @@ def with_qa_suffix(main_base_name: str) -> str:
     return f"{main_base_name}_VM"
 
 def get_geometry_column(table_name, engine, schema):
+    """
+    Looks up the geometry column name for a PostGIS table via the
+    geometry_columns system view.
+
+    Args:
+        table_name (str): the table to look up.
+        engine: a SQLAlchemy engine.
+        schema (str): the schema the table lives in.
+
+    Returns:
+        str | None: the geometry column name, or None if not found.
+    """
     try:
         with engine.connect() as conn:
             query = text("""
@@ -858,7 +970,9 @@ def load_in_global_mapper(filepath):
     except Exception as e:
         print(f"⚠️ Could not open in Global Mapper: {e}")
 
-# ----------------- CRS UTILITY -----------------
+# ========================================
+# CRS UTILITY
+# ========================================
 # PRS92_ZONE_BOUNDS: same zone boundary numbers road_width.py already
 # used, restructured into the table-driven form shared with
 # lot_location.py / road_frontage.py, so all three tools stay in sync if
@@ -950,7 +1064,9 @@ def detect_prs92_zone(labeled_gdfs):
 
     raise ValueError(f"Could not determine PRS92 zone for longitude {center_lon}")
 
-# ----------------- ROAD CLASSIFICATION UTILITIES (new) -----------------
+# ========================================
+# ROAD CLASSIFICATION UTILITIES (new)
+# ========================================
 # Ported verbatim from road_frontage.py's Road Classification feature
 # (the canonical, approved reference implementation).
 
@@ -1209,10 +1325,15 @@ def resolve_classification(brgy_gdf, use_lot_classification, filter_by_road_type
     }
 
 
-# ----------------- FRONTAGE-FIRST WIDTH MEASUREMENT UTILITIES -----------------
+# ========================================
+# FRONTAGE-FIRST WIDTH MEASUREMENT UTILITIES
+# ========================================
 # split_boundary_to_segments(): ported verbatim from road_frontage.py.
 # No behavioral changes.
 def split_boundary_to_segments(boundary):
+    """Splits a LineString or MultiLineString boundary into individual
+    2-point LineString segments (one per consecutive coordinate pair),
+    for per-segment frontage testing against the road network."""
     segments = []
     if boundary.geom_type == 'LineString':
         coords = list(boundary.coords)
@@ -1282,8 +1403,36 @@ def _edge_covered_portion_and_road(seg, road_union, tol=10):
     return covered_piece, road_in_zone
 
 
-# ----------------- MAIN PROCESS -----------------
+# ========================================
+# MAIN PROCESS
+# ========================================
 def process(barangay_gdf, road_gdf, source_name="", progress_cb=None, classification=None, output_column_name="CAMA_ROAD_WIDTH"):
+    """
+    Core measurement engine: for each parcel, finds its road-frontage
+    boundary segment (within ROAD_FRONT_TOLERANCE of the road network,
+    via split_boundary_to_segments() + _edge_covered_portion_and_road())
+    and measures the road width across that frontage, subject to the
+    MAX_ROAD_DISTANCE sanity cutoff. Optionally gated by classification
+    (Road Type filter or per-source Lot Location/Lot Label
+    classification -- see resolve_classification()).
+
+    Args:
+        barangay_gdf (geopandas.GeoDataFrame): parcels to process.
+        road_gdf (geopandas.GeoDataFrame): road network layer.
+        source_name (str): label used in progress/log messages only.
+        progress_cb (callable, optional): progress callback invoked
+        during the per-parcel loop.
+        classification (dict, optional): output of
+        resolve_classification() -- gates which parcels/roads
+        participate. Defaults to "no_gating" (identical to this tool's
+        pre-Road-Classification-feature behavior).
+        output_column_name (str): exact column name to write the
+        computed width into -- see the preserved comment below for why
+        this can differ from the default "CAMA_ROAD_WIDTH".
+
+    Returns:
+        The processed GeoDataFrame with output_column_name populated.
+    """
     # classification: dict produced by resolve_classification() -- see
     # its docstring for the exact shape. Defaults to "no gating at all"
     # (identical to this tool's original, pre-feature behavior) so any
@@ -1626,12 +1775,33 @@ def process(barangay_gdf, road_gdf, source_name="", progress_cb=None, classifica
 
     return barangay_gdf, qa_gdf
 
-# ----------------- SINGLE MAIN WINDOW -----------------
+# ========================================
+# MAIN WINDOW
+# ========================================
 # Drop-in replacement for the entire open_main_window function in road_width.py
 # Key fix: all toggle functions are defined BEFORE any widget references them,
 # and toggle is explicitly called after widget creation to set initial state.
 
 def open_main_window(root):
+    """
+    Builds and shows the tool's single unified configuration window:
+    Land Parcel and Road Network source pickers (each with a
+    Local-file/Database-table radio toggle), a Road Classification
+    section (per-source Lot Location/Lot Label checkboxes, mutually
+    exclusive with the Road Type exclusion filter), an Output
+    destination picker, and a Run button.
+
+    Runs TWO independent background detect-on-select systems (each its
+    own daemon thread + root.after()-polled queue.Queue): one for Land
+    Parcel existing-output-column detection
+    (_refresh_parcel_classification()), one for Road Network road-type/
+    classification reading (_refresh_road_classification(), cached in
+    _road_gdf_cache for run_processing() to reuse). Both are
+    independent of Run being clicked.
+
+    Args:
+        root: the parent Tk root this window is opened under.
+    """
 
     win = tk.Toplevel(root)
     apply_icon(win, "roadwidth.ico")
@@ -1838,8 +2008,7 @@ def open_main_window(root):
         below on purpose):
           1. Guarded mutual-exclusion mutation
           2. (No cache synchronization step -- detection results are no
-             longer cached at all, see group-05-cache-removal-
-             analysis.md; parcel_classification_vars is simply the
+             longer cached at all; parcel_classification_vars is simply the
              live, current set of BooleanVars for whatever was most
              recently read.)
           3. Visibility refresh
@@ -1888,8 +2057,8 @@ def open_main_window(root):
 
         Always creates fresh BooleanVars -- no reuse-across-calls
         mechanism (that existed only to preserve checkbox state across a
-        cache hit; detection results are no longer cached at all, see
-        group-05-cache-removal-analysis.md, so every rebuild reflects a
+        cache hit; detection results are no longer cached at all, so
+        every rebuild reflects a
         genuinely fresh read and starts each checkbox unchecked).
 
         Plain destroy-and-repopulate, called directly by the CALLER
@@ -2042,8 +2211,7 @@ def open_main_window(root):
         _on_parcel_classification_checkbox_changed() above, deliberately:
           1. Guarded mutual-exclusion mutation
           2. (No cache synchronization step -- Road Network's read
-             result is no longer cached at all, see
-             group-05-cache-removal-analysis.md; kept as an explicit
+             result is no longer cached at all; kept as an explicit
              "nothing to do" step only for structural symmetry with the
              other callback)
           3. Visibility refresh
@@ -2322,8 +2490,8 @@ def open_main_window(root):
         tool, QGIS, or Global Mapper modifying it) since it was last
         read here -- serving a stale result would defeat the purpose of
         the ROAD_WIDTH-conflict check this same read also performs (see
-        below). See group-05-cache-removal-analysis.md for the full
-        reasoning. What IS still remembered across calls is only WHICH
+        below) -- the check must always reflect a fresh read, never a
+        cached result. What IS still remembered across calls is only WHICH
         file/table is selected per mode (parcel_local_path /
         parcel_db_table) -- a separate concern, untouched by this
         function.
@@ -2515,8 +2683,8 @@ def open_main_window(root):
         state -- every call, whether triggered by a fresh Browse
         selection or by toggling Local <-> Database, always performs a
         real read. This extends the same reasoning already applied to
-        Land Parcel's existing-output-column detection (see
-        group-05-cache-removal-analysis.md) to Road Network's road-type
+        Land Parcel's existing-output-column detection to Road
+        Network's road-type
         filter too: a cache keyed only on "which file/table was
         selected" cannot detect that the file/table's CONTENTS changed
         externally since it was last read here.
@@ -2853,8 +3021,7 @@ def open_main_window(root):
         # Switching Local <-> Database does NOT clear the other mode's
         # remembered selection -- that's pre-existing behavior, left
         # untouched. Always re-checks fresh for whichever mode is now
-        # active -- no cached result is ever restored (see
-        # group-05-cache-removal-analysis.md).
+        # active -- no cached result is ever restored.
         _refresh_parcel_classification()
 
     # ── parcel radio buttons (command wired AFTER toggle defined) ─
@@ -3023,8 +3190,7 @@ def open_main_window(root):
         # Switching Local <-> Database does NOT clear the other mode's
         # remembered selection -- that's pre-existing behavior, left
         # untouched. Always re-checks fresh for whichever mode is now
-        # active -- no cached result is ever restored (see
-        # group-05-cache-removal-analysis.md).
+        # active -- no cached result is ever restored.
         _refresh_road_classification()
 
     # ── road radio buttons ────────────────────────────────────────
@@ -3282,6 +3448,17 @@ def open_main_window(root):
 
 # ── shared DB table picker (used by both parcel and road) ────────
 def _pick_db_tables(parent, tables, multi, on_select):
+    """
+    Simple modal listbox dialog for picking one (multi=False) or more
+    (multi=True) table names from `tables`. Calls on_select(selection)
+    and closes itself once the user confirms a non-empty selection.
+
+    Args:
+        parent: parent Tk window.
+        tables (list[str]): table names to list.
+        multi (bool): whether multiple selection is allowed.
+        on_select (callable): called with the list of selected names.
+    """
     picker = tk.Toplevel(parent)
     picker.title("Select Table(s)")
     picker.resizable(False, False)
@@ -3303,6 +3480,14 @@ def _pick_db_tables(parent, tables, multi, on_select):
               width=20).pack(pady=(0, 10))
 
 def select_output_window(root):
+    """
+    Standalone Output-destination picker window (Local folder vs.
+    Database), setting the module-level output_mode global. Appears
+    unused -- open_main_window() has its own inline output picker and
+    is the actual window shown to the user; no call site for this
+    function was found anywhere in this file. Kept as-is, not removed
+    or consolidated (see Section 3.E.7 of the governing instructions).
+    """
     win = tk.Toplevel(root)
     win.title("Select Output Destination")
 
@@ -3357,7 +3542,9 @@ def select_output_window(root):
         width=18
     ).pack(side=tk.LEFT, padx=5)
 
-# ----------------- SUCCESS DIALOG -----------------
+# ========================================
+# SUCCESS DIALOG
+# ========================================
 def show_success_dialog(parent, total_sources, failed_sources, single_success_detail=None):
     """
     "Processing complete" summary dialog -- or, for the one specific
@@ -3753,7 +3940,9 @@ def ask_overwrite_dialog(parent, conflicting_names):
     dialog.wait_window()
     return result["choice"]
 
-# ----------------- PROGRESS WINDOW (thread-safe) -----------------
+# ========================================
+# PROGRESS WINDOW (thread-safe)
+# ========================================
 # ============================================================
 # Progress Event Protocol v9 — Phase 3 migration (road_width.py)
 # ============================================================
@@ -3988,7 +4177,9 @@ class ProgressWindow:
         self._view.destroy()
 
 
-# ----------------- PROGRESS WINDOW (OLD -- kept temporarily, unused) -----------------
+# ========================================
+# PROGRESS WINDOW (OLD -- kept temporarily, unused)
+# ========================================
 # NOTE: superseded by the ProgressWindow class above as part of moving
 # run_processing() onto a background thread (see that function's own
 # docstring). create_progress_window()/update_progress() below are no
@@ -4027,7 +4218,9 @@ def update_progress(win, lbl, bar, count_lbl, step, total, msg):
     win.update()
 
 
-# ----------------- PROCESSING -----------------
+# ========================================
+# RUN
+# ========================================
 def _translate_exception(e, source_label):
     """
     Maps a caught exception to a plain-language, non-technical message
@@ -4765,8 +4958,24 @@ def run_processing(app_root, overwrite_mode=None, resolved_table_name=None, reso
     poll_queue()
 
 
-# ----------------- MAIN -----------------
+# ========================================
+# MAIN / ENTRYPOINT
+# ========================================
 def main(parent=None):
+    """
+    Tool entry point. If parent is given (invoked from within another
+    running Tk app), reuses it as root and just opens this tool's
+    window. Otherwise creates and hides a new Tk root, then directly
+    manipulates its Win32 extended window style (clearing
+    WS_EX_APPWINDOW, setting WS_EX_TOOLWINDOW) so the permanently-hidden
+    root never shows a taskbar entry or alt-tab icon -- this happens
+    here, inside main(), not as a module-level import-time side effect
+    (unlike other CAMA Tools files' FORCE WINDOWS APP ICON pattern; see
+    module docstring SIDE EFFECTS).
+
+    Args:
+        parent: an existing Tk root to reuse, or None to create one.
+    """
     global root
 
     if parent is not None:
