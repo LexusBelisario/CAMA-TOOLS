@@ -7,10 +7,15 @@ PURPOSE:
     routed distance (falling back to straight-line distance) to the 3
     nearest POIs of each type present in ALLOWED_FCLASS (school, church,
     shop, transport, university), writing up to 3 ranked distance +
-    method columns per type (CAMA_{TYPE}{1-3} and its _METHOD
-    companion). Tool-style version, mirroring road_width.py's overall
-    architecture (progress dialog, DB-output resolution flow, window-
-    chrome handling).
+    name columns per type (CAMA_{TYPE}{1-3} and its _NAME companion --
+    the corresponding POI's own name, or Python None if missing/
+    unavailable). Only types actually present in the selected POI
+    source get any columns at all, and only ranks that are
+    categorically achievable from that type's total POI count (see
+    task()'s pre-init notes) -- a type with, say, only 1 total POI
+    never gets CAMA_{TYPE}2/3 columns. Tool-style version, mirroring
+    road_width.py's overall architecture (progress dialog, DB-output
+    resolution flow, window-chrome handling).
 
 DISPATCH:
     Run as an isolated subprocess by MAIN.py via its `--tool` dispatch
@@ -77,12 +82,17 @@ import json
 import subprocess
 import ctypes
 import sys
+import bisect
+import threading
+import queue
 import tkinter as tk
 from tkinter import filedialog, messagebox, Listbox, ttk
 
 import geopandas as gpd
 import networkx as nx
 from shapely.geometry import Point, LineString
+from shapely.strtree import STRtree
+from shapely.ops import nearest_points
 import numpy as np
 import pandas as pd
 from scipy.spatial import cKDTree
@@ -152,6 +162,16 @@ parcel_source = None     # ("local", [paths]) OR ("db", [tables])
 poi_source = None        # ("local", [path])  OR ("db", [table])
 road_source = None       # ("local", [path])  OR ("db", [table])
 output_mode = None       # ("local", out_dir) OR ("db", None)
+
+# PART 2: {raw_normalized_fclass: assigned_CAMA_column_suffix} for
+# whichever "Include Other Landmark Types" sub-checkboxes were checked
+# at Run time (see on_run()). Empty dict or None -- the default -- means
+# no dynamic types are processed, i.e. today's exact ALLOWED_FCLASS-only
+# behavior. Populated using the SAME suffix assignment already shown to
+# the user in the checklist (see _assign_other_type_column_suffixes()),
+# never recomputed from just the checked subset, so what the checklist
+# displayed always matches what gets written.
+selected_other_poi_column_map = None
 
 ALLOWED_FCLASS = {"school", "church", "shop", "transport", "university"}
 
@@ -340,36 +360,215 @@ def read_postgis_clean(table, engine, schema):
 # Business decision (confirmed): only check for types that are actually
 # PRESENT in the selected POI source this run -- if there's no
 # "university" POI in the selected POI layer, there's no reason to
-# check for a pre-existing CAMA_UNIVERSITY1 conflict. All three ranks
-# (1-3) are checked for every present type, plus each rank's _METHOD
-# companion column, e.g. present type "school" -> CAMA_SCHOOL1,
-# CAMA_SCHOOL2, CAMA_SCHOOL3, CAMA_SCHOOL1_METHOD, CAMA_SCHOOL2_METHOD,
-# CAMA_SCHOOL3_METHOD.
+# check for a pre-existing CAMA_UNIVERSITY1 conflict. Every rank that
+# is categorically achievable for a present type (per that type's own
+# total POI count -- see task()'s pre-init notes) is checked, plus each
+# rank's _NAME companion column, e.g. present type "school" with 3+
+# total POIs -> CAMA_SCHOOL1, CAMA_SCHOOL1_NAME, CAMA_SCHOOL2,
+# CAMA_SCHOOL2_NAME, CAMA_SCHOOL3, CAMA_SCHOOL3_NAME.
 #
-# NOTE (flagged, not acted on): the per-row distance-write loop in
-# task() below unconditionally pre-initializes ALL FIVE ALLOWED_FCLASS
-# types' distance columns (CAMA_SCHOOL1..CAMA_UNIVERSITY3) to NaN every
-# run, regardless of which types are actually present in this run's POI
-# source -- this is pre-existing tool behavior, unrelated to and not
-# modified by this change. Scoping the conflict CHECK to only
-# currently-present types (per the confirmed decision above) means a
-# type absent this run won't trigger a warning even though its
-# pre-init step will still silently wipe that column's old values to
-# NaN, same as it always has. This is an accepted, informed tradeoff,
-# not an oversight.
+# RESOLVED (previously flagged here as an accepted, unfixed gap): the
+# main-output pre-init loop in task() below now iterates fixed_types
+# (present-only) and rank-caps via min(3, that type's total POI count)
+# instead of unconditionally pre-creating all three ranks for the full
+# static ALLOWED_FCLASS set -- a type absent from this run's POI source
+# gets no columns at all, and a present type with fewer than 3 total
+# POIs only gets the ranks it could ever actually populate. The two
+# steps (this conflict CHECK, and the actual pre-init) are therefore
+# consistent with each other again.
+def _sanitize_fclass_to_suffix(normalized_fclass):
+    """
+    PART 2: converts one already-normalized (lowercase, stripped)
+    fclass value into a valid CAMA_ column-name suffix: any run of
+    non-alphanumeric characters becomes a single underscore, repeated
+    underscores collapse to one, leading/trailing underscores are
+    stripped, and the result is uppercased.
+
+    The result is guaranteed non-empty: if sanitization leaves nothing
+    (e.g. the raw value was purely punctuation/whitespace/symbols), a
+    fixed placeholder ("OTHER") is used instead. This placeholder is
+    NOT special-cased for collisions -- it flows through
+    _assign_other_type_column_suffixes() exactly like any other
+    suffix, so two different unsanitizable values still get correctly
+    disambiguated from each other rather than silently colliding.
+
+    This function does NOT check for collisions with other dynamic
+    types or with the fixed ALLOWED_FCLASS column names -- that is
+    _assign_other_type_column_suffixes()'s job, since collision
+    resolution requires seeing every candidate at once.
+    """
+    suffix = re.sub(r"[^0-9A-Za-z]+", "_", normalized_fclass)
+    suffix = re.sub(r"_+", "_", suffix).strip("_")
+    suffix = suffix.upper()
+    if not suffix:
+        suffix = "OTHER"
+    return suffix
+
+
+def _int_to_letter_tier(n):
+    """
+    PART 2: deterministic 0-indexed integer -> letter-tier string,
+    used only to disambiguate colliding sanitized suffixes (0->"A",
+    1->"B", ..., 25->"Z", 26->"AA", 27->"AB", ...). A LETTER tier is
+    used specifically because the existing CAMA_{TYPE}{1-3} convention
+    already appends a bare digit (1/2/3) for rank -- disambiguating
+    with digits too (e.g. "_1") would make "CAMA_SUFFIX_11" ambiguous
+    between disambiguator "_1" + rank "1" and a literal rank "11".
+    Letters can never be confused with that numeric rank suffix.
+    """
+    n += 1
+    letters = ""
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        letters = chr(ord("A") + rem) + letters
+    return letters
+
+
+def _assign_other_type_column_suffixes(other_types):
+    """
+    PART 2: assigns a valid, mutually-distinct, collision-safe CAMA_
+    column-name suffix to every distinct "other" (non-ALLOWED_FCLASS)
+    fclass value discovered in a POI source.
+
+    Args:
+        other_types: iterable of distinct, already-normalized
+        (lowercase, stripped) fclass strings. Must NOT include any
+        value already in ALLOWED_FCLASS -- callers are responsible for
+        excluding those upstream (they are always processed via the
+        existing fixed-type path instead, unaffected by this
+        function).
+
+    Returns:
+        dict: {normalized_fclass: column_suffix}. Every value is
+        non-empty (see _sanitize_fclass_to_suffix()), every value is
+        distinct from every other value in this dict, and no value
+        ever equals an upper-cased ALLOWED_FCLASS name (SCHOOL,
+        CHURCH, SHOP, TRANSPORT, UNIVERSITY) -- even if a type's own
+        sanitized form would otherwise exactly match one (e.g. a raw
+        fclass value like "school!" sanitizes to "SCHOOL", which would
+        silently collide with the existing fixed CAMA_SCHOOL* columns
+        if not caught here).
+
+        Collision handling (never silently drops a type): types are
+        grouped by their sanitized base suffix (via
+        _sanitize_fclass_to_suffix()). A group's single member keeps
+        that base suffix as-is ONLY if it doesn't collide with a fixed
+        ALLOWED_FCLASS name. Any group with more than one member, or
+        whose base suffix collides with a fixed name, has EVERY member
+        disambiguated to "{base}_{letter}" (A, B, C, ... -- see
+        _int_to_letter_tier()), assigned in a deterministic order
+        (sorted by the member's own normalized fclass string) so the
+        same POI source always produces the same assignment across
+        repeated reads -- required since the checklist and task()'s
+        actual column-writing step must always agree (see
+        selected_other_poi_column_map's module-level docstring).
+    """
+    reserved_fixed_suffixes = {f.upper() for f in ALLOWED_FCLASS}
+
+    base_suffix_groups = {}
+    for t in sorted(set(other_types)):
+        base = _sanitize_fclass_to_suffix(t)
+        base_suffix_groups.setdefault(base, []).append(t)
+
+    result = {}
+    for base, members in base_suffix_groups.items():
+        needs_disambiguation = len(members) > 1 or base in reserved_fixed_suffixes
+        if not needs_disambiguation:
+            result[members[0]] = base
+            continue
+        for i, t in enumerate(sorted(members)):
+            result[t] = f"{base}_{_int_to_letter_tier(i)}"
+    return result
+
+
 def _realizable_targets(poi_types):
     """
     Builds this run's actual list of CAMA_-prefixed target column names
-    -- only for POI types present in poi_types (already filtered to
-    ALLOWED_FCLASS and normalized/lowercased upstream). Six targets per
-    type: three distance ranks + their three _METHOD companions.
+    for the MAIN CAMA output -- only for POI types present in poi_types
+    (already filtered to ALLOWED_FCLASS and normalized/lowercased
+    upstream, or already a pre-assigned dynamic suffix -- see task()).
+    Six targets per type, interleaved per rank: CAMA_{TYPE}1,
+    CAMA_{TYPE}1_NAME, CAMA_{TYPE}2, CAMA_{TYPE}2_NAME, CAMA_{TYPE}3,
+    CAMA_{TYPE}3_NAME -- matching the exact column order task() now
+    pre-creates in the main output (see its pre-init loop).
+
+    NOTE: this always checks all three ranks unconditionally, even
+    though task()'s actual pre-init step only creates a rank's columns
+    when that rank is categorically achievable (>= that many total
+    POIs of that type in the source). This function has no access to
+    per-type POI counts -- it only ever receives a list of type name
+    strings, at both of its call sites (task() below, and on_run()'s
+    lighter pre-check earlier in this file) -- and checking for a
+    conflict on a column name that happens not to exist is harmless:
+    it simply never matches, never produces a false conflict. Trading
+    a little unnecessary over-checking here avoids plumbing per-type
+    POI counts through the pre-check flow, which is out of scope for
+    this change.
+
+    _METHOD is intentionally NOT generated here -- this is the MAIN
+    CAMA output's target list only. The separate, dormant
+    poi_routes.gpkg QA/diagnostic export (see worker_process()'s
+    route_records) is completely untouched by this change and still
+    carries its own METHOD internally; it has no target-list/conflict-
+    check concept of its own today, so there is nothing to update for
+    it here.
     """
     targets = []
     for t in poi_types:
         for i in range(1, 4):
             targets.append(f"CAMA_{t.upper()}{i}")
-            targets.append(f"CAMA_{t.upper()}{i}_METHOD")
+            targets.append(f"CAMA_{t.upper()}{i}_NAME")
     return targets
+
+
+def _read_poi_fclass_values_worker(source_type, path_or_table):
+    """
+    PART 2: runs on a background thread (see open_main_window()'s
+    _refresh_poi_landmark_types()). Fresh, standalone read of the given
+    POI source that returns EVERY distinct normalized fclass value
+    present -- not filtered to ALLOWED_FCLASS -- for the "Include Other
+    Landmark Types" checklist.
+
+    Deliberately separate from _get_poi_types_for_check() above: that
+    function stays exactly as it was (ALLOWED_FCLASS-filtered,
+    Run-time-only, called from on_run()'s existing-output-column
+    conflict pre-check -- a Part 3 concern to relocate, not touched by
+    this change). This function serves a different purpose (populating
+    the dynamic checklist) and is never reused by that pre-check.
+
+    Never touches any Tkinter widget or variable -- returns
+    (fclass_values, error) only, matching road_width.py's
+    _read_gdf_worker() contract, so it is safe to call from a
+    background thread.
+
+    Returns:
+        tuple: (sorted list of distinct non-empty normalized fclass
+        strings, None) on success, or (None, error_message) on
+        failure (missing 'fclass' column, unreadable source, DB
+        credential failure, etc.) -- treated by the caller as
+        purely informational; see _poll_poi_landmark_queue()'s own
+        docstring for why a failure here never invalidates the
+        already-selected POI source.
+    """
+    try:
+        if source_type == "local":
+            gdf = gpd.read_file(path_or_table)
+        else:
+            creds = load_db_credentials()
+            if not creds:
+                return None, "Could not load DB credentials."
+            engine = create_engine(
+                f"postgresql://{creds['username']}:{creds['password']}@"
+                f"{creds['host']}:{creds['port']}/{creds['database']}"
+            )
+            gdf = read_postgis_clean(path_or_table, engine, creds["schema"])
+        if "fclass" not in gdf.columns:
+            return None, "POI source has no 'fclass' column."
+        fclass_norm = gdf["fclass"].astype(str).str.lower().str.strip()
+        values = sorted(v for v in fclass_norm.unique() if v)
+        return values, None
+    except Exception as e:
+        return None, str(e)
 
 
 def _get_poi_types_for_check(poi_source, engine, schema):
@@ -531,10 +730,16 @@ def graph_from_roads(road_gdf):
         geometry (Polygons, Points) is silently skipped.
 
     Returns:
-        tuple: (G, edges, nodes_coords) where G is the networkx.Graph,
-        edges is a list of (u, v, length) tuples, and nodes_coords is an
-        (N, 2) numpy array of every distinct node coordinate (for
-        nearest-neighbor queries elsewhere).
+        tuple: (G, edges, nodes_coords, edge_geoms) where G is the
+        networkx.Graph, edges is a list of (u, v, length) tuples,
+        nodes_coords is an (N, 2) numpy array of every distinct node
+        coordinate (for nearest-neighbor queries elsewhere), and
+        edge_geoms is a list of shapely LineString objects -- one per
+        entry in `edges`, in the same order/index -- built for an
+        edge-level STRtree spatial index so callers can snap an
+        arbitrary point to its true nearest point ON a road segment
+        (not just to the nearest existing vertex; see worker_process()
+        below).
 
     Raises:
         Exception: if road_gdf has no LineString/MultiLineString
@@ -542,6 +747,7 @@ def graph_from_roads(road_gdf):
     """
     G = nx.Graph()
     edges = []
+    edge_geoms = []
     nodes_coords = set()
 
     geom_types = road_gdf.geometry.geom_type.dropna().unique().tolist()
@@ -574,23 +780,29 @@ def graph_from_roads(road_gdf):
                     length = Point(u).distance(Point(v))
                     G.add_edge(u, v, length=float(length))
                     edges.append((u, v, float(length)))
+                    edge_geoms.append(LineString([u, v]))
                     nodes_coords.add(u)
                     nodes_coords.add(v)
         except Exception:
             continue
 
     nodes_coords = np.array(list(nodes_coords)) if nodes_coords else np.zeros((0, 2))
-    return G, edges, nodes_coords
+    return G, edges, nodes_coords, edge_geoms
 
 
 # ========================================
 # ROUTING WORKER
 # ========================================
-# Routing logic UNCHANGED -- same nearest-vertex snap, same
-# silent-to-straight-line fallback behavior as the original baseline.
-# Only addition: this now also returns a METHOD label and the route
-# geometry, so what the baseline was already doing internally becomes
-# visible instead of hidden.
+# Snapping (PART 1 fix): a parcel/POI point is now snapped to the true
+# geometric nearest point on the road network -- interpolated along a
+# road segment via an edge-level STRtree + nearest_points() projection
+# if that is closer than any existing vertex, inserted as a "virtual"
+# graph node connected to that edge's two endpoints -- instead of the
+# previous nearest-existing-vertex-only snap. Same silent-to-
+# straight-line fallback behavior as before on any lookup/projection/
+# routing failure. Also returns a METHOD label and the route geometry,
+# so what the baseline was already doing internally becomes visible
+# instead of hidden.
 def worker_process(args):
     """
     For one parcel centroid, finds the 3 nearest POIs of each type in
@@ -599,36 +811,193 @@ def worker_process(args):
 
     Args:
         args: (row_idx, centroid_xy, poi_types, poi_coords_dict,
-        edges_list, nodes_coords) tuple -- packed this way so this
-        function can be called uniformly whether or not the caller
-        parallelizes (see run_cpu_parallel_with_progress(), which
-        currently calls this sequentially).
+        poi_names_dict, edges_list, nodes_coords, edge_geoms) tuple --
+        packed this way so this function can be called uniformly
+        whether or not the caller parallelizes (see
+        run_cpu_parallel_with_progress(), which currently calls this
+        sequentially). poi_names_dict mirrors poi_coords_dict exactly
+        (same keys, same per-type ordering) -- type -> list of each
+        POI's own "name" attribute value (Python None where missing or
+        where the source has no name column at all -- never the
+        string "None", never an empty string). Built from the SAME
+        filtered subset as poi_coords_dict for each type (see task()),
+        so a given index pi always refers to the same POI in both
+        dicts. edge_geoms is a picklable list[LineString] (one per
+        edges_list entry, same index) -- NOT a live STRtree, which is
+        rebuilt fresh inside this function from edge_geoms, matching
+        the existing rebuild-per-call convention already used for
+        nodes_kdtree/G_local, so this function stays safe to call from
+        a future multiprocessing pool even though it currently runs
+        sequentially.
 
     Returns:
         tuple: (row_idx, results, route_records). results is a dict of
-        CAMA_{TYPE}{1-3} / CAMA_{TYPE}{1-3}_METHOD -> value for this
-        parcel. route_records is a list of per-route dicts (parcel
-        index, category, rank, method, distance, route geometry) used
-        only by the currently-disabled poi_routes.gpkg diagnostic
-        export (see its own comment further below). On error, results
-        is {"_error": str(e)} instead.
+        CAMA_{TYPE}{1-3} / CAMA_{TYPE}{1-3}_NAME -> value for this
+        parcel's MAIN output row (the corresponding POI's own name, or
+        None if missing/unavailable -- never written for a rank this
+        type doesn't have enough total POIs to reach; see task()'s
+        pre-init notes). route_records is a list of per-route dicts
+        (parcel index, category, rank, METHOD, distance, route
+        geometry) used ONLY by the separate, still-disabled
+        poi_routes.gpkg QA/diagnostic export (see its own comment
+        further below) -- this is intentionally untouched by the
+        MAIN-output METHOD->NAME change: the `method` variable
+        computed below is still fully alive and still flows into
+        route_records exactly as before. On error, results is
+        {"_error": str(e)} instead.
     """
-    (row_idx, centroid_xy, poi_types, poi_coords_dict, edges_list, nodes_coords) = args
+    (row_idx, centroid_xy, poi_types, poi_coords_dict, poi_names_dict, edges_list, nodes_coords, edge_geoms) = args
     route_records = []  # (typ, rank, method, dist, geometry)
     try:
         if len(nodes_coords) == 0:
             return row_idx, {}, route_records
 
-        nodes_kdtree = cKDTree(nodes_coords)
         G_local = nx.Graph()
         for u, v, length in edges_list:
             G_local.add_edge(tuple(u), tuple(v), length=float(length))
+
+        # Edge-level spatial index for true nearest-point-on-road
+        # snapping (PART 1 fix). Rebuilt fresh from the picklable
+        # edge_geoms list on every call, matching the existing
+        # rebuild-per-call convention already used above for G_local
+        # (and previously for nodes_kdtree) -- see the args docstring
+        # note on why a live STRtree is never passed through args.
+        edge_tree = STRtree(edge_geoms) if edge_geoms else None
+
+        # Per-edge ordered "chain" of every point placed on that edge
+        # so far during THIS call: edge_idx -> sorted list of
+        # (proj_dist_along_edge, node_id), always seeded lazily with
+        # the edge's own two original endpoints (proj_dist 0 and
+        # elen). Needed so that if a second point (e.g. the centroid's
+        # start-snap and a POI's end-snap) lands on the SAME edge as
+        # an earlier point, it gets connected to its correct
+        # immediate neighbor(s) on that edge -- not just to that
+        # edge's far-apart original endpoints, which would silently
+        # produce a too-long route between two points that are
+        # actually close together on the same segment.
+        edge_chains = {}
+
+        def _snap_to_road(point_xy):
+            """
+            Projects point_xy onto its true nearest point on the road
+            network (nearest-point-on-line -- interpolated along a
+            segment if that is closer than any existing vertex, not
+            restricted to existing vertices only) and returns the
+            (x, y) coordinate tuple to use as a G_local routing
+            endpoint.
+
+            If the edge this point snaps to has not been touched
+            before in this call, the new point is inserted as a
+            virtual node connected to that edge's two original
+            endpoints (distance-weighted), same as before. If the
+            edge HAS already had one or more points placed on it
+            earlier in this same call, the new point is instead
+            spliced into the existing ordered chain of points on that
+            edge: it is connected only to its immediate left/right
+            neighbors on the edge (with the correct sub-distances),
+            and the single now-superseded edge directly between those
+            two neighbors is removed -- so two points on the same
+            road segment always route at their true along-segment
+            distance from each other, not via that segment's far
+            endpoints.
+
+            The virtual node's ID is its own (x, y) coordinate tuple
+            -- required because route_geom = LineString(path) further
+            below assumes every graph node ID IS an (x, y) coordinate,
+            same as every existing road-vertex node ID already is.
+
+            Collision handling: if the projected coordinate already
+            matches an existing node in G_local -- an original road
+            vertex, or a virtual node inserted earlier in THIS SAME
+            call (e.g. the projection lands exactly on an existing
+            vertex, or two different input points project to the same
+            location) -- that existing node is reused as-is; no new
+            node or edges are inserted, avoiding both an unintended
+            overwrite of that node's existing edges and a zero-length
+            self-loop.
+
+            Returns:
+                tuple[float, float] | None: the node ID to route
+                to/from, or None if the edge lookup or projection
+                fails for any reason. A None here is treated by the
+                caller exactly like "no path found" -- it falls back
+                to the existing straight-line distance, never raises.
+            """
+            if edge_tree is None:
+                return None
+            try:
+                nearest = edge_tree.nearest(Point(point_xy))
+                if isinstance(nearest, (int, np.integer)):
+                    edge_idx = int(nearest)
+                else:
+                    # Older shapely returns the geometry itself; recover
+                    # its index for the parallel edges_list lookup --
+                    # same int-vs-geometry compatibility pattern already
+                    # used in influence_to_map.py's process_parcels().
+                    edge_idx = edge_geoms.index(nearest)
+
+                edge_line = edge_geoms[edge_idx]
+                eu, ev, elen = edges_list[edge_idx]
+                eu = tuple(eu)
+                ev = tuple(ev)
+
+                projected = nearest_points(Point(point_xy), edge_line)[1]
+                node_id = (float(projected.x), float(projected.y))
+
+                # Coordinate-based collision check FIRST, independent
+                # of which edge_idx this lookup landed on -- if this
+                # exact point is already a node anywhere in G_local
+                # (original vertex or earlier virtual node), reuse it
+                # outright rather than touching any chain bookkeeping.
+                if node_id in G_local:
+                    return node_id
+
+                chain = edge_chains.get(edge_idx)
+                if chain is None:
+                    # First point on this edge this call -- seed the
+                    # chain with the edge's own original endpoints.
+                    # The base edge (eu, ev, elen) already exists in
+                    # G_local from the initial build above, so nothing
+                    # needs to change in the graph yet.
+                    chain = [(0.0, eu), (float(elen), ev)]
+                    edge_chains[edge_idx] = chain
+
+                proj_dist = float(edge_line.project(projected))
+                positions = [c[0] for c in chain]
+                insert_at = bisect.bisect_left(positions, proj_dist)
+
+                # nearest_points() guarantees proj_dist falls within
+                # [0, elen], and the chain always spans that full
+                # range (seeded with both endpoints), so a left AND a
+                # right neighbor always exist here.
+                left_pos, left_id = chain[insert_at - 1]
+                right_pos, right_id = chain[insert_at]
+
+                if G_local.has_edge(left_id, right_id):
+                    G_local.remove_edge(left_id, right_id)
+
+                G_local.add_edge(node_id, left_id, length=float(proj_dist - left_pos))
+                G_local.add_edge(node_id, right_id, length=float(right_pos - proj_dist))
+
+                chain.insert(insert_at, (proj_dist, node_id))
+                return node_id
+            except Exception:
+                return None
+
+        # The centroid's true nearest-point-on-road snap is the same
+        # for every POI type/candidate queried below -- computed once
+        # here instead of being recomputed identically on every
+        # candidate iteration (previous behavior queried this inside
+        # the innermost loop even though centroid_xy never changes
+        # within this call).
+        start = _snap_to_road(centroid_xy)
 
         results = {}
         for typ in poi_types:
             coords = poi_coords_dict.get(typ)
             if coords is None or len(coords) == 0:
                 continue
+            names = poi_names_dict.get(typ, [])
 
             k = min(3, len(coords))
             tree = cKDTree(coords)
@@ -639,15 +1008,13 @@ def worker_process(args):
             network_results = []
             for pi in idxs:
                 poi_xy = coords[pi]
-                _, sidx = nodes_kdtree.query([centroid_xy])
-                _, eidx = nodes_kdtree.query([poi_xy])
-                start = tuple(nodes_coords[int(sidx[0])])
-                end = tuple(nodes_coords[int(eidx[0])])
+                poi_name = names[pi] if pi < len(names) else None
+                end = _snap_to_road(poi_xy)
 
                 method = "Straight"
                 route_geom = LineString([centroid_xy, tuple(poi_xy)])
                 try:
-                    if nx.has_path(G_local, start, end):
+                    if start is not None and end is not None and nx.has_path(G_local, start, end):
                         dist, path = nx.bidirectional_dijkstra(G_local, start, end, weight="length")
                         method = "Road"
                         route_geom = LineString(path)
@@ -656,12 +1023,12 @@ def worker_process(args):
                 except Exception:
                     dist = Point(centroid_xy).distance(Point(poi_xy))
 
-                network_results.append((round(dist, 2), method, route_geom))
+                network_results.append((round(dist, 2), method, route_geom, poi_name))
 
             network_results = sorted(network_results, key=lambda r: r[0])
-            for i, (dist, method, route_geom) in enumerate(network_results[:3], start=1):
+            for i, (dist, method, route_geom, poi_name) in enumerate(network_results[:3], start=1):
                 results[f"CAMA_{typ.upper()}{i}"] = float(dist)
-                results[f"CAMA_{typ.upper()}{i}_METHOD"] = method
+                results[f"CAMA_{typ.upper()}{i}_NAME"] = poi_name
                 route_records.append({
                     "PARCEL_IDX": row_idx,
                     "CATEGORY": typ.upper(),
@@ -679,7 +1046,7 @@ def worker_process(args):
 
 def run_cpu_parallel_with_progress(
     gdf, poi_gdf, road_gdf,
-    poi_types, poi_coords_dict,
+    poi_types, poi_coords_dict, poi_names_dict,
     output_path,
     progress_bar, status_var,
     stop_flag,
@@ -697,6 +1064,14 @@ def run_cpu_parallel_with_progress(
         poi_types (list[str]): POI types to compute distances for.
         poi_coords_dict (dict): type -> (N, 2) numpy array of POI
         coordinates.
+        poi_names_dict (dict): type -> list of each POI's own "name"
+        attribute value, same keys and same per-index ordering as
+        poi_coords_dict (built from the identical filtered subset per
+        type -- see task()) -- Python None where a name is missing or
+        the POI source has no name column at all, never the string
+        "None" or an empty string. Threaded straight through to
+        worker_process() via args_list below for the MAIN output's
+        CAMA_{TYPE}{N}_NAME columns.
         output_path (str | None): if given, the result is written here
         via _write_gpkg() after processing (local output mode). None
         for DB output mode, where the caller writes to PostGIS instead.
@@ -734,7 +1109,7 @@ def run_cpu_parallel_with_progress(
     # transform coordinates -- that's what .to_crs() is for).
     projected_crs = gdf.crs
 
-    G_main, edges_list, nodes_coords = graph_from_roads(road_gdf)
+    G_main, edges_list, nodes_coords, edge_geoms = graph_from_roads(road_gdf)
     if len(edges_list) == 0:
         raise Exception("No valid edges found in road network.")
 
@@ -749,7 +1124,7 @@ def run_cpu_parallel_with_progress(
     for idx, row in gdf.iterrows():
         centroid_xy = (row.geometry.centroid.x, row.geometry.centroid.y)
         args_list.append(
-            (idx, centroid_xy, poi_types, poi_coords_dict, edges_list, nodes_coords)
+            (idx, centroid_xy, poi_types, poi_coords_dict, poi_names_dict, edges_list, nodes_coords, edge_geoms)
         )
 
     total = len(args_list)
@@ -1231,12 +1606,18 @@ def open_main_window(app_root):
 
     poi_radio_row = tk.Frame(poi_frame)
     poi_radio_row.pack(fill="x")
-    tk.Radiobutton(poi_radio_row, text="Local File",
+    # PART 2: captured as named references (previously anonymous) so
+    # _set_poi_reading_state() below can disable them while the
+    # background landmark-type discovery read is in progress, matching
+    # road_width.py's parcel_radio_local/parcel_radio_db precedent.
+    poi_radio_local = tk.Radiobutton(poi_radio_row, text="Local File",
                    variable=poi_source_type, value="local",
-                   command=lambda: _toggle_poi()).pack(side="left")
-    tk.Radiobutton(poi_radio_row, text="Database Table",
+                   command=lambda: _toggle_poi())
+    poi_radio_local.pack(side="left")
+    poi_radio_db = tk.Radiobutton(poi_radio_row, text="Database Table",
                    variable=poi_source_type, value="db",
-                   command=lambda: _toggle_poi()).pack(side="left", padx=(12, 0))
+                   command=lambda: _toggle_poi())
+    poi_radio_db.pack(side="left", padx=(12, 0))
 
     poi_file_var = tk.StringVar(master=win, value="No file selected")
     poi_db_var   = tk.StringVar(master=win, value="No table selected")
@@ -1251,6 +1632,528 @@ def open_main_window(app_root):
     poi_btn = tk.Button(poi_action_row, text="Browse…", width=10)
     poi_btn.pack(side="left", **PAD)
 
+    # ── PART 2: "Include Other Landmark Types" state ────────────────
+    # poi_types_reading: guards against overlapping background
+    # discovery reads and gates the Run button (see
+    # _update_run_button_state() below) -- distinct from, and never
+    # affected by, which/whether landmark sub-checkboxes are checked.
+    poi_types_reading = False
+    # other_landmark_type_vars: {display_fclass: tk.BooleanVar},
+    # rebuilt from scratch on every fresh discovery read -- never
+    # merged/cached across POI source reselections, matching the
+    # established no-cache convention already used for "Filter by Road
+    # Type" in road_width.py.
+    other_landmark_type_vars = {}
+    # other_landmark_column_suffixes: {display_fclass: column_suffix},
+    # the SAME assignment shown in the checklist -- reused verbatim by
+    # on_run() so what's displayed always matches what gets written
+    # (see _assign_other_type_column_suffixes()'s own docstring).
+    other_landmark_column_suffixes = {}
+
+    include_other_landmarks_var = tk.BooleanVar(master=win, value=False)
+
+    # other_landmarks_header_row: shared row holding the "Include
+    # Other Landmark Types" checkbox AND the "Check All" / "Uncheck
+    # All" hyperlink-style labels on the SAME line -- no extra row,
+    # no extra vertical space. The row itself is packed/unpacked by
+    # _update_other_landmarks_visibility() below using the same
+    # "has content" gate the checkbox alone previously used (never
+    # destroyed, matching road_width.py's road_filter_checkbox
+    # convention, plus this tool's own "has content" gate that
+    # road_filter_checkbox does not need). The two link labels are
+    # NOT gated by this row's own visibility alone -- they have their
+    # own independent, narrower pack/pack_forget (checked AND has
+    # content -- the exact same condition the checklist itself uses),
+    # since "Check All"/"Uncheck All" are only meaningful once the
+    # checklist they operate on is actually visible.
+    other_landmarks_header_row = tk.Frame(poi_frame)
+
+    include_other_checkbox = tk.Checkbutton(
+        other_landmarks_header_row, text="Include Other Landmark Types",
+        variable=include_other_landmarks_var,
+        command=lambda: _on_include_other_toggled())
+    include_other_checkbox.pack(side="left")
+
+    # other_landmarks_links_frame: groups "Check All" / "|" / "Uncheck
+    # All" together and packs the GROUP to the far right edge of the
+    # header row (side="right") -- rather than simply appending them
+    # after the checkbox text, which is what previously made the row
+    # (and therefore the window) grow wider than intended. Hyperlink-
+    # style labels: plain tk.Label styled to look clickable (blue,
+    # underlined, hand cursor), bound to <Button-1> -- there is no
+    # native Tkinter "link" widget. Text is static Title Case in both
+    # states (never toggles to reflect current selection), per the
+    # approved spec -- "Check All" always checks everything, "Uncheck
+    # All" always unchecks everything, regardless of the checklist's
+    # current state.
+    other_landmarks_links_frame = tk.Frame(other_landmarks_header_row)
+
+    check_all_link = tk.Label(
+        other_landmarks_links_frame, text="Check All",
+        fg="#1a73e8", cursor="hand2", font=("Segoe UI", 8, "underline"))
+    check_all_link.pack(side="left")
+    check_all_link.bind("<Button-1>", lambda e: _check_all_other_landmarks())
+
+    other_landmarks_links_separator = tk.Label(
+        other_landmarks_links_frame, text=" | ", fg="gray", font=("Segoe UI", 8))
+    other_landmarks_links_separator.pack(side="left")
+
+    uncheck_all_link = tk.Label(
+        other_landmarks_links_frame, text="Uncheck All",
+        fg="#1a73e8", cursor="hand2", font=("Segoe UI", 8, "underline"))
+    uncheck_all_link.pack(side="left")
+    uncheck_all_link.bind("<Button-1>", lambda e: _uncheck_all_other_landmarks())
+
+    def _check_all_other_landmarks():
+        """
+        Sets every DISCOVERED "Other Landmark Type" BooleanVar to True
+        -- iterates other_landmark_type_vars directly (the full
+        dictionary populated by _rebuild_other_landmarks_checklist()
+        for every eligible type this read found), never the Tkinter
+        Checkbutton widgets currently rendered inside the Canvas
+        viewport -- so every type is checked regardless of whether its
+        row is currently scrolled into view. Each Checkbutton is bound
+        to its own BooleanVar, so this automatically and correctly
+        updates every widget's displayed check-state too, including
+        off-screen ones, the moment they're scrolled into view.
+        """
+        for var in other_landmark_type_vars.values():
+            var.set(True)
+        _update_run_button_state()
+
+    def _uncheck_all_other_landmarks():
+        """Mirror of _check_all_other_landmarks() -- sets every
+        discovered type's BooleanVar to False, same off-screen-safe
+        approach (iterates the variable dict directly, never the
+        currently-rendered widgets)."""
+        for var in other_landmark_type_vars.values():
+            var.set(False)
+        _update_run_button_state()
+
+    # Holds one Checkbutton per distinct non-ALLOWED_FCLASS fclass
+    # value found in the currently selected POI source. Only packed
+    # while the checkbox above is checked AND the checklist is
+    # non-empty. Content-adaptive height with a vertical scrollbar
+    # ONLY once more than 8 distinct types are found (per approved
+    # spec -- an item-count threshold, computed from measured content
+    # rather than road_width.py's own fixed-pixel cap, though the
+    # rest of this Canvas/Scrollbar/mousewheel/bbox architecture is
+    # otherwise identical to that reference), and a horizontal
+    # scrollbar only when a label is wider than the box -- never
+    # truncated or wrapped, only ever scrolled into view.
+    OTHER_LANDMARKS_MAX_ITEMS_BEFORE_VSCROLL = 8
+    # Left indent used when packing other_landmarks_checklist_outer
+    # below (visually nests the checklist under the checkbox, matching
+    # road_width.py's own sub-checklist indentation convention). Named
+    # here so _resize_other_landmarks_checklist_box() can subtract this
+    # exact same value from its available-width budget -- omitting it
+    # there previously let the checklist's canvas+vertical-scrollbar
+    # combined width extend this many pixels PAST poi_action_row's own
+    # right edge (the Browse button), since the indent shifts the
+    # whole outer frame right without shrinking its own width budget
+    # to match.
+    OTHER_LANDMARKS_CHECKLIST_LEFT_INDENT = 20
+
+    other_landmarks_checklist_outer = tk.Frame(poi_frame)
+    other_landmarks_checklist_canvas = tk.Canvas(
+        other_landmarks_checklist_outer, highlightthickness=0, bd=0)
+    other_landmarks_vscroll = tk.Scrollbar(
+        other_landmarks_checklist_outer, orient="vertical",
+        command=other_landmarks_checklist_canvas.yview)
+    other_landmarks_hscroll = tk.Scrollbar(
+        other_landmarks_checklist_outer, orient="horizontal",
+        command=other_landmarks_checklist_canvas.xview)
+    other_landmarks_checklist_canvas.configure(
+        yscrollcommand=other_landmarks_vscroll.set,
+        xscrollcommand=other_landmarks_hscroll.set)
+    other_landmarks_checklist_canvas.pack(side="left", fill="both", expand=True)
+    # Both scrollbars packed/unpacked dynamically by
+    # _resize_other_landmarks_checklist_box() below -- only shown when
+    # content actually exceeds the box in that direction.
+
+    other_landmarks_checklist_container = tk.Frame(other_landmarks_checklist_canvas)
+    _other_landmarks_canvas_window = other_landmarks_checklist_canvas.create_window(
+        (0, 0), window=other_landmarks_checklist_container, anchor="nw")
+
+    def _on_other_landmarks_content_configure(_event=None):
+        other_landmarks_checklist_canvas.configure(
+            scrollregion=other_landmarks_checklist_canvas.bbox("all"))
+    other_landmarks_checklist_container.bind(
+        "<Configure>", _on_other_landmarks_content_configure)
+
+    def _on_other_landmarks_mousewheel(event):
+        other_landmarks_checklist_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+    other_landmarks_checklist_canvas.bind(
+        "<Enter>", lambda e: other_landmarks_checklist_canvas.bind_all(
+            "<MouseWheel>", _on_other_landmarks_mousewheel))
+    other_landmarks_checklist_canvas.bind(
+        "<Leave>", lambda e: other_landmarks_checklist_canvas.unbind_all("<MouseWheel>"))
+
+    def _resize_other_landmarks_checklist_box():
+        """
+        Recomputes other_landmarks_checklist_canvas's own height/width
+        handling to fit its current content. Vertical scrollbar trigger
+        is an ITEM COUNT (> 8 distinct types, per approved spec), not
+        road_width.py's own fixed-pixel cap -- the per-row pixel height
+        is measured from the container's actual current content
+        (content_height / n_items) so the 8-item cap is translated into
+        an accurate pixel height regardless of font/theme, rather than
+        guessing a constant.
+
+        Horizontal overflow handling: the canvas's own displayed WIDTH
+        is explicitly pinned here to a FIXED value on every call --
+        never left to grow to match wide content. That fixed value is
+        derived from poi_action_row's own already-established
+        requested width, MINUS both the vertical scrollbar's width
+        (whenever shown) AND OTHER_LANDMARKS_CHECKLIST_LEFT_INDENT
+        (the same left indent already applied when
+        other_landmarks_checklist_outer itself is packed below) --
+        omitting that indent previously let canvas+scrollbar's combined
+        width extend past poi_action_row's own right edge (the Browse
+        button) by exactly the indent amount, since the indent shifts
+        the whole outer frame right without shrinking its own width
+        budget to compensate. Without this pin altogether, a long
+        fclass label would need the embedded item widened past the
+        canvas's then-current width (via itemconfig() below) to enable
+        horizontal scrolling, but an un-pinned canvas's own natural/
+        requested size grows to match that wider embedded item too --
+        and since nothing else constrains this window's overall size,
+        that growth cascades all the way up and visibly widens the
+        whole configuration window. Pinning the canvas's width here
+        means overflow is handled ENTIRELY by the horizontal
+        scrollbar appearing, exactly as expected -- the window itself
+        only ever grows taller (to fit new checklist rows), never
+        wider.
+        """
+        other_landmarks_checklist_container.update_idletasks()
+        n_items = len(other_landmark_type_vars)
+        content_height = other_landmarks_checklist_container.winfo_reqheight()
+        content_width = other_landmarks_checklist_container.winfo_reqwidth()
+
+        show_vscroll = n_items > OTHER_LANDMARKS_MAX_ITEMS_BEFORE_VSCROLL and n_items > 0
+        vscroll_width = other_landmarks_vscroll.winfo_reqwidth() if show_vscroll else 0
+        fixed_row_width = poi_action_row.winfo_reqwidth()
+        canvas_width = max(
+            fixed_row_width - vscroll_width - OTHER_LANDMARKS_CHECKLIST_LEFT_INDENT, 1)
+        other_landmarks_checklist_canvas.configure(width=canvas_width)
+
+        if n_items <= OTHER_LANDMARKS_MAX_ITEMS_BEFORE_VSCROLL or n_items == 0:
+            other_landmarks_checklist_canvas.configure(height=content_height)
+            other_landmarks_vscroll.pack_forget()
+        else:
+            row_height = content_height / n_items
+            capped_height = int(round(row_height * OTHER_LANDMARKS_MAX_ITEMS_BEFORE_VSCROLL))
+            other_landmarks_checklist_canvas.configure(height=capped_height)
+            other_landmarks_vscroll.pack(side="right", fill="y")
+
+        if content_width > canvas_width:
+            other_landmarks_checklist_canvas.itemconfig(_other_landmarks_canvas_window, width=content_width)
+            other_landmarks_hscroll.pack(side="bottom", fill="x")
+        else:
+            other_landmarks_checklist_canvas.itemconfig(_other_landmarks_canvas_window, width=canvas_width)
+            other_landmarks_hscroll.pack_forget()
+    # Both scrollbars start unpacked; _update_other_landmarks_
+    # visibility() (via the discovery-read completion callback)
+    # decides what to show.
+
+    def _rebuild_other_landmarks_checklist(fclass_values):
+        """
+        Plain destroy-and-repopulate of the "Other Landmark Types"
+        checklist from a fresh list of distinct fclass values (see
+        _refresh_poi_landmark_types()/_poll_poi_landmark_queue()) --
+        never merged with any previous checklist state, matching the
+        established no-cache convention. Values already covered by
+        ALLOWED_FCLASS are excluded here (they are always processed
+        via the existing fixed-type path regardless of this checklist).
+        Column-suffix assignment (with collision handling) is computed
+        once here, via _assign_other_type_column_suffixes(), and
+        reused verbatim by on_run() -- see that function's own
+        docstring for why this must never be recomputed from a
+        filtered-down subset.
+        """
+        nonlocal other_landmark_type_vars, other_landmark_column_suffixes
+        for child in other_landmarks_checklist_container.winfo_children():
+            child.destroy()
+        other_landmark_type_vars = {}
+
+        eligible = sorted(v for v in fclass_values if v not in ALLOWED_FCLASS)
+        other_landmark_column_suffixes = _assign_other_type_column_suffixes(eligible)
+
+        for display_text in eligible:
+            var = tk.BooleanVar(master=win, value=False)
+            other_landmark_type_vars[display_text] = var
+            suffix = other_landmark_column_suffixes.get(display_text, "")
+            base_suffix = _sanitize_fclass_to_suffix(display_text)
+            label_text = display_text
+            if suffix != base_suffix:
+                # Collision was disambiguated -- make it explicit in
+                # the checklist rather than resolving it invisibly.
+                label_text = f"{display_text}  (\u2192 CAMA_{suffix}#)"
+            tk.Checkbutton(other_landmarks_checklist_container, text=label_text,
+                           variable=var).pack(anchor="w")
+
+        # NOTE: _resize_other_landmarks_checklist_box() is deliberately
+        # NOT called here -- see _update_other_landmarks_visibility()
+        # below for why it must run AFTER the checklist is actually
+        # packed into the window, not before.
+
+    def _reflow_window():
+        """
+        PART 2: adapted from road_width.py's own _reflow_window()
+        (same underlying principle -- measuring win.winfo_reqwidth()/
+        reqheight() after update_idletasks() and explicitly setting
+        minsize/maxsize/geometry to that exact value forces ONE clean,
+        complete window repaint instead of an incremental resize,
+        which is what was leaving a stale/unpainted region (reported
+        as a black area, typically near Output Destination -- wherever
+        the newly-exposed space happened to land) behind whenever the
+        "Other Landmark Types" checklist was packed or unpacked).
+
+        Adaptation notes -- this window's geometry differs from
+        road_width.py's, so this is not a blind copy:
+        - road_width.py calls its own _reflow_window() from SEVERAL
+          independent checklist-visibility functions (Land Parcel
+          classification, Filter by Road Type), since that tool has
+          multiple dynamic-content sections. POI_All_Distance.py's
+          `win` has exactly ONE dynamic-content section -- this one --
+          so this function is called from exactly one place,
+          _update_other_landmarks_visibility() below, never from
+          anywhere else in this window.
+        - Unlike road_width.py's own `win`, THIS window's `win` (see
+          open_main_window()'s construction above) has never called
+          .geometry() at all -- it has only ever relied on pack()'s
+          own initial auto-sizing. This function is the first place in
+          this file that explicitly locks win's size. That lock only
+          ever takes effect from the first time the checklist actually
+          changes visibility onward; the window's very first on-screen
+          size (before any POI source is even selected) is completely
+          unaffected, still purely pack()-computed exactly as before.
+        - Called only in response to an actual checklist/link
+          visibility change (never on a timer, keystroke, or any other
+          repeating event), so there is no continuous geometry/repaint
+          loop -- and since this function only ever reads/sets `win`'s
+          OWN overall size, it never touches, resizes, or repacks any
+          widget belonging to the Land Parcel, Road Network, or Output
+          Destination sections.
+        """
+        win.update_idletasks()
+        req_w = win.winfo_reqwidth()
+        req_h = win.winfo_reqheight()
+        win.minsize(req_w, req_h)
+        win.maxsize(req_w, req_h)
+        win.geometry(f"{req_w}x{req_h}")
+
+    def _update_other_landmarks_visibility():
+        """
+        Single source of truth for the "Include Other Landmark Types"
+        header row's visibility (checkbox + Check All/Uncheck All
+        links), the links group's own narrower visibility, and the
+        checklist's visibility -- re-run after every checklist rebuild
+        (see _poll_poi_landmark_queue()) and every checkbox toggle
+        (see _on_include_other_toggled()).
+
+        Header row (checkbox): shown ONLY once a completed discovery
+        read has actually found at least one eligible non-
+        ALLOWED_FCLASS type (other_landmark_type_vars non-empty).
+        Hidden before any POI source is selected, while a read is in
+        progress, or when a completed read finds nothing -- matching
+        the requirement that this checkbox must never appear as if it
+        always offers something to check. When hidden,
+        include_other_landmarks_var is also forced back to False, so
+        a later POI source that DOES have eligible types always starts
+        the checkbox in its default unchecked state rather than
+        silently carrying over a stale checked state from a previous,
+        now-irrelevant source.
+
+        Header row WIDTH: pinned every time the row is shown, via
+        pack_propagate(False), to poi_action_row's own established
+        width (the same reference _resize_other_landmarks_checklist_
+        box() already uses for the canvas). This row now holds THREE
+        pieces of text on one line (checkbox label + the Check All /
+        Uncheck All group) -- without this pin, that combined text's
+        natural/requested width can exceed the window's established
+        width and grow the whole configuration window, exactly the
+        bug reported. Pinning here means the row (and therefore the
+        window) stays at a constant width regardless of link content;
+        other_landmarks_links_frame is packed side="right" within
+        this fixed-width row so it sits flush against the far right
+        edge, with the checkbox flush against the far left.
+
+        Check All / Uncheck All links group: shown only when the
+        checklist itself would be shown (checked AND has content) --
+        the exact same condition as the checklist below, since acting
+        on an invisible checklist would be meaningless.
+
+        Checklist: shown only when the checkbox is both visible
+        (content exists) AND checked. The width/height measurement
+        _resize_other_landmarks_checklist_box() depends on must run
+        AFTER other_landmarks_checklist_outer.pack() below, with an
+        explicit update_idletasks() in between -- measuring before
+        packing reads the canvas's stale/near-zero un-rendered width,
+        which previously made the horizontal-scrollbar decision
+        ("content wider than box") almost always true, spuriously
+        showing that scrollbar and widening the whole configuration
+        window to fit it.
+
+        _reflow_window() runs once at the end, unconditionally --
+        matching road_width.py's own "one resize per cycle" principle
+        -- so this window's overall size is always recalculated to
+        exactly fit whatever ended up packed/unpacked above, with a
+        single clean repaint and no leftover unpainted region.
+        """
+        has_content = bool(other_landmark_type_vars)
+
+        if has_content:
+            win.update_idletasks()
+            fixed_row_width = poi_action_row.winfo_reqwidth()
+            row_height = include_other_checkbox.winfo_reqheight()
+            other_landmarks_header_row.configure(width=fixed_row_width, height=row_height)
+            other_landmarks_header_row.pack_propagate(False)
+            other_landmarks_header_row.pack(fill="x", pady=(2, 0))
+        else:
+            other_landmarks_header_row.pack_forget()
+            include_other_landmarks_var.set(False)
+
+        checklist_should_show = include_other_landmarks_var.get() and has_content
+
+        if checklist_should_show:
+            other_landmarks_links_frame.pack(side="right")
+        else:
+            other_landmarks_links_frame.pack_forget()
+
+        if checklist_should_show:
+            other_landmarks_checklist_outer.pack(
+                fill="x", padx=(OTHER_LANDMARKS_CHECKLIST_LEFT_INDENT, 0), pady=(0, 4))
+            win.update_idletasks()
+            _resize_other_landmarks_checklist_box()
+        else:
+            other_landmarks_checklist_outer.pack_forget()
+
+        _reflow_window()
+
+    def _on_include_other_toggled():
+        # Checking/unchecking this box only ever shows/hides the
+        # checklist -- it never gates Run (see _update_run_button_
+        # state(), which is keyed only on poi_types_reading, never on
+        # this checkbox or any sub-checkbox).
+        _update_other_landmarks_visibility()
+        _update_run_button_state()
+
+    def _set_poi_reading_state(reading):
+        """
+        PART 2: mirrors road_width.py's _set_parcel_reading_state()
+        exactly -- disables the POI Browse button and both POI radio
+        buttons while the background landmark-type discovery read is
+        in progress, and reuses the EXISTING "No file selected" /
+        filename / "No table selected" label (poi_lbl, bound to
+        poi_file_var / poi_db_var) via a temporary text swap rather
+        than a separate widget, restoring it from the authority
+        variables (poi_local_path / poi_db_table) once done -- never
+        from whatever the StringVar happened to show during reading.
+        """
+        nonlocal poi_types_reading
+        poi_types_reading = reading
+        state = "disabled" if reading else "normal"
+        poi_btn.config(state=state)
+        poi_radio_local.config(state=state)
+        poi_radio_db.config(state=state)
+
+        if reading:
+            poi_file_var.set("⏳ Reading POI...")
+            poi_db_var.set("⏳ Reading POI...")
+            poi_lbl.config(fg="#b36b00")
+        else:
+            poi_file_var.set(
+                os.path.basename(poi_local_path.get()) if poi_local_path.get()
+                else "No file selected"
+            )
+            poi_db_var.set(
+                poi_db_table.get() if poi_db_table.get()
+                else "No table selected"
+            )
+            poi_lbl.config(fg="gray")
+        _update_run_button_state()
+
+    def _refresh_poi_landmark_types():
+        """
+        PART 2: background-reads the currently selected POI source
+        fresh (no caching -- every call performs a real read,
+        regardless of whether this exact source was read before) to
+        discover every distinct fclass value present, for the
+        "Include Other Landmark Types" checklist. Fires on every POI
+        selection change (Browse, DB table pick, or Local/Database
+        toggle -- see browse_poi_file()/_on_poi_db_selected()/
+        _toggle_poi() below).
+
+        Purely informational: this read's failure never invalidates
+        the already-selected POI source (poi_local_path/poi_db_table
+        are untouched here) and never blocks Run once the read
+        finishes -- see _poll_poi_landmark_queue(). No timeout/
+        deadline logic (unlike road_width.py's parcel/road
+        classification reads) -- explicitly not needed for this
+        initial version.
+        """
+        if poi_types_reading:
+            return
+
+        if poi_source_type.get() == "local":
+            source_type = "local"
+            path_or_table = poi_local_path.get()
+        else:
+            source_type = "db"
+            path_or_table = poi_db_table.get()
+
+        if not path_or_table:
+            _rebuild_other_landmarks_checklist([])
+            _update_other_landmarks_visibility()
+            _update_run_button_state()
+            return
+
+        result_queue = queue.Queue()
+
+        def worker():
+            values, error = _read_poi_fclass_values_worker(source_type, path_or_table)
+            result_queue.put((values, error))
+
+        _set_poi_reading_state(True)
+        threading.Thread(target=worker, daemon=True).start()
+        win.after(100, lambda: _poll_poi_landmark_queue(result_queue))
+
+    def _poll_poi_landmark_queue(result_queue):
+        """
+        Runs on the main thread via win.after() polling. Picks up the
+        (fclass_values, error) result placed on the queue by the
+        background worker. No deadline/timeout branch -- see
+        _refresh_poi_landmark_types()'s own docstring for why.
+
+        A failure (error is not None) is purely informational: the
+        already-selected POI source (poi_local_path/poi_db_table) is
+        left completely untouched, the reading-state gate is released
+        exactly the same as on success (so Run becomes available again
+        immediately), a message is logged to the console, and the
+        checklist is simply left empty/unavailable -- never treated as
+        a failure of the mandatory POI source itself.
+        """
+        if not win.winfo_exists():
+            return
+        try:
+            values, error = result_queue.get_nowait()
+        except queue.Empty:
+            win.after(100, lambda: _poll_poi_landmark_queue(result_queue))
+            return
+
+        _set_poi_reading_state(False)
+
+        if error is not None or values is None:
+            print(f"⚠️ Could not read POI source for Other Landmark Types "
+                  f"discovery -- checklist left empty. Details: {error}")
+            _rebuild_other_landmarks_checklist([])
+        else:
+            _rebuild_other_landmarks_checklist(values)
+
+        _update_other_landmarks_visibility()
+        _update_run_button_state()
+
     def browse_poi_file():
         f = filedialog.askopenfilename(filetypes=[
             ("Shapefiles", "*.shp"), ("GeoPackage", "*.gpkg"), ("All", "*.*")])
@@ -1258,6 +2161,7 @@ def open_main_window(app_root):
             poi_local_path.set(f)
             poi_file_var.set(os.path.basename(f))
             _update_run_button_state()
+            _refresh_poi_landmark_types()
 
     def _on_poi_db_selected(sel):
         # _pick_db_tables() only invokes on_select after a confirmed
@@ -1268,6 +2172,7 @@ def open_main_window(app_root):
         poi_db_table.set(sel[0])
         poi_db_var.set(sel[0])
         _update_run_button_state()
+        _refresh_poi_landmark_types()
 
     def browse_poi_db():
         creds = load_db_credentials()
@@ -1288,6 +2193,7 @@ def open_main_window(app_root):
             poi_lbl.config(textvariable=poi_db_var)
             poi_btn.config(text="Select…", command=browse_poi_db)
         _update_run_button_state()
+        _refresh_poi_landmark_types()
 
     # ── SECTION 3: ROAD NETWORK ──────────────────────────────────
     section_label(win, "Road Network Source")
@@ -1412,9 +2318,11 @@ def open_main_window(app_root):
         table resolution (Priority 3) -- in that order, each able to
         cancel the whole run -- then destroys this window and hands off
         to run_with_progress(). Sets the module-level parcel_source,
-        poi_source, road_source, output_mode globals on success.
+        poi_source, road_source, output_mode globals on success, plus
+        (PART 2) selected_other_poi_column_map.
         """
         global parcel_source, poi_source, road_source, output_mode
+        global selected_other_poi_column_map
 
         # validate parcel
         if parcel_source_type.get() == "local":
@@ -1467,6 +2375,29 @@ def open_main_window(app_root):
             output_mode = ("local", output_local_dir.get())
         else:
             output_mode = ("db", None)
+
+        # ------------------------------------------------------------------
+        # PART 2: capture which "Other Landmark Types" are checked, using
+        # the EXACT column-suffix assignment already shown in the
+        # checklist (other_landmark_column_suffixes, built by
+        # _rebuild_other_landmarks_checklist() from the full set of
+        # discovered non-ALLOWED_FCLASS types) -- never recomputed from
+        # just the checked subset, so the checklist and the columns
+        # task() actually writes always agree (see
+        # _assign_other_type_column_suffixes()'s own docstring for why
+        # recomputing from a filtered subset could silently change a
+        # collision-disambiguated suffix). Empty dict (not None) when
+        # the checkbox is unchecked or no sub-checkbox is checked --
+        # today's exact default behavior, fully unchanged.
+        # ------------------------------------------------------------------
+        if include_other_landmarks_var.get():
+            selected_other_poi_column_map = {
+                t: other_landmark_column_suffixes[t]
+                for t, var in other_landmark_type_vars.items()
+                if var.get() and t in other_landmark_column_suffixes
+            }
+        else:
+            selected_other_poi_column_map = {}
 
         # ------------------------------------------------------------------
         # Existing OUTPUT-COLUMN conflict warning. This tool's output
@@ -1610,7 +2541,9 @@ def open_main_window(app_root):
         Single source of truth for whether the Run button may be
         pressed. Disabled (with an explanatory status message) until a
         Land Parcel source, a POI source, a Road Network source, and an
-        Output destination are all present.
+        Output destination are all present, AND no PART 2 background
+        POI landmark-type discovery read (poi_types_reading) is
+        currently in progress.
 
         The cascade below intentionally mirrors on_run()'s own
         validation order further down -- conscious duplication for a
@@ -1619,6 +2552,13 @@ def open_main_window(app_root):
         ever change. (The additional single-parcel-table check inside
         run_with_progress()'s task() for DB output is deeper than what
         on_run() validates and is intentionally NOT mirrored here.)
+
+        PART 2 note: poi_types_reading is the ONLY landmark-related
+        condition that gates Run here. Whether "Include Other Landmark
+        Types" is checked, or which/how many of its sub-checkboxes are
+        checked, NEVER affects Run availability -- see
+        _on_include_other_toggled(), which never calls this function
+        in a way that could disable Run based on checkbox content.
 
         Explicit bg/fg/cursor toggling (not just state=) is required:
         Tkinter does NOT automatically gray out a classic tk.Button's
@@ -1636,6 +2576,9 @@ def open_main_window(app_root):
             ready = False
         elif not has_poi:
             run_status_var.set("Please select a POI source.")
+            ready = False
+        elif poi_types_reading:
+            run_status_var.set("Reading POI landmark types...")
             ready = False
         elif not has_road:
             run_status_var.set("Please select a Road Network source.")
@@ -2087,15 +3030,69 @@ def run_with_progress(app_root, overwrite_mode=None, resolved_table_name=None):
             progress_win.update_idletasks()
 
             poi_gdf["_fclass_norm"] = poi_gdf["fclass"].str.lower().str.strip()
-            poi_types = sorted(
+            fixed_types = sorted(
                 t for t in poi_gdf["_fclass_norm"].unique()
                 if t in ALLOWED_FCLASS
             )
 
-            poi_coords = {
-                t: np.array([[p.x, p.y] for p in poi_gdf[poi_gdf["_fclass_norm"] == t].geometry])
-                for t in poi_types
-            }
+            # PART 2: dynamic "Other Landmark Types" the user checked at
+            # Run time, mapped raw_normalized_fclass -> already-final
+            # column suffix (see on_run() / _assign_other_type_column_
+            # suffixes()). Empty when the checkbox was unchecked or no
+            # sub-checkbox was checked -- today's exact default
+            # behavior, fully unchanged below.
+            other_type_map = selected_other_poi_column_map or {}
+
+            # poi_types doubles as both the per-type iteration key
+            # (worker_process()) and the column-name source
+            # (typ.upper()) -- fixed types keep using their raw
+            # lowercase normalized string (unchanged, e.g. "school" ->
+            # CAMA_SCHOOL*), dynamic types use their pre-assigned
+            # suffix directly (already final/uppercase/underscore-only,
+            # so typ.upper() on it downstream is a no-op) instead of
+            # the raw fclass string, so worker_process() and every
+            # other already-generic downstream function need no
+            # changes at all.
+            poi_types = fixed_types + sorted(other_type_map.values())
+
+            # Whether this POI source has a usable "name" attribute at
+            # all -- "name" is treated as OPTIONAL (unlike "fclass",
+            # which the whole pipeline already requires): if this
+            # column is absent, every CAMA_{TYPE}{N}_NAME value below
+            # simply becomes Python None for every candidate, the run
+            # is never invalidated, and nothing crashes.
+            has_poi_name_column = "name" in poi_gdf.columns
+
+            def _coords_and_names_for(fclass_value):
+                """
+                Builds one type's coordinate array AND its parallel
+                names list from the SAME filtered subset of poi_gdf,
+                in the SAME row order -- required so a given
+                candidate's name always travels with its own
+                coordinate through the ranking pipeline in
+                worker_process() (never independently re-filtered,
+                which could otherwise let the two drift out of
+                alignment). A missing/NULL "name" value becomes Python
+                None here -- never the literal string "None", never an
+                empty string -- preserved as None all the way through
+                to the output GeoPackage, where GDAL/OGR (and
+                therefore QGIS) renders it as NULL, matching the
+                source data's own NULL semantics exactly.
+                """
+                subset = poi_gdf[poi_gdf["_fclass_norm"] == fclass_value]
+                coords = np.array([[p.x, p.y] for p in subset.geometry])
+                if has_poi_name_column:
+                    names = [v if pd.notna(v) else None for v in subset["name"].tolist()]
+                else:
+                    names = [None] * len(subset)
+                return coords, names
+
+            poi_coords = {}
+            poi_names = {}
+            for t in fixed_types:
+                poi_coords[t], poi_names[t] = _coords_and_names_for(t)
+            for raw_t, suffix in other_type_map.items():
+                poi_coords[suffix], poi_names[suffix] = _coords_and_names_for(raw_t)
 
             # Consolidate any pre-existing, differently-cased CAMA_*
             # column(s) detected in the confirmation step (on_run()
@@ -2109,9 +3106,50 @@ def run_with_progress(app_root, overwrite_mode=None, resolved_table_name=None):
             realizable_targets = _realizable_targets(poi_types)
             gdf = _normalize_conflicting_columns(gdf, realizable_targets)
 
-            for t in ALLOWED_FCLASS:
-                for i in range(1, 4):
+            # Main CAMA output column pre-init -- explicit, deterministic
+            # order (NOT relying on pandas' .at[] lazy-column-creation
+            # inside worker_process()'s caller below, which would
+            # otherwise append each column in first-write order instead
+            # -- previously the exact reason METHOD columns ended up
+            # grouped at the very end of the output, in a non-
+            # deterministic order dependent on which parcel happened to
+            # populate a given type/rank first).
+            #
+            # For every realizable type, only the ranks that are
+            # CATEGORICALLY POSSIBLE get columns at all: capped via
+            # min(3, total POIs of that type in this source) -- the
+            # exact same cap already used per-parcel for k in
+            # worker_process()'s cKDTree query, so a type with e.g. only
+            # 1 total POI can never populate a CAMA_{TYPE}2/3 value for
+            # ANY parcel in this run, and therefore never gets those
+            # columns pre-created either. This closes the previously-
+            # flagged gap where ALL FIVE ALLOWED_FCLASS types' columns
+            # were unconditionally created regardless of presence (see
+            # the standing comment above _sanitize_fclass_to_suffix()) --
+            # now using fixed_types (present-only) instead of the full
+            # static ALLOWED_FCLASS set.
+            #
+            # Each rank's distance column is immediately followed by its
+            # _NAME column (CAMA_{TYPE}1, CAMA_{TYPE}1_NAME,
+            # CAMA_{TYPE}2, CAMA_{TYPE}2_NAME, ...) -- this insertion
+            # order IS the final output column order, matching
+            # _realizable_targets()'s own interleaved ordering above.
+            # METHOD is intentionally not pre-initialized here at all --
+            # removed from the MAIN output entirely (the internal
+            # `method` variable itself is untouched inside
+            # worker_process(), still feeding the separate, dormant
+            # poi_routes.gpkg QA export unchanged).
+            for t in fixed_types:
+                max_rank = min(3, len(poi_coords[t]))
+                for i in range(1, max_rank + 1):
                     gdf[f"CAMA_{t.upper()}{i}"] = np.nan
+                    gdf[f"CAMA_{t.upper()}{i}_NAME"] = None
+
+            for suffix in other_type_map.values():
+                max_rank = min(3, len(poi_coords[suffix]))
+                for i in range(1, max_rank + 1):
+                    gdf[f"CAMA_{suffix}{i}"] = np.nan
+                    gdf[f"CAMA_{suffix}{i}_NAME"] = None
 
             if output_mode[0] == "local":
                 if parcel_source[0] == "local":
@@ -2132,7 +3170,7 @@ def run_with_progress(app_root, overwrite_mode=None, resolved_table_name=None):
 
             routes_path = run_cpu_parallel_with_progress(
                 gdf, poi_gdf, road_gdf,
-                poi_types, poi_coords,
+                poi_types, poi_coords, poi_names,
                 output_path,
                 progress_bar, status_var,
                 stop_flag,
