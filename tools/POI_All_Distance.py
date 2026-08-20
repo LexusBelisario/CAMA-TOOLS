@@ -175,6 +175,115 @@ selected_other_poi_column_map = None
 
 ALLOWED_FCLASS = {"school", "church", "shop", "transport", "university"}
 
+# Ordinary fixed-type POI fclass set used by task()'s main
+# "ordinary_fixed_types" computation further below -- deliberately
+# NARROWER than ALLOWED_FCLASS, which is NOT changed by this addition:
+# ALLOWED_FCLASS still protects "SCHOOL"/"UNIVERSITY" as reserved
+# suffixes for dynamic "Other Landmark Types" (see
+# _assign_other_type_column_suffixes()) and is still consumed by the
+# Part 3 pre-check (_get_poi_types_for_check()) -- neither of those is
+# touched by this addition. "school", "university", and every other
+# education-related fclass (elementary_school, high_school,
+# kindergarten, college, etc.) are now routed through the separate,
+# unified CAMA_SCHOOL{1-3} pool below (see _is_education_fclass() /
+# _classify_education_poi() and task()'s own education-pool
+# construction) instead of this ordinary fixed-type path.
+ORDINARY_FIXED_FCLASS = {"church", "shop", "transport"}
+
+# Priority-ordered keyword -> CAMA_SCHOOL*_TYPE value mapping, checked
+# in this exact order against a POI's own combined fclass+name
+# "haystack" (see _classify_education_poi() below) -- first match
+# wins. More specific phrases MUST precede less specific ones that
+# could otherwise also match the same POI (e.g. "junior high" before
+# plain "high school"). ACADEMY is deliberately last among the named
+# keywords so a name like "ABC Senior High Academy" resolves to SENIOR
+# HIGH, not ACADEMY.
+_EDUCATION_TYPE_PRIORITY = [
+    ("UNIVERSITY",        ("university",)),
+    ("COLLEGE",           ("college",)),
+    ("JUNIOR HIGH",       ("juniorhigh",)),
+    ("SENIOR HIGH",       ("seniorhigh",)),
+    ("HIGH SCHOOL",       ("highschool",)),
+    ("SECONDARY SCHOOL",  ("secondaryschool",)),
+    ("MIDDLE SCHOOL",     ("middleschool",)),
+    ("VOCATIONAL",        ("vocational",)),
+    ("MONTESSORI",        ("montessori",)),
+    ("ELEMENTARY",        ("elementary",)),
+    ("PRIMARY",           ("primary",)),
+    ("KINDERGARTEN",      ("kindergarten",)),
+    ("PRESCHOOL",         ("preschool",)),
+    ("NURSERY",           ("nursery",)),
+    ("DAYCARE",           ("daycare",)),
+    ("ACADEMY",           ("academy",)),
+]
+
+
+def _classify_education_poi(fclass_norm, name_raw):
+    """
+    Returns the CAMA_SCHOOL*_TYPE value (e.g. "MONTESSORI") for one POI
+    already confirmed eligible for the education pool (see
+    _is_education_fclass()) -- or None if no keyword in
+    _EDUCATION_TYPE_PRIORITY matched (still part of the pool, simply
+    untyped -- e.g. a bare fclass="school" whose name gives no further
+    detail).
+
+    Checks a single combined "haystack" -- normalize_name(fclass_norm)
+    concatenated with normalize_name(str(name_raw)) -- against every
+    keyword in priority order, first match wins. This means a POI whose
+    fclass ALONE already identifies its education level (e.g.
+    fclass="middle school", fclass="junior_high_school",
+    fclass="university") resolves correctly without ever needing to
+    look at `name` at all -- the fclass contributes to the same
+    haystack the name would, so it is classified automatically.
+    `name_raw` may be None/NaN; that becomes an empty-string
+    contribution to the haystack, never a crash.
+
+    normalize_name() (from utils.table_name_matching, already imported
+    at the top of this file) lowercases and strips every non-letter
+    character, so "Junior High School", "junior_high_school", and
+    "junior-high-school" all normalize identically -- one keyword
+    ("juniorhigh") covers every spacing/punctuation variant without
+    needing to enumerate each one.
+    """
+    haystack = normalize_name(fclass_norm) + normalize_name(str(name_raw or ""))
+    for type_value, keywords in _EDUCATION_TYPE_PRIORITY:
+        if any(kw in haystack for kw in keywords):
+            return type_value
+    return None
+
+
+def _is_education_fclass(fclass_norm):
+    """
+    Eligibility gate for the unified CAMA_SCHOOL pool -- deliberately a
+    SEPARATE decision from _classify_education_poi()'s TYPE
+    classification: whether a POI enters the pool at all must not
+    depend on which specific keyword its name happens to contain.
+
+    A normalized fclass is eligible if it contains "school" anywhere
+    (catches "school" itself and every literal variant like
+    "elementary_school", "high school", "day care school",
+    "nursery-school", "academy school", etc. -- ANY fclass that
+    literally says "school" is eligible, regardless of which
+    education-level keyword also appears within it), OR if it is
+    exactly "university", "college", "kindergarten", or "preschool"
+    (eligible even without the word "school" appearing at all, since
+    these four are themselves unambiguous education-level fclass
+    values in common use).
+
+    Deliberately NOT eligible: bare "daycare", "nursery", or "academy"
+    (no "school" in them, and not one of the four exact-match values
+    above) -- these three are TYPE values ONLY, reached exclusively via
+    a POI whose fclass already qualifies through another route
+    (typically bare fclass="school") with one of these words appearing
+    in its `name`. This is intentional, not an oversight: e.g.
+    fclass="daycare" alone must never enter the pool, while
+    fclass="day care school" must (it contains "school").
+    """
+    n = normalize_name(fclass_norm)
+    if "school" in n:
+        return True
+    return n in ("university", "college", "kindergarten", "preschool")
+
 PRS92_ZONE_BOUNDS = [
     (-180.0, 118.0, 3121, "Zone I"),
     (118.0, 120.0, 3122, "Zone II"),
@@ -512,12 +621,21 @@ def _realizable_targets(poi_types):
     carries its own METHOD internally; it has no target-list/conflict-
     check concept of its own today, so there is nothing to update for
     it here.
+    SCHOOL is a deliberate, narrow special case: it represents the
+    unified education pool (see task()'s own construction of it, and
+    _classify_education_poi()/_is_education_fclass() above), which
+    carries a third per-rank value -- CAMA_SCHOOL{N}_TYPE -- alongside
+    its distance and name. No other type in poi_types has this third
+    dimension, so this is intentionally NOT a generic mechanism applied
+    to every type; it only fires when t.upper() == "SCHOOL".
     """
     targets = []
     for t in poi_types:
         for i in range(1, 4):
             targets.append(f"CAMA_{t.upper()}{i}")
             targets.append(f"CAMA_{t.upper()}{i}_NAME")
+            if t.upper() == "SCHOOL":
+                targets.append(f"CAMA_{t.upper()}{i}_TYPE")
     return targets
 
 
@@ -811,24 +929,33 @@ def worker_process(args):
 
     Args:
         args: (row_idx, centroid_xy, poi_types, poi_coords_dict,
-        poi_names_dict, edges_list, nodes_coords, edge_geoms) tuple --
-        packed this way so this function can be called uniformly
-        whether or not the caller parallelizes (see
+        poi_names_dict, poi_types_tag_dict, edges_list, nodes_coords,
+        edge_geoms) tuple -- packed this way so this function can be
+        called uniformly whether or not the caller parallelizes (see
         run_cpu_parallel_with_progress(), which currently calls this
         sequentially). poi_names_dict mirrors poi_coords_dict exactly
         (same keys, same per-type ordering) -- type -> list of each
         POI's own "name" attribute value (Python None where missing or
         where the source has no name column at all -- never the
-        string "None", never an empty string). Built from the SAME
-        filtered subset as poi_coords_dict for each type (see task()),
-        so a given index pi always refers to the same POI in both
-        dicts. edge_geoms is a picklable list[LineString] (one per
-        edges_list entry, same index) -- NOT a live STRtree, which is
-        rebuilt fresh inside this function from edge_geoms, matching
-        the existing rebuild-per-call convention already used for
-        nodes_kdtree/G_local, so this function stays safe to call from
-        a future multiprocessing pool even though it currently runs
-        sequentially.
+        string "None", never an empty string). poi_types_tag_dict is
+        SPARSE -- it only ever has a "SCHOOL" key (the unified
+        education pool; see task()'s own construction of it and
+        _classify_education_poi()/_is_education_fclass() above), with
+        the same per-index ordering as poi_coords_dict["SCHOOL"]/
+        poi_names_dict["SCHOOL"] -- type -> CAMA_SCHOOL*_TYPE
+        classification value (e.g. "MONTESSORI") or None per POI. Every
+        other type has no entry in this dict at all, and is completely
+        unaffected -- this is a deliberate, narrow addition for the
+        school pool only, not a generic third dimension for every type.
+        Built from the SAME filtered subset as poi_coords_dict for each
+        type (see task()), so a given index pi always refers to the
+        same POI across all three dicts. edge_geoms is a picklable
+        list[LineString] (one per edges_list entry, same index) -- NOT
+        a live STRtree, which is rebuilt fresh inside this function
+        from edge_geoms, matching the existing rebuild-per-call
+        convention already used for nodes_kdtree/G_local, so this
+        function stays safe to call from a future multiprocessing pool
+        even though it currently runs sequentially.
 
     Returns:
         tuple: (row_idx, results, route_records). results is a dict of
@@ -836,17 +963,18 @@ def worker_process(args):
         parcel's MAIN output row (the corresponding POI's own name, or
         None if missing/unavailable -- never written for a rank this
         type doesn't have enough total POIs to reach; see task()'s
-        pre-init notes). route_records is a list of per-route dicts
-        (parcel index, category, rank, METHOD, distance, route
-        geometry) used ONLY by the separate, still-disabled
-        poi_routes.gpkg QA/diagnostic export (see its own comment
-        further below) -- this is intentionally untouched by the
-        MAIN-output METHOD->NAME change: the `method` variable
+        pre-init notes), PLUS CAMA_SCHOOL{1-3}_TYPE for the school pool
+        specifically (see poi_types_tag_dict above). route_records is a
+        list of per-route dicts (parcel index, category, rank, METHOD,
+        distance, route geometry) used ONLY by the separate, still-
+        disabled poi_routes.gpkg QA/diagnostic export (see its own
+        comment further below) -- this is intentionally untouched by
+        the MAIN-output METHOD->NAME change: the `method` variable
         computed below is still fully alive and still flows into
         route_records exactly as before. On error, results is
         {"_error": str(e)} instead.
     """
-    (row_idx, centroid_xy, poi_types, poi_coords_dict, poi_names_dict, edges_list, nodes_coords, edge_geoms) = args
+    (row_idx, centroid_xy, poi_types, poi_coords_dict, poi_names_dict, poi_types_tag_dict, edges_list, nodes_coords, edge_geoms) = args
     route_records = []  # (typ, rank, method, dist, geometry)
     try:
         if len(nodes_coords) == 0:
@@ -998,6 +1126,10 @@ def worker_process(args):
             if coords is None or len(coords) == 0:
                 continue
             names = poi_names_dict.get(typ, [])
+            # Sparse: None for every type except "SCHOOL" (the unified
+            # education pool) -- see poi_types_tag_dict's own docstring
+            # note above.
+            types_tag = poi_types_tag_dict.get(typ)
 
             k = min(3, len(coords))
             tree = cKDTree(coords)
@@ -1009,6 +1141,7 @@ def worker_process(args):
             for pi in idxs:
                 poi_xy = coords[pi]
                 poi_name = names[pi] if pi < len(names) else None
+                poi_type_tag = types_tag[pi] if types_tag is not None and pi < len(types_tag) else None
                 end = _snap_to_road(poi_xy)
 
                 method = "Straight"
@@ -1023,12 +1156,14 @@ def worker_process(args):
                 except Exception:
                     dist = Point(centroid_xy).distance(Point(poi_xy))
 
-                network_results.append((round(dist, 2), method, route_geom, poi_name))
+                network_results.append((round(dist, 2), method, route_geom, poi_name, poi_type_tag))
 
             network_results = sorted(network_results, key=lambda r: r[0])
-            for i, (dist, method, route_geom, poi_name) in enumerate(network_results[:3], start=1):
+            for i, (dist, method, route_geom, poi_name, poi_type_tag) in enumerate(network_results[:3], start=1):
                 results[f"CAMA_{typ.upper()}{i}"] = float(dist)
                 results[f"CAMA_{typ.upper()}{i}_NAME"] = poi_name
+                if types_tag is not None:
+                    results[f"CAMA_{typ.upper()}{i}_TYPE"] = poi_type_tag
                 route_records.append({
                     "PARCEL_IDX": row_idx,
                     "CATEGORY": typ.upper(),
@@ -1046,7 +1181,7 @@ def worker_process(args):
 
 def run_cpu_parallel_with_progress(
     gdf, poi_gdf, road_gdf,
-    poi_types, poi_coords_dict, poi_names_dict,
+    poi_types, poi_coords_dict, poi_names_dict, poi_types_tag_dict,
     output_path,
     progress_bar, status_var,
     stop_flag,
@@ -1072,6 +1207,14 @@ def run_cpu_parallel_with_progress(
         "None" or an empty string. Threaded straight through to
         worker_process() via args_list below for the MAIN output's
         CAMA_{TYPE}{N}_NAME columns.
+        poi_types_tag_dict (dict): SPARSE -- only ever has a "SCHOOL"
+        key (the unified education pool; see task()'s own construction
+        of it), same per-index ordering as poi_coords_dict["SCHOOL"] --
+        type -> list of each POI's CAMA_SCHOOL*_TYPE classification
+        value (e.g. "MONTESSORI") or None. Every other type has no
+        entry here at all. Threaded straight through to
+        worker_process() for the MAIN output's CAMA_SCHOOL{N}_TYPE
+        columns.
         output_path (str | None): if given, the result is written here
         via _write_gpkg() after processing (local output mode). None
         for DB output mode, where the caller writes to PostGIS instead.
@@ -1124,7 +1267,7 @@ def run_cpu_parallel_with_progress(
     for idx, row in gdf.iterrows():
         centroid_xy = (row.geometry.centroid.x, row.geometry.centroid.y)
         args_list.append(
-            (idx, centroid_xy, poi_types, poi_coords_dict, poi_names_dict, edges_list, nodes_coords, edge_geoms)
+            (idx, centroid_xy, poi_types, poi_coords_dict, poi_names_dict, poi_types_tag_dict, edges_list, nodes_coords, edge_geoms)
         )
 
     total = len(args_list)
@@ -1876,7 +2019,10 @@ def open_main_window(app_root):
             child.destroy()
         other_landmark_type_vars = {}
 
-        eligible = sorted(v for v in fclass_values if v not in ALLOWED_FCLASS)
+        eligible = sorted(
+            v for v in fclass_values
+            if v not in ALLOWED_FCLASS and not _is_education_fclass(v)
+        )
         other_landmark_column_suffixes = _assign_other_type_column_suffixes(eligible)
 
         for display_text in eligible:
@@ -3030,9 +3176,17 @@ def run_with_progress(app_root, overwrite_mode=None, resolved_table_name=None):
             progress_win.update_idletasks()
 
             poi_gdf["_fclass_norm"] = poi_gdf["fclass"].str.lower().str.strip()
-            fixed_types = sorted(
+
+            # Ordinary fixed-type POIs -- church/shop/transport only.
+            # "school" and "university" (and every other education-
+            # related fclass) are NOT processed here anymore; they flow
+            # through the separate unified education pool below
+            # instead (see ORDINARY_FIXED_FCLASS's own module-level
+            # docstring for why ALLOWED_FCLASS itself is deliberately
+            # left unchanged rather than narrowed in place).
+            ordinary_fixed_types = sorted(
                 t for t in poi_gdf["_fclass_norm"].unique()
-                if t in ALLOWED_FCLASS
+                if t in ORDINARY_FIXED_FCLASS
             )
 
             # PART 2: dynamic "Other Landmark Types" the user checked at
@@ -3042,18 +3196,6 @@ def run_with_progress(app_root, overwrite_mode=None, resolved_table_name=None):
             # sub-checkbox was checked -- today's exact default
             # behavior, fully unchanged below.
             other_type_map = selected_other_poi_column_map or {}
-
-            # poi_types doubles as both the per-type iteration key
-            # (worker_process()) and the column-name source
-            # (typ.upper()) -- fixed types keep using their raw
-            # lowercase normalized string (unchanged, e.g. "school" ->
-            # CAMA_SCHOOL*), dynamic types use their pre-assigned
-            # suffix directly (already final/uppercase/underscore-only,
-            # so typ.upper() on it downstream is a no-op) instead of
-            # the raw fclass string, so worker_process() and every
-            # other already-generic downstream function need no
-            # changes at all.
-            poi_types = fixed_types + sorted(other_type_map.values())
 
             # Whether this POI source has a usable "name" attribute at
             # all -- "name" is treated as OPTIONAL (unlike "fclass",
@@ -3089,10 +3231,63 @@ def run_with_progress(app_root, overwrite_mode=None, resolved_table_name=None):
 
             poi_coords = {}
             poi_names = {}
-            for t in fixed_types:
+            for t in ordinary_fixed_types:
                 poi_coords[t], poi_names[t] = _coords_and_names_for(t)
             for raw_t, suffix in other_type_map.items():
                 poi_coords[suffix], poi_names[suffix] = _coords_and_names_for(raw_t)
+
+            # ------------------------------------------------------------------
+            # Unified education pool ("CAMA_SCHOOL{1-3}"). Every POI whose
+            # normalized fclass passes _is_education_fclass() (bare "school",
+            # every literal "*_school" variant, or exactly university/
+            # college/kindergarten/preschool) is gathered into ONE pool,
+            # ranked purely by distance regardless of sub-type -- NOT split
+            # into separate per-subtype buckets/columns. Each POI's own
+            # classification (_classify_education_poi(), keyword-matched
+            # against its own fclass+name -- see that function's docstring
+            # for why a POI whose fclass alone already says "university" or
+            # "middle school" resolves automatically without needing a name
+            # at all) travels alongside its coordinate and name as a third
+            # parallel array, written to CAMA_SCHOOL{rank}_TYPE by
+            # worker_process(). "SCHOOL" is used as the literal poi_types/
+            # poi_coords/poi_names/poi_types_tag key -- typ.upper() on it
+            # downstream is a no-op, exactly like every other already-
+            # uppercase dynamic suffix.
+            # ------------------------------------------------------------------
+            poi_types_tag = {}
+            education_mask = poi_gdf["_fclass_norm"].apply(_is_education_fclass)
+            education_subset = poi_gdf[education_mask]
+            if len(education_subset) > 0:
+                school_coords = np.array([[p.x, p.y] for p in education_subset.geometry])
+                if has_poi_name_column:
+                    school_names_raw = education_subset["name"].tolist()
+                else:
+                    school_names_raw = [None] * len(education_subset)
+                school_names = [v if pd.notna(v) else None for v in school_names_raw]
+                school_types = [
+                    _classify_education_poi(fc, nm)
+                    for fc, nm in zip(education_subset["_fclass_norm"].tolist(), school_names_raw)
+                ]
+                poi_coords["SCHOOL"] = school_coords
+                poi_names["SCHOOL"] = school_names
+                poi_types_tag["SCHOOL"] = school_types
+
+            # poi_types doubles as both the per-type iteration key
+            # (worker_process()) and the column-name source
+            # (typ.upper()) -- ordinary fixed types keep using their raw
+            # lowercase normalized string (unchanged, e.g. "church" ->
+            # CAMA_CHURCH*), "SCHOOL" (the unified education pool) and
+            # dynamic types use their pre-assigned/already-final suffix
+            # directly (already uppercase/underscore-only, so
+            # typ.upper() on it downstream is a no-op) instead of a raw
+            # fclass string, so worker_process() and every other
+            # already-generic downstream function need no further
+            # changes at all.
+            poi_types = (
+                ordinary_fixed_types
+                + (["SCHOOL"] if "SCHOOL" in poi_coords else [])
+                + sorted(other_type_map.values())
+            )
 
             # Consolidate any pre-existing, differently-cased CAMA_*
             # column(s) detected in the confirmation step (on_run()
@@ -3126,8 +3321,8 @@ def run_with_progress(app_root, overwrite_mode=None, resolved_table_name=None):
             # flagged gap where ALL FIVE ALLOWED_FCLASS types' columns
             # were unconditionally created regardless of presence (see
             # the standing comment above _sanitize_fclass_to_suffix()) --
-            # now using fixed_types (present-only) instead of the full
-            # static ALLOWED_FCLASS set.
+            # now using ordinary_fixed_types (present-only) instead of
+            # the full static ALLOWED_FCLASS set.
             #
             # Each rank's distance column is immediately followed by its
             # _NAME column (CAMA_{TYPE}1, CAMA_{TYPE}1_NAME,
@@ -3139,7 +3334,7 @@ def run_with_progress(app_root, overwrite_mode=None, resolved_table_name=None):
             # `method` variable itself is untouched inside
             # worker_process(), still feeding the separate, dormant
             # poi_routes.gpkg QA export unchanged).
-            for t in fixed_types:
+            for t in ordinary_fixed_types:
                 max_rank = min(3, len(poi_coords[t]))
                 for i in range(1, max_rank + 1):
                     gdf[f"CAMA_{t.upper()}{i}"] = np.nan
@@ -3150,6 +3345,18 @@ def run_with_progress(app_root, overwrite_mode=None, resolved_table_name=None):
                 for i in range(1, max_rank + 1):
                     gdf[f"CAMA_{suffix}{i}"] = np.nan
                     gdf[f"CAMA_{suffix}{i}_NAME"] = None
+
+            # Unified education pool pre-init -- same rank-capping
+            # rule as every other type above, PLUS a third column per
+            # rank (_TYPE) unique to the school pool (see
+            # poi_types_tag's own docstring notes in worker_process()
+            # and run_cpu_parallel_with_progress()).
+            if "SCHOOL" in poi_coords:
+                max_rank = min(3, len(poi_coords["SCHOOL"]))
+                for i in range(1, max_rank + 1):
+                    gdf[f"CAMA_SCHOOL{i}"] = np.nan
+                    gdf[f"CAMA_SCHOOL{i}_NAME"] = None
+                    gdf[f"CAMA_SCHOOL{i}_TYPE"] = None
 
             if output_mode[0] == "local":
                 if parcel_source[0] == "local":
@@ -3170,7 +3377,7 @@ def run_with_progress(app_root, overwrite_mode=None, resolved_table_name=None):
 
             routes_path = run_cpu_parallel_with_progress(
                 gdf, poi_gdf, road_gdf,
-                poi_types, poi_coords, poi_names,
+                poi_types, poi_coords, poi_names, poi_types_tag,
                 output_path,
                 progress_bar, status_var,
                 stop_flag,
