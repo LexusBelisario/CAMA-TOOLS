@@ -2030,7 +2030,7 @@ def open_main_window(root):
 
     win = tk.Toplevel(root)
     apply_icon(win, "influencemap.ico")
-    win.title("Influence Map to Land Parcel")
+    win.title("Influence Map to Land Parcel Tool")
     win.resizable(False, False)
     win.update_idletasks()
     win.deiconify()
