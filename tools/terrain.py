@@ -65,18 +65,46 @@ SIDE EFFECTS:
     behavior, and they should not be conflated:
 
     1. A REAL, REQUIRED initialization dependency, not a stylistic
-       preference: `os.environ["PROJ_LIB"]` and `os.environ["PROJ_DATA"]`
-       (right after the `import pyproj` at the very top of this file)
-       MUST be set before `import rasterio` (and before `import
-       geopandas`, which also depends on GDAL/PROJ) -- GDAL/rasterio
-       reads these env vars at import time to locate PROJ's data files,
-       and importing rasterio first can cause it to silently pick up
-       the wrong PROJ data directory (or fail to find one at all) on a
-       machine with multiple PROJ installations, which is exactly the
-       scenario a PyInstaller-frozen executable creates. This ordering
-       is preserved exactly as found, including which imports precede
-       vs. follow it -- not reorganized into the stdlib/third-party
-       grouping used everywhere else in this file.
+       preference: `os.environ["PROJ_DATA"]` (right at the very top of
+       this file, before any third-party import) MUST be set before
+       `import rasterio` (and before `import geopandas`, which also
+       depends on GDAL/PROJ) -- GDAL/rasterio reads this env var at
+       import time to locate PROJ's data files.
+
+       CONFIRMED ROOT CAUSE (direct inspection, both dev-mode venv and
+       the PyInstaller-frozen build bundle four SEPARATE, independently
+       -versioned copies of PROJ's proj.db -- one each from rasterio,
+       pyproj, pyogrio, and fiona, since each of those packages' wheels
+       bundles its own): their DATABASE.LAYOUT.VERSION schemas differ.
+       rasterio's OWN bundled copy is the one whose schema actually
+       matches this rasterio build's compiled GDAL requirement; the
+       other three packages' copies are older and will trigger
+       "DATABASE.LAYOUT.VERSION.MINOR = N whereas a number >= 6 is
+       expected" if rasterio ends up pointed at any of them instead of
+       its own. This is NOT a "point PROJ_DATA at pyproj" fix (an
+       earlier, disproven diagnosis) -- it is specifically "point
+       PROJ_DATA at rasterio's own bundled proj_data directory",
+       resolved via `importlib.util.find_spec("rasterio")` (locates the
+       package without importing/initializing it, so the required
+       set-env-var-before-import ordering is preserved). This resolves
+       correctly in both dev-mode (venv site-packages) and a frozen
+       build (sys._MEIPASS), since find_spec() goes through whatever
+       import machinery is active either way. A newer PROJ database
+       schema is a superset of older ones for long-established EPSG
+       definitions -- PRS92 zones (EPSG 3121-3125) have been in the
+       PROJ database for well over a decade -- so using rasterio's copy
+       for BOTH raster (rasterio.warp) and vector (geopandas/pyproj)
+       CRS work in this file is safe; a second, different PROJ_DATA
+       value is not needed for the two libraries. If rasterio's own
+       proj_data directory cannot be located (unexpected on any machine
+       where rasterio is actually importable), this falls back to
+       pyproj's copy as a last resort, so the app degrades to
+       previously-observed (imperfect but sometimes-working) behavior
+       rather than leaving PROJ_DATA completely unset.
+
+       This ordering is preserved exactly as found, including which
+       imports precede vs. follow it -- not reorganized into the
+       stdlib/third-party grouping used everywhere else in this file.
 
     2. An import-time SIDE EFFECT that is not itself an inter-import
        dependency: the module-level call to set_app_user_model_id()
@@ -106,9 +134,31 @@ SIDE EFFECTS:
 import os
 import re
 import math
-import pyproj
-os.environ["PROJ_LIB"] = pyproj.datadir.get_data_dir()
-os.environ["PROJ_DATA"] = pyproj.datadir.get_data_dir()
+import importlib.util
+
+# --- PROJ data-directory resolution (see module docstring above for the
+# confirmed root cause) -- must run before `import rasterio` / `import
+# geopandas` below. Locate rasterio's OWN bundled proj_data directory
+# without importing rasterio itself (find_spec only resolves the
+# package's location; it does not execute/initialize the module).
+_rasterio_spec = importlib.util.find_spec("rasterio")
+_proj_data_dir = None
+if _rasterio_spec and _rasterio_spec.submodule_search_locations:
+    _rasterio_pkg_dir = list(_rasterio_spec.submodule_search_locations)[0]
+    _candidate = os.path.join(_rasterio_pkg_dir, "proj_data")
+    if os.path.isdir(_candidate):
+        _proj_data_dir = _candidate
+
+if _proj_data_dir:
+    os.environ["PROJ_DATA"] = _proj_data_dir
+else:
+    # Fallback: rasterio's own proj_data wasn't found -- fall back to
+    # pyproj's copy so PROJ_DATA is still set to *something* rather than
+    # left unset entirely (see module docstring for why this is a
+    # degraded, imperfect-but-sometimes-working fallback, not the
+    # primary fix).
+    import pyproj
+    os.environ["PROJ_DATA"] = pyproj.datadir.get_data_dir()
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, Listbox
