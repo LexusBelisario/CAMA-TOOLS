@@ -1,5 +1,5 @@
 """
-tools/POI_All_Distance.py
+tools/meters_from_school_shop_transport_church.py
 
 PURPOSE:
     CAMA Tools tool ("METERS FROM (SCHOOL, SHOP, TRANSPORT, CHURCH)" in
@@ -1626,7 +1626,7 @@ def open_main_window(app_root):
     """
     win = tk.Toplevel(app_root)
     apply_icon(win, "distancefrom.ico")
-    win.title("POI Distance Tool")
+    win.title("Meters From (School, Shop, Transport, Church) Tool")
     win.resizable(False, False)
     win.update_idletasks()
     win.deiconify()
@@ -2060,7 +2060,7 @@ def open_main_window(app_root):
         - road_width.py calls its own _reflow_window() from SEVERAL
           independent checklist-visibility functions (Land Parcel
           classification, Filter by Road Type), since that tool has
-          multiple dynamic-content sections. POI_All_Distance.py's
+          multiple dynamic-content sections. meters_from_school_shop_transport_church.py's
           `win` has exactly ONE dynamic-content section -- this one --
           so this function is called from exactly one place,
           _update_other_landmarks_visibility() below, never from
@@ -2791,7 +2791,7 @@ def confirm_db_overwrite_dialog(parent, table_name):
 
     dialog = tk.Toplevel(parent)
     apply_icon(dialog, "distancefrom.ico")
-    dialog.title("POI ALL DISTANCE TOOL")
+    dialog.title("Meters From (School, Shop, Transport, Church) Tool")
     dialog.resizable(False, False)
     dialog.grab_set()
 
@@ -2864,7 +2864,7 @@ def choose_db_overwrite_dialog(parent, candidates):
 
     dialog = tk.Toplevel(parent)
     apply_icon(dialog, "distancefrom.ico")
-    dialog.title("POI ALL DISTANCE TOOL")
+    dialog.title("Meters From (School, Shop, Transport, Church) Tool")
     dialog.resizable(False, False)
     dialog.grab_set()
 

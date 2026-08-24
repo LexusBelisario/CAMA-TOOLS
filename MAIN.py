@@ -281,9 +281,9 @@ TOOL_MODULES = {
     "ROAD WIDTH": "tools.road_width",
     "ROAD FRONTAGE & DEPTH-TO-WIDTH RATIO": "tools.road_frontage",
     "LOT LOCATION": "tools.lot_location",
-    "LAND SHAPE": "tools.land_shape_compactness",
-    "METERS FROM (SCHOOL, SHOP, TRANSPORT, CHURCH)": "tools.POI_All_Distance",
-    "LANDMARKS WITHIN METERS": "tools.landmarks_within_200_meters",
+    "LAND SHAPE": "tools.land_shape",
+    "METERS FROM (SCHOOL, SHOP, TRANSPORT, CHURCH)": "tools.meters_from_school_shop_transport_church",
+    "LANDMARKS WITHIN METERS": "tools.landmarks_within_meters",
     "PARCEL TERRAIN LEVEL": "tools.terrain",
     "ROAD DENSITY": "tools.road_density",
     "ROAD SURFACE": "tools.road_surface",
@@ -2690,7 +2690,7 @@ def update_map_and_select_recorded():
                 table by querying PostGIS's own geometry_columns catalog
                 view - the same approach already used throughout this
                 project's other tool modules (see get_geometry_column()
-                in road_width.py, land_shape_compactness.py, lot_location.py,
+                in road_width.py, land_shape.py, lot_location.py,
                 etc.), confirmed available in this environment. Avoids
                 assuming the geometry column is literally named "geom":
                 tables that were never written by CAMA Tools' own Safe
