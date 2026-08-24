@@ -1,8 +1,8 @@
 """
-tools/influence_to_barangay.py
+tools/influence_map_to_land_parcel.py
 
 PURPOSE:
-    CAMA Tools tool ("ANY MAP TO LAND PARCEL" in MAIN.py's dispatch
+    CAMA Tools tool ("INFLUENCE MAP TO LAND PARCEL" in MAIN.py's dispatch
     table): for each selected Land Parcel/Barangay source, transfers one
     attribute value per selected Influence Map (thematic) layer onto the
     parcel, via a spatial join of the parcel's centroid against the
@@ -1152,7 +1152,7 @@ def run_processing(root, overwrite_mode=None, resolved_table_name=None, resolved
     # full CAMA_Table/CAMA_Transaction_Log transaction -- now wrapped
     # inside a background worker() thread instead of running inline on
     # the main thread.
-    progress = ProgressWindow(root, "Influence to Barangay Progress")
+    progress = ProgressWindow(root, "Influence Map to Land Parcel — Progress")
     q = queue.Queue()
 
     def worker():
@@ -1550,7 +1550,7 @@ def run_processing(root, overwrite_mode=None, resolved_table_name=None, resolved
                             ),
                             {
                                 "tbl": f"{target_table} ({table_action})",
-                                "tool": "influence_to_barangay",
+                                "tool": "influence_map_to_land_parcel",
                                 "details": ", ".join(added_fields),
                             },
                         )
@@ -1811,7 +1811,7 @@ def confirm_db_overwrite_dialog(parent, table_name):
 
     dialog = tk.Toplevel(parent)
     apply_icon(dialog, "influencemap.ico")
-    dialog.title("INFLUENCE TO BARANGAY TOOL")
+    dialog.title("INFLUENCE MAP TO LAND PARCEL TOOL")
     dialog.resizable(False, False)
     dialog.grab_set()
     dialog.deiconify()
@@ -1876,7 +1876,7 @@ def choose_db_overwrite_dialog(parent, candidates):
 
     dialog = tk.Toplevel(parent)
     apply_icon(dialog, "influencemap.ico")
-    dialog.title("INFLUENCE TO BARANGAY TOOL")
+    dialog.title("INFLUENCE MAP TO LAND PARCEL TOOL")
     dialog.resizable(False, False)
     dialog.grab_set()
     dialog.deiconify()
@@ -2030,7 +2030,7 @@ def open_main_window(root):
 
     win = tk.Toplevel(root)
     apply_icon(win, "influencemap.ico")
-    win.title("Influence to Parcel Tool")
+    win.title("Influence Map to Land Parcel")
     win.resizable(False, False)
     win.update_idletasks()
     win.deiconify()

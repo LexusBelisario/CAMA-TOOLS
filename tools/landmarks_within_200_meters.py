@@ -1,5 +1,5 @@
 """
-tools/poi_within_200_meters_for_parcellary_church_mall_police_park.py
+tools/landmarks_within_200_meters.py
 
 PURPOSE:
     CAMA Tools tool ("LANDMARKS WITHIN METERS" in MAIN.py's dispatch

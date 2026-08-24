@@ -276,14 +276,14 @@ EXPORT_HARD_TIMEOUT_S = 900
 # TOOL DISPATCH TABLE
 # ========================================
 TOOL_MODULES = {
-    "ANY MAP TO LAND PARCEL": "tools.influence_to_barangay",
-    "INFLUENCE TO MAP": "tools.influence_to_map",
+    "INFLUENCE MAP TO LAND PARCEL": "tools.influence_map_to_land_parcel",
+    "INFLUENCE MAP DISTANCE TO LAND PARCEL": "tools.influence_map_distance_to_land_parcel",
     "ROAD WIDTH": "tools.road_width",
     "ROAD FRONTAGE & DEPTH-TO-WIDTH RATIO": "tools.road_frontage",
     "LOT LOCATION": "tools.lot_location",
     "LAND SHAPE": "tools.land_shape_compactness",
     "METERS FROM (SCHOOL, SHOP, TRANSPORT, CHURCH)": "tools.POI_All_Distance",
-    "LANDMARKS WITHIN METERS": "tools.poi_within_200_meters_for_parcellary_church_mall_police_park",
+    "LANDMARKS WITHIN METERS": "tools.landmarks_within_200_meters",
     "PARCEL TERRAIN LEVEL": "tools.terrain",
     "ROAD DENSITY": "tools.road_density",
     "ROAD SURFACE": "tools.road_surface",
@@ -3243,7 +3243,7 @@ def run_tool_by_label(label: str):
     IS_FROZEN = getattr(sys, 'frozen', False)
 
     icon_map = {
-        "ANY MAP TO LAND PARCEL": "influencemap.ico",
+        "INFLUENCE MAP TO LAND PARCEL": "influencemap.ico",
         "ROAD WIDTH": "roadwidth.ico",
         "ROAD FRONTAGE & DEPTH-TO-WIDTH RATIO": "roadfrontage.ico",
         "LOT LOCATION": "lotlocation.ico",
@@ -3871,8 +3871,8 @@ clicked_bg = round_image(str(ICONS_DIR / "click.png"), size=(38, 38), radius=7)
 
 # Map labels to icon filenames (short & clean):
 _icon_files = {
-    "ANY MAP TO LAND PARCEL": "influencemap.png",
-    "INFLUENCE TO MAP": "distancefactor.png",
+    "INFLUENCE MAP TO LAND PARCEL": "influencemap.png",
+    "INFLUENCE MAP DISTANCE TO LAND PARCEL": "distancefactor.png",
     "ROAD WIDTH": "roadwidth.png",
     "ROAD FRONTAGE & DEPTH-TO-WIDTH RATIO": "roadfrontage.png",
     "LOT LOCATION": "lotlocation.png",
@@ -3903,8 +3903,8 @@ button_frame.pack(padx=8, pady=(6, 6))
 
 # === Tooltip descriptions for icon buttons ===
 tooltip_descriptions = {
-    "ANY MAP TO LAND PARCEL": "Any map source to Land Parcel",
-    "INFLUENCE TO MAP": "Distance to nearest Fault Line",
+    "INFLUENCE MAP TO LAND PARCEL": "Influence Map to Land Parcel",
+    "INFLUENCE MAP DISTANCE TO LAND PARCEL": "Distance to nearest Fault Line",
     "ROAD WIDTH": "Measure average road width",
     "ROAD FRONTAGE & DEPTH-TO-WIDTH RATIO": "Analyze parcel depth and frontage",
     "LOT LOCATION": "Classify lots based on proximity",
@@ -3926,8 +3926,8 @@ tooltip_descriptions = {
 
 # === BUTTON DEFINITIONS ===
 buttons_1st_row = [
-    "ANY MAP TO LAND PARCEL",
-    "INFLUENCE TO MAP",
+    "INFLUENCE MAP TO LAND PARCEL",
+    "INFLUENCE MAP DISTANCE TO LAND PARCEL",
     "ROAD WIDTH",
     "ROAD FRONTAGE & DEPTH-TO-WIDTH RATIO",
     "LOT LOCATION",
@@ -3966,7 +3966,7 @@ for label in buttons_1st_row:
         icon_img_id = canvas.create_image(2, 2, anchor="nw", image=icons[label])
     else:
         # Isolated fallback for a button with no bundled icon yet (e.g.
-        # "INFLUENCE TO MAP"): render plain text instead of fabricating
+        # "INFLUENCE MAP DISTANCE TO LAND PARCEL"): render plain text instead of fabricating
         # a placeholder PNG. Guards on `icons` -- the runtime dict this
         # loop actually indexes two lines above -- rather than
         # `_icon_files`, its config-source dict, so this stays correct
@@ -4002,7 +4002,7 @@ for label in buttons_1st_row:
     canvas.pack(side="left", padx=(2, 2), pady=(2, 2))
 
     # Per-button packing adjustments
-    if label == "ANY MAP TO LAND PARCEL":
+    if label == "INFLUENCE MAP TO LAND PARCEL":
         canvas.pack(side="left", padx=(2, 2), pady=(2, 2))
     elif label == "ROAD WIDTH":
         canvas.pack(side="left", padx=(2, 2), pady=(2, 2))

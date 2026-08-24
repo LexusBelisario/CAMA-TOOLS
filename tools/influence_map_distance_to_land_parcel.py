@@ -1,8 +1,8 @@
 """
-tools/influence_to_map.py
+tools/influence_map_distance_to_land_parcel.py
 
 PURPOSE:
-    CAMA Tools tool ("INFLUENCE TO MAP" in MAIN.py's dispatch table):
+    CAMA Tools tool ("INFLUENCE MAP DISTANCE TO LAND PARCEL" in MAIN.py's dispatch table):
     for each Land Parcel, finds the single nearest feature in a Fault
     Line Map layer (Point, LineString, or Polygon geometry all
     supported) and writes CAMA_FAULT_NAME and CAMA_FAULT_DISTANCE. The
@@ -956,7 +956,7 @@ def ask_overwrite_dialog(parent, conflicting_names):
 
     dialog = tk.Toplevel(parent)
     apply_icon(dialog, "distancefactor.ico")
-    dialog.title("INFLUENCE TO MAP TOOL")
+    dialog.title("INFLUENCE MAP DISTANCE TO LAND PARCEL TOOL")
     dialog.resizable(False, False)
     dialog.grab_set()
 
@@ -1060,7 +1060,7 @@ def confirm_db_overwrite_dialog(parent, table_name):
 
     dialog = tk.Toplevel(parent)
     apply_icon(dialog, "distancefactor.ico")
-    dialog.title("INFLUENCE TO MAP TOOL")
+    dialog.title("INFLUENCE MAP DISTANCE TO LAND PARCEL TOOL")
     dialog.resizable(False, False)
     dialog.grab_set()
 
@@ -1129,7 +1129,7 @@ def choose_db_overwrite_dialog(parent, candidates):
 
     dialog = tk.Toplevel(parent)
     apply_icon(dialog, "distancefactor.ico")
-    dialog.title("INFLUENCE TO MAP TOOL")
+    dialog.title("INFLUENCE MAP DISTANCE TO LAND PARCEL TOOL")
     dialog.resizable(False, False)
     dialog.grab_set()
 
@@ -1537,7 +1537,7 @@ def run_processing(app_root, overwrite_mode=None, per_source_resolution=None):
         f"postgresql://{creds['username']}:{creds['password']}@{creds['host']}:{creds['port']}/{creds['database']}"
     )
 
-    progress = ProgressWindow(app_root, title="Influence to Map — Processing")
+    progress = ProgressWindow(app_root, title="Influence Map Distance to Land Parcel — Processing")
 
     q = queue.Queue()
 
@@ -1739,7 +1739,7 @@ def open_main_window(root):
 
     win = tk.Toplevel(root)
     apply_icon(win, "distancefactor.ico")
-    win.title("Influence to Map")
+    win.title("Influence Map Distance to Land Parcel")
     win.resizable(False, False)
     win.update_idletasks()
     win.deiconify()
