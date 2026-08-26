@@ -108,7 +108,7 @@ import geopandas as gpd
 import pandas as pd
 import numpy as np
 from shapely.geometry import LineString, MultiLineString, Point, box
-from shapely.ops import unary_union, nearest_points, linemerge
+from shapely.ops import unary_union, nearest_points, linemerge, transform
 from shapely.strtree import STRtree
 from shapely.validation import make_valid
 from sqlalchemy import create_engine, inspect, text
@@ -1340,6 +1340,31 @@ def read_postgis_clean(table, engine, schema):
     return gpd.read_postgis(query, engine, geom_col="geometry")
 
 
+def _force_2d(gdf):
+    """Drops any Z coordinate from every geometry in gdf. Safe to call
+    on already-2D geometry (no-op in that case).
+
+    Fix for: LandParcel_3.gpkg-style sources carry a Z coordinate on
+    every vertex (each coordinate a (x, y, 0.0) 3-tuple), while
+    RoadNetwork.gpkg-style sources are pure 2D. That asymmetry causes
+    a bare `x1, y1 = coords[0]`-style unpack (see
+    process_frontage_single()'s inline depth-direction block) to raise
+    `ValueError: too many values to unpack (expected 2)` the moment it
+    hits a 3D coordinate. Applied once at every read/reuse site for
+    both brgy_gdf (parcel) and road_gdf (road network) -- local file,
+    DB table, and the cached road_gdf reuse path alike -- so nothing
+    downstream (resolve_classification(), process_frontage_single(),
+    or any future geometry-touching code) ever has to special-case a
+    3D input again.
+    """
+    gdf = gdf.copy()
+    gdf["geometry"] = gdf["geometry"].apply(
+        lambda geom: transform(lambda x, y, z=None: (x, y), geom)
+        if geom is not None else None
+    )
+    return gdf
+
+
 # ========================================
 # PROGRESS WINDOW
 # ========================================
@@ -1442,10 +1467,22 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
     """
     Core measurement engine: for each parcel, computes road frontage
     (via split_boundary_to_segments() + buffer-intersection against
-    the road network), depth (calculate_depth_perpendicular(), falling
-    back to calculate_centroid_to_road_depth() when no frontage segment
-    is found), and depth-to-width ratio, writing the three results into
-    road_frontage_col/depth_col/dwr_col.
+    the road network), depth, and depth-to-width ratio, writing the
+    three results into road_frontage_col/depth_col/dwr_col.
+
+    Depth is computed inline (NOT via calculate_depth_perpendicular()
+    or calculate_centroid_to_road_depth() -- neither is actually called
+    anywhere in this file; see those functions' own docstrings/module
+    notes). The live logic: if frontage_total > 0, take the longest
+    covered frontage piece (_fl), find its midpoint, and derive a
+    perpendicular direction from that piece's first-to-last-coordinate
+    vector rotated 90 degrees. Two probe rays of length max_depth are
+    cast from the midpoint in both directions along that perpendicular;
+    whichever ray's intersection with the parcel polygon is longer is
+    kept, and that intersection length is the depth value. If
+    frontage_total is 0 (no frontage segment found), depth falls back
+    to 0.0 directly in this inline block -- there is currently no
+    centroid-to-road fallback measure wired into the live path.
 
     Args:
         brgy_gdf (geopandas.GeoDataFrame): parcels to process.
@@ -2282,13 +2319,18 @@ def run_processing(app_root, resolved_table_name=None):
             # actually run, since the two are cached independently.
             road_slot = _road_gdf_cache.get(road_source[0], {})
             if road_slot.get("key") == road_source[1][0] and road_slot.get("gdf") is not None:
-                road_gdf = road_slot["gdf"]
+                # Already forced to 2D at the cache-write site (see
+                # _poll_road_classification_queue()'s _road_gdf_cache[...]
+                # assignment); wrapped again here as a cheap no-op
+                # safeguard so this reuse path never depends on that
+                # being the only place the cache is ever written.
+                road_gdf = _force_2d(road_slot["gdf"])
                 print("ℹ️ Reusing cached road network (already read during source selection).")
             elif road_source[0] == "local":
-                road_gdf = gpd.read_file(road_source[1][0])
+                road_gdf = _force_2d(gpd.read_file(road_source[1][0]))
             else:
                 road_table = road_source[1][0]
-                road_gdf = read_postgis_clean(road_table, engine, schema)
+                road_gdf = _force_2d(read_postgis_clean(road_table, engine, schema))
 
             if barangay_source[0] == "local":
                 sources = [("local", p) for p in barangay_source[1]]
@@ -2301,12 +2343,12 @@ def run_processing(app_root, resolved_table_name=None):
                     if src_type == "local":
                         name = os.path.basename(src)
                         q.put(("update", f"Loading {name}", None, None))
-                        brgy_gdf = gpd.read_file(src)
+                        brgy_gdf = _force_2d(gpd.read_file(src))
                         out_base = os.path.splitext(name)[0]
                     else:
                         name = src
                         q.put(("update", f"Loading DB table {name}", None, None))
-                        brgy_gdf = read_postgis_clean(name, engine, schema)
+                        brgy_gdf = _force_2d(read_postgis_clean(name, engine, schema))
                         out_base = name
 
                     # Road Classification: resolved independently for THIS
@@ -4029,7 +4071,7 @@ def open_main_window(root):
         # for this mode -- kept ONLY for run_processing()'s Run-time
         # reuse (see _road_gdf_cache's module-level comment); the other
         # mode's slot is completely untouched.
-        _road_gdf_cache[source_type] = {"key": path_or_table, "gdf": gdf}
+        _road_gdf_cache[source_type] = {"key": path_or_table, "gdf": _force_2d(gdf)}
         road_type_value_vars.clear()
         road_type_value_vars.update(new_value_vars)
         _rebuild_road_type_checklist()
