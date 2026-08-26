@@ -961,7 +961,7 @@ def confirm_db_overwrite_dialog(parent, table_name):
 
     dialog = tk.Toplevel(parent)
     apply_icon(dialog, "terrain.ico")
-    dialog.title("TERRAIN TOOL")
+    dialog.title("PARCEL TERRAIN LEVEL TOOL")
     dialog.resizable(False, False)
     dialog.grab_set()
     dialog.deiconify()
@@ -1026,7 +1026,7 @@ def choose_db_overwrite_dialog(parent, candidates):
 
     dialog = tk.Toplevel(parent)
     apply_icon(dialog, "terrain.ico")
-    dialog.title("TERRAIN TOOL")
+    dialog.title("PARCEL TERRAIN LEVEL TOOL")
     dialog.resizable(False, False)
     dialog.grab_set()
     dialog.deiconify()
@@ -1184,7 +1184,7 @@ def open_main_window(root):
 
     win = tk.Toplevel(root)
     apply_icon(win, "terrain.ico")
-    win.title("Terrain Analysis Tool")
+    win.title("Parcel Terrain Level Tool")
     win.resizable(False, False)
     win.update_idletasks()
     win.deiconify()
