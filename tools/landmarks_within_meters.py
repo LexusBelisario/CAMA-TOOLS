@@ -3,12 +3,17 @@ tools/landmarks_within_meters.py
 
 PURPOSE:
     CAMA Tools tool ("LANDMARKS WITHIN METERS" in MAIN.py's dispatch
-    table): for each Land Parcel, counts how many POIs of each type
-    (police, park, mall, and a catch-all "others" for any other fclass)
-    are within a network-routed distance of a user-specified radius
-    (default 200 meters) of the parcel centroid. Writes four
-    CAMA_-prefixed count columns: CAMA_NUM_POLICE, CAMA_NUM_PARK,
-    CAMA_NUM_MALL, CAMA_NUM_OTHERS.
+    table): for each Land Parcel, counts how many POIs fall within
+    range of the parcel centroid, per user-checked landmark category
+    (dynamically discovered from the POI source's own 'fclass' values
+    -- see the "Landmark Categories" checklist in open_main_window()).
+    Each checked category independently uses either the Aerial method
+    (straight-line geodesic distance, within a user-entered Aerial
+    radius) or the Road method (network-routed distance along a
+    user-supplied Road Network source, within a separate user-entered
+    Road distance) -- see process_poi_counts_dynamic(). Writes one
+    CAMA_NUM_{KEY}-prefixed count column per checked category
+    (derive_target_columns()), e.g. CAMA_NUM_POLICE_STATION.
 
 DISPATCH:
     Run as an isolated subprocess by MAIN.py via its `--tool` dispatch
@@ -44,13 +49,20 @@ DEPENDENCIES:
 
 SIDE EFFECTS:
     File reads/writes (.shp/.gpkg). PostGIS reads/writes. A live
-    PostgreSQL connection. Tkinter GUI windows throughout, including a
-    synchronous, module-global-driven progress window
+    PostgreSQL connection. Tkinter GUI windows throughout. The progress
+    window itself is still module-global-driven
     (PROG_WIN/PROG_BAR/PROG_LABEL/PROG_STOP_FLAG -- see RUNTIME STATE
-    below) rather than a background-thread/queue pattern. A subprocess
-    launch to Global Mapper (load_in_global_mapper()) on local-output
-    saves, plus a Win32 EnumWindows call to find/focus an already-open
-    Global Mapper window first.
+    below), but as of Part 3, run_processing()'s own processing runs on
+    a background worker thread, following this file's own established
+    worker-thread + queue.Queue() + win.after()-polling pattern (the
+    same one _refresh_poi_categories()/_poll_poi_category_queue() use
+    for POI category discovery) -- all Tkinter calls (progress window
+    creation/update/close, the final result dialog) happen only in the
+    main-thread poller, never in the worker. A subprocess launch to
+    Global Mapper (load_in_global_mapper()) on local-output saves, plus
+    a Win32 EnumWindows call to find/focus an already-open Global
+    Mapper window first -- both run on the worker thread, since neither
+    touches Tkinter.
 
     D3c: this tool no longer makes any network call of any kind -- the
     old osmnx-based road-network download (OpenStreetMap Overpass API)
@@ -109,7 +121,7 @@ from geopy.distance import geodesic
 from sqlalchemy import create_engine, inspect, text
 import psycopg2
 
-from utils.table_name_matching import normalize_name, find_matching_tables
+from utils.table_name_matching import find_matching_tables
 from utils.resource_path import resource_path
 from utils.db_discovery import load_db_credentials, fetch_tables
 from utils.column_detection import detect_existing_output_columns
@@ -118,7 +130,6 @@ from utils.window_icon import apply_icon
 # ========================================
 # CONFIGURATION
 # ========================================
-ICON_PATH = r"D:/2025_PROJECTS/BLGF-GM_TEST/FOR TESTING/DCS_CODES/BLGF.ico"
 # Hardcoded (current behavior). Planned improvement: dynamic Global
 # Mapper executable discovery. Actual implementation: separate future
 # task -- see module docstring SIDE EFFECTS for the full note.
@@ -172,13 +183,16 @@ barangay_source = None
 poi_source = None
 output_mode = None
 
-# D3a additions -- built and validated in on_run() (Cluster D3a), but
-# NOT consumed by run_processing()/process_poi_counts_dynamic() yet --
-# that wiring is D3c's job. Kept as module-level globals for the same
-# reason barangay_source/poi_source/output_mode already are: on_run()
-# and run_processing() are separate functions (the latter is NOT
-# nested inside open_main_window()), so this is the established
-# handoff mechanism between them in this file, not a new pattern.
+# Handoff globals between on_run() and run_processing() (D3a/D3c):
+# built and validated in on_run(), consumed by run_processing() (which
+# passes them into process_poi_counts_dynamic()). Kept as module-level
+# globals because on_run() and run_processing() are separate functions
+# (the latter is NOT nested inside open_main_window()), matching the
+# same handoff mechanism barangay_source/poi_source/output_mode
+# already use. Read-only from run_processing()'s own background worker
+# thread as of Part 3's threading change -- see run_processing()'s
+# docstring for why this is safe (on_run() never reassigns them while
+# a run is in flight).
 checked_categories = None      # {sanitized_key: "aerial" | "road"} -- CHECKED categories only
 target_column_map = None       # {sanitized_key: "CAMA_NUM_..."} -- derive_target_columns()'s mapping
 aerial_radius_meters = None    # only meaningful if any checked_categories value == "aerial"
@@ -193,18 +207,22 @@ PROG_STOP_FLAG = {"stop": False}
 # ========================================
 # OUTPUT-COLUMN CONFLICT DETECTION
 # ========================================
-# OUTPUT_COLUMN_TARGETS: this tool's four output column names, checked
-# for pre-existing conflicts in a selected LOCAL Land Parcel source (see
-# _check_parcel_poi_conflicts() below, and the combined dialog in
-# on_run()). Mirrors road_frontage.py's / terrain.py's /
-# land_shape_compactness.py's OUTPUT_COLUMN_TARGETS exactly: ALL four
-# are checked, not just one -- they are one feature set computed
-# together in the same run, so a source with (for example) an existing
-# CAMA_NUM_POLICE column but no existing CAMA_NUM_PARK column still
-# needs a conflict warning, to avoid ending up with an old
-# CAMA_NUM_PARK value sitting alongside a freshly-computed
-# CAMA_NUM_POLICE from a DIFFERENT run/computation -- an inconsistent,
-# misleading combination.
+# Output-column targets for this tool's conflict check are entirely
+# dynamic -- there is no fixed list. _check_parcel_poi_conflicts()
+# below takes its `targets` argument from the CURRENT run's own
+# target_column_map (built in on_run()'s D3a validation, one
+# CAMA_NUM_{KEY} name per checked category -- see derive_target_
+# columns()), so the set of columns checked always matches exactly
+# what this run is about to write. This mirrors road_frontage.py's /
+# terrain.py's / land_shape_compactness.py's own conflict-check
+# pattern, adapted from their fixed OUTPUT_COLUMN_TARGETS tuple to
+# this tool's dynamic category set: ALL currently-checked targets are
+# checked together, not just one, since they're one feature set
+# computed in the same run -- an existing CAMA_NUM_POLICE_STATION
+# column with no existing CAMA_NUM_PARK column still needs a conflict
+# warning, to avoid an old CAMA_NUM_PARK value sitting alongside a
+# freshly-computed CAMA_NUM_POLICE_STATION from a different
+# run/computation.
 #
 # Cross-tool CAMA_ prefix standard: every column this tool CREATES gets
 # a "CAMA_" prefix -- matches road_width.py's own CAMA_ROAD_WIDTH
@@ -226,13 +244,10 @@ PROG_STOP_FLAG = {"stop": False}
 # "Cama_Num_Police"/etc. (same letters, any casing) count as the same
 # column.
 #
-# D3c: the old fixed 4-column OUTPUT_COLUMN_TARGETS tuple has been
-# removed entirely -- output columns are now fully dynamic, one
-# CAMA_NUM_{KEY} column per checked category (see derive_target_
-# columns() and target_column_map). _check_parcel_poi_conflicts()
-# below now requires its `targets` argument explicitly (no default) --
-# its only call site (run_processing()) always supplies the current
-# run's own target_column_map values.
+# _check_parcel_poi_conflicts() below requires its `targets` argument
+# explicitly (no default) -- its only call site (on_run()'s PRIORITY 1
+# block) always supplies the current run's own target_column_map
+# values.
 
 # parcel_output_column_overrides: {path_or_table: {"CAMA_NUM_POLICE":
 # name, ...}} -- for any Land Parcel source (Local file OR Database
@@ -471,28 +486,21 @@ def read_postgis_clean(table, engine, schema):
     query = f'SELECT {col_str + "," if col_str else ""}"{geom_col}" AS geometry FROM "{schema}"."{table}"'
     return gpd.read_postgis(query, engine, geom_col="geometry")
 
-def open_in_global_mapper(path):
-    """Opens path in Global Mapper (subprocess), if both GM_EXE_PATH and
-    path exist. Simpler than load_in_global_mapper() further below (no
-    EnumWindows focus-existing-window step) -- appears unused by
-    run_processing(), which calls load_in_global_mapper() instead; kept
-    as-is, not removed or consolidated (see Section 3.E.7 of the
-    governing instructions)."""
-    if os.path.exists(GM_EXE_PATH) and os.path.exists(path):
-        subprocess.Popen([GM_EXE_PATH, path], shell=True)
-
 # ========================================
 # PROGRESS WINDOW HELPERS
 # ========================================
-def create_progress_window(root, total, title="Processing Parcels"):
+def create_progress_window(root, total, title="Landmarks Within Meters Tool"):
     """
-    Creates (destroying any previous instance first) the synchronous,
-    module-global progress window used by run_processing()'s per-source
-    processing loop. Sets the module-level PROG_WIN/PROG_BAR/PROG_LABEL/
-    PROG_STOP_FLAG globals -- unlike this project's other, newer tools
-    (which use a background-thread/queue.Queue pattern instead), this
-    tool updates the progress dialog via direct update_progress() calls
-    inside a synchronous loop.
+    Creates (destroying any previous instance first) the module-global
+    progress window. Sets the module-level PROG_WIN/PROG_BAR/PROG_LABEL/
+    PROG_STOP_FLAG globals. This function's own body is a plain,
+    direct-Tkinter-call function, unchanged by Part 3's threading work
+    -- as of Part 3, it is called only from run_processing()'s
+    main-thread poller (_poll_run_processing_queue(), in response to a
+    "new_source" message from the worker thread), never directly from
+    a background thread and never from inside the per-source processing
+    loop itself (that loop now runs on the worker thread, which
+    contains no Tkinter calls of any kind).
 
     Args:
         root: parent Tk window.
@@ -511,15 +519,27 @@ def create_progress_window(root, total, title="Processing Parcels"):
 
     PROG_WIN = tk.Toplevel(root)
     PROG_WIN.title(title)
-    PROG_WIN.geometry("420x150")
+    apply_icon(PROG_WIN, "landmarks200.ico")
+    PROG_WIN.geometry("420x170")
     PROG_WIN.resizable(False, False)
 
     PROG_WIN.update_idletasks()
     sw = PROG_WIN.winfo_screenwidth()
     x = (sw // 2) - 210
-    PROG_WIN.geometry(f"420x150+{x}+80")
+    PROG_WIN.geometry(f"420x170+{x}+80")
 
-    PROG_LABEL = tk.Label(PROG_WIN, text=f"0 / {total} parcels processed", anchor="w")
+    # Two-line, centered status text: a constant, friendly top line plus
+    # a "current / total" count line below it -- deliberately general
+    # rather than technical, for non-technical users. The per-parcel
+    # category:count breakdown (msg, in update_progress() below) is
+    # still computed and passed all the way through from
+    # process_poi_counts_dynamic() unchanged, but is intentionally not
+    # shown here anymore -- it was too technical for this dialog's
+    # audience (e.g. "bank:0, department_store:0").
+    PROG_LABEL = tk.Label(
+        PROG_WIN,
+        text=f"Counting nearby landmarks...\n0 / {total} parcels processed",
+        justify="center")
     PROG_LABEL.pack(fill="x", padx=12, pady=(12, 6))
 
     PROG_BAR = ttk.Progressbar(PROG_WIN, orient="horizontal",
@@ -528,8 +548,9 @@ def create_progress_window(root, total, title="Processing Parcels"):
 
     # Cancel button and its on_cancel() handler removed entirely, per
     # explicit instruction: there is no reliable in-progress cancel for
-    # this tool's actual workload (network graph download + per-parcel
-    # routing), matching the same decision already made for
+    # this tool's actual workload (per-parcel Road-network routing over
+    # a potentially large parcel/POI set), matching the same decision
+    # already made for
     # road_width.py's own progress dialog. The X (close) button is
     # neutralized the same way road_width.py's is -- see
     # _remove_close_button()'s own docstring for why both the Win32
@@ -569,10 +590,12 @@ def update_progress(current, total, msg=None):
         return False  # ← signal to stop
 
     PROG_BAR["value"] = current
-    if msg:
-        PROG_LABEL.config(text=f"{current} / {total} parcels processed — {msg}")
-    else:
-        PROG_LABEL.config(text=f"{current} / {total} parcels processed")
+    # msg (the category:count breakdown from process_poi_counts_dynamic())
+    # is still received but intentionally unused here -- too technical
+    # for this dialog; see create_progress_window()'s own comment on the
+    # same decision.
+    PROG_LABEL.config(
+        text=f"Counting nearby landmarks...\n{current} / {total} parcels processed")
 
     if current == 1 or current == total or current % 5 == 0:
         PROG_WIN.update_idletasks()
@@ -605,17 +628,19 @@ def close_progress_window():
 # those columns, and on_run() shows a combined confirmation dialog
 # before proceeding, regardless of which source type was selected.
 #
-# Unlike road_frontage.py/road_width.py, this tool has no background
-# worker thread -- run_processing() runs synchronously on the main
-# thread (on_run() validates, destroys the window, then calls
-# run_processing() directly; the modal progress window during
-# processing is driven by direct update_progress() calls inside the
-# synchronous loop, not a queue-polling pattern). So this check also
+# This function itself, _check_parcel_poi_conflicts(), still runs
+# synchronously -- it's called directly from on_run(), on the main
+# thread, before win.destroy() and before run_processing() (and its
+# worker thread) even exist. As of Part 3, run_processing()'s own
+# per-source processing loop DOES run on a background worker thread
+# (this file's own established worker-thread + queue.Queue() +
+# .after()-polling pattern -- see run_processing()'s docstring), but
+# that's a separate function with a separate call site; it doesn't
+# change anything about how or when this check runs. This check still
 # runs synchronously, called directly from on_run() right before Run
 # actually starts -- same adaptation already applied in
 # road_density.py, road_surface.py, terrain.py, and
-# land_shape_compactness.py. Adding threading here would be a separate,
-# out-of-scope architectural change.
+# land_shape_compactness.py.
 #
 # Read approach: plain gpd.read_file(path) for a Local source, matching
 # road_width.py's own canonical _read_gdf_worker() exactly -- no
@@ -1685,7 +1710,12 @@ def process_poi_counts_dynamic(gdf, poi_gdf, checked_categories, aerial_radius_m
             entirely (Task 2 -- no catch-all "others" bucket).
         aerial_radius_m, road_radius_m: independent radii (Task 4),
             applied respectively to every "aerial"-method and "road"-
-            method checked category.
+            method checked category. Either may be None -- on_run()
+            leaves whichever method has no checked category at None
+            (Step 4/5) -- but not both, since checked_categories is
+            never empty by the time this function is called (on_run()
+            requires at least one checked category), so at least one
+            of the two is always a real float.
         road_context: a RoadContext (above), or None if no checked
             category currently uses the "road" method. Built ONCE per
             run by the caller (run_processing(), D3c) -- this function
@@ -1786,7 +1816,18 @@ def process_poi_counts_dynamic(gdf, poi_gdf, checked_categories, aerial_radius_m
         gdf_road = None
         poi_gdf_road = None
 
-    bbox_margin_m = max(aerial_radius_m, road_radius_m)
+    # bbox_margin_m: the shared candidate-prefilter margin (see
+    # _geodesic_bbox_envelope()'s own docstring for why max() of the two
+    # radii is a valid shared bound when both are in use). Either
+    # aerial_radius_m or road_radius_m may be None -- on_run() leaves
+    # whichever method has no checked category at None (Step 4/5) -- so
+    # this filters None out before taking max(), rather than assuming
+    # both are always floats. At least one of the two is always a real
+    # float, since checked_categories is never empty by the time this
+    # function is called (on_run() requires at least one checked
+    # category, and every checked category is either "aerial" or
+    # "road").
+    bbox_margin_m = max(v for v in (aerial_radius_m, road_radius_m) if v is not None)
 
     total = len(gdf)
     for pos, (idx, row) in enumerate(gdf.iterrows()):
@@ -1909,9 +1950,13 @@ def open_main_window(root):
     """
     Builds and shows the tool's single unified configuration window:
     Land Parcel and POI source pickers (each with a Local-file/
-    Database-table radio toggle), a search-radius entry, an Output
-    destination picker, and a Run button gated by
-    _update_run_button_state().
+    Database-table radio toggle), a dynamic Landmark Categories
+    checklist with per-category Aerial/Road method selection
+    (discovered from the POI source, see _refresh_poi_categories()),
+    independent Aerial/Road distance entries, a Road Network Source
+    picker (Local-file/Database-table, used only if any checked
+    category selects Road), an Output destination picker, and a Run
+    button gated by _update_run_button_state().
 
     Args:
         root: the parent Tk root this window is opened under.
@@ -2052,12 +2097,9 @@ def open_main_window(root):
     # POI's tk.StringVar pattern, since this section sits structurally
     # right below Land Parcel Source (its closest sibling) and needs
     # one extra piece of state (road_local_layer) that Land Parcel
-    # doesn't. NOT wired into _update_run_button_state() yet -- Task
-    # 5's Run-gating requirement ("blocked only if a checked category
-    # is Road AND no road source is selected") is deliberately deferred
-    # to the final gating-consolidation cluster, together with the
-    # "at least one category checked" gate deferred earlier, to avoid
-    # fragmenting the Run-readiness logic across multiple clusters.
+    # doesn't. Feeds _update_run_button_state()'s has_road_source gate
+    # ("blocked if a checked category is Road AND no road source is
+    # selected") alongside road_source_type.
     road_source_type = tk.StringVar(master=win, value="local")
     road_local_path  = None   # authority: single local file path
     road_local_layer = None   # resolved GPKG layer name, or None (non-GPKG / single-layer)
@@ -4013,10 +4055,11 @@ def open_main_window(root):
         # progress" gate here -- that check used to run in the
         # background the moment a Land Parcel source was selected, and
         # this gate existed to block Run while its result was still
-        # unknown. It has been relocated to run inside run_processing()
-        # itself, synchronously, at the moment Run is actually clicked
-        # -- there is no more in-between "reading" state for the Run
-        # button to ever need to gate against.
+        # unknown. It has been relocated to run inside on_run()'s own
+        # PRIORITY 1 block, synchronously, at the moment Run is
+        # actually clicked, before win.destroy() -- there is no more
+        # in-between "reading" state for the Run button to ever need
+        # to gate against.
         if not has_parcel:
             run_status_var.set("Please select a Land Parcel source.")
             ready = False
@@ -4082,8 +4125,10 @@ def resolve_db_output_table(root, schema, barangay_source):
     Determines the DB-output destination table for the Land Parcel
     source, BEFORE any processing or writing starts -- same "resolve
     everything up front" philosophy as ask_overwrite_dialog() (see
-    run_processing()). This tool has no background worker thread --
-    this function is still called once, up front, for separation of
+    run_processing()). This function runs synchronously, called from
+    on_run() before win.destroy() -- before run_processing() (and its
+    Part 3 background worker thread) is even invoked. It is still
+    called once, up front, for separation of
     responsibilities: this function owns ALL user interaction and
     overwrite decisions, so the processing/write logic further below
     never has to ask any UI or overwrite question of its own.
@@ -4131,36 +4176,97 @@ def resolve_db_output_table(root, schema, barangay_source):
 # ========================================
 def run_processing(app_root, overwrite_mode=None, resolved_table_name=None):
     """
-    Orchestrates the full run synchronously on the main thread (no
-    background worker/queue.Queue -- see create_progress_window()'s
-    docstring): loads the POI data once, builds a run-level RoadContext
-    exactly once if any checked category uses the Road method (D3c),
-    then for each Land Parcel file/table, opens a fresh progress window
-    (create_progress_window()), runs process_poi_counts_dynamic() (the
-    dynamic, per-category Aerial/Road counting engine -- D2), and saves
-    the result either locally (.gpkg, optionally opened in Global
-    Mapper) or to PostGIS (matched to an existing table by name for
-    local sources, or replaced in place for DB sources).
+    Orchestrates the full run on a background worker thread, following
+    this file's own established worker-thread + queue.Queue() +
+    .after()-polling pattern (the same one
+    _refresh_poi_categories()/_poll_poi_category_queue() use for POI
+    category discovery, see those functions' own docstrings): loads
+    the POI data once, builds a run-level RoadContext exactly once if
+    any checked category uses the Road method (D3c), then for each
+    Land Parcel file/table, opens a fresh progress window, runs
+    process_poi_counts_dynamic() (the dynamic, per-category
+    Aerial/Road counting engine -- D2), and saves the result either
+    locally (.gpkg, optionally opened in Global Mapper) or to PostGIS
+    (matched to an existing table by name for local sources, or
+    replaced in place for DB sources).
 
     D3c retires the OLD fixed-4-category process_poi_counts() (Task
     2's actual removal) -- this function is now the ONLY processing
     path; there is no longer an inert parallel pipeline coexisting with
     it, unlike every prior cluster of this redesign.
 
+    THREADING (Part 3): the "Selections incomplete" guard right below
+    stays on the main thread (instantaneous, and already Tkinter-safe
+    -- run_processing() is itself called from on_run() on the main
+    thread). Once that guard passes, everything else -- credential
+    loading, engine construction, POI/Road Network/Land-Parcel reads,
+    road_context construction, and the full per-source
+    process_poi_counts_dynamic()/save loop -- runs inside the nested
+    worker() closure, on a background threading.Thread(daemon=True).
+    worker() contains NO Tkinter calls of any kind (confirmed via a
+    full trace of every call in this function's old synchronous body,
+    including load_in_global_mapper(), which needed no changes -- it
+    only uses ctypes/Win32 EnumWindows and subprocess.Popen, neither
+    of which touches Tkinter). Every Tkinter call (create_progress_
+    window(), update_progress(), close_progress_window(), and the
+    final result messagebox) instead happens exclusively in the nested
+    _poll_run_processing_queue() closure, on the main thread, via
+    app_root.after(100, ...) polling -- never in worker(). worker()
+    communicates with the poller exclusively through result_queue
+    (queue.Queue()), using these message tags, always in this order
+    per source: ("new_source", total) -> zero or more
+    ("progress", current, total, msg) -> ("source_done",); and exactly
+    one terminal message at the very end of the run:
+    ("aborted_silently",) if load_db_credentials() failed (preserves
+    the exact pre-Part-3 behavior: close the progress window if one
+    happened to be open, but show no dialog at all -- this was already
+    true before Part 3, since that early return happened before any
+    exception was raised, skipping the old function's own trailing
+    success/error dialog code), ("finished", None) on a clean
+    completion (shows the existing success dialog), or
+    ("finished", error_str) if any exception was raised (shows the
+    existing error dialog, same message as before). The FIFO ordering
+    of queue.Queue() guarantees a source's "new_source" message is
+    always drained by the poller before any "progress" message queued
+    behind it, even if the worker races ahead and queues several
+    progress updates before the next 100ms poll tick.
+
+    process_poi_counts_dynamic()'s own progress_cb contract (callable
+    (current, total, msg=...) -> bool, a False return stopping early)
+    is preserved exactly -- worker_progress_cb() below satisfies it
+    without ever touching Tkinter: it pushes a "progress" message onto
+    result_queue, then returns `not PROG_STOP_FLAG.get("stop")`.
+    PROG_STOP_FLAG is a plain dict, not inherently thread-safe as a
+    general synchronization primitive -- but nothing in this file ever
+    sets PROG_STOP_FLAG["stop"] = True during processing (no Cancel
+    button is wired to it; see create_progress_window()'s own
+    docstring), so there is no concurrent mutation for
+    worker_progress_cb()'s read to race against. Referencing
+    PROG_STOP_FLAG by its global name (not a captured local alias)
+    also means a fresh create_progress_window() reset (on the main
+    thread, for the NEXT source) is always visible to the worker's next
+    read, exactly matching the pre-Part-3 behavior of update_progress()
+    reading the same global.
+
     Wraps EVERYTHING from credential loading through the final output
-    save in one try/except/finally, so any exception -- a malformed DB
-    credential, a Road Network source read/geometry failure, a Land
-    Parcel/POI read failure, an unexpected error inside process_poi_
-    counts_dynamic(), a save failure -- shows one graceful error dialog
-    (instead of propagating silently as an uncaught crash) and the
-    progress window is always closed regardless of outcome. Only the
-    initial "Selections incomplete" guard, right below, sits outside
-    this try -- that's a controlled, intentional early return, not a
-    fallible operation.
+    save in one try/except inside worker(), so any exception -- a
+    malformed DB credential, a Road Network source read/geometry
+    failure, a Land Parcel/POI read failure, an unexpected error inside
+    process_poi_counts_dynamic(), a save failure -- is caught and sent
+    to the poller as a ("finished", error_str) message (instead of
+    propagating silently as an uncaught crash on a background thread,
+    which Python would otherwise only print a traceback for and never
+    surface to the user at all). The poller always closes the progress
+    window on any terminal message, regardless of outcome -- the same
+    unconditional-cleanup guarantee the old synchronous finally: block
+    provided.
 
     Args:
         app_root: the parent Tk root, used to open progress/error
-        dialogs.
+        dialogs, and as the anchor for _poll_run_processing_queue()'s
+        own app_root.after(...) polling (NOT win -- win no longer
+        exists by the time run_processing() runs; on_run() always
+        calls win.destroy() before calling this function).
         overwrite_mode (str | None): "overwrite" or "new", from
         ask_overwrite_dialog() in on_run() -- only relevant for local
         output mode.
@@ -4176,231 +4282,310 @@ def run_processing(app_root, overwrite_mode=None, resolved_table_name=None):
         messagebox.showerror("Error", "Selections incomplete.")
         return
 
-    # error_message/try starts HERE, not further below -- covers
-    # credential loading, engine construction (create_engine() parses/
-    # validates the connection string immediately, even though the
-    # actual DB connection itself is lazy -- a malformed credential
-    # value, e.g. an unescaped special character, can raise right
-    # here, not just later during an actual query), the D3b conflict-
-    # check block, POI loading, road_context construction, and the
-    # full per-source processing loop -- genuinely everything that can
-    # realistically fail during a run, not just the per-source loop.
-    error_message = None
-    try:
-        creds = load_db_credentials()
-        if not creds:
+    result_queue = queue.Queue()
+
+    def worker_progress_cb(current, total, msg=None):
+        """
+        Passed as process_poi_counts_dynamic()'s progress_cb -- runs on
+        the worker thread, alongside everything else in worker() below.
+        Touches no Tkinter object; see this function's own docstring
+        (THREADING section) for the PROG_STOP_FLAG safety argument.
+        """
+        result_queue.put(("progress", current, total, msg))
+        return not PROG_STOP_FLAG.get("stop")
+
+    def worker():
+        """
+        Runs entirely on a background thread -- pure computation plus
+        file/DB I/O only, NO Tkinter calls of any kind. Progress and
+        the terminal outcome are communicated back to the main thread
+        exclusively via result_queue.put(...); _poll_run_processing_
+        queue() below is the only code that ever touches
+        PROG_WIN/PROG_BAR/PROG_LABEL or calls messagebox. See this
+        function's enclosing docstring for the full message-tag
+        protocol.
+        """
+        try:
+            creds = load_db_credentials()
+            if not creds:
+                result_queue.put(("aborted_silently",))
+                return
+
+            schema = creds["schema"]
+            engine = create_engine(
+                f"postgresql://{creds['username']}:{creds['password']}@{creds['host']}:{creds['port']}/{creds['database']}"
+            )
+
+            # parcel_output_column_overrides is already resolved by the
+            # time this function runs -- on_run()'s own PRIORITY 1 (before
+            # win.destroy()) is what performs the conflict check and the
+            # "Existing output column(s) found" confirmation dialog now;
+            # see on_run()'s docstring for why this must happen there, not
+            # here (a "No" response must be able to return the user to
+            # their still-live configuration window, which is impossible
+            # once this function is even reached -- win.destroy() has
+            # already run by then).
+
+            # resolved_table_name: the DB-output destination table. Resolution
+            # responsibility now belongs to on_run() (PRIORITY 3), on the main
+            # thread, BEFORE win.destroy() -- see Fix 1. By the time it reaches
+            # this function it is treated as an already-validated value: either
+            # None (local output, or output_mode[0] != "db") or a confirmed
+            # table name (DB output, user already had the chance to cancel in
+            # on_run()). No re-resolution or re-validation happens here.
+
+            # ============================================================
+            # Error handling -- newly added, previously missing entirely.
+            # ============================================================
+            # Everything from here down used to run with NO try/except at all:
+            # any exception (a network failure during OSM graph download, a
+            # bad geometry, a DB write error, etc.) would propagate all the
+            # way up uncaught -- no error dialog would ever appear, and if it
+            # happened while a per-source progress window was open
+            # (create_progress_window(), one per source in the loop, now
+            # opened by the poller in response to this function's own
+            # "new_source" message), that window would never be closed
+            # either. As of Part 3, this try/except's own except clause
+            # (below) always sends a terminal message so the poller can
+            # close the window and show the right dialog no matter how this
+            # function exits.
+            #
+            # error_message is captured (sent via the terminal queue
+            # message) instead of calling messagebox.showerror() directly
+            # inline, so that no modal dialog is ever shown while a
+            # progress window might still be alive -- same principle
+            # already applied to POI_All_Distance.py's run_with_progress()/
+            # task() (and, as of Part 3, also required simply because this
+            # function runs on a background thread and must never call
+            # Tkinter directly at all).
+            print("\n🔷 Loading POI data...")
+            if poi_source[0] == "local":
+                poi_gdf = gpd.read_file(poi_source[1][0])
+            else:
+                poi_gdf = read_postgis_clean(poi_source[1][0], engine, schema)
+            print(f"✅ Loaded {len(poi_gdf)} POIs")
+
+            # ============================================================
+            # D3c: build road_context ONCE per run -- the expensive, run-
+            # level road-network artifacts (D1's build_road_network_index())
+            # -- conditionally, only if at least one checked category
+            # currently uses the Road method (Task 5's explicit
+            # requirement: no Road Network source work at all when every
+            # checked category is Aerial). Passed into every parcel's
+            # process_poi_counts_dynamic() call below unchanged -- never
+            # rebuilt per parcel (see RoadContext's own docstring for the
+            # full performance rationale this whole redesign exists to
+            # fix).
+            #
+            # Working CRS is detected from the Road Network source + POI
+            # source only (NOT every Land Parcel source too) -- this
+            # tool's whole operating domain is a single LGU's cadastral
+            # area, always far smaller than a single PRS92 zone's ~2°
+            # longitude span, so this is sufficient without needing to
+            # pre-load every Land Parcel source before this point (which
+            # would mean reading each one twice: once here, once again in
+            # the per-source loop below).
+            #
+            # Deliberately inside this function's existing try/except:
+            # Task 6's "no usable line geometry" error (build_road_
+            # network_index()), or any Road Network source read failure
+            # here, must surface via the SAME graceful error dialog as
+            # every other structural failure in this function -- not a
+            # separate, uncaught crash.
+            # ============================================================
+            road_context = None
+            if road_source is not None and any(m == "road" for m in checked_categories.values()):
+                print("\n🔷 Loading Road Network source...")
+                if road_source[0] == "local":
+                    road_path, road_layer = road_source[1]
+                    road_gdf = (gpd.read_file(road_path, layer=road_layer) if road_layer
+                                else gpd.read_file(road_path))
+                else:
+                    road_table = road_source[1][0]
+                    road_gdf = read_postgis_clean(road_table, engine, schema)
+                print(f"✅ Loaded {len(road_gdf)} road features")
+
+                working_epsg = _detect_road_working_crs([
+                    ("Road Network", road_gdf), ("POI", poi_gdf)])
+                road_gdf_projected = road_gdf.to_crs(epsg=working_epsg)
+                edges_list, edge_geoms, edge_tree = build_road_network_index(road_gdf_projected)
+                road_context = RoadContext(
+                    edges_list=edges_list, edge_geoms=edge_geoms,
+                    edge_tree=edge_tree, working_epsg=working_epsg)
+                print(f"✅ Road network index built ({len(edges_list)} edges, "
+                      f"EPSG:{working_epsg})")
+
+
+            if barangay_source[0] == "local":
+                for path in barangay_source[1]:
+                    base_name = os.path.splitext(os.path.basename(path))[0]
+                    print(f"\n🔷 Processing: {base_name}")
+                    gdf = gpd.read_file(path)
+
+                    # Preserves each source's existing output column name(s)/
+                    # casing exactly, if a conflict was detected and confirmed
+                    # in on_run()'s own PRIORITY 1 conflict check above --
+                    # e.g. a detected "caMA_NUM_SCHOOL" is written back to
+                    # "caMA_NUM_SCHOOL", not the default "CAMA_NUM_SCHOOL".
+                    # Defaults to target_column_map's own name for any
+                    # checked category this source has no override for.
+                    # Unlike the old fixed-4-column override logic (num_
+                    # police_col/num_park_col/num_mall_col/num_others_col),
+                    # this resolves ALL currently-checked categories
+                    # dynamically, in one dict comprehension, since the
+                    # actual set of columns is only known at Run time.
+                    output_col_overrides = parcel_output_column_overrides.get(path, {})
+                    resolved_target_column_map = {
+                        key: output_col_overrides.get(default_col, default_col)
+                        for key, default_col in target_column_map.items()
+                    }
+
+                    result_queue.put(("new_source", len(gdf)))
+                    result = process_poi_counts_dynamic(
+                        gdf, poi_gdf, checked_categories, aerial_radius_meters,
+                        road_radius_meters, road_context, resolved_target_column_map,
+                        progress_cb=worker_progress_cb)
+                    result_queue.put(("source_done",))
+
+                    if output_mode[0] == "local":
+                        desired_base_name = base_name
+                        candidate_path = os.path.join(output_mode[1], f"{desired_base_name}.gpkg")
+                        had_conflict = os.path.exists(candidate_path)
+                        if had_conflict and overwrite_mode == "new":
+                            base_name = resolve_output_base_name(output_mode[1], desired_base_name)
+                        else:
+                            base_name = desired_base_name
+                        out = os.path.join(output_mode[1], f"{base_name}.gpkg")
+                        _write_gpkg(result, out)
+                        print(f"✅ Saved: {out}")
+                        load_in_global_mapper(out)
+                    else:
+                        # The actual destination table was already decided by
+                        # resolve_db_output_table(), BEFORE this loop even
+                        # started -- fuzzy matching + user confirmation already
+                        # happened there (see that function's docstring). This
+                        # just uses the result. Falls back to the old
+                        # filename-lowercased behavior only if
+                        # resolved_table_name is somehow None here
+                        # (output_mode[0] != "db" can't reach this branch, so
+                        # this is just a defensive fallback).
+                        output_table = resolved_table_name if resolved_table_name is not None else base_name.lower()
+                        with engine.begin() as conn:
+                            result.to_postgis(output_table, conn, schema=schema,
+                                              if_exists="replace", index=False)
+                        print(f"✅ Saved to DB: {output_table}")
+            else:
+                # Database Land Parcel sources: same dynamic override
+                # resolution as the LOCAL branch above -- preserves the
+                # exact existing column casing(s) detected in on_run()'s
+                # own PRIORITY 1 conflict check.
+                for table in barangay_source[1]:
+                    print(f"\n🔷 Processing DB table: {table}")
+                    gdf = read_postgis_clean(table, engine, schema)
+
+                    output_col_overrides = parcel_output_column_overrides.get(table, {})
+                    resolved_target_column_map = {
+                        key: output_col_overrides.get(default_col, default_col)
+                        for key, default_col in target_column_map.items()
+                    }
+
+                    result_queue.put(("new_source", len(gdf)))
+                    result = process_poi_counts_dynamic(
+                        gdf, poi_gdf, checked_categories, aerial_radius_meters,
+                        road_radius_meters, road_context, resolved_target_column_map,
+                        progress_cb=worker_progress_cb)
+                    result_queue.put(("source_done",))
+
+                    if output_mode[0] == "local":
+                        desired_base_name = table
+                        candidate_path = os.path.join(output_mode[1], f"{desired_base_name}.gpkg")
+                        had_conflict = os.path.exists(candidate_path)
+                        if had_conflict and overwrite_mode == "new":
+                            base_name = resolve_output_base_name(output_mode[1], desired_base_name)
+                        else:
+                            base_name = desired_base_name
+                        out = os.path.join(output_mode[1], f"{base_name}.gpkg")
+                        _write_gpkg(result, out)
+                        print(f"✅ Saved: {out}")
+                        load_in_global_mapper(out)
+                    else:
+                        with engine.begin() as conn:
+                            result.to_postgis(table, conn, schema=schema,
+                                              if_exists="replace", index=False)
+                        print(f"✅ Updated DB table: {table}")
+
+        except Exception as e:
+            result_queue.put(("finished", str(e)))
             return
 
-        schema = creds["schema"]
-        engine = create_engine(
-            f"postgresql://{creds['username']}:{creds['password']}@{creds['host']}:{creds['port']}/{creds['database']}"
-        )
+        result_queue.put(("finished", None))
 
-        # parcel_output_column_overrides is already resolved by the
-        # time this function runs -- on_run()'s own PRIORITY 1 (before
-        # win.destroy()) is what performs the conflict check and the
-        # "Existing output column(s) found" confirmation dialog now;
-        # see on_run()'s docstring for why this must happen there, not
-        # here (a "No" response must be able to return the user to
-        # their still-live configuration window, which is impossible
-        # once this function is even reached -- win.destroy() has
-        # already run by then).
+    def _poll_run_processing_queue():
+        """
+        Runs on the main thread via app_root.after() polling -- the
+        counterpart to worker()/worker_progress_cb() above, following
+        this file's own _poll_poi_category_queue() pattern exactly
+        (drain the queue, react to each message, reschedule unless a
+        terminal message was seen). This is the ONLY place any Tkinter
+        call happens for the duration of a run: create_progress_
+        window(), update_progress(), close_progress_window(), and the
+        final result messagebox are all called from here, never from
+        worker().
 
-        # resolved_table_name: the DB-output destination table. Resolution
-        # responsibility now belongs to on_run() (PRIORITY 3), on the main
-        # thread, BEFORE win.destroy() -- see Fix 1. By the time it reaches
-        # this function it is treated as an already-validated value: either
-        # None (local output, or output_mode[0] != "db") or a confirmed
-        # table name (DB output, user already had the chance to cancel in
-        # on_run()). No re-resolution or re-validation happens here.
+        Guards on app_root.winfo_exists() first, matching _poll_poi_
+        category_queue()'s own guard on win -- needed here for a new
+        reason as of Part 3: since the main thread's event loop now
+        stays live and responsive for the whole duration of a run
+        (rather than being blocked inside a synchronous run_
+        processing() call, as before), it's newly possible for the
+        rest of the app to be closed while a run is still in flight.
+        If that happens, there is no live root left to open a progress
+        window or a dialog on, so this just stops polling silently --
+        the same safe behavior _poll_poi_category_queue() already
+        falls back to in the equivalent situation.
 
-        # ============================================================
-        # Error handling -- newly added, previously missing entirely.
-        # ============================================================
-        # Everything from here down used to run with NO try/except at all:
-        # any exception (a network failure during OSM graph download, a
-        # bad geometry, a DB write error, etc.) would propagate all the
-        # way up uncaught -- no error dialog would ever appear, and if it
-        # happened while a per-source progress window was open
-        # (create_progress_window() below, one per source in the loop),
-        # that window would never be closed either, since there was no
-        # finally to guarantee it.
-        #
-        # error_message is captured here instead of calling
-        # messagebox.showerror() directly inline, so that no modal dialog
-        # is ever shown while a progress window might still be alive --
-        # same principle already applied to POI_All_Distance.py's
-        # run_with_progress()/task(). close_progress_window() in finally is
-        # safe to call even if no window is currently open (it already
-        # guards internally on `if PROG_WIN and PROG_WIN.winfo_exists()`),
-        # so this is a single, unconditional cleanup path regardless of
-        # which source was being processed (or whether processing had even
-        # started) when/if an exception occurs.
-        print("\n🔷 Loading POI data...")
-        if poi_source[0] == "local":
-            poi_gdf = gpd.read_file(poi_source[1][0])
-        else:
-            poi_gdf = read_postgis_clean(poi_source[1][0], engine, schema)
-        print(f"✅ Loaded {len(poi_gdf)} POIs")
-
-        # ============================================================
-        # D3c: build road_context ONCE per run -- the expensive, run-
-        # level road-network artifacts (D1's build_road_network_index())
-        # -- conditionally, only if at least one checked category
-        # currently uses the Road method (Task 5's explicit
-        # requirement: no Road Network source work at all when every
-        # checked category is Aerial). Passed into every parcel's
-        # process_poi_counts_dynamic() call below unchanged -- never
-        # rebuilt per parcel (see RoadContext's own docstring for the
-        # full performance rationale this whole redesign exists to
-        # fix).
-        #
-        # Working CRS is detected from the Road Network source + POI
-        # source only (NOT every Land Parcel source too) -- this
-        # tool's whole operating domain is a single LGU's cadastral
-        # area, always far smaller than a single PRS92 zone's ~2°
-        # longitude span, so this is sufficient without needing to
-        # pre-load every Land Parcel source before this point (which
-        # would mean reading each one twice: once here, once again in
-        # the per-source loop below).
-        #
-        # Deliberately inside this function's existing try/except:
-        # Task 6's "no usable line geometry" error (build_road_
-        # network_index()), or any Road Network source read failure
-        # here, must surface via the SAME graceful error dialog as
-        # every other structural failure in this function -- not a
-        # separate, uncaught crash.
-        # ============================================================
-        road_context = None
-        if road_source is not None and any(m == "road" for m in checked_categories.values()):
-            print("\n🔷 Loading Road Network source...")
-            if road_source[0] == "local":
-                road_path, road_layer = road_source[1]
-                road_gdf = (gpd.read_file(road_path, layer=road_layer) if road_layer
-                            else gpd.read_file(road_path))
-            else:
-                road_table = road_source[1][0]
-                road_gdf = read_postgis_clean(road_table, engine, schema)
-            print(f"✅ Loaded {len(road_gdf)} road features")
-
-            working_epsg = _detect_road_working_crs([
-                ("Road Network", road_gdf), ("POI", poi_gdf)])
-            road_gdf_projected = road_gdf.to_crs(epsg=working_epsg)
-            edges_list, edge_geoms, edge_tree = build_road_network_index(road_gdf_projected)
-            road_context = RoadContext(
-                edges_list=edges_list, edge_geoms=edge_geoms,
-                edge_tree=edge_tree, working_epsg=working_epsg)
-            print(f"✅ Road network index built ({len(edges_list)} edges, "
-                  f"EPSG:{working_epsg})")
-
-
-        if barangay_source[0] == "local":
-            for path in barangay_source[1]:
-                base_name = os.path.splitext(os.path.basename(path))[0]
-                print(f"\n🔷 Processing: {base_name}")
-                gdf = gpd.read_file(path)
-
-                # Preserves each source's existing output column name(s)/
-                # casing exactly, if a conflict was detected and confirmed
-                # in run_processing()'s own D3b conflict check above --
-                # e.g. a detected "caMA_NUM_SCHOOL" is written back to
-                # "caMA_NUM_SCHOOL", not the default "CAMA_NUM_SCHOOL".
-                # Defaults to target_column_map's own name for any
-                # checked category this source has no override for.
-                # Unlike the old fixed-4-column override logic (num_
-                # police_col/num_park_col/num_mall_col/num_others_col),
-                # this resolves ALL currently-checked categories
-                # dynamically, in one dict comprehension, since the
-                # actual set of columns is only known at Run time.
-                output_col_overrides = parcel_output_column_overrides.get(path, {})
-                resolved_target_column_map = {
-                    key: output_col_overrides.get(default_col, default_col)
-                    for key, default_col in target_column_map.items()
-                }
-
-                create_progress_window(app_root, len(gdf), title=f"Processing: {base_name}")
-                result = process_poi_counts_dynamic(
-                    gdf, poi_gdf, checked_categories, aerial_radius_meters,
-                    road_radius_meters, road_context, resolved_target_column_map,
-                    progress_cb=update_progress)
-                close_progress_window()
-
-                if output_mode[0] == "local":
-                    desired_base_name = base_name
-                    candidate_path = os.path.join(output_mode[1], f"{desired_base_name}.gpkg")
-                    had_conflict = os.path.exists(candidate_path)
-                    if had_conflict and overwrite_mode == "new":
-                        base_name = resolve_output_base_name(output_mode[1], desired_base_name)
+        Drains every message currently queued per tick (not just one),
+        since a single 100ms tick can easily contain several
+        "progress" messages for a fast-processing parcel batch --
+        the queue.Queue() FIFO ordering guarantees they're always
+        handled in the exact order worker() produced them.
+        """
+        if not app_root.winfo_exists():
+            return
+        try:
+            while True:
+                msg = result_queue.get_nowait()
+                tag = msg[0]
+                if tag == "new_source":
+                    _, total = msg
+                    create_progress_window(app_root, total)
+                elif tag == "progress":
+                    _, current, total, pmsg = msg
+                    update_progress(current, total, pmsg)
+                elif tag == "source_done":
+                    close_progress_window()
+                elif tag == "aborted_silently":
+                    # Preserves the exact pre-Part-3 behavior: a
+                    # load_db_credentials() failure closes the progress
+                    # window (a no-op here, since none was ever opened --
+                    # this failure happens before the first "new_source")
+                    # but shows NO dialog at all, success or error.
+                    close_progress_window()
+                    return
+                elif tag == "finished":
+                    _, error_message = msg
+                    close_progress_window()
+                    if error_message:
+                        messagebox.showerror("Error", error_message)
                     else:
-                        base_name = desired_base_name
-                    out = os.path.join(output_mode[1], f"{base_name}.gpkg")
-                    _write_gpkg(result, out)
-                    print(f"✅ Saved: {out}")
-                    load_in_global_mapper(out)
-                else:
-                    # The actual destination table was already decided by
-                    # resolve_db_output_table(), BEFORE this loop even
-                    # started -- fuzzy matching + user confirmation already
-                    # happened there (see that function's docstring). This
-                    # just uses the result. Falls back to the old
-                    # filename-lowercased behavior only if
-                    # resolved_table_name is somehow None here
-                    # (output_mode[0] != "db" can't reach this branch, so
-                    # this is just a defensive fallback).
-                    output_table = resolved_table_name if resolved_table_name is not None else base_name.lower()
-                    with engine.begin() as conn:
-                        result.to_postgis(output_table, conn, schema=schema,
-                                          if_exists="replace", index=False)
-                    print(f"✅ Saved to DB: {output_table}")
-        else:
-            # Database Land Parcel sources: same dynamic override
-            # resolution as the LOCAL branch above -- preserves the
-            # exact existing column casing(s) detected in run_
-            # processing()'s own D3b conflict check.
-            for table in barangay_source[1]:
-                print(f"\n🔷 Processing DB table: {table}")
-                gdf = read_postgis_clean(table, engine, schema)
+                        messagebox.showinfo("Success", "Processing complete!")
+                    return
+        except queue.Empty:
+            pass
+        app_root.after(100, _poll_run_processing_queue)
 
-                output_col_overrides = parcel_output_column_overrides.get(table, {})
-                resolved_target_column_map = {
-                    key: output_col_overrides.get(default_col, default_col)
-                    for key, default_col in target_column_map.items()
-                }
-
-                create_progress_window(app_root, len(gdf), title=f"Processing: {table}")
-                result = process_poi_counts_dynamic(
-                    gdf, poi_gdf, checked_categories, aerial_radius_meters,
-                    road_radius_meters, road_context, resolved_target_column_map,
-                    progress_cb=update_progress)
-                close_progress_window()
-
-                if output_mode[0] == "local":
-                    desired_base_name = table
-                    candidate_path = os.path.join(output_mode[1], f"{desired_base_name}.gpkg")
-                    had_conflict = os.path.exists(candidate_path)
-                    if had_conflict and overwrite_mode == "new":
-                        base_name = resolve_output_base_name(output_mode[1], desired_base_name)
-                    else:
-                        base_name = desired_base_name
-                    out = os.path.join(output_mode[1], f"{base_name}.gpkg")
-                    _write_gpkg(result, out)
-                    print(f"✅ Saved: {out}")
-                    load_in_global_mapper(out)
-                else:
-                    with engine.begin() as conn:
-                        result.to_postgis(table, conn, schema=schema,
-                                          if_exists="replace", index=False)
-                    print(f"✅ Updated DB table: {table}")
-
-    except Exception as e:
-        error_message = str(e)
-    finally:
-        close_progress_window()
-
-    if error_message:
-        messagebox.showerror("Error", error_message)
-    else:
-        messagebox.showinfo("Success", "Processing complete!")
+    threading.Thread(target=worker, daemon=True).start()
+    app_root.after(100, _poll_run_processing_queue)
 
 
 # ========================================
