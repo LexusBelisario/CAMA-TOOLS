@@ -111,6 +111,7 @@ from utils.resource_path import resource_path
 from utils.db_discovery import load_db_credentials, fetch_tables
 from utils.column_detection import detect_existing_output_columns
 from utils.window_icon import apply_icon
+from utils.gpkg_io import write_gpkg_atomic as _write_gpkg
 
 # ============================
 # FORCE WINDOWS APP ICON
@@ -904,19 +905,6 @@ class ProgressWindow:
 # ========================================
 # LOCAL FILE WRITE HELPERS
 # ========================================
-def _write_gpkg(gdf, out_path):
-    """Atomic write: temp file, verified readable, then os.replace()."""
-    tmp_path = out_path + ".tmp"
-    if os.path.exists(tmp_path):
-        os.remove(tmp_path)
-    gdf.to_file(tmp_path, driver="GPKG")
-    # Verify readability before committing.
-    gpd.read_file(tmp_path, rows=1)
-    if os.path.exists(out_path):
-        os.remove(out_path)
-    os.replace(tmp_path, out_path)
-
-
 def resolve_output_base_name(out_dir, desired_base_name):
     """Finds the next available '<name>_<n>' base name in out_dir."""
     n = 1

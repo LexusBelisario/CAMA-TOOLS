@@ -183,6 +183,7 @@ from utils.resource_path import resource_path
 from utils.db_discovery import load_db_credentials, fetch_tables
 from utils.column_detection import detect_existing_output_columns
 from utils.window_icon import apply_icon
+from utils.gpkg_io import write_gpkg_atomic as _write_gpkg
 
 # ============================
 # FORCE WINDOWS APP ICON
@@ -792,65 +793,6 @@ def resolve_output_base_name(folder: str, desired_base_name: str, ext: str = "gp
     except OSError:
         pass
     return f"{root}_{max_n + 1}"
-
-
-def _write_gpkg(gdf, path):
-    """
-    Writes a GeoDataFrame to a .gpkg file, atomically.
-
-    Why atomicity is necessary here specifically: the previous version
-    of this function deleted any pre-existing file at `path` FIRST,
-    then wrote the new content -- necessary because GeoPackage is a
-    SQLite-based container that can hold multiple named layers, and
-    calling gdf.to_file(path, driver="GPKG") when `path` already exists
-    does NOT simply replace its contents; pyogrio/GDAL tries to create
-    a new layer inside the existing file and fails with "Layer <name>
-    already exists, CreateLayer failed" if a layer of that name is
-    already there (confirmed reproduced when a user chose "Overwrite"
-    in ask_overwrite_dialog() -- crashed the whole run with no success
-    dialog and no clear message, just a console traceback invisible in
-    the compiled EXE).
-
-    But delete-then-write has its own, worse failure mode: if anything
-    interrupts the process between the delete and the write completing
-    (a crash, the machine losing power, disk full mid-write), the
-    result isn't a corrupted file -- there is NO FILE AT ALL at `path`
-    anymore, having deleted the original with nothing to show for it.
-
-    This version instead writes to a temporary file first, VERIFIES
-    that file is actually readable back (a write that raised no
-    exception but produced something GDAL itself can't re-open is
-    exactly the failure this guards against), and only then atomically
-    replaces the destination via os.replace() -- which is atomic on
-    the same filesystem on both Windows and POSIX, unlike
-    os.remove()+os.rename(): there is no window where `path` doesn't
-    exist. If ANY step before the final os.replace() fails, `path` is
-    left completely untouched, exactly as if this call never happened.
-    """
-    tmp_path = f"{os.path.splitext(path)[0]}.tmp{os.path.splitext(path)[1]}"
-    if os.path.exists(tmp_path):
-        os.remove(tmp_path)
-
-    gdf.to_file(tmp_path, driver="GPKG")
-
-    try:
-        verify_gdf = gpd.read_file(tmp_path)
-        if len(verify_gdf) != len(gdf):
-            raise ValueError(
-                f"Row count mismatch after write: expected {len(gdf)}, "
-                f"got {len(verify_gdf)}."
-            )
-    except Exception as e:
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
-        raise RuntimeError(
-            f"Could not verify the written file before replacing the "
-            f"destination -- destination left unchanged. Details: {e}"
-        )
-
-    os.replace(tmp_path, path)
 
 
 # ========================================
