@@ -37,11 +37,17 @@ OUTPUTS:
     resolved via resolve_db_output_table() -- an exact-match replace for
     a DB Land Parcel source, or a fuzzy-match-with-confirmation flow
     (confirm_db_overwrite_dialog() / choose_db_overwrite_dialog()) for a
-    local-file Land Parcel source.
+    local-file Land Parcel source. As of D4, the actual DB write never
+    touches the real destination table directly -- see
+    _write_db_output_safely() under "DB ATOMIC WRITE / CANCEL-SAFE
+    STAGING" below for the staging-write / verify / atomic-rename-swap
+    sequence, and see create_progress_window()/run_processing() for how
+    Cancel is supported during PROCESSING but disabled once that
+    sequence begins.
 
 DEPENDENCIES:
     stdlib: os, re, subprocess, json, sys, threading, queue, time,
-    bisect, typing, tkinter (+ ttk).
+    secrets, bisect, typing, tkinter (+ ttk).
     third-party: geopandas, numpy, pandas, networkx, shapely, geopy,
     sqlalchemy, psycopg2.
     local: utils.table_name_matching, utils.resource_path,
@@ -83,6 +89,29 @@ SIDE EFFECTS:
     documentation/reorganization pass, since it would change runtime
     behavior.
 
+    D4 (DB atomic-write / Cancel safety): the direct
+    `result.to_postgis(..., if_exists="replace")` DB-write path used by
+    every prior version of this file has been replaced with a staging-
+    table-then-atomic-rename-swap sequence (_write_db_output_safely()),
+    piloted in this file only -- see the project's own architecture
+    documents for the full design and the decisions behind it. A
+    genuine Cancel control now exists on the progress window --
+    D4.1: the title-bar X (close) button itself, per explicit feedback
+    that Cancel and X should be the same control rather than two (see
+    create_progress_window()) -- enabled only during PROCESSING (the
+    per-parcel counting loop), disabled from the moment a source's
+    result is about to be saved (STAGING_WRITE through the final
+    rename swap and post-swap backup cleanup) -- a run cancelled
+    during PROCESSING leaves the real destination table completely
+    untouched; nothing after that point can be interrupted by the user.
+    Leftover staging/backup tables from a run interrupted by something
+    OUTSIDE this application's control (a hard process kill, a computer
+    shutdown/power loss, a lost DB connection) are detected on the next
+    DB-output run via _scan_orphaned_cama_tables() (called from
+    resolve_db_output_table()) and surfaced to the user for an explicit
+    remove-now-or-leave-for-review choice
+    (_prompt_orphaned_cama_tables()) -- nothing is ever auto-deleted.
+
     REDESIGN COMPLETE (Clusters A through D3c -- see project task
     documents for the full plan): the "Landmark Categories" checklist
     (dynamic, discovered from the POI source's distinct 'fclass'
@@ -103,6 +132,7 @@ import sys
 import threading
 import queue
 import time
+import secrets
 import tkinter as tk
 from tkinter import filedialog, messagebox, Listbox, ttk
 
@@ -521,7 +551,7 @@ def read_postgis_clean(table, engine, schema):
 # ========================================
 # PROGRESS WINDOW HELPERS
 # ========================================
-def create_progress_window(root, total, title="Landmarks Within Meters Tool"):
+def create_progress_window(root, total, title="Landmarks Within Meters in progress"):
     """
     Creates (destroying any previous instance first) the module-global
     progress window. Sets the module-level PROG_WIN/PROG_BAR/PROG_LABEL/
@@ -534,9 +564,49 @@ def create_progress_window(root, total, title="Landmarks Within Meters Tool"):
     loop itself (that loop now runs on the worker thread, which
     contains no Tkinter calls of any kind).
 
+    D6: also called with total=None directly from run_processing()
+    itself, on the main thread, immediately before the background
+    worker thread even starts -- i.e. before POI/Road Network loading,
+    which can itself take a noticeable while and previously left NOTHING
+    visible on screen for that whole stretch (root is withdrawn, and the
+    configuration window was already destroyed by on_run() before
+    run_processing() was ever called) -- not even something to Alt+Tab
+    to. Matches meters_from_school_shop_transport_church.py's own
+    run_with_progress(), which opens its progress window immediately,
+    before any loading, for the exact same reason. total=None shows an
+    indeterminate ("Preparing…") bar instead of a determinate one, since
+    the real parcel count isn't known yet. Once it IS known (the first
+    "new_source" message), _configure_progress_window_for_counting()
+    reconfigures THIS SAME window in place rather than calling this
+    function again -- destroying and recreating it here a second time
+    would itself cause a brief gap with nothing visible/Alt+Tab-able,
+    the exact problem this D6 change exists to fix.
+
+    D4.1: the title-bar X (close) button IS the Cancel control -- there
+    is no separate Cancel button in the window body anymore (an earlier
+    D4 version had one; removed per explicit feedback that Cancel and X
+    should be the same control, not two). X starts ENABLED every time
+    this function runs -- i.e. at the start of every source, matching
+    PROG_STOP_FLAG's own per-source reset immediately below -- and is
+    later disabled by _set_progress_committing(), called from the
+    main-thread poller once this source's result is about to be saved.
+    This is identical for local and DB output: both share the exact
+    same PROCESSING/committing boundary in run_processing()'s worker()
+    (the cancellation check runs before branching into either save
+    path), so there is no correctness reason to give X different
+    behavior per output mode -- see _on_cancel() below. X is also
+    already clickable during D6's "Preparing…" state -- POI/Road
+    loading hasn't written anything anywhere either, so it's exactly as
+    safe to cancel as PROCESSING itself; see run_processing()'s own
+    cancellation check for why this only actually takes effect once
+    loading finishes, not the instant it's clicked (geopandas'/fiona's
+    own file/DB reads have no natural checkpoint to interrupt mid-read).
+
     Args:
         root: parent Tk window.
-        total (int): total item count, used as the progress bar maximum.
+        total (int | None): total item count, used as the progress bar
+        maximum. None shows an indeterminate "Preparing…" bar instead
+        (D6) -- see above.
         title (str): window title.
     """
     global PROG_WIN, PROG_BAR, PROG_LABEL, PROG_STOP_FLAG
@@ -552,55 +622,80 @@ def create_progress_window(root, total, title="Landmarks Within Meters Tool"):
     PROG_WIN = tk.Toplevel(root)
     PROG_WIN.title(title)
     apply_icon(PROG_WIN, "landmarks200.ico")
-    PROG_WIN.geometry("420x170")
     PROG_WIN.resizable(False, False)
 
+    if total is None:
+        # D6: shown immediately, before POI/Road Network loading -- the
+        # real parcel count isn't known yet, so there's nothing
+        # meaningful for a determinate bar to show.
+        PROG_LABEL = tk.Label(
+            PROG_WIN,
+            text="Preparing…\nLoading POI and Road Network data…",
+            justify="center")
+        PROG_LABEL.pack(fill="x", padx=12, pady=(12, 6))
+
+        PROG_BAR = ttk.Progressbar(PROG_WIN, orient="horizontal",
+                                    mode="indeterminate")
+        PROG_BAR.pack(fill="x", padx=12, pady=(0, 12))
+        PROG_BAR.start(12)
+    else:
+        # Two-line, centered status text: a constant, friendly top line
+        # plus a "current / total" count line below it -- deliberately
+        # general rather than technical, for non-technical users. The
+        # per-parcel category:count breakdown (msg, in update_progress()
+        # below) is still computed and passed all the way through from
+        # process_poi_counts_dynamic() unchanged, but is intentionally
+        # not shown here anymore -- it was too technical for this
+        # dialog's audience (e.g. "bank:0, department_store:0").
+        PROG_LABEL = tk.Label(
+            PROG_WIN,
+            text=f"Counting nearby landmarks...\n0 / {total} parcels processed",
+            justify="center")
+        PROG_LABEL.pack(fill="x", padx=12, pady=(12, 6))
+
+        PROG_BAR = ttk.Progressbar(PROG_WIN, orient="horizontal",
+                                    mode="determinate", maximum=total)
+        PROG_BAR.pack(fill="x", padx=12, pady=(0, 12))
+
+    # D4.2: the window is sized to its actual packed content (label +
+    # bar), not a fixed height guessed in advance -- a hardcoded height
+    # drifts out of sync the moment a widget is added or removed (this
+    # is exactly what happened after D4.1 removed the Cancel button:
+    # the old fixed 170px left a visible empty gap where the button used
+    # to be). update_idletasks() forces Tkinter to compute real
+    # requested sizes for the widgets just packed above before
+    # winfo_reqheight() is read.
     PROG_WIN.update_idletasks()
+    win_w = 420
+    win_h = PROG_WIN.winfo_reqheight()
     sw = PROG_WIN.winfo_screenwidth()
-    x = (sw // 2) - 210
-    PROG_WIN.geometry(f"420x170+{x}+80")
+    x = (sw // 2) - (win_w // 2)
+    PROG_WIN.geometry(f"{win_w}x{win_h}+{x}+80")
 
-    # Two-line, centered status text: a constant, friendly top line plus
-    # a "current / total" count line below it -- deliberately general
-    # rather than technical, for non-technical users. The per-parcel
-    # category:count breakdown (msg, in update_progress() below) is
-    # still computed and passed all the way through from
-    # process_poi_counts_dynamic() unchanged, but is intentionally not
-    # shown here anymore -- it was too technical for this dialog's
-    # audience (e.g. "bank:0, department_store:0").
-    PROG_LABEL = tk.Label(
-        PROG_WIN,
-        text=f"Counting nearby landmarks...\n0 / {total} parcels processed",
-        justify="center")
-    PROG_LABEL.pack(fill="x", padx=12, pady=(12, 6))
+    # D4.1: the title-bar X IS Cancel -- no separate button. X starts
+    # enabled (nothing disables it here, unlike every other dialog in
+    # this file); clicking it only ever sets PROG_STOP_FLAG["stop"] =
+    # True -- worker_progress_cb() (background worker thread, see
+    # run_processing()) is what actually notices and stops the
+    # per-parcel loop. _on_cancel() itself never touches the database or
+    # the destination table. Once clicked, it immediately disables
+    # itself (both the visual X via _disable_close_button() and the
+    # protocol binding) so a second click, or Alt+F4, while the worker
+    # thread hasn't yet noticed the flag can't do anything unexpected --
+    # the same defense-in-depth _set_progress_committing() applies once
+    # committing actually begins.
+    def _on_cancel():
+        PROG_STOP_FLAG["stop"] = True
+        try:
+            PROG_LABEL.config(
+                text="Cancelling...\nPlease wait, finishing up safely.")
+        except Exception:
+            pass
+        _disable_close_button(PROG_WIN)
+        PROG_WIN.protocol("WM_DELETE_WINDOW", lambda: None)
 
-    PROG_BAR = ttk.Progressbar(PROG_WIN, orient="horizontal",
-                                mode="determinate", maximum=total)
-    PROG_BAR.pack(fill="x", padx=12, pady=(0, 6))
+    PROG_WIN.protocol("WM_DELETE_WINDOW", _on_cancel)
 
-    # Cancel button and its on_cancel() handler removed entirely, per
-    # explicit instruction: there is no reliable in-progress cancel for
-    # this tool's actual workload (per-parcel Road-network routing over
-    # a potentially large parcel/POI set), matching the same decision
-    # already made for
-    # road_width.py's own progress dialog. The X (close) button is
-    # grayed out -- see _disable_close_button()'s own docstring for
-    # why this approach replaced the earlier WS_SYSMENU-based one, and
-    # for why both the Win32 disable attempt AND the protocol()
-    # no-op fallback are kept together regardless.
-    PROG_WIN.protocol("WM_DELETE_WINDOW", lambda: None)
-
-    # Call order below was set while testing the EARLIER WS_SYSMENU-
-    # based approach (matching road_width.py's ProgressWindow: topmost
-    # -> close-button call -> focus_force()/lift(), with transient()/
-    # grab_set() -- which road_width.py's ProgressWindow doesn't call
-    # at all, since it isn't modal -- moved to run BEFORE the close-
-    # button call rather than after). _disable_close_button() operates
-    # on system-menu state rather than window style (see its own
-    # docstring), so it should no longer be sensitive to this ordering
-    # the way the old approach was -- but the order is left as-is here
-    # since reverting it would be unnecessary, unrequested churn, not
-    # because it's newly required.
     PROG_WIN.transient(root)
     PROG_WIN.grab_set()
     PROG_WIN.attributes("-topmost", True)
@@ -613,11 +708,40 @@ def create_progress_window(root, total, title="Landmarks Within Meters Tool"):
     # runs in the background -- a permanently topmost progress window
     # would block that.
     PROG_WIN.after(100, lambda: PROG_WIN.attributes("-topmost", False))
-    _disable_close_button(PROG_WIN)
     PROG_WIN.focus_force()
     PROG_WIN.lift()
     PROG_WIN.update_idletasks()
     PROG_WIN.update()
+
+
+def _configure_progress_window_for_counting(total):
+    """
+    D6: reconfigures the ALREADY-OPEN "Preparing…" progress window
+    (created immediately when run_processing() starts, before POI/Road
+    loading -- see create_progress_window()'s own docstring) into the
+    per-parcel counting display, IN PLACE -- never destroys/recreates
+    the window for this transition, so it never disappears from
+    Alt+Tab, never loses its already-live X-is-Cancel wiring, and never
+    resets PROG_STOP_FLAG partway through a single source's run. This
+    file only ever has one Land Parcel source per run (confirmed:
+    barangay_source is always a 1-tuple), so this is the ONLY
+    transition the progress window needs to make within a run; a fresh
+    destroy+recreate (create_progress_window()) remains correct at the
+    START of the NEXT run.
+
+    No-op if the window has already been closed for any reason (e.g. a
+    Cancel click during "Preparing…" already ended the run before this
+    was reached) -- see run_processing()'s own post-loading cancellation
+    check for why that path never actually calls this function at all.
+    """
+    global PROG_WIN, PROG_BAR, PROG_LABEL
+    if not PROG_WIN or not PROG_WIN.winfo_exists():
+        return
+    PROG_BAR.stop()
+    PROG_BAR.config(mode="determinate", maximum=total, value=0)
+    PROG_LABEL.config(
+        text=f"Counting nearby landmarks...\n0 / {total} parcels processed")
+    PROG_WIN.update_idletasks()
 
 
 def update_progress(current, total, msg=None):
@@ -666,6 +790,46 @@ def close_progress_window():
     except:
         pass
     PROG_WIN = None
+
+
+def _set_progress_committing():
+    """
+    D4: called only from _poll_run_processing_queue() (main thread) on a
+    ("phase", "committing") message from the worker thread -- disables
+    Cancel and updates the label to reflect that a save operation has
+    begun. From this point through the end of this source (STAGING_WRITE,
+    VERIFY, FINAL_SWAP, the post-swap backup drop, or the equivalent
+    local .gpkg write) nothing can safely be interrupted -- see
+    _write_db_output_safely()'s own docstring for why the DB side of this
+    specifically can't be made cancelable without either leaving the
+    destination in a possibly-half-written state or reintroducing the
+    same unsolved problem this whole design exists to avoid. Applies
+    identically for local and DB output -- see create_progress_window()'s
+    own docstring for why there's no correctness reason to treat them
+    differently here.
+
+    D4.1: "Cancel" is the title-bar X itself (create_progress_window()),
+    not a separate button -- disabling it means both re-graying the
+    visible X (_disable_close_button()) and rebinding
+    WM_DELETE_WINDOW to a no-op, so neither a click nor Alt+F4 can do
+    anything from here on.
+
+    No-op if the window has already been closed -- a "committing" message
+    racing a window that's gone is harmless, since the very next message
+    is always "source_done" or "finished" either way.
+    """
+    global PROG_WIN, PROG_LABEL
+    if not PROG_WIN or not PROG_WIN.winfo_exists():
+        return
+    _disable_close_button(PROG_WIN)
+    PROG_WIN.protocol("WM_DELETE_WINDOW", lambda: None)
+    if PROG_LABEL is not None:
+        try:
+            PROG_LABEL.config(
+                text="Saving results...\nPlease do not close this window.")
+        except Exception:
+            pass
+    PROG_WIN.update_idletasks()
 
 
 # ========================================
@@ -915,7 +1079,7 @@ def confirm_db_overwrite_dialog(parent, table_name):
 
     dialog = tk.Toplevel(parent)
     apply_icon(dialog, "landmarks200.ico")
-    dialog.title("POI PROXIMITY TOOL")
+    dialog.title("Landmarks Within Meters Tool")
     dialog.resizable(False, False)
     dialog.grab_set()
     dialog.deiconify()
@@ -980,7 +1144,7 @@ def choose_db_overwrite_dialog(parent, candidates):
 
     dialog = tk.Toplevel(parent)
     apply_icon(dialog, "landmarks200.ico")
-    dialog.title("POI PROXIMITY TOOL")
+    dialog.title("Landmarks Within Meters Tool")
     dialog.resizable(False, False)
     dialog.grab_set()
     dialog.deiconify()
@@ -3209,16 +3373,50 @@ def open_main_window(root):
 
     def _set_poi_category_reading_state(is_reading):
         """
-        Shows category_status_row (guide text) and toggles its message
-        while POI category discovery is in progress. Deliberately does
-        NOT show category_checklist_outer (the "POI"/"Method" headers
-        and checklist body) yet -- that only becomes visible once
-        discovery actually COMPLETES with at least one eligible
-        category (see _poll_poi_category_queue()'s N>0 branch below).
-        Showing it during "reading" would prematurely display stale/
-        empty header content before there's anything real to show
-        (this was a reported bug: the "POI" header appearing while
-        "Detecting..." was still up).
+        D5: while reading, "⏳ Reading POI source…" is shown by
+        temporarily overwriting the POI Source row's own label
+        (poi_file_var if Local, poi_db_var if Database -- whichever
+        poi_lbl currently displays, per _toggle_poi()) rather than
+        packing category_status_row for it. Per explicit feedback: at
+        this point category_checklist_outer (the "POI"/"Method" headers)
+        is deliberately still hidden (see below), so a separate
+        category_status_row line had no visible section framing around
+        it and read as a stray extra widget floating below the file/
+        table name, instead of that name simply changing state in place.
+
+        D5.1: this is exactly the pattern lot_location.py/road_width.py/
+        road_frontage.py/road_density.py/road_surface.py/
+        influence_to_map.py/land_shape_compactness.py/terrain.py already
+        use for their own "Reading Land Parcel..."/"Reading Road
+        Network..." indicators -- reuse the existing label in place,
+        color it amber (fg="#b36b00", this codebase's own established
+        "reading" color -- not gray, which is the neutral placeholder/
+        idle color; the earlier version of this function used gray by
+        mistake), and on completion restore from the AUTHORITY variable
+        (poi_local_path / poi_db_table) rather than a saved snapshot of
+        what the label happened to say before -- see terrain.py's own
+        _set_parcel_reading_state()-equivalent for the identical
+        reasoning: this is immune to a Local/Database toggle happening
+        while a read is still in flight, since it never depends on what
+        was captured at the moment reading started.
+
+        category_status_row itself is untouched by this function now --
+        it still exists for its OTHER, legitimate messages
+        (_handle_poi_category_discovery_failure()'s "Could not read POI
+        source...", and the post-discovery
+        "SELECT THE LANDMARK TYPES..." guide text in
+        _poll_poi_category_queue()) -- those callers now pack it
+        themselves, right before setting a real message, instead of
+        relying on it having been packed here first.
+
+        Deliberately does NOT show category_checklist_outer (the
+        "POI"/"Method" headers and checklist body) yet -- that only
+        becomes visible once discovery actually COMPLETES with at least
+        one eligible category (see _poll_poi_category_queue()'s N>0
+        branch below). Showing it during "reading" would prematurely
+        display stale/empty header content before there's anything real
+        to show (this was a reported bug: the "POI" header appearing
+        while "Detecting..." was still up).
 
         Deliberately does NOT disable the POI Browse/Select controls or
         the Local/Database radios (the Land Parcel section used to
@@ -3231,30 +3429,46 @@ def open_main_window(root):
 
         Only ever called with is_reading=True from a context where a
         real POI source IS selected (see _refresh_poi_categories()
-        below) -- so packing category_status_row here is exactly the
-        "a POI source has been selected" moment; hiding it again is
-        _refresh_poi_categories()'s "nothing selected" branch's job
-        (or _handle_zero_eligible_categories()'s, for a rejected
-        source), not this function's.
+        below).
         """
         nonlocal poi_category_reading
         poi_category_reading = is_reading
         if is_reading:
+            if poi_source_type.get() == "local":
+                poi_file_var.set("⏳ Reading POI source…")
+            else:
+                poi_db_var.set("⏳ Reading POI source…")
+            poi_lbl.config(fg="#b36b00")
+
             # Destroy+recreate FIRST, before packing anything -- see
             # _create_category_section()'s docstring for why this is
             # the correct, proven lifecycle boundary (not just
             # pack_forget/pack on the existing widgets). Guarantees
             # category_frame starts genuinely fresh for this discovery
             # cycle, regardless of whether the previous state was
-            # populated (poisoned) or already empty.
+            # populated (poisoned) or already empty. Still needed here
+            # even though category_status_row is no longer packed by
+            # this branch (D5): category_frame's OTHER descendants
+            # (checklist headers/canvases) still need this same
+            # fresh-start guarantee once discovery completes.
             _destroy_category_section()
             _create_category_section()
-            category_status_row.pack(fill="x")
             _set_category_status_emphasis(False)
-            category_status_var.set("⏳ Reading POI source…")
-            category_status_lbl.config(fg="#b36b00")
             _reflow_window()
         else:
+            # Restore from authority variables -- never from StringVar
+            # state -- same pattern _toggle_poi() itself already uses.
+            if poi_source_type.get() == "local":
+                poi_file_var.set(
+                    os.path.basename(poi_local_path.get())
+                    if poi_local_path.get() else "No file selected"
+                )
+            else:
+                poi_db_var.set(
+                    poi_db_table.get() if poi_db_table.get()
+                    else "No table selected"
+                )
+            poi_lbl.config(fg="gray")
             category_status_lbl.config(fg="gray")
 
     def _handle_zero_eligible_categories(source_type):
@@ -3343,6 +3557,11 @@ def open_main_window(root):
         poi_categories = {}
         _rebuild_category_checklist()
         _set_poi_category_reading_state(False)
+        # D5: category_status_row is no longer packed by
+        # _set_poi_category_reading_state() itself (see that function's
+        # docstring) -- pack it here, right where it's actually needed,
+        # since this failure message IS a real thing to show.
+        category_status_row.pack(fill="x")
         if reason == "timeout":
             category_status_var.set(
                 "Could not read POI source within 60 seconds.")
@@ -3399,6 +3618,11 @@ def open_main_window(root):
         _set_poi_category_reading_state(False)
         count = len(poi_categories)
         _set_category_status_emphasis(True)
+        # D5: category_status_row is no longer packed by
+        # _set_poi_category_reading_state() itself (see that function's
+        # docstring) -- pack it here, right where it's actually needed,
+        # since this guide text IS a real thing to show.
+        category_status_row.pack(fill="x")
         category_status_var.set(
             "SELECT THE LANDMARK TYPES TO COUNT AND THEIR METHOD:")
         category_count_var.set(
@@ -3989,20 +4213,21 @@ def open_main_window(root):
         # shrink, or reorder that wrapper in any way.
         # ------------------------------------------------------------------
         resolved_table_name = None
+        resolved_outcome = None
         if output_mode[0] == "db":
             _resolve_creds = load_db_credentials()
             if not _resolve_creds:
                 return
             _resolve_schema = _resolve_creds["schema"]
-            resolved_table_name, _resolved_outcome = resolve_db_output_table(
-                win, _resolve_schema, barangay_source
+            resolved_table_name, resolved_outcome = resolve_db_output_table(
+                win, _resolve_schema, barangay_source, _resolve_creds
             )
             if resolved_table_name is None:
                 print("Run cancelled by user (database output table not confirmed).")
                 return
 
         win.destroy()
-        run_processing(root, overwrite_mode, resolved_table_name)
+        run_processing(root, overwrite_mode, resolved_table_name, resolved_outcome)
 
     # Single source of truth for the Run button's enabled/disabled
     # colors -- used both at button creation and inside
@@ -4124,9 +4349,588 @@ def open_main_window(root):
 
 
 # ========================================
+# DB ATOMIC WRITE / CANCEL-SAFE STAGING  (D4)
+# ========================================
+# Replaces every prior direct `result.to_postgis(..., if_exists="replace")`
+# call in this file's worker() with a staging-table-then-atomic-rename-swap
+# sequence. The real destination table is never touched until FINAL_SWAP,
+# a single PostgreSQL transaction that either fully commits or is fully
+# rolled back by PostgreSQL itself -- there is no code path that leaves it
+# partially written. See the project's own architecture documents for the
+# full design and the decisions behind the specifics below (synthetic
+# staging/backup names, immediate best-effort backup drop, the advisory-
+# lock-based orphan scan). Piloted in this file only.
+#
+# Naming: staging/backup identifiers are independently random
+# (_gen_id()), never derived from the destination table name -- this
+# keeps them well under PostgreSQL's 63-byte identifier limit regardless
+# of how long a user-derived destination name is, and avoids embedding the
+# destination name in a staging/backup identifier at all. Human-readable
+# context (which destination, which run, when) lives entirely in a
+# COMMENT ON TABLE (_comment_cama_table()) -- metadata only, playing no
+# role in collision safety, which is the random id alone.
+#
+# Ownership / crash recovery: each run acquires a PostgreSQL session-level
+# advisory lock on a DEDICATED, non-pooled connection (_acquire_run_lock())
+# for the entire DB-output portion of the run -- deliberately not a
+# connection borrowed from the SQLAlchemy engine's pool, since a pooled
+# connection can be returned and reused (or a different one handed out on
+# the next call) while PostgreSQL still considers the original session's
+# lock held, which would make "lock lifetime == run lifetime" false. On
+# the next DB-output run, _scan_orphaned_cama_tables() finds any leftover
+# staging/backup table, re-derives the same lock key from the run_id
+# recorded in that table's own comment, and treats it as orphaned only if
+# the lock is NOT currently held by anyone -- i.e. only if the run that
+# created it is provably no longer alive.
+
+
+def _gen_id():
+    """
+    12 lowercase hex characters (48 bits) of cryptographically random
+    entropy, used for both staging and backup table names. Independently
+    generated each time it's called -- a staging table and its paired
+    backup table get two SEPARATE calls to this function, not one value
+    reused with different prefixes, per the project's explicit naming
+    decision.
+    """
+    return secrets.token_hex(6)
+
+
+def _advisory_lock_key(run_id):
+    """
+    Deterministic signed-bigint PostgreSQL advisory-lock key derived from
+    a run id. Must produce the IDENTICAL key from the same run_id every
+    time: the owning run derives it once (_acquire_run_lock()) to acquire
+    the lock, and _scan_orphaned_cama_tables() independently re-derives it
+    later from only the run_id text recorded in a table's own COMMENT --
+    there is no other channel between the two. run_id is 12 hex chars (48
+    bits), always well under pg_try_advisory_lock()'s signed-64-bit range,
+    so no overflow/wraparound handling is needed at the current id length.
+    """
+    return int(run_id, 16)
+
+
+def _table_exists(conn, schema, table_name):
+    """
+    True if schema.table_name currently exists as a real relation, via
+    PostgreSQL's own to_regclass() -- authoritative against the live
+    catalog, not any caller-side cache or an earlier information_schema
+    snapshot. Used both for FINAL_SWAP's create-new race re-check and
+    inside _write_db_output_safely()'s own outcome-detection fallback.
+    """
+    result = conn.execute(
+        text("SELECT to_regclass(:qualified) IS NOT NULL"),
+        {"qualified": f'"{schema}"."{table_name}"'}
+    ).scalar()
+    return bool(result)
+
+
+def _get_spatial_index_name(conn, schema, table_name, column_name="geometry"):
+    """
+    SQLAlchemy-Connection port of MAIN.py's own _get_spatial_index_name()
+    (its DB-import safe-replace pipeline) -- looks up the actual name of
+    the GIST spatial index attached to a column via PostgreSQL's own
+    catalogs (pg_class, pg_index, pg_am, pg_attribute), never assuming any
+    naming convention such as "idx_<table>_geometry". column_name defaults
+    to "geometry" here, NOT MAIN.py's "geom" default -- this file's own
+    to_postgis() writes never rename the geometry column (confirmed: no
+    rename_geometry()/set_geometry() call anywhere in this file, and
+    read_postgis_clean() explicitly names it "geometry"), so reusing
+    MAIN.py's default here would make this lookup silently find nothing.
+
+    Returns None if no spatial index exists on this column (e.g. a
+    brand-new staging table before to_postgis() has created one). Raises
+    RuntimeError if more than one GIST index is found on the same column
+    -- this should never happen in this pipeline's normal single-index
+    case, so silently picking one would hide a genuinely unexpected schema
+    state instead of surfacing it.
+    """
+    rows = conn.execute(text(
+        """
+        SELECT ix.relname AS index_name
+        FROM pg_class t
+        JOIN pg_namespace n ON n.oid = t.relnamespace
+        JOIN pg_index idx ON idx.indrelid = t.oid
+        JOIN pg_class ix ON ix.oid = idx.indexrelid
+        JOIN pg_am am ON am.oid = ix.relam
+        JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(idx.indkey)
+        WHERE n.nspname = :schema AND t.relname = :table_name
+          AND a.attname = :column_name AND am.amname = 'gist';
+        """
+    ), {"schema": schema, "table_name": table_name,
+        "column_name": column_name}).fetchall()
+
+    if len(rows) == 0:
+        return None
+    elif len(rows) == 1:
+        return rows[0][0]
+    else:
+        raise RuntimeError(
+            f"Expected at most one GIST spatial index on "
+            f"\"{schema}\".\"{table_name}\".\"{column_name}\", but found "
+            f"{len(rows)}: {[r[0] for r in rows]}. Schema is in an "
+            f"unexpected state -- aborting rather than guessing which "
+            f"index to rename."
+        )
+
+
+def _index_exists(conn, schema, index_name):
+    """True if an index of this exact name already exists in the given
+    schema -- pre-flight check before a rename, so a collision produces a
+    clear diagnostic instead of a generic PostgreSQL duplicate-object
+    error. Ported from MAIN.py's own _index_exists()."""
+    result = conn.execute(
+        text("SELECT 1 FROM pg_indexes WHERE schemaname = :schema "
+             "AND indexname = :index_name"),
+        {"schema": schema, "index_name": index_name}
+    ).fetchone()
+    return result is not None
+
+
+def _rename_spatial_index(conn, schema, table_name, desired_name,
+                           column_name="geometry"):
+    """
+    Finds the actual spatial index on table_name/column_name via
+    _get_spatial_index_name() and renames it to desired_name. No-op if no
+    spatial index exists yet. Raises a clear diagnostic (rather than
+    letting PostgreSQL fail with a generic duplicate-object error) if
+    desired_name is already taken by something else in the schema.
+
+    Ported from MAIN.py's own _rename_spatial_index() -- see that
+    function's docstring for why this step exists at all: PostgreSQL does
+    NOT rename a table's index just because the table itself was renamed
+    (confirmed there via live testing). Without this step, a table
+    promoted by FINAL_SWAP below would keep carrying its staging table's
+    auto-generated index name indefinitely -- cosmetically wrong, and
+    exactly the kind of schema drift MAIN.py's own history shows is worth
+    avoiding deliberately rather than accepting by omission.
+    """
+    current_name = _get_spatial_index_name(conn, schema, table_name, column_name)
+    if current_name is None:
+        return
+    if current_name == desired_name:
+        return
+    if _index_exists(conn, schema, desired_name):
+        raise RuntimeError(
+            f"Spatial index rename aborted. Target index name "
+            f"'{desired_name}' already exists in schema '{schema}'. Schema "
+            f"state is inconsistent -- a previous swap likely left an "
+            f"index behind under this name. Manual cleanup may be required."
+        )
+    conn.execute(text(
+        f'ALTER INDEX "{schema}"."{current_name}" RENAME TO "{desired_name}";'
+    ))
+
+
+def _drop_table_best_effort(engine, schema, table_name):
+    """
+    Drops schema.table_name, catching and logging any failure rather than
+    raising. Used for staging cleanup after a failed/cancelled write and
+    for the post-swap backup drop -- in both cases the property being
+    protected (the real destination table) is already safe by the time
+    this is called, so a failed DROP here is a cleanup nuisance, not a
+    data-safety problem; _scan_orphaned_cama_tables() will surface it on a
+    future run. table_name is always a caller-supplied staging_name or
+    backup_name -- per the project's own invariant, this function must
+    NEVER be called with a real destination table name.
+    """
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(
+                f'DROP TABLE IF EXISTS "{schema}"."{table_name}" CASCADE;'
+            ))
+    except Exception as drop_err:
+        print(f"  ⚠ Could not drop '{schema}.{table_name}': {drop_err}. "
+              f"This does not affect the live table -- it will be surfaced "
+              f"as a recoverable leftover item on a future run.")
+
+
+def _comment_cama_table(conn, schema, table_name, role, dest, run_id,
+                         started_at_iso):
+    """
+    Attaches recovery metadata to a staging or backup table via
+    COMMENT ON TABLE. PostgreSQL comments have no practical length limit,
+    unlike the 63-byte identifier cap _gen_id()'s short synthetic names
+    are deliberately designed to stay under -- so the comment is where the
+    otherwise-unencoded human-readable context (which destination, which
+    run, when) lives. This is metadata ONLY: it plays no role in collision
+    safety (the random id in the table name is the entire collision-safety
+    mechanism) and no role in proving ownership by itself (the advisory
+    lock, re-derived from the run_id recorded here, is what
+    _scan_orphaned_cama_tables() actually uses to decide whether a run is
+    still alive).
+
+    Format (parsed back by _parse_cama_comment()):
+        "cama-run-id: <12-hex>; role: staging|backup; dest: <schema>.<table>; started: <iso8601>"
+    """
+    comment = (
+        f"cama-run-id: {run_id}; role: {role}; "
+        f"dest: {schema}.{dest}; started: {started_at_iso}"
+    )
+    conn.execute(text(f'COMMENT ON TABLE "{schema}"."{table_name}" IS :c'),
+                 {"c": comment})
+
+
+def _parse_cama_comment(comment):
+    """
+    Parses _comment_cama_table()'s own format back out. Returns
+    (run_id, dest), or (None, None) if comment is missing or doesn't match
+    the expected format -- e.g. a table that predates this mechanism, or
+    one whose comment step never ran because the process died before it
+    (STAGING_WRITE succeeded, but the connection was lost before VERIFY's
+    own _comment_cama_table() call). _scan_orphaned_cama_tables() treats
+    that case as unverifiable and always surfaces it, rather than silently
+    skipping a table it can't positively identify.
+    """
+    if not comment:
+        return None, None
+    m = re.search(r"cama-run-id:\s*([0-9a-f]{12});.*?dest:\s*([^;]+)", comment)
+    if not m:
+        return None, None
+    return m.group(1).strip(), m.group(2).strip()
+
+
+def _acquire_run_lock(creds, run_id):
+    """
+    Opens ONE dedicated, non-pooled psycopg2 connection -- deliberately
+    NOT taken from the SQLAlchemy engine's connection pool, see this
+    section's own header comment for why -- and acquires a session-level
+    advisory lock on it, keyed by _advisory_lock_key(run_id). The
+    connection must be kept open, unused for anything else, for the
+    entire DB-output portion of this run, and released via
+    _release_run_lock() exactly once -- see run_processing()'s worker(),
+    which does this in a try/finally so the lock is always released
+    (success, failure, or Cancel).
+
+    Returns the open connection (holding the lock) on success, or None if
+    the connection itself could not be opened or the lock could not be
+    acquired for any reason -- the caller treats None as a hard abort: no
+    staging write is ever attempted without a held lock, since the lock is
+    what lets a future run's orphan scan tell this run's own artifacts
+    apart from a genuinely abandoned one.
+    """
+    try:
+        conn = psycopg2.connect(
+            host=creds["host"], port=creds["port"],
+            dbname=creds["database"], user=creds["username"],
+            password=creds["password"],
+        )
+        cur = conn.cursor()
+        cur.execute("SELECT pg_advisory_lock(%s);", (_advisory_lock_key(run_id),))
+        conn.commit()
+        cur.close()
+        return conn
+    except Exception as lock_err:
+        print(f"  ⚠ Could not acquire DB run lock: {lock_err}")
+        return None
+
+
+def _release_run_lock(lock_conn):
+    """
+    Releases the advisory lock held by _acquire_run_lock() and closes that
+    dedicated connection. Closing the connection is sufficient by itself
+    -- PostgreSQL releases all of a session's advisory locks automatically
+    when that session ends, so no explicit pg_advisory_unlock() call is
+    needed first. Best-effort: a failure here does not affect any
+    already-committed table data -- it only means this run's advisory
+    lock lingers until PostgreSQL notices the connection is actually gone,
+    so a subsequent _scan_orphaned_cama_tables() correctly continues to
+    treat this run's own staging/backup artifacts as still "live" until
+    then, rather than as newly-orphaned.
+    """
+    try:
+        lock_conn.close()
+    except Exception:
+        pass
+
+
+def _write_db_output_safely(engine, schema, gdf, resolved_table_name,
+                             resolved_outcome, run_id, started_at_iso):
+    """
+    The D4 replacement for every direct
+    `result.to_postgis(..., if_exists="replace")` call in this file.
+    Implements STAGING_WRITE -> VERIFY -> FINAL_SWAP -> (DISCARDING on
+    failure) -> post-swap backup cleanup. The real destination table
+    (resolved_table_name) is never touched before FINAL_SWAP, and
+    FINAL_SWAP is a single PostgreSQL transaction -- either both renames
+    inside it commit, or PostgreSQL rolls back both and the destination is
+    exactly as it was before this call. This function is only ever called
+    from worker() AFTER the PROG_STOP_FLAG cancellation check has already
+    passed for this source (see run_processing()) -- nothing inside this
+    function is cancelable, by design (see _set_progress_committing()'s
+    docstring for the UI side of that same decision).
+
+    Args:
+        engine: SQLAlchemy engine.
+        schema (str): destination schema.
+        gdf (GeoDataFrame): the processed result to write.
+        resolved_table_name (str): destination table name, from
+            resolve_db_output_table() (via on_run()/run_processing()).
+        resolved_outcome (str | None): "overwritten" or "created", from
+            the same source. If it's anything else (the documented
+            defensive-fallback case in worker(), where resolved_table_name
+            itself was somehow None), the real outcome is determined here
+            directly via _table_exists() rather than guessed.
+        run_id (str): this run's _gen_id() value, recorded in the staging/
+            backup tables' comments for _scan_orphaned_cama_tables().
+        started_at_iso (str): human-readable run start time, for the same
+            comment metadata.
+
+    Raises:
+        Exception: on any failure at any step. The caller (worker()'s own
+        try/except) turns this into the run's error dialog. By the time
+        any exception reaches the caller, the staging table has already
+        been dropped (best-effort) here, and the destination table is
+        guaranteed untouched if the failure happened before FINAL_SWAP's
+        transaction committed.
+    """
+    if resolved_outcome not in ("overwritten", "created"):
+        with engine.begin() as conn:
+            resolved_outcome = (
+                "overwritten" if _table_exists(conn, schema, resolved_table_name)
+                else "created"
+            )
+
+    is_overwrite = (resolved_outcome == "overwritten")
+    staging_name = f"_camastg_{_gen_id()}"
+    backup_name = f"_camabak_{_gen_id()}" if is_overwrite else None
+
+    # STAGING_WRITE -- the real destination table is completely untouched
+    # at this point. Uses `conn` (not the bare engine), same as every
+    # other DB write in this codebase (see road_width.py's own verified
+    # conn-vs-engine transactional-DDL note) -- a failure partway through
+    # this call rolls back cleanly rather than leaving a half-written
+    # staging table.
+    with engine.begin() as conn:
+        gdf.to_postgis(staging_name, conn, schema=schema,
+                        if_exists="replace", index=False)
+
+    # VERIFY -- confirm the staging write actually landed, and that its
+    # row count matches what we intended to write, before this table is
+    # ever eligible for promotion.
+    with engine.begin() as conn:
+        try:
+            actual_count = conn.execute(text(
+                f'SELECT COUNT(*) FROM "{schema}"."{staging_name}"'
+            )).scalar()
+        except Exception as verify_err:
+            raise RuntimeError(
+                f"Staging table '{staging_name}' could not be verified "
+                f"after write -- it may not have been created. Existing "
+                f"table '{resolved_table_name}' was not modified. "
+                f"Cause: {verify_err}"
+            ) from verify_err
+
+        if actual_count != len(gdf):
+            _drop_table_best_effort(engine, schema, staging_name)
+            raise RuntimeError(
+                f"Staging table '{staging_name}' row count "
+                f"({actual_count}) does not match the processed result "
+                f"({len(gdf)}). Aborting before promotion -- existing "
+                f"table '{resolved_table_name}' was not modified."
+            )
+
+        _comment_cama_table(conn, schema, staging_name, "staging",
+                             resolved_table_name, run_id, started_at_iso)
+
+    # FINAL_SWAP -- one transaction, never cancelable. Either both renames
+    # commit, or PostgreSQL rolls back both and resolved_table_name is
+    # exactly as it was before this call.
+    try:
+        with engine.begin() as conn:
+            exists_now = _table_exists(conn, schema, resolved_table_name)
+            if is_overwrite:
+                if not exists_now:
+                    raise RuntimeError(
+                        f"Expected an existing table '{resolved_table_name}' "
+                        f"to overwrite, but it no longer exists. Aborting -- "
+                        f"nothing was promoted. The processed data is still "
+                        f"available in staging table '{staging_name}'."
+                    )
+                conn.execute(text(
+                    f'ALTER TABLE "{schema}"."{resolved_table_name}" '
+                    f'RENAME TO "{backup_name}";'
+                ))
+                _rename_spatial_index(conn, schema, backup_name,
+                                       f"idx_{backup_name}_geometry")
+                _comment_cama_table(conn, schema, backup_name, "backup",
+                                     resolved_table_name, run_id,
+                                     started_at_iso)
+            else:
+                if exists_now:
+                    raise RuntimeError(
+                        f"A table named '{resolved_table_name}' now exists, "
+                        f"but this run was resolved as a new table. "
+                        f"Aborting -- nothing was promoted. The processed "
+                        f"data is still available in staging table "
+                        f"'{staging_name}'."
+                    )
+            conn.execute(text(
+                f'ALTER TABLE "{schema}"."{staging_name}" '
+                f'RENAME TO "{resolved_table_name}";'
+            ))
+            _rename_spatial_index(conn, schema, resolved_table_name,
+                                   f"idx_{resolved_table_name}_geometry")
+    except Exception:
+        # DISCARDING -- staging was never promoted. This DROP only ever
+        # targets staging_name, per this section's own invariant -- never
+        # resolved_table_name or backup_name.
+        _drop_table_best_effort(engine, schema, staging_name)
+        raise
+
+    # Backup is now redundant -- the swap committed, so the new data is
+    # confirmed live. Drop immediately, best-effort: matches this same
+    # codebase's own established convention (see MAIN.py's DB-import
+    # pipeline, Step F) of never treating the backup as a long-term
+    # retention artifact. Normally transient; retained only if this
+    # post-commit cleanup itself fails, or the process crashes before it
+    # runs -- either way, _scan_orphaned_cama_tables() surfaces it on a
+    # future run. A failed drop here does not affect the live table, which
+    # is already safely promoted.
+    if is_overwrite:
+        _drop_table_best_effort(engine, schema, backup_name)
+
+
+def _scan_orphaned_cama_tables(schema, creds):
+    """
+    Looks for every _camastg_*/_camabak_* table currently in `schema` and
+    returns the ones whose owning run is NOT currently alive. Relies on
+    pg_try_advisory_lock() on the SAME key the owning run acquired (see
+    _advisory_lock_key()/_acquire_run_lock()), re-derived here from the
+    run_id recorded in each table's own COMMENT ON TABLE -- succeeding
+    means no live session currently holds that key, i.e. the run that
+    created this table is provably gone (a hard process kill, a computer
+    shutdown/power loss, or a lost DB connection -- normal completion,
+    normal Cancel, and normal failure all clean up after themselves via
+    _write_db_output_safely()/_drop_table_best_effort() and never reach
+    this scan). A table whose comment is missing or doesn't match the
+    expected format (something failed before the comment step itself ever
+    ran) is treated as unverifiable and always included, rather than
+    silently skipped -- see _parse_cama_comment().
+
+    Read-only with respect to table data: this function only tests locks
+    (releasing each one immediately after testing -- it must never itself
+    end up holding one) and reads catalog metadata. It never drops
+    anything -- see _prompt_orphaned_cama_tables() for the user-driven
+    removal step, called from resolve_db_output_table() before its
+    existing fuzzy-match logic runs.
+    """
+    engine = create_engine(
+        f"postgresql://{creds['username']}:{creds['password']}@"
+        f"{creds['host']}:{creds['port']}/{creds['database']}"
+    )
+    orphans = []
+    with engine.begin() as conn:
+        rows = conn.execute(text(
+            """
+            SELECT c.relname, obj_description(c.oid, 'pg_class')
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = :schema AND c.relkind = 'r'
+              AND (c.relname LIKE '\\_camastg\\_%' ESCAPE '\\'
+                   OR c.relname LIKE '\\_camabak\\_%' ESCAPE '\\')
+            """
+        ), {"schema": schema}).fetchall()
+
+        for relname, comment in rows:
+            role = "staging" if relname.startswith("_camastg_") else "backup"
+            run_id, dest = _parse_cama_comment(comment)
+            if run_id is None:
+                orphans.append({"table": relname, "role": role,
+                                 "run_id": None, "dest": dest})
+                continue
+            key = _advisory_lock_key(run_id)
+            acquired = conn.execute(
+                text("SELECT pg_try_advisory_lock(:k)"), {"k": key}
+            ).scalar()
+            if acquired:
+                conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": key})
+                orphans.append({"table": relname, "role": role,
+                                 "run_id": run_id, "dest": dest})
+            # else: a live run holds this lock -- not orphaned, skip.
+    return orphans
+
+
+def _prompt_orphaned_cama_tables(root, orphans, schema, creds):
+    """
+    Shown once, from resolve_db_output_table(), before its own normal
+    fuzzy-match flow -- see the project's Target Architecture document,
+    Section 8, for the full design this implements. Presents each orphan
+    (its destination table, role, and run start time when available) and
+    offers a per-item checkbox choice: remove now, or leave for later
+    manual review. Never deletes anything the user hasn't explicitly
+    checked -- declining to check anything, or closing this dialog, is
+    the same as choosing "leave" for every item found; nothing is ever
+    auto-deleted.
+    """
+    if not orphans:
+        return
+
+    win = tk.Toplevel(root)
+    win.title("Recovered Items From an Interrupted Run")
+    apply_icon(win, "landmarks200.ico")
+    win.resizable(False, False)
+    win.transient(root)
+    win.grab_set()
+
+    intro = (
+        "The following leftover database table(s) were found. These are "
+        "normally cleaned up automatically -- they were likely left "
+        "behind by a run that was interrupted (e.g. the app or computer "
+        "was closed unexpectedly) while writing to the database. Your "
+        "existing data was never affected by this."
+    )
+    tk.Label(win, text=intro, justify="left", wraplength=460,
+             padx=14, pady=10).pack()
+
+    list_frame = tk.Frame(win)
+    list_frame.pack(fill="x", padx=14)
+    vars_by_table = {}
+    for o in orphans:
+        dest_display = o["dest"] or "unknown (no recovery metadata found)"
+        label = f'{o["table"]}   (role: {o["role"]}, destination: {dest_display})'
+        var = tk.BooleanVar(value=False)
+        vars_by_table[o["table"]] = var
+        tk.Checkbutton(list_frame, text=label, variable=var, anchor="w",
+                        justify="left", wraplength=440).pack(fill="x", anchor="w")
+
+    tk.Label(
+        win,
+        text=("Check any items you want removed now. Unchecked items are\n"
+              "left in place for manual review and will be shown again."),
+        justify="left", padx=14, pady=(6, 10)
+    ).pack()
+
+    def _on_remove_selected():
+        engine = create_engine(
+            f"postgresql://{creds['username']}:{creds['password']}@"
+            f"{creds['host']}:{creds['port']}/{creds['database']}"
+        )
+        for o in orphans:
+            if vars_by_table[o["table"]].get():
+                _drop_table_best_effort(engine, schema, o["table"])
+        win.destroy()
+
+    btn_frame = tk.Frame(win)
+    btn_frame.pack(pady=(0, 12))
+    tk.Button(btn_frame, text="Remove Checked", command=_on_remove_selected,
+              width=16).pack(side="left", padx=6)
+    tk.Button(btn_frame, text="Leave All For Now", command=win.destroy,
+              width=16).pack(side="left", padx=6)
+
+    win.update_idletasks()
+    sw = win.winfo_screenwidth()
+    win.geometry(f"+{(sw // 2) - 250}+120")
+    win.attributes("-topmost", True)
+    win.after(100, lambda: win.attributes("-topmost", False))
+    win.focus_force()
+    win.wait_window()
+
+
+# ========================================
 # DB OUTPUT RESOLUTION
 # ========================================
-def resolve_db_output_table(root, schema, barangay_source):
+def resolve_db_output_table(root, schema, barangay_source, creds):
     """
     Determines the DB-output destination table for the Land Parcel
     source, BEFORE any processing or writing starts -- same "resolve
@@ -4138,6 +4942,14 @@ def resolve_db_output_table(root, schema, barangay_source):
     responsibilities: this function owns ALL user interaction and
     overwrite decisions, so the processing/write logic further below
     never has to ask any UI or overwrite question of its own.
+
+    D4: also runs the crash-orphan recovery scan first, before any of
+    its own existing logic -- _scan_orphaned_cama_tables() plus, if it
+    finds anything, _prompt_orphaned_cama_tables(). This is the natural
+    point for it: it's the one place in this file that already runs on
+    the main thread, synchronously, with a live `root` to open a dialog
+    on, before any new staging table for THIS run could possibly exist
+    to confuse the scan.
 
     Two cases:
       - DB-source Land Parcel (barangay_source[0] == "db"): always
@@ -4157,6 +4969,10 @@ def resolve_db_output_table(root, schema, barangay_source):
     cancel-aborts-everything semantics (there is no "create new" choice
     for DB output).
     """
+    orphans = _scan_orphaned_cama_tables(schema, creds)
+    if orphans:
+        _prompt_orphaned_cama_tables(root, orphans, schema, creds)
+
     if barangay_source[0] == "db":
         return barangay_source[1][0], "overwritten"
 
@@ -4180,7 +4996,8 @@ def resolve_db_output_table(root, schema, barangay_source):
 # ========================================
 # RUN PROCESSING
 # ========================================
-def run_processing(app_root, overwrite_mode=None, resolved_table_name=None):
+def run_processing(app_root, overwrite_mode=None, resolved_table_name=None,
+                    resolved_outcome=None):
     """
     Orchestrates the full run on a background worker thread, following
     this file's own established worker-thread + queue.Queue() +
@@ -4219,16 +5036,28 @@ def run_processing(app_root, overwrite_mode=None, resolved_table_name=None):
     _poll_run_processing_queue() closure, on the main thread, via
     app_root.after(100, ...) polling -- never in worker(). worker()
     communicates with the poller exclusively through result_queue
-    (queue.Queue()), using these message tags, always in this order
-    per source: ("new_source", total) -> zero or more
-    ("progress", current, total, msg) -> ("source_done",); and exactly
-    one terminal message at the very end of the run:
-    ("aborted_silently",) if load_db_credentials() failed (preserves
-    the exact pre-Part-3 behavior: close the progress window if one
-    happened to be open, but show no dialog at all -- this was already
-    true before Part 3, since that early return happened before any
-    exception was raised, skipping the old function's own trailing
-    success/error dialog code), ("finished", None) on a clean
+    (queue.Queue()), using these message tags, always in this order per
+    source: ("new_source", total) -> zero or more
+    ("progress", current, total, msg) -> then either
+    ("cancelled",) (D4: PROG_STOP_FLAG was set during PROCESSING -- ends
+    the ENTIRE run, not just this source; see the cancellation check
+    immediately below each process_poi_counts_dynamic() call) or
+    ("phase", "committing") (D4: about to save this source's result --
+    Cancel is disabled from here on, see _set_progress_committing())
+    followed by ("source_done",) once that save actually completes.
+    source_done therefore now fires AFTER the save (local .gpkg write,
+    or _write_db_output_safely()'s full STAGING_WRITE/VERIFY/FINAL_SWAP
+    sequence for DB output), not immediately after
+    process_poi_counts_dynamic() returns as before D4 -- deliberately,
+    so the progress window stays open and visibly non-interactive for
+    the whole non-cancelable portion of the run, instead of vanishing
+    right as the part of the run that can no longer be safely
+    interrupted begins. Exactly one terminal message at the very end of
+    the run: ("aborted_silently",) if load_db_credentials() failed
+    (preserves the exact pre-Part-3 behavior: close the progress window
+    if one happened to be open, but show no dialog at all), a
+    ("cancelled",) already seen mid-run ends the run right there (no
+    further terminal message follows it), ("finished", None) on a clean
     completion (shows the existing success dialog), or
     ("finished", error_str) if any exception was raised (shows the
     existing error dialog, same message as before). The FIFO ordering
@@ -4243,16 +5072,20 @@ def run_processing(app_root, overwrite_mode=None, resolved_table_name=None):
     without ever touching Tkinter: it pushes a "progress" message onto
     result_queue, then returns `not PROG_STOP_FLAG.get("stop")`.
     PROG_STOP_FLAG is a plain dict, not inherently thread-safe as a
-    general synchronization primitive -- but nothing in this file ever
-    sets PROG_STOP_FLAG["stop"] = True during processing (no Cancel
-    button is wired to it; see create_progress_window()'s own
-    docstring), so there is no concurrent mutation for
-    worker_progress_cb()'s read to race against. Referencing
-    PROG_STOP_FLAG by its global name (not a captured local alias)
-    also means a fresh create_progress_window() reset (on the main
-    thread, for the NEXT source) is always visible to the worker's next
-    read, exactly matching the pre-Part-3 behavior of update_progress()
-    reading the same global.
+    general synchronization primitive -- but the only mutation is a
+    single `PROG_STOP_FLAG["stop"] = True` from _on_cancel(), the
+    title-bar X's WM_DELETE_WINDOW handler (main thread, see
+    create_progress_window()) against a plain dict read here on the
+    worker thread; CPython's GIL makes each of those individual
+    operations atomic, so there is nothing to race on beyond "did the
+    worker's very next read happen before or after the click" -- which
+    is exactly the ordinary, acceptable latency of any Cancel control,
+    not a correctness issue. Referencing PROG_STOP_FLAG
+    by its global name (not a captured local alias) also means a fresh
+    create_progress_window() reset (on the main thread, for the NEXT
+    source) is always visible to the worker's next read, exactly
+    matching the pre-Part-3 behavior of update_progress() reading the
+    same global.
 
     Wraps EVERYTHING from credential loading through the final output
     save in one try/except inside worker(), so any exception -- a
@@ -4279,6 +5112,14 @@ def run_processing(app_root, overwrite_mode=None, resolved_table_name=None):
         resolved_table_name (str | None): the already-confirmed DB
         output table name from resolve_db_output_table() in on_run() --
         only relevant for DB output mode.
+        resolved_outcome (str | None): "overwritten" or "created", the
+        other half of resolve_db_output_table()'s return value (D4) --
+        only relevant for DB output mode; passed to
+        _write_db_output_safely() so it knows whether FINAL_SWAP needs a
+        rename-existing-aside-to-backup step. If somehow None while
+        resolved_table_name is set (the documented defensive-fallback
+        case below), _write_db_output_safely() determines the real
+        outcome itself via a direct existence check rather than guessing.
     """
     global barangay_source, poi_source, output_mode
     global checked_categories, target_column_map
@@ -4311,6 +5152,8 @@ def run_processing(app_root, overwrite_mode=None, resolved_table_name=None):
         function's enclosing docstring for the full message-tag
         protocol.
         """
+        lock_conn = None  # D4: released in the finally: block below,
+                           # regardless of how this function exits.
         try:
             creds = load_db_credentials()
             if not creds:
@@ -4321,6 +5164,28 @@ def run_processing(app_root, overwrite_mode=None, resolved_table_name=None):
             engine = create_engine(
                 f"postgresql://{creds['username']}:{creds['password']}@{creds['host']}:{creds['port']}/{creds['database']}"
             )
+
+            # D4: one run_id for the whole run (this file only ever
+            # processes a single Land Parcel source -- confirmed via
+            # barangay_source always being a 1-tuple, see on_run() --
+            # so "per run" and "per source" are the same thing here).
+            # Cheap to always generate, even for local output mode, which
+            # doesn't use it -- avoids a branch for something with no
+            # real cost. The advisory lock itself is only ever acquired
+            # for DB output mode, since it exists purely to let a FUTURE
+            # run's _scan_orphaned_cama_tables() tell this run's staging/
+            # backup artifacts apart from a genuinely abandoned one.
+            run_id = _gen_id()
+            run_started_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+            if output_mode[0] == "db":
+                lock_conn = _acquire_run_lock(creds, run_id)
+                if lock_conn is None:
+                    raise RuntimeError(
+                        "Could not acquire the database run lock. Another "
+                        "CAMA Tools database write may already be in "
+                        "progress, or the database connection failed. "
+                        "Aborting before any write -- no data was changed."
+                    )
 
             # parcel_output_column_overrides is already resolved by the
             # time this function runs -- on_run()'s own PRIORITY 1 (before
@@ -4421,6 +5286,19 @@ def run_processing(app_root, overwrite_mode=None, resolved_table_name=None):
                 print(f"✅ Road network index built ({len(edges_list)} edges, "
                       f"EPSG:{working_epsg})")
 
+            # D6: honors a Cancel (X) clicked during the "Preparing…"
+            # window -- i.e. anywhere during POI/Road Network loading
+            # above, before the per-parcel counting loop (and its own
+            # PROG_STOP_FLAG check, see worker_progress_cb()) has even
+            # started. This is the first point loading can actually be
+            # interrupted at: geopandas'/fiona's own file/DB reads have
+            # no natural mid-read checkpoint, so a click during loading
+            # itself only takes effect once loading finishes and control
+            # reaches here -- not instantly, but still well before any
+            # write of any kind, local or DB.
+            if PROG_STOP_FLAG.get("stop"):
+                result_queue.put(("cancelled",))
+                return
 
             if barangay_source[0] == "local":
                 for path in barangay_source[1]:
@@ -4451,7 +5329,27 @@ def run_processing(app_root, overwrite_mode=None, resolved_table_name=None):
                         gdf, poi_gdf, checked_categories, aerial_radius_meters,
                         road_radius_meters, road_context, resolved_target_column_map,
                         progress_cb=worker_progress_cb)
-                    result_queue.put(("source_done",))
+
+                    # D4: process_poi_counts_dynamic() can return a PARTIAL
+                    # result after a mid-run Cancel, without raising (it
+                    # returns whatever it had counted so far -- see its own
+                    # docstring). This check is the wrapper-level boundary
+                    # that catches that: a cancelled source is discarded
+                    # here and the ENTIRE run ends as CANCELLED, never
+                    # reaching either save branch below. This file only
+                    # ever has one Land Parcel source per run (confirmed
+                    # via barangay_source always being a 1-tuple), so
+                    # "abort this source" and "abort the run" are the same
+                    # outcome here.
+                    if PROG_STOP_FLAG.get("stop"):
+                        result_queue.put(("cancelled",))
+                        return
+
+                    # D4: from here on, this source's result WILL be saved
+                    # -- nothing past this point can be safely interrupted.
+                    # Tell the poller to disable Cancel before any save
+                    # work starts.
+                    result_queue.put(("phase", "committing"))
 
                     if output_mode[0] == "local":
                         desired_base_name = base_name
@@ -4476,10 +5374,12 @@ def run_processing(app_root, overwrite_mode=None, resolved_table_name=None):
                         # (output_mode[0] != "db" can't reach this branch, so
                         # this is just a defensive fallback).
                         output_table = resolved_table_name if resolved_table_name is not None else base_name.lower()
-                        with engine.begin() as conn:
-                            result.to_postgis(output_table, conn, schema=schema,
-                                              if_exists="replace", index=False)
+                        _write_db_output_safely(engine, schema, result,
+                                                 output_table, resolved_outcome,
+                                                 run_id, run_started_at)
                         print(f"✅ Saved to DB: {output_table}")
+
+                    result_queue.put(("source_done",))
             else:
                 # Database Land Parcel sources: same dynamic override
                 # resolution as the LOCAL branch above -- preserves the
@@ -4500,7 +5400,15 @@ def run_processing(app_root, overwrite_mode=None, resolved_table_name=None):
                         gdf, poi_gdf, checked_categories, aerial_radius_meters,
                         road_radius_meters, road_context, resolved_target_column_map,
                         progress_cb=worker_progress_cb)
-                    result_queue.put(("source_done",))
+
+                    # D4: same wrapper-level cancellation boundary as the
+                    # local-source loop above -- see that loop's own
+                    # comment for the full rationale.
+                    if PROG_STOP_FLAG.get("stop"):
+                        result_queue.put(("cancelled",))
+                        return
+
+                    result_queue.put(("phase", "committing"))
 
                     if output_mode[0] == "local":
                         desired_base_name = table
@@ -4515,14 +5423,33 @@ def run_processing(app_root, overwrite_mode=None, resolved_table_name=None):
                         print(f"✅ Saved: {out}")
                         load_in_global_mapper(out)
                     else:
-                        with engine.begin() as conn:
-                            result.to_postgis(table, conn, schema=schema,
-                                              if_exists="replace", index=False)
+                        # DB-source Land Parcel: resolve_db_output_table()
+                        # always resolves this case to (table, "overwritten")
+                        # -- writing back to the exact same table it was
+                        # read from -- so `table` and resolved_outcome are
+                        # used directly here rather than resolved_table_name,
+                        # matching this branch's own pre-D4 behavior.
+                        _write_db_output_safely(engine, schema, result,
+                                                 table, resolved_outcome,
+                                                 run_id, run_started_at)
                         print(f"✅ Updated DB table: {table}")
+
+                    result_queue.put(("source_done",))
 
         except Exception as e:
             result_queue.put(("finished", str(e)))
             return
+        finally:
+            # D4: released here regardless of how the try block above
+            # exits -- clean success (falls through to the line below),
+            # a mid-run Cancel (the `return` inside either source loop
+            # above), or an exception (the `except` clause's own
+            # `return`). A lingering advisory lock past this point would
+            # make a FUTURE run's _scan_orphaned_cama_tables() wrongly
+            # treat this run's own staging/backup tables as still "live"
+            # even after this run has fully ended.
+            if lock_conn is not None:
+                _release_run_lock(lock_conn)
 
         result_queue.put(("finished", None))
 
@@ -4534,9 +5461,9 @@ def run_processing(app_root, overwrite_mode=None, resolved_table_name=None):
         (drain the queue, react to each message, reschedule unless a
         terminal message was seen). This is the ONLY place any Tkinter
         call happens for the duration of a run: create_progress_
-        window(), update_progress(), close_progress_window(), and the
-        final result messagebox are all called from here, never from
-        worker().
+        window(), update_progress(), close_progress_window(),
+        _set_progress_committing() (D4), and the final result
+        messagebox are all called from here, never from worker().
 
         Guards on app_root.winfo_exists() first, matching _poll_poi_
         category_queue()'s own guard on win -- needed here for a new
@@ -4564,10 +5491,37 @@ def run_processing(app_root, overwrite_mode=None, resolved_table_name=None):
                 tag = msg[0]
                 if tag == "new_source":
                     _, total = msg
-                    create_progress_window(app_root, total)
+                    # D6: the "Preparing…" window (create_progress_
+                    # window(app_root, None), called at the top of
+                    # run_processing() before the worker thread even
+                    # started) is normally still open at this point --
+                    # reconfigure it in place rather than destroying and
+                    # recreating it, so it never disappears from
+                    # Alt+Tab for even a moment. Falls back to a fresh
+                    # create_progress_window() only if that window is
+                    # somehow already gone.
+                    if PROG_WIN and PROG_WIN.winfo_exists():
+                        _configure_progress_window_for_counting(total)
+                    else:
+                        create_progress_window(app_root, total)
                 elif tag == "progress":
                     _, current, total, pmsg = msg
                     update_progress(current, total, pmsg)
+                elif tag == "phase":
+                    _, phase_name = msg
+                    if phase_name == "committing":
+                        _set_progress_committing()
+                elif tag == "cancelled":
+                    # D4: PROG_STOP_FLAG was set during PROCESSING, before
+                    # any save was attempted for this source -- the real
+                    # destination table was never touched. This file only
+                    # ever has one Land Parcel source per run, so this
+                    # ends the whole run, not just the current source.
+                    close_progress_window()
+                    messagebox.showinfo(
+                        "Cancelled",
+                        "The run was cancelled. No data was changed.")
+                    return
                 elif tag == "source_done":
                     close_progress_window()
                 elif tag == "aborted_silently":
@@ -4589,6 +5543,16 @@ def run_processing(app_root, overwrite_mode=None, resolved_table_name=None):
         except queue.Empty:
             pass
         app_root.after(100, _poll_run_processing_queue)
+
+    # D6: opened HERE, on the main thread, before the worker thread
+    # even starts -- i.e. before POI/Road Network loading, which can
+    # itself take a noticeable while. Without this, there was nothing
+    # visible on screen (root is withdrawn, and on_run() already
+    # destroyed the configuration window) for that whole stretch -- not
+    # even something to Alt+Tab to. See create_progress_window()'s own
+    # docstring for the full rationale and the matching pattern in
+    # meters_from_school_shop_transport_church.py's run_with_progress().
+    create_progress_window(app_root, None)
 
     threading.Thread(target=worker, daemon=True).start()
     app_root.after(100, _poll_run_processing_queue)
