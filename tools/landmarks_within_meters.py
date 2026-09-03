@@ -140,39 +140,70 @@ GM_EXE_PATH = r"C:\Program Files\GlobalMapper26.1_64bit\global_mapper.exe"
 # ========================================
 # WINDOW CHROME HELPERS
 # ========================================
-def _remove_close_button(win):
+def _disable_close_button(win):
     """
-    Strips the titlebar's close (X) button (and system menu) via the
-    Win32 API directly, ported from road_width.py's implementation.
+    Grays out the titlebar's close (X) button via the Win32 API --
+    the button stays visibly present but visually disabled, and
+    clicking it does nothing.
+
+    HISTORY -- why this replaced the earlier WS_SYSMENU-clearing
+    approach: that approach (clearing WS_SYSMENU via GetWindowLongW/
+    SetWindowLongW, ported from road_width.py) aimed to remove the X
+    entirely, and worked immediately after window creation -- but was
+    confirmed, via real on-machine testing, to NOT survive a window
+    activation/focus-change event (e.g. using the Windows Snipping
+    Tool while this window was open): the X (and the titlebar icon,
+    lost as a side effect of clearing WS_SYSMENU) would reappear after
+    such an event, even though a SetWindowPos(..., SWP_FRAMECHANGED)
+    call had been added specifically to force an immediate redraw
+    after the style change. The suspected reason: WS_SYSMENU is a
+    window STYLE bit, and Windows appears to recompute the titlebar's
+    chrome from current window style on activation-class events
+    regardless of what SetWindowPos forced immediately after creation
+    -- making that approach fundamentally unreliable for a window that
+    stays open for any length of time (exactly this tool's actual
+    usage: a progress window open for the full duration of a
+    potentially long-running per-parcel run), not merely inconsistent
+    across Windows/DWM builds as first suspected.
+
+    This function instead disables only the SC_CLOSE command in the
+    window's system menu -- a menu-item-level change, not a window-
+    style change, so there is no window style for Windows to
+    recompute chrome from on an activation event. This is the
+    standard, Microsoft-documented pattern for disabling a title-bar
+    close button (see Raymond Chen's "The Old New Thing"): the
+    titlebar's close button glyph reads its enabled/disabled visual
+    state from the same SC_CLOSE system-menu entry, so disabling it
+    here grays out the visible X too, not just the system-menu
+    dropdown entry -- and the same SC_CLOSE state is what Windows
+    consults for Alt+F4 on this window, so that should be blocked too
+    (not independently confirmed here).
+
+    Explicit, accepted tradeoff versus the earlier approach: the X
+    stays visibly present (grayed rather than gone), in exchange for
+    the titlebar icon surviving (WS_SYSMENU is never touched, so
+    apply_icon()'s icon is never lost) and -- expected, not yet
+    confirmed on real Windows -- surviving activation/focus-change
+    events, since no window style is being changed for Windows to
+    recompute.
 
     protocol("WM_DELETE_WINDOW", lambda: None) (used alongside this,
-    see create_progress_window() below) only prevents the CLICK from
-    doing anything -- the X itself stays fully visible, still
-    highlights on hover, and still looks clickable, since Tkinter/the
-    OS's own window chrome has no idea the close action has been
-    neutralized, which reads as broken (a button that does nothing
-    when clicked) rather than intentionally absent. This function is a
-    stronger fix -- actually removing the button from the titlebar so
-    there's nothing there to click in the first place.
-
-    NOTE (carried over from road_width.py, still applies here):
-    clearing WS_SYSMENU via GetWindowLongW/SetWindowLongW is the
-    correct, well-documented Win32 pattern for this, but its actual
-    visual result can vary by Windows/DWM build/theme -- confirmed in
-    practice on this project's own deployment target that it does not
-    always visibly remove the X, in which case the protocol()-based
-    "click does nothing" behavior below is what actually takes effect.
-    Kept anyway (it's the more correct fix when it does work, and is
-    fully harmless when it doesn't -- any failure here is caught and
-    silently ignored, falling back to the protocol() behavior).
+    see create_progress_window() below) is kept as a defensive
+    fallback regardless -- any failure in the Win32 call below is
+    caught and silently ignored, falling back to that protocol()-only
+    behavior (X visible and looks clickable, but does nothing).
     """
     try:
         import ctypes
-        GWL_STYLE = -16
-        WS_SYSMENU = 0x00080000
+        MF_BYCOMMAND = 0x00000000
+        MF_GRAYED = 0x00000001
+        MF_DISABLED = 0x00000002
+        SC_CLOSE = 0xF060
         hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
-        style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_STYLE)
-        ctypes.windll.user32.SetWindowLongW(hwnd, GWL_STYLE, style & ~WS_SYSMENU)
+        hmenu = ctypes.windll.user32.GetSystemMenu(hwnd, False)
+        if hmenu:
+            ctypes.windll.user32.EnableMenuItem(
+                hmenu, SC_CLOSE, MF_BYCOMMAND | MF_GRAYED | MF_DISABLED)
     except Exception:
         pass
 
@@ -553,18 +584,38 @@ def create_progress_window(root, total, title="Landmarks Within Meters Tool"):
     # a potentially large parcel/POI set), matching the same decision
     # already made for
     # road_width.py's own progress dialog. The X (close) button is
-    # neutralized the same way road_width.py's is -- see
-    # _remove_close_button()'s own docstring for why both the Win32
-    # removal attempt AND the protocol() no-op fallback are used
-    # together, and for the caveat that visible removal isn't
-    # guaranteed on every Windows/DWM build (the protocol() fallback is
-    # what actually guarantees clicking X does nothing, even then).
+    # grayed out -- see _disable_close_button()'s own docstring for
+    # why this approach replaced the earlier WS_SYSMENU-based one, and
+    # for why both the Win32 disable attempt AND the protocol()
+    # no-op fallback are kept together regardless.
     PROG_WIN.protocol("WM_DELETE_WINDOW", lambda: None)
-    _remove_close_button(PROG_WIN)
 
+    # Call order below was set while testing the EARLIER WS_SYSMENU-
+    # based approach (matching road_width.py's ProgressWindow: topmost
+    # -> close-button call -> focus_force()/lift(), with transient()/
+    # grab_set() -- which road_width.py's ProgressWindow doesn't call
+    # at all, since it isn't modal -- moved to run BEFORE the close-
+    # button call rather than after). _disable_close_button() operates
+    # on system-menu state rather than window style (see its own
+    # docstring), so it should no longer be sensitive to this ordering
+    # the way the old approach was -- but the order is left as-is here
+    # since reverting it would be unnecessary, unrequested churn, not
+    # because it's newly required.
     PROG_WIN.transient(root)
     PROG_WIN.grab_set()
     PROG_WIN.attributes("-topmost", True)
+    # Released after a brief moment rather than left permanently
+    # topmost -- matches this same file's own established convention
+    # for every other dialog (see e.g. the ask_overwrite-style dialogs
+    # above) and road_width.py's ProgressWindow. Explicitly confirmed:
+    # this window should NOT stay permanently on top, since users need
+    # to be able to work in Global Mapper (digitizing) while this tool
+    # runs in the background -- a permanently topmost progress window
+    # would block that.
+    PROG_WIN.after(100, lambda: PROG_WIN.attributes("-topmost", False))
+    _disable_close_button(PROG_WIN)
+    PROG_WIN.focus_force()
+    PROG_WIN.lift()
     PROG_WIN.update_idletasks()
     PROG_WIN.update()
 
@@ -1989,52 +2040,33 @@ def open_main_window(root):
         win.maxsize(req_w, req_h)
         win.geometry(f"{req_w}x{req_h}")
 
-    # Hides the dotted focus-indicator rectangle that ttk.Radiobutton
-    # (used for the Aerial/Road method radios, Cluster B) draws around
-    # itself on click -- explicit feedback: it read as a rendering
-    # glitch/broken box, not an intentional focus cue, in this
-    # single-purpose tool. Matching focuscolor to the widget's own
-    # background makes the ring invisible rather than disabling focus
-    # outright, so keyboard Tab-navigation between radios still works
-    # exactly as before -- only the visible dotted outline is gone.
-    # ttk.Style shares one process-wide style registry (passing `win`
-    # here doesn't create an isolated namespace scoped just to this
-    # window) -- but since this tool runs as its own isolated
-    # subprocess (Section A: MAIN.py dispatches each tool as a
-    # separate process), this change can never reach any other tool's
-    # GUI regardless.
+    # theme_use("clam") was previously called here to suppress a
+    # dotted focus-ring rendering glitch on the Aerial/Road method
+    # radios (Cluster B) -- REMOVED. Because ttk.Style's theme is
+    # process-wide (not scoped to any one window), that change also
+    # silently changed every OTHER ttk widget created afterward in
+    # this same process -- including the progress window's
+    # ttk.Progressbar (created later, in create_progress_window()),
+    # which rendered gray under "clam" instead of Windows' native
+    # green, and the POI-category checklist's ttk.Radiobutton rows
+    # (see that widget's own comment further down in this file),
+    # which were deliberately built to depend on native theme
+    # rendering for unambiguous disabled/unselected-state display --
+    # "clam" was silently undermining the very reason that widget
+    # choice was made there.
     #
-    # theme_use("clam") FIRST -- confirmed via explicit feedback that
-    # the focuscolor override alone did NOT actually hide the ring on
-    # a real Windows machine, even though it worked in this sandbox's
-    # Xvfb testing. Root cause: Windows' default active ttk theme
-    # ("vista"/"xpnative") renders focus indicators through native
-    # Windows UxTheme APIs and largely ignores synthetic ttk.Style.
-    # configure() properties such as focuscolor -- the override was
-    # being silently no-opped by the native theme. "clam" is a pure-Tk
-    # theme (not OS-native-rendered) that DOES respect Python-
-    # configured style properties, so switching to it first is what
-    # actually makes the focuscolor override take effect. The only
-    # other ttk widget in this window is ttk.Separator (the thin
-    # horizontal divider lines) -- its appearance under "clam" is
-    # still a plain line, no meaningful visual change there.
-    _style = ttk.Style(win)
-    _style.theme_use("clam")
-    # Explicit correction: switching to "clam" (above) fixed the
-    # focus-ring issue, but introduced a NEW visible artifact --
-    # "clam"'s own baked-in TRadiobutton background color (its
-    # default, independent of this window) doesn't match this
-    # window's actual background, so each radio button showed a
-    # faint but clearly visible colored box/patch behind it, even
-    # when grayed out/disabled -- confirmed via explicit feedback.
-    # Fixed by explicitly matching BOTH the normal and disabled-state
-    # background (and focuscolor, unchanged from before) to this
-    # window's own real background color (win.cget("bg")), rather
-    # than trusting "clam" theme's own default value to already
-    # match -- it does not.
-    _win_bg = win.cget("bg")
-    _style.configure("TRadiobutton", background=_win_bg, focuscolor=_win_bg)
-    _style.map("TRadiobutton", background=[("disabled", _win_bg), ("active", _win_bg)])
+    # Removing theme_use("clam") restores Windows' native active ttk
+    # theme ("vista"/"xpnative") process-wide -- matching road_width.py,
+    # which never called theme_use() and has always rendered its
+    # Progressbar in the native green. The TRadiobutton background/
+    # focuscolor overrides that existed solely to patch a visual bug
+    # "clam" itself introduced (a colored box/patch behind each radio
+    # button) are removed along with it, since that bug cannot occur
+    # under the native theme.
+    #
+    # Known, accepted tradeoff: the dotted focus-ring glitch on the
+    # Aerial/Road method radios returns -- confirmed acceptable, this
+    # tool does not actually need that suppression.
 
     # ── state ────────────────────────────────────────────────────
     parcel_source_type = tk.StringVar(master=win, value="local")
@@ -3104,12 +3136,28 @@ def open_main_window(root):
                 method_row_wrapper.grid(row=row_idx, column=0, sticky="w")
                 # Road first (left), Aerial second (right) -- explicit
                 # request to swap the original Aerial-first order.
+                #
+                # takefocus=0 on both: excludes these radios from
+                # Tab-key focus traversal entirely, which is what
+                # actually suppresses the dotted focus-ring rendering
+                # glitch this pair (Task 3, Cluster B) is prone to on
+                # click -- without needing theme_use("clam") (removed
+                # elsewhere in this file; see that comment) or any
+                # ttk.Style override, both of which would have
+                # conflicted with this same widget's need for native
+                # theme rendering (see the comment above -- ttk's
+                # native theme is what makes disabled/unselected state
+                # render unambiguously here). Known, accepted tradeoff:
+                # a keyboard user can no longer Tab into these specific
+                # radios -- mouse/click selection is unaffected.
                 radio_road = ttk.Radiobutton(
                     method_row_wrapper, text="Road", variable=method_var,
-                    value="road", state="disabled", command=_recompute_radius_enablement)
+                    value="road", state="disabled", takefocus=0,
+                    command=_recompute_radius_enablement)
                 radio_aerial = ttk.Radiobutton(
                     method_row_wrapper, text="Aerial", variable=method_var,
-                    value="aerial", state="disabled", command=_recompute_radius_enablement)
+                    value="aerial", state="disabled", takefocus=0,
+                    command=_recompute_radius_enablement)
                 # Small, roughly one-space gaps on both sides -- the
                 # Road radio sits close to the column's left edge so
                 # it lines up with the flush-left "Method" header text
