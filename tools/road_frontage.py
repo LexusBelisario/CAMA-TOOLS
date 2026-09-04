@@ -47,7 +47,7 @@ DEPENDENCIES:
     strtree, validation), sqlalchemy, psycopg2.
     local: utils.table_name_matching, utils.resource_path,
     utils.db_discovery, utils.column_detection, utils.window_icon,
-    tools.progress_framework (imported mid-file, directly above the
+    utils.progress_framework (imported mid-file, directly above the
     class/function that uses it -- see the Progress Event Protocol v9
     comment block further below).
 
@@ -1313,7 +1313,7 @@ def _force_2d(gdf):
 # PresentationState, the Presentation Policy, and the Tkinter View are
 # no longer defined locally in this file -- identical to
 # lot_location.py's Phase 3 migration, both tools now import the same
-# three classes from tools/progress_framework.py instead of each
+# three classes from utils/progress_framework.py instead of each
 # keeping its own copy. Pure extraction: no behavior change, no new
 # abstraction, no wrapper/adapter/compatibility layer.
 #
@@ -1325,7 +1325,7 @@ def _force_2d(gdf):
 # -- see progress_framework.py's own top-of-file comment for why.
 # ============================================================
 
-from tools.progress_framework import (
+from utils.progress_framework import (
     PresentationState,
     ProgressPresentationPolicy,
     TkinterProgressView,

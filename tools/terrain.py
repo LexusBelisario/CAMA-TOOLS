@@ -40,7 +40,7 @@ DEPENDENCIES:
     (geometry + strtree), numpy, psycopg2, sqlalchemy, scipy.ndimage.
     local: utils.table_name_matching, utils.resource_path,
     utils.db_discovery, utils.column_detection, utils.window_icon,
-    tools.progress_framework (imported mid-file, directly above the
+    utils.progress_framework (imported mid-file, directly above the
     class/function that uses it -- see the Progress Event Protocol v9
     comment block further below).
 
@@ -282,7 +282,7 @@ parcel_output_column_overrides = {}
 #     one unit -- that all-or-nothing behavior is preserved exactly).
 #   - The 3 overwrite dialogs in this file are untouched.
 # ============================================================
-from tools.progress_framework import (
+from utils.progress_framework import (
     PresentationState,
     ProgressPresentationPolicy,
     TkinterProgressView,

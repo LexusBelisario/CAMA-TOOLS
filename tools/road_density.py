@@ -38,7 +38,7 @@ DEPENDENCIES:
     sqlalchemy.
     local: utils.table_name_matching, utils.resource_path,
     utils.db_discovery, utils.column_detection, utils.window_icon,
-    tools.progress_framework (imported mid-file, directly above the
+    utils.progress_framework (imported mid-file, directly above the
     class/function that uses it -- see the Progress Event Protocol v9
     comment block further below for why this file's progress dialog was
     migrated to that shared framework).
@@ -1674,7 +1674,7 @@ def resolve_db_output_table(root, schema, barangay_source):
 #   - The 3 overwrite dialogs in this file are untouched -- any
 #     topmost/hiding fix for them is a separate, dedicated follow-up.
 # ============================================================
-from tools.progress_framework import (
+from utils.progress_framework import (
     PresentationState,
     ProgressPresentationPolicy,
     TkinterProgressView,
