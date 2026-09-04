@@ -287,7 +287,23 @@ class TkinterProgressView:
         _on_cancel() above); then forces an immediate GUI refresh via
         the preserved update_idletasks() -> geometry("") -> update()
         sequence.
+
+        D1.1: no-ops entirely if self.win no longer exists (winfo_exists()
+        false) -- a real crash was hit and reported during testing: a
+        worker thread queues progress events faster than the main-thread
+        poller drains them, and if the window gets destroyed (today,
+        before any tool has wired cancel_flag in, this can already
+        happen via the ordinary, currently-unprotected close button --
+        it is not specific to Cancel) while an already-queued event is
+        still waiting to be drained, the next poll_queue() tick calls
+        this render() against widgets that are already gone:
+        `_tkinter.TclError: invalid command name ".!toplevel3.!progressbar"`.
+        This guard makes that entire class of race impossible, for every
+        tool using this module, independent of whether that tool has
+        wired Cancel support at all yet.
         """
+        if not self.win.winfo_exists():
+            return
         self.status_var.set(state.message)
         if state.maximum is not None:
             self.progress["maximum"] = state.maximum
@@ -305,5 +321,12 @@ class TkinterProgressView:
         self.win.update()
 
     def destroy(self):
-        """Destroys the progress window."""
-        self.win.destroy()
+        """Destroys the progress window. D1.1: safe to call even if the
+        window is already gone (e.g. destroyed by the user via a close
+        button this tool hasn't wired Cancel protection onto yet) --
+        does not raise."""
+        try:
+            if self.win.winfo_exists():
+                self.win.destroy()
+        except Exception:
+            pass
