@@ -49,7 +49,7 @@ DEPENDENCIES:
     only where GeoPackage layer inspection is needed).
     local: utils.table_name_matching, utils.resource_path,
     utils.db_discovery, utils.column_detection, utils.window_icon,
-    tools.progress_framework.
+    utils.progress_framework.
 
 SIDE EFFECTS:
     File reads/writes (.shp/.gpkg). PostGIS reads/writes. A live
@@ -846,7 +846,7 @@ def resolve_db_output_table(root, schema, parcel_src, desired_name):
 # ========================================
 # PROGRESS WINDOW
 # ========================================
-from tools.progress_framework import (
+from utils.progress_framework import (
     PresentationState,
     ProgressPresentationPolicy,
     TkinterProgressView,

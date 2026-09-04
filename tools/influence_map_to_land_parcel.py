@@ -56,7 +56,7 @@ DEPENDENCIES:
     tkinter.
     third-party: geopandas, psycopg2, sqlalchemy, shapely.
     local: utils.table_name_matching, utils.resource_path,
-    utils.db_discovery, utils.window_icon, tools.progress_framework
+    utils.db_discovery, utils.window_icon, utils.progress_framework
     (imported mid-file, directly above the class/function that uses it
     -- see the Progress Event Protocol v9 comment block further below).
 
@@ -999,7 +999,7 @@ def resolve_db_output_table(root, schema, barangay_source):
 #   - No per-source failure isolation added.
 #   - The 3 overwrite dialogs in this file are untouched.
 # ============================================================
-from tools.progress_framework import (
+from utils.progress_framework import (
     PresentationState,
     ProgressPresentationPolicy,
     TkinterProgressView,
