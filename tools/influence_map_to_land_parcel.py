@@ -1256,6 +1256,19 @@ def run_processing(root, overwrite_mode=None, resolved_table_name=None, resolved
                 added_fields.extend(final_col for _raw_col, final_col in column_pairs)
 
             # --- Process Barangay ---
+            # any_overlay_found: tracks, across EVERY parcel source processed
+            # in this run, whether at least one written output column had at
+            # least one non-null value for at least one parcel row -- i.e.
+            # whether the Influence Map actually overlaps the Land Parcel
+            # anywhere. gpd.sjoin(..., how="left", ...) inside
+            # transfer_attributes() is a LEFT join, so a non-overlapping
+            # parcel row simply gets a null value in that column rather than
+            # raising an error or skipping the row -- this flag is what lets
+            # the final success message distinguish "ran fine, values written"
+            # from "ran fine, but nothing overlapped anywhere." OR-accumulated
+            # across sources: one source with a match is enough to keep this
+            # True even if another source in the same run has none.
+            any_overlay_found = False
             sources = barangay_source[1]
             for src in sources:
                 if barangay_source[0] == "local":
@@ -1301,6 +1314,25 @@ def run_processing(root, overwrite_mode=None, resolved_table_name=None, resolved
                     output_column_map=output_column_map,
                     progress=progress_cb,
                 )
+
+                # Runs once per source, right after transfer_attributes() and
+                # before the local/DB save split below, so both output modes
+                # are covered by this single check (they both consume the
+                # same b_gdf written by the same call above). Checks the
+                # ACTUAL written column names (output_column_map's values,
+                # not added_fields' raw names) since a source can override
+                # the output column name. if added_fields is empty this is
+                # skipped (defensive only -- the GUI's Run-button validation
+                # already requires at least one checked column before a run
+                # can start, so added_fields is not expected to be empty
+                # here in practice).
+                if added_fields:
+                    written_cols = [
+                        output_column_map.get(final_col, final_col)
+                        for final_col in added_fields
+                    ]
+                    if b_gdf[written_cols].notna().any().any():
+                        any_overlay_found = True
 
                 # --- Save outputs ---
                 if output_mode[0] == "local":
@@ -1525,38 +1557,73 @@ def run_processing(root, overwrite_mode=None, resolved_table_name=None, resolved
                         #
                                 # conn.execute(text(sql), params)
 
-                        # Ensure CAMA_Transaction_Log exists
-                        conn.execute(
-                            text(
-                                f"""
-                            CREATE TABLE IF NOT EXISTS "{schema}"."CAMA_Transaction_Log" (
-                                id SERIAL PRIMARY KEY,
-                                table_name TEXT,
-                                cama_tool TEXT,
-                                cama_fields TEXT,
-                                transaction_date_time TIMESTAMP DEFAULT NOW()
-                            );
-                        """
-                            )
-                        )
+                        # ------------------------------------------------------------------
+                        # CAMA_Transaction_Log write -- DISABLED (commented out, not removed).
+                        #
+                        # This entry is not currently needed -- there is no active
+                        # requirement for a per-run log of which table/tool/fields were
+                        # written. This is NOT a statement that the implementation below is
+                        # broken, obsolete, or wrong -- it is a forward-looking write that
+                        # simply isn't needed right now. It is left fully intact so it can
+                        # be re-enabled later with no rework if a future need for a
+                        # transaction log (e.g. an audit trail or run-history feature)
+                        # appears.
+                        #
+                        # Untouched by this change: the b_gdf.to_postgis() main table write
+                        # above, and the disabled CAMA_Table block above this one -- both
+                        # stay exactly as they are. The main table write remains the only
+                        # live statement inside this `with engine.begin() as conn:` block.
+                        # ------------------------------------------------------------------
+                        # # Ensure CAMA_Transaction_Log exists
+                        # conn.execute(
+                            # text(
+                                # f"""
+                            # CREATE TABLE IF NOT EXISTS "{schema}"."CAMA_Transaction_Log" (
+                                # id SERIAL PRIMARY KEY,
+                                # table_name TEXT,
+                                # cama_tool TEXT,
+                                # cama_fields TEXT,
+                                # transaction_date_time TIMESTAMP DEFAULT NOW()
+                            # );
+                        # """
+                            # )
+                        # )
+                        #
+                        # # Log transaction
+                        # conn.execute(
+                            # text(
+                                # f"""
+                            # INSERT INTO "{schema}"."CAMA_Transaction_Log" 
+                            # (table_name, cama_tool, cama_fields)
+                            # VALUES (:tbl, :tool, :details);
+                        # """
+                            # ),
+                            # {
+                                # "tbl": f"{target_table} ({table_action})",
+                                # "tool": "influence_map_to_land_parcel",
+                                # "details": ", ".join(added_fields),
+                            # },
+                        # )
 
-                        # Log transaction
-                        conn.execute(
-                            text(
-                                f"""
-                            INSERT INTO "{schema}"."CAMA_Transaction_Log" 
-                            (table_name, cama_tool, cama_fields)
-                            VALUES (:tbl, :tool, :details);
-                        """
-                            ),
-                            {
-                                "tbl": f"{target_table} ({table_action})",
-                                "tool": "influence_map_to_land_parcel",
-                                "details": ", ".join(added_fields),
-                            },
-                        )
-
-            q.put(("done", "✅ Processing done with CAMA logs!", None, None))
+            # any_overlay_found (see its own comment above the per-source
+            # loop): True as soon as ANY parcel row, in ANY processed
+            # source, got a non-null value in ANY written output column.
+            # False here means every checked Influence Map source's
+            # geometry never overlapped any parcel centroid anywhere in
+            # this run -- the run itself completed with no error, but
+            # produced an output where every CAMA_-prefixed column is
+            # entirely null, which the plain "Processing done!" message
+            # would otherwise present as an unqualified success. The
+            # dialog box itself (see poll_queue()'s messagebox.showinfo(
+            # "Success", ...) call) is untouched and still titled
+            # "Success" either way -- only this body text changes.
+            if added_fields and not any_overlay_found:
+                q.put(("done",
+                       "Processing done — no value has been written.\n"
+                       "Please make sure the Influence Map overlays the Land Parcel.",
+                       None, None))
+            else:
+                q.put(("done", "✅ Processing done!", None, None))
 
         except Exception as e:
             # New: this function had no top-level try/except before --
