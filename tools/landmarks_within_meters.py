@@ -3747,10 +3747,30 @@ def open_main_window(root):
     # appending it to the very end of the window on every recreation
     # after the first -- see _create_category_section()'s own comment
     # on this anchor for the full explanation.
-    distance_radius_anchor = section_label(win, "Search Distance (Aerial / Road)")
+    distance_radius_anchor = section_label(win, "Search Distance")
 
     dual_radius_frame = tk.Frame(win)
     dual_radius_frame.pack(fill="x", padx=18, pady=2)
+
+    # Road distance row packed FIRST (appears on top), Aerial radius row
+    # packed SECOND (appears below) -- per explicit request, swapped
+    # from this section's original top-to-bottom order. Label reads
+    # "Road distance", not "Road radius" -- a road-network path length
+    # is a linear distance along the network, not a circular/
+    # omnidirectional radius (which "Aerial radius" correctly is, being
+    # straight-line). Deliberately deviates from Document 1 Task 4's
+    # literal field-label wording for this reason (confirmed decision).
+    # The underlying variable/widget names (road_radius_var,
+    # road_radius_row, road_radius_entry) are left as-is -- internal
+    # identifiers, not user-facing text, and unaffected by either the
+    # label wording or this row-order swap.
+    road_radius_row = tk.Frame(dual_radius_frame)
+    road_radius_row.pack(fill="x", pady=2)
+    tk.Label(road_radius_row, text="Road distance (meters):",
+             anchor="w", width=18).pack(side="left")
+    road_radius_entry = tk.Entry(road_radius_row, textvariable=road_radius_var,
+                                  width=10, state="disabled")
+    road_radius_entry.pack(side="left", padx=(4, 0))
 
     aerial_radius_row = tk.Frame(dual_radius_frame)
     aerial_radius_row.pack(fill="x", pady=2)
@@ -3763,22 +3783,6 @@ def open_main_window(root):
     aerial_radius_entry = tk.Entry(aerial_radius_row, textvariable=aerial_radius_var,
                                     width=10, state="disabled")
     aerial_radius_entry.pack(side="left", padx=(4, 0))
-
-    road_radius_row = tk.Frame(dual_radius_frame)
-    road_radius_row.pack(fill="x", pady=2)
-    # Label reads "Road distance", not "Road radius" -- a road-network
-    # path length is a linear distance along the network, not a
-    # circular/omnidirectional radius (which "Aerial radius" correctly
-    # is, being straight-line). Deliberately deviates from Document 1
-    # Task 4's literal field-label wording for this reason (confirmed
-    # decision). The underlying variable/widget names (road_radius_var,
-    # road_radius_row, road_radius_entry) are left as-is -- internal
-    # identifiers, not user-facing text.
-    tk.Label(road_radius_row, text="Road distance (meters):",
-             anchor="w", width=18).pack(side="left")
-    road_radius_entry = tk.Entry(road_radius_row, textvariable=road_radius_var,
-                                  width=10, state="disabled")
-    road_radius_entry.pack(side="left", padx=(4, 0))
 
     def _recompute_radius_enablement():
         """
