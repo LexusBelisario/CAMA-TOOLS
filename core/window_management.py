@@ -2,42 +2,37 @@
 core/window_management.py
 
 PURPOSE:
-    New module (this task) holding all Win32/process/window-management
-    logic for three related fixes at the CAMA Tools launcher boundary:
+    Win32/process/window-management logic for the CAMA Tools launcher
+    boundary, covering three related responsibilities:
 
-    TASK A -- Single-instance enforcement + duplicate-launch dialog.
-        A second launch of CAMA-Tools.exe, while a first instance is
-        still running, must not create a second session. Instead it
-        raises the existing Global Mapper window then the existing CAMA
-        panel above it (both disabled for input), shows a small
-        "CAMA Tools is already running" dialog, and exits once the
-        dialog is dismissed -- either by the user clicking OK, or
-        automatically if the first instance is detected to have died
-        while the dialog was still showing.
+    Single-instance enforcement and the duplicate-launch dialog. A
+    second launch of CAMA-Tools.exe, while a first instance is still
+    running, must not create a second session. Instead it raises the
+    existing Global Mapper window then the existing CAMA panel above it
+    (both disabled for input), shows a small "CAMA Tools is already
+    running" dialog, and exits once the dialog is dismissed -- either by
+    the user clicking OK, or automatically if the first instance is
+    detected to have died while the dialog was still showing.
 
-    TASK B -- Global Mapper window identification fix.
-        launch_global_mapper()/wait_for_global_mapper() in MAIN.py
-        currently lock onto the first "Global Mapper Pro"-titled window
-        found, with no way to distinguish CAMA's own just-launched GM
-        instance from a pre-existing, unrelated GM window. This module
-        provides the candidate-identification logic (PID match,
-        authoritative; HWND-snapshot-diff, fallback; never an arbitrary
-        guess) -- MAIN.py's wait_for_global_mapper() calls into it but
-        keeps its own polling/stability loop unchanged.
+    Global Mapper window identification. launch_global_mapper()/
+    wait_for_global_mapper() in MAIN.py used to lock onto the first
+    "Global Mapper Pro"-titled window found, with no way to distinguish
+    CAMA's own just-launched GM instance from a pre-existing, unrelated
+    GM window. This module provides the candidate-identification logic
+    (PID match, authoritative; HWND-snapshot-diff, fallback; never an
+    arbitrary guess) -- MAIN.py's wait_for_global_mapper() calls into it
+    but keeps its own polling/stability loop unchanged.
 
-    TASK C -- Topmost re-pin scope fix.
-        MAIN.py's periodic topmost re-pin currently fires whenever ANY
-        "relevant" window has focus (GM, CAMA itself, or any CAMA tool
-        subprocess), which pushes transient popups (a file dialog's own
-        dropdowns, an Explorer context menu) behind CAMA even when GM
-        had nothing to do with that moment. This module provides a
-        narrower, pure predicate -- should_repin_topmost() -- for
-        MAIN.py's periodic re-pin call sites to use INSTEAD of the
-        broader is_relevant_window_focused() check, for that one
-        decision only.
+    Topmost re-pin scope. MAIN.py's periodic topmost re-pin used to fire
+    whenever ANY "relevant" window had focus (GM, CAMA itself, or any
+    CAMA tool subprocess), which pushed transient popups (a file
+    dialog's own dropdowns, an Explorer context menu) behind CAMA even
+    when GM had nothing to do with that moment. This module provides a
+    narrower, pure predicate -- should_repin_topmost() -- for MAIN.py's
+    periodic re-pin call sites to use INSTEAD of the broader
+    is_relevant_window_focused() check, for that one decision only.
 
-NOT this module's responsibility (per the approved module boundary --
-stays in MAIN.py, unmodified by this task):
+NOT this module's responsibility (stays in MAIN.py, unmodified):
     is_relevant_window_focused(), get_foreground_hwnd(),
     get_foreground_pid(), _locked_gm_snapshot(), _extract_hwnd(),
     monitor_gm_closure(), the gm_moved follow/reposition logic,
@@ -51,7 +46,8 @@ DEPENDENCIES:
     stdlib only: ctypes, ctypes.wintypes, os, sys, json, tempfile, time,
     tkinter. No new pip package introduced (see Instructions Section D).
 
-CROSS-PROCESS STATE MECHANISM (Task A <-> Task B bridge):
+CROSS-PROCESS STATE MECHANISM (bridging the duplicate-launch dialog and
+Global Mapper identification):
     _locked_gm_hwnd[0]/_locked_gm_pid[0] in MAIN.py are plain Python
     list globals living in the first instance's own process memory -- a
     second, separate OS process cannot read them directly. This module
@@ -65,7 +61,7 @@ CROSS-PROCESS STATE MECHANISM (Task A <-> Task B bridge):
 
     Written ONLY by the first instance (write_session_state()), ONLY
     after wait_for_global_mapper() has already verified and locked a
-    real candidate (Task B) -- never a guess. Written via a temp-file +
+    real candidate -- never a guess. Written via a temp-file +
     os.replace() atomic swap so a concurrently-launched duplicate-launch
     instance can never observe a partially-written file.
 
@@ -138,85 +134,6 @@ CLEANUP / RESTORE GUARANTEES:
       the FIRST_INSTANCE_PID process handle, and the dialog-guard mutex
       handle, in that order, regardless of which path (OK-click, stale-
       detection, or an exception) got there.
-
-KNOWN MACHINE-DEPENDENT BEHAVIOR THAT STILL REQUIRES ON-MACHINE TESTING
-(cannot be confirmed by static code reading alone -- see Instructions
-Section G.4):
-    1. Task B's own documented limitation (restated, unchanged): whether
-       Global Mapper's launched-process PID matches its eventual main
-       window's owning PID 1:1, or whether GM reuses an existing
-       process/window in some configurations.
-    2. RESOLVED (was open, now confirmed on-machine): the dialog's
-       z-order mechanism originally included GWLP_HWNDPARENT ownership
-       of cama_hwnd alongside HWND_TOPMOST. On-machine testing confirmed
-       this as the cause of the dialog being excluded from Alt+Tab --
-       Windows' task-switch list deliberately omits owned windows
-       (documented Win32 behavior). Ownership was removed; the dialog is
-       now HWND_TOPMOST-pinned (_set_topmost()) plus explicitly
-       activated (_bring_to_foreground()) as a fully independent
-       top-level window, and IS Alt+Tab visible. The dialog's z-order
-       precedence for its full lifetime against the first instance's own
-       periodic topmost re-pin loop (monitor_gm_state(), still running
-       in the first instance's process, unaffected by this module)
-       remains a residual, unresolved risk -- Task C's narrowing
-       (should_repin_topmost() firing only when GM itself has focus)
-       reduces the collision window but does not eliminate it, since a
-       user could refocus GM or CAMA while the dialog is up. Resolving
-       it further would require MAIN.py changes, out of scope for this
-       file.
-    3. RESOLVED (was open, investigated via added diagnostic logging,
-       now understood -- see _try_set_foreground()'s [fg-diag] print()
-       instrumentation, still present in the code as of this writing for
-       one confirming retest): initial _bring_to_foreground() reports
-       showed inconsistent-seeming success across on-machine duplicate-
-       launch tests, narrowed to the dialog appearing not to be
-       foreground specifically at the native file-picker ("Select Global
-       Mapper Workspace File") stage. Direct Win32 measurement
-       (GetForegroundWindow(), checked at 0ms/10ms/50ms/100ms after each
-       SetForegroundWindow() call, plus the state at the start of the
-       subsequent 500ms deferred pass) showed the dialog's own HWND WAS
-       genuinely the foreground window at every checkpoint, with no
-       steal-back and no delay. There was no foreground-lock failure, no
-       evidence the earlier ALT-key fallback was ever actually needed,
-       and no evidence that Tk's mainloop() timing was the problem --
-       those were reasonable hypotheses at the time, but the diagnostic
-       data does not support them as the explanation here.
-       What the logging DID surface: the first-instance CAMA main window
-       and this dialog were BOTH titled "CAMA Tools" (MAIN.py sets the
-       former; this dialog previously set the same string via
-       top.title()) -- two different HWNDs, same title, both visible in
-       Alt+Tab. The technically accurate conclusion is: the Win32
-       diagnostics confirm the duplicate-launch dialog was actually
-       becoming and remaining the foreground window; the earlier visual
-       observation was ambiguous because two different windows shared an
-       identical title, not because of a confirmed Windows/Alt+Tab
-       display defect. The dialog's title was changed to "CAMA Tools -
-       Already Running" (cosmetic only -- no z-order, ownership, mutex,
-       or foreground-activation logic changed) so the two windows are
-       distinguishable in Alt+Tab going forward. The single bounded
-       ALT-key fallback in _bring_to_foreground() (keybd_event(VK_MENU,
-       ...) + one retry, if the first attempt is denied) and the
-       deferred 50ms/500ms scheduling of the activation call both remain
-       in place as harmless, already-bounded (non-looping) mechanisms,
-       even though the diagnostic evidence suggests neither was actually
-       the fix for what was observed -- removing them is not necessary,
-       but no further foreground-activation mechanisms should be added
-       on top of this without new evidence.
-    4. The narrow OpenProcess(first_instance_pid) failure race (window
-       still found via FindWindowW, but the owning process has already
-       exited by the time OpenProcess runs): this module's chosen policy
-       -- still perform the normal raise/disable/dialog sequence, but
-       skip the auto-liveness poll (dialog then closes only via user
-       OK-click) -- is a judgment call (category (c) per Section G.4),
-       not a documented Win32 contract, and should be exercised on a
-       real machine if feasible (e.g. via a scripted near-simultaneous
-       kill).
-    5. Whether SeCreateGlobalPrivilege is actually available to the
-       interactive user on all target deployment machines (required for
-       the Global\\ mutex namespace) -- expected to be true for normal,
-       non-hardened desktop/workstation Windows per the confirmed
-       deployment model, but not independently re-verified against any
-       specific target machine's Group Policy here.
 """
 
 import ctypes
@@ -236,6 +153,7 @@ from tkinter import messagebox
 ERROR_ALREADY_EXISTS = 183
 
 SYNCHRONIZE = 0x00100000
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
 WAIT_OBJECT_0 = 0x00000000
 WAIT_ABANDONED = 0x00000080
@@ -274,6 +192,17 @@ DIALOG_GUARD_MUTEX_NAME = r"Global\CAMA_Tools_DuplicateDialog_Mutex"
 # already-working pattern, not a new risk.
 CAMA_WINDOW_TITLE = "CAMA Tools"
 
+# Owning-process verification for a CAMA_WINDOW_TITLE match (see
+# _find_cama_hwnd_with_retry()): a bare exact-title match is NOT
+# restricted to CAMA Tools itself -- an on-machine testing session
+# raised the real edge case that any other window with this exact title
+# (e.g. a browser tab or chat app window renamed to "CAMA Tools") would
+# otherwise be trusted and acted on. A title match is only trusted if
+# its owning process's executable name (case-insensitive) is one of
+# these -- CAMA-Tools.exe (frozen/production build) or python.exe /
+# pythonw.exe (dev-mode `python MAIN.py`).
+EXPECTED_CAMA_PROCESS_NAMES = {"cama-tools.exe", "python.exe", "pythonw.exe"}
+
 # Substring used only by this module's OWN raw EnumWindows scan
 # (snapshot_gm_hwnds()) -- this module does not import pygetwindow.
 GM_WINDOW_TITLE_SUBSTRING = "Global Mapper Pro"
@@ -303,6 +232,10 @@ _kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCW
 _kernel32.CreateMutexW.restype = wintypes.HANDLE
 _kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
 _kernel32.OpenProcess.restype = wintypes.HANDLE
+_kernel32.QueryFullProcessImageNameW.argtypes = [
+    wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)
+]
+_kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
 _kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
 _kernel32.WaitForSingleObject.restype = wintypes.DWORD
 _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
@@ -353,6 +286,34 @@ def _get_window_pid(hwnd):
     pid = wintypes.DWORD()
     _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
     return pid.value
+
+
+def _get_process_image_name(pid):
+    """
+    Best-effort lookup of the executable FILENAME (not full path) owning
+    `pid`, via OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) +
+    QueryFullProcessImageNameW -- both documented Win32 APIs (available
+    since Vista), not the PEB-reading/command-line-inspection approach
+    that would be needed for a stronger check. Returns "" on any failure
+    (invalid pid, access denied, process already gone) -- never raises.
+
+    Used only to verify that a CAMA_WINDOW_TITLE match is actually owned
+    by a CAMA Tools process -- see _find_cama_hwnd_with_retry() and
+    EXPECTED_CAMA_PROCESS_NAMES.
+    """
+    handle = _kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(260)
+        size = wintypes.DWORD(260)
+        if not _kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+            return ""
+        return os.path.basename(buf.value)
+    except Exception:
+        return ""
+    finally:
+        _kernel32.CloseHandle(handle)
 
 
 def _get_window_title(hwnd):
@@ -815,15 +776,37 @@ def _find_cama_hwnd_with_retry(timeout_ms=CAMA_HWND_RETRY_TIMEOUT_MS,
     launch arriving in that narrow window would see ERROR_ALREADY_EXISTS
     but find no CAMA HWND yet.
 
+    VERIFICATION (edge case found during on-machine testing): a bare
+    exact-title match on CAMA_WINDOW_TITLE is NOT restricted to CAMA
+    Tools itself -- ANY window on the desktop with that exact title (a
+    browser tab or chat-app window renamed to "CAMA Tools", for example)
+    would otherwise be trusted and acted on -- raised, disabled, etc.
+    Each title match is additionally verified via
+    _get_process_image_name(): its owning process's executable name
+    (case-insensitive) must be in EXPECTED_CAMA_PROCESS_NAMES. A title
+    match whose owning process fails this check is treated exactly like
+    "not found yet" -- polling continues, never trusted. This narrows
+    the false-positive window from "any app, any exact title match" down
+    to "a python.exe/pythonw.exe/CAMA-Tools.exe process specifically,
+    with that exact title" -- a residual, accepted risk, not eliminated
+    further here (verifying the actual command line/script path would
+    require more invasive, less-documented APIs than are used elsewhere
+    in this module).
+
     Polls every interval_ms up to a total of timeout_ms; returns the
-    HWND (int) as soon as found, or None if the timeout elapses first.
-    Never guesses another window as a substitute.
+    HWND (int) as soon as a VERIFIED match is found, or None if the
+    timeout elapses first. Never guesses another window as a substitute.
     """
     elapsed = 0
     while elapsed <= timeout_ms:
         hwnd = _find_window(CAMA_WINDOW_TITLE)
         if hwnd:
-            return hwnd
+            pid = _get_window_pid(hwnd)
+            image_name = _get_process_image_name(pid).lower()
+            if image_name in EXPECTED_CAMA_PROCESS_NAMES:
+                return hwnd
+            # Title matched but the owning process is not a recognized
+            # CAMA Tools process -- do not trust it.
         time.sleep(interval_ms / 1000.0)
         elapsed += interval_ms
     return None
