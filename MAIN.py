@@ -138,6 +138,16 @@ from PIL import Image, ImageTk, ImageDraw
 
 from utils_paths import resource_path
 
+from core.window_management import (
+    acquire_singleton,
+    release_singleton,
+    snapshot_gm_hwnds,
+    identify_gm_candidate,
+    write_session_state,
+    cleanup_session_state,
+    should_repin_topmost,
+)
+
 # ========================================
 # ICON HELPERS
 # ========================================
@@ -376,6 +386,46 @@ def dispatch_tool_if_requested():
 # never continues past this line in that case (see module docstring
 # SIDE EFFECTS for the full explanation).
 IS_TOOL_RUN = dispatch_tool_if_requested()
+
+
+# ========================================
+# SINGLE-INSTANCE ENFORCEMENT (Task A)
+# ========================================
+# Must run here: dispatch_tool_if_requested() has already returned
+# (--tool subprocess dispatches exit from INSIDE that call and never
+# reach this line -- see the comment above its call site), and nothing
+# GUI/file/credential-dependent below this point has run yet (ICONS_DIR
+# is just a path string, not a prompt; root = tk.Tk() is still several
+# lines below). acquire_singleton() never returns for a duplicate
+# launch -- it calls sys.exit(0) itself once the "already running"
+# dialog is dismissed. See core/window_management.py's module docstring
+# for the full mutex semantics, fail-closed policy, and cross-process
+# session-state mechanism this depends on.
+acquire_singleton(TEMP_DIR)
+
+def _release_singleton_on_exit():
+    """
+    atexit hook (atexit already imported at module top, previously
+    unused -- see module docstring DEPENDENCIES) -- explicit cleanup for
+    the Task B session-state file and the singleton mutex handle on
+    normal shutdown. Not required for crash cleanup (the OS releases the
+    mutex handle automatically on process termination, including a
+    crash), but a clean, intentional shutdown should not rely on that
+    fallback alone.
+
+    Order matters: clear the session-state file (this session's GM
+    identity record) BEFORE releasing the singleton mutex, so a brand
+    new first instance can never observe a session-state file describing
+    a session that is (or is about to be) gone. Session-state validation
+    in core.window_management.read_and_validate_session_state() already
+    rejects a stale first_instance_pid regardless of ordering, but
+    clearing it first here is the more correct sequencing in principle,
+    not just defense-in-depth.
+    """
+    cleanup_session_state(TEMP_DIR)
+    release_singleton()
+
+atexit.register(_release_singleton_on_exit)
 
 
 # Define where icons are located (works both in dev and PyInstaller .exe)
@@ -4130,8 +4180,14 @@ def launch_main_window():
 
     # Force Z-order above GM immediately after showing
     def _force_z_order():
+        # Task C fix: only re-pin topmost when Global Mapper itself
+        # currently has the foreground -- narrower than the previous
+        # unconditional re-pin. is_relevant_window_focused() is NOT used
+        # here (it stays reserved for the separate withdraw/show
+        # decision in monitor_gm_state(), unchanged). See
+        # should_repin_topmost() in core/window_management.py.
         cama_hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
-        if cama_hwnd:
+        if cama_hwnd and should_repin_topmost(get_foreground_pid(), _locked_gm_pid[0]):
             ctypes.windll.user32.SetWindowPos(
                 cama_hwnd, HWND_TOPMOST,
                 0, 0, 0, 0,
@@ -4221,7 +4277,20 @@ def launch_global_mapper():
     except Exception as e:
         print(f"⚠ Could not patch .gmw file: {e} — launching with original")
 
-    subprocess.Popen([GM_EXE_PATH, patched_path], shell=False)
+    # Task B fix: snapshot existing "Global Mapper Pro" windows BEFORE
+    # launching, and capture the launched process's own PID -- both feed
+    # identify_gm_candidate() below via wait_for_global_mapper(), so it
+    # can distinguish the window THIS session just launched from any
+    # pre-existing, unrelated Global Mapper window. launch_global_
+    # mapper() is called exactly once per CAMA process lifetime (its
+    # only call site is try_connect() inside show_login_and_connect(),
+    # which destroys the login window immediately before calling this --
+    # there is no path back to the login dialog after a successful
+    # connect), so _gm_stable_count[0]/_gm_stable_hwnd[0] never need a
+    # reset here.
+    _gm_existing_hwnds[0] = snapshot_gm_hwnds()
+    _gm_proc = subprocess.Popen([GM_EXE_PATH, patched_path], shell=False)
+    _gm_launch_pid[0] = _gm_proc.pid
     wait_for_global_mapper()
 
 # ========================================
@@ -4283,13 +4352,24 @@ def monitor_gm_state():
                         _topmost_recheck_counter[0] += 1
                         if _topmost_recheck_counter[0] >= 10:  # ~every 2s instead of every 200ms
                             _topmost_recheck_counter[0] = 0
-                            ctypes.windll.user32.SetWindowPos(
-                                cama_hwnd, HWND_TOPMOST,
-                                0, 0, 0, 0,
-                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
-                            )
-                            # Z-order fix: see _repin_active_tooltips().
-                            _repin_active_tooltips()
+                            # Task C fix: only re-pin topmost when Global
+                            # Mapper itself currently has the foreground --
+                            # narrower than is_relevant_window_focused()
+                            # (which still gates the withdraw/show decision
+                            # above, unchanged). The throttle counter still
+                            # resets every cycle either way, preserving the
+                            # existing ~2s cadence -- only the SetWindowPos
+                            # call itself becomes conditional. See
+                            # should_repin_topmost() in
+                            # core/window_management.py.
+                            if should_repin_topmost(get_foreground_pid(), _locked_gm_pid[0]):
+                                ctypes.windll.user32.SetWindowPos(
+                                    cama_hwnd, HWND_TOPMOST,
+                                    0, 0, 0, 0,
+                                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+                                )
+                                # Z-order fix: see _repin_active_tooltips().
+                                _repin_active_tooltips()
 
                 # --- Follow GM when it moves ---
                 gm_moved = (
@@ -4345,37 +4425,91 @@ def monitor_gm_closure():
         root.after(2000, monitor_gm_closure)
 
 
-_gm_stable_count = [0]  # needs to be visible twice before we consider it ready
+_gm_launch_pid = [None]       # PID captured from subprocess.Popen(...).pid this session (see launch_global_mapper())
+_gm_existing_hwnds = [set()]  # pre-launch GM-titled HWND snapshot, captured before Popen (see launch_global_mapper())
+_gm_stable_count = [0]        # needs to be visible twice before we consider it ready
+_gm_stable_hwnd = [None]      # the specific candidate HWND being stability-checked -- resets if the candidate itself changes between polls
 
 def wait_for_global_mapper():
     """
-    Polls (self-reschedules via root.after()) until a visible, non-
-    minimized, real-sized Global Mapper window is found, then proceeds
-    to launch_main_window() -- the handoff point between "Global
-    Mapper is starting up" and "the CAMA Tools panel can now be shown
-    and positioned relative to it."
+    Polls (self-reschedules via root.after()) until a Task-B-verified
+    Global Mapper candidate window is confirmed visible, non-minimized,
+    and real-sized for 2 consecutive polls, then proceeds to
+    launch_main_window() -- the handoff point between "Global Mapper is
+    starting up" and "the CAMA Tools panel can now be shown and
+    positioned relative to it." Same unchanged handoff sequence
+    (launch_main_window() / monitor_gm_state() / monitor_gm_closure())
+    as before this task.
+
+    Task B fix: identify_gm_candidate() (core/window_management.py) runs
+    first each poll, using the launch PID / pre-launch snapshot captured
+    by launch_global_mapper(), so the title-match ambiguity that used to
+    lock onto gm_windows[0] unconditionally -- which could be a
+    pre-existing, unrelated Global Mapper window -- can no longer
+    happen. If neither the PID-match nor the snapshot-diff signal
+    identifies a single candidate this poll, nothing is locked and
+    polling simply continues, bounded by the same 1s reschedule as
+    always.
+
+    The visible/non-minimized/real-size readiness check is now done via
+    raw ctypes directly against the specific verified candidate HWND
+    (same style as _locked_gm_snapshot()'s proven pattern elsewhere in
+    this file), since the candidate here is a raw HWND int rather than a
+    pygetwindow Win32Window object -- pygetwindow itself is untouched
+    and remains in use elsewhere in this file.
     """
-    gm_windows = [w for w in gw.getWindowsWithTitle('Global Mapper Pro') if w.visible]
-    # Require GM window to be visible AND non-minimized AND have a real size
-    ready = (
-        gm_windows and
-        not gm_windows[0].isMinimized and
-        gm_windows[0].width > 100 and
-        gm_windows[0].height > 100
+    candidate_hwnds = snapshot_gm_hwnds()
+    candidate = identify_gm_candidate(
+        candidate_hwnds, _gm_launch_pid[0], _gm_existing_hwnds[0]
     )
+
+    # 2-consecutive-poll stability must be against the SAME candidate,
+    # not just "some candidate, twice" -- restart the count if the
+    # identified candidate changed since the previous poll.
+    if candidate != _gm_stable_hwnd[0]:
+        _gm_stable_hwnd[0] = candidate
+        _gm_stable_count[0] = 0
+
+    ready = False
+    if candidate:
+        r = ctypes.wintypes.RECT()
+        got_rect = bool(ctypes.windll.user32.GetWindowRect(candidate, ctypes.byref(r)))
+        visible = bool(ctypes.windll.user32.IsWindowVisible(candidate))
+        minimized = bool(ctypes.windll.user32.IsIconic(candidate))
+        width = (r.right - r.left) if got_rect else 0
+        height = (r.bottom - r.top) if got_rect else 0
+        # Same visible/non-minimized/real-size requirement as before,
+        # now evaluated against the specific verified candidate.
+        ready = got_rect and visible and not minimized and width > 100 and height > 100
+
     if ready:
         _gm_stable_count[0] += 1
         if _gm_stable_count[0] >= 2:      # stable for 2 consecutive checks (2s)
-            # Lock onto the exact Win32Window instance pygetwindow just
-            # confirmed as ready — not a fresh title lookup. This is
-            # the single point where the session-wide lock is set; see
-            # _locked_gm_hwnd for why every other GM-window consumer
-            # below reads this instead of searching by title again.
-            _locked_gm_hwnd[0] = _extract_hwnd(gm_windows[0])
+            # Lock onto the verified candidate HWND -- not gm_windows[0],
+            # not a fresh title lookup. This is the single point where
+            # the session-wide lock is set; see _locked_gm_hwnd for why
+            # every other GM-window consumer below reads this instead of
+            # searching by title again.
+            _locked_gm_hwnd[0] = candidate
             _pid_buf = ctypes.wintypes.DWORD()
-            ctypes.windll.user32.GetWindowThreadProcessId(_locked_gm_hwnd[0], ctypes.byref(_pid_buf))
+            _tid = ctypes.windll.user32.GetWindowThreadProcessId(_locked_gm_hwnd[0], ctypes.byref(_pid_buf))
             _locked_gm_pid[0] = _pid_buf.value
             _log(f"Global Mapper is fully open. Locked HWND: {_locked_gm_hwnd[0]} | Locked PID: {_locked_gm_pid[0]}")
+
+            # Task A/B bridge: publish the verified lock to the
+            # cross-process session-state file so a duplicate-launch
+            # instance can find and raise/disable the correct Global
+            # Mapper window instead of guessing -- but ONLY if
+            # GetWindowThreadProcessId() actually succeeded (non-zero
+            # thread ID AND non-zero PID). Never write a state file
+            # containing an unverified/zero PID -- _locked_gm_pid[0]
+            # itself is left as-is either way (its other, unrelated
+            # consumers -- is_relevant_window_focused(),
+            # monitor_gm_closure(), etc. -- are unchanged, out of this
+            # task's scope).
+            if _tid and _locked_gm_pid[0]:
+                write_session_state(TEMP_DIR, os.getpid(), _locked_gm_hwnd[0], _locked_gm_pid[0])
+
             launch_main_window()
             monitor_gm_state()
             monitor_gm_closure()
