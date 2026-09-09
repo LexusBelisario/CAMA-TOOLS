@@ -3954,7 +3954,7 @@ button_frame.pack(padx=8, pady=(6, 6))
 # === Tooltip descriptions for icon buttons ===
 tooltip_descriptions = {
     "INFLUENCE MAP TO LAND PARCEL": "Influence Map to Land Parcel",
-    "INFLUENCE MAP DISTANCE TO LAND PARCEL": "Distance to nearest Fault Line",
+    "INFLUENCE MAP DISTANCE TO LAND PARCEL": "Distance to nearest Influence Map",
     "ROAD WIDTH": "Measure average road width",
     "ROAD FRONTAGE & DEPTH-TO-WIDTH RATIO": "Analyze parcel depth and frontage",
     "LOT LOCATION": "Classify lots based on proximity",
