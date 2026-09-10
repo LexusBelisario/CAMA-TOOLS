@@ -1826,6 +1826,27 @@ def update_database_from_geopackage():
         # To support a future shapefile schema with its own identifier
         # column (e.g. BUILDING_ID, LOT_ID), add one line here — no other
         # code in this function needs to change.
+        #
+        # "ud_id" DELIBERATELY LAST: a table that already went through
+        # this function once (and had no real candidate, so got a
+        # surrogate ud_id promoted to PRIMARY KEY) will carry that ud_id
+        # column back in if its data ever round-trips out to Global
+        # Mapper (via Update Map) and back in here again (via Update
+        # Database) — at that point ud_id is present in the incoming
+        # data like any other ordinary column, not yet a PRIMARY KEY on
+        # THIS staging table. Listing it last means: a genuine business
+        # identifier, if one is present THIS time, still wins first (matches
+        # the original design intent — ud_id is a last-resort fallback,
+        # never preferred over a real identifier); but if none is
+        # present (the common case for a table that never had one to
+        # begin with), the loop reaches "ud_id" before falling through
+        # to the surrogate-creation block below, finds it already
+        # unique/non-null (as it almost always will be, since it
+        # originated as a SERIAL column), and promotes it directly --
+        # instead of hitting a DuplicateColumn error trying to add a
+        # second one. This is what the "already exists" errors traced
+        # back to (Update Database run against layer data that had
+        # already round-tripped through Update Map at least once).
         PK_CANDIDATES = [
             "id",
             "pin",
@@ -1836,6 +1857,7 @@ def update_database_from_geopackage():
             "gid",
             "objectid",
             "fid",
+            "ud_id",
         ]
 
         for layer in layers:
@@ -1905,120 +1927,177 @@ def update_database_from_geopackage():
             staging_name = f"{target_name}_staging"
             backup_name  = f"{target_name}_backup"
 
-            # Step C: Write new data to staging table.
-            # The existing target table is completely untouched at this point.
-            # if_exists="replace" handles orphaned staging tables from a
-            # previous interrupted run — idempotent on retry.
-            print(f"  Writing to staging: {staging_name}")
-            gdf.to_postgis(
-                name=staging_name,
-                con=engine,
-                schema=DB_SCHEMA,
-                if_exists="replace",
-                index=False,
-                dtype=dtype
-            )
-
-            # Step D: Validate staging table.
-            #
-            # Hard requirements (abort if either fails):
-            #   1. Staging table exists in information_schema — confirms
-            #      to_postgis completed and PostgreSQL registered the table.
-            #   2. Geometry column "geom" exists in staging — confirms the
-            #      spatial data was written, not just attribute columns.
-            #      A missing geometry column means a non-spatial layer was
-            #      matched against a spatial target (wrong layer mapping).
-            #
-            # Soft warnings (user confirms, does not abort):
-            #   - Zero rows: may be intentional (user cleared a layer) but
-            #     unusual enough to require explicit confirmation.
-            #   - Geometry type mismatch: common due to GM export promotions
-            #     (Polygon → MultiPolygon), shown as informational warning only.
-
-            cursor.execute(
-                """
-                SELECT column_name, udt_name
-                FROM information_schema.columns
-                WHERE table_schema = %s AND table_name = %s;
-                """,
-                (DB_SCHEMA, staging_name)
-            )
-            staging_columns = {row[0]: row[1] for row in cursor.fetchall()}
-
-            # Hard requirement 1: staging table must exist.
-            if not staging_columns:
-                raise RuntimeError(
-                    f"Staging table '{staging_name}' was not found in the database "
-                    f"after import. The write may have failed silently."
+            try:
+                # Step C: Write new data to staging table.
+                # The existing target table is completely untouched at this point.
+                # if_exists="replace" handles orphaned staging tables from a
+                # previous interrupted run — idempotent on retry.
+                print(f"  Writing to staging: {staging_name}")
+                gdf.to_postgis(
+                    name=staging_name,
+                    con=engine,
+                    schema=DB_SCHEMA,
+                    if_exists="replace",
+                    index=False,
+                    dtype=dtype
                 )
 
-            # Hard requirement 2: geometry column must be present.
-            # Missing geometry column indicates a non-spatial layer was
-            # matched to a spatial target — high probability of wrong mapping.
-            if "geom" not in staging_columns:
-                cursor.execute(f'DROP TABLE IF EXISTS "{DB_SCHEMA}"."{staging_name}" CASCADE;')
-                conn.connection.commit()
-                raise RuntimeError(
-                    f"Staging table '{staging_name}' has no geometry column. "
-                    f"The incoming layer '{layer}' may be non-spatial or incorrectly matched. "
-                    f"Staging table has been dropped. Existing table '{target_name}' is untouched."
-                )
+                # Step D: Validate staging table.
+                #
+                # Hard requirements (abort if either fails):
+                #   1. Staging table exists in information_schema — confirms
+                #      to_postgis completed and PostgreSQL registered the table.
+                #   2. Geometry column "geom" exists in staging — confirms the
+                #      spatial data was written, not just attribute columns.
+                #      A missing geometry column means a non-spatial layer was
+                #      matched against a spatial target (wrong layer mapping).
+                #
+                # Soft warnings (user confirms, does not abort):
+                #   - Zero rows: may be intentional (user cleared a layer) but
+                #     unusual enough to require explicit confirmation.
+                #   - Geometry type mismatch: common due to GM export promotions
+                #     (Polygon → MultiPolygon), shown as informational warning only.
 
-            # Step D.5: Primary key resolution.
-            #
-            # Walk PK_CANDIDATES in order (case-insensitive match against
-            # staging_columns). For each candidate present in the table,
-            # verify it has zero NULLs and zero duplicate values across
-            # ALL rows (not just non-null ones) — a candidate is only
-            # usable if every row has a distinct, non-null value. The
-            # first candidate that qualifies is promoted to PRIMARY KEY
-            # via ALTER TABLE (no data is modified, altered, or dropped —
-            # the column is used exactly as the source data provided it).
-            #
-            # If no candidate qualifies (none present, or all present
-            # candidates have NULLs/duplicates), a surrogate ud_id SERIAL
-            # PRIMARY KEY column is added instead. The original candidate
-            # column(s), if any, are left completely untouched — e.g. a
-            # duplicate 'pin' value is never modified, deleted, or forced
-            # into uniqueness; ud_id exists alongside it as the table's
-            # stable row identity.
-            pk_chosen = None
-            for candidate in PK_CANDIDATES:
-                # staging_columns keys are already lowercase (from the
-                # earlier information_schema.columns query), and gdf
-                # columns were lowercased in Step A, so a direct lowercase
-                # comparison is sufficient here.
-                if candidate not in staging_columns:
-                    continue
                 cursor.execute(
-                    f'SELECT COUNT(*), COUNT("{candidate}"), COUNT(DISTINCT "{candidate}") '
-                    f'FROM "{DB_SCHEMA}"."{staging_name}";'
+                    """
+                    SELECT column_name, udt_name
+                    FROM information_schema.columns
+                    WHERE table_schema = %s AND table_name = %s;
+                    """,
+                    (DB_SCHEMA, staging_name)
                 )
-                total, non_null, distinct = cursor.fetchone()
-                null_count = total - non_null
-                dup_count = non_null - distinct
-                if null_count == 0 and dup_count == 0:
+                staging_columns = {row[0]: row[1] for row in cursor.fetchall()}
+
+                # Hard requirement 1: staging table must exist.
+                if not staging_columns:
+                    raise RuntimeError(
+                        f"Staging table '{staging_name}' was not found in the database "
+                        f"after import. The write may have failed silently."
+                    )
+
+                # Hard requirement 2: geometry column must be present.
+                # Missing geometry column indicates a non-spatial layer was
+                # matched to a spatial target — high probability of wrong mapping.
+                if "geom" not in staging_columns:
+                    cursor.execute(f'DROP TABLE IF EXISTS "{DB_SCHEMA}"."{staging_name}" CASCADE;')
+                    conn.connection.commit()
+                    raise RuntimeError(
+                        f"Staging table '{staging_name}' has no geometry column. "
+                        f"The incoming layer '{layer}' may be non-spatial or incorrectly matched. "
+                        f"Staging table has been dropped. Existing table '{target_name}' is untouched."
+                    )
+
+                # Step D.5: Primary key resolution.
+                #
+                # Walk PK_CANDIDATES in order (case-insensitive match against
+                # staging_columns). For each candidate present in the table,
+                # verify it has zero NULLs and zero duplicate values across
+                # ALL rows (not just non-null ones) — a candidate is only
+                # usable if every row has a distinct, non-null value. The
+                # first candidate that qualifies is promoted to PRIMARY KEY
+                # via ALTER TABLE (no data is modified, altered, or dropped —
+                # the column is used exactly as the source data provided it).
+                #
+                # If no candidate qualifies (none present, or all present
+                # candidates have NULLs/duplicates), a surrogate ud_id SERIAL
+                # PRIMARY KEY column is added instead. The original candidate
+                # column(s), if any, are left completely untouched — e.g. a
+                # duplicate 'pin' value is never modified, deleted, or forced
+                # into uniqueness; ud_id exists alongside it as the table's
+                # stable row identity.
+                pk_chosen = None
+                for candidate in PK_CANDIDATES:
+                    # staging_columns keys are already lowercase (from the
+                    # earlier information_schema.columns query), and gdf
+                    # columns were lowercased in Step A, so a direct lowercase
+                    # comparison is sufficient here.
+                    if candidate not in staging_columns:
+                        continue
+                    cursor.execute(
+                        f'SELECT COUNT(*), COUNT("{candidate}"), COUNT(DISTINCT "{candidate}") '
+                        f'FROM "{DB_SCHEMA}"."{staging_name}";'
+                    )
+                    total, non_null, distinct = cursor.fetchone()
+                    null_count = total - non_null
+                    dup_count = non_null - distinct
+                    if null_count == 0 and dup_count == 0:
+                        cursor.execute(
+                            f'ALTER TABLE "{DB_SCHEMA}"."{staging_name}" '
+                            f'ADD PRIMARY KEY ("{candidate}");'
+                        )
+                        conn.connection.commit()
+                        pk_chosen = candidate
+                        _log(f"  PK: '{candidate}' promoted to PRIMARY KEY for {staging_name} "
+                             f"(rows={total}, nulls=0, duplicates=0)")
+                        break
+                    else:
+                        _log(f"  PK: candidate '{candidate}' rejected for {staging_name} "
+                             f"(rows={total}, nulls={null_count}, duplicates={dup_count})")
+
+                if pk_chosen is None:
+                    if "ud_id" in staging_columns:
+                        # With "ud_id" now in PK_CANDIDATES above, the only
+                        # way to reach this point with an existing ud_id
+                        # column is that it was already checked and
+                        # REJECTED there (NULLs and/or duplicate values --
+                        # see the "PK: candidate 'ud_id' rejected" log line
+                        # just above). Blindly running ADD COLUMN here would
+                        # fail with an opaque DuplicateColumn error (this is
+                        # the exact failure this guard replaces), so raise
+                        # a specific, actionable error instead. The staging
+                        # table is left in place (not dropped) so it can be
+                        # inspected directly -- matches this function's
+                        # existing pattern of surfacing a precise cause
+                        # rather than a generic catch-all.
+                        raise RuntimeError(
+                            f"Staging table '{staging_name}' already has a "
+                            f"'ud_id' column, but it has NULL and/or duplicate "
+                            f"values, so it cannot be reused or safely "
+                            f"replaced as the primary key automatically. This "
+                            f"usually means the incoming data already went "
+                            f"through Update Map/Update Database before and "
+                            f"its 'ud_id' values were altered afterward. "
+                            f"Please inspect '{DB_SCHEMA}.{staging_name}' "
+                            f"manually before retrying."
+                        )
                     cursor.execute(
                         f'ALTER TABLE "{DB_SCHEMA}"."{staging_name}" '
-                        f'ADD PRIMARY KEY ("{candidate}");'
+                        f'ADD COLUMN ud_id SERIAL PRIMARY KEY;'
                     )
                     conn.connection.commit()
-                    pk_chosen = candidate
-                    _log(f"  PK: '{candidate}' promoted to PRIMARY KEY for {staging_name} "
-                         f"(rows={total}, nulls=0, duplicates=0)")
-                    break
-                else:
-                    _log(f"  PK: candidate '{candidate}' rejected for {staging_name} "
-                         f"(rows={total}, nulls={null_count}, duplicates={dup_count})")
-
-            if pk_chosen is None:
-                cursor.execute(
-                    f'ALTER TABLE "{DB_SCHEMA}"."{staging_name}" '
-                    f'ADD COLUMN ud_id SERIAL PRIMARY KEY;'
-                )
-                conn.connection.commit()
-                _log(f"  PK: no qualifying candidate found for {staging_name} — "
-                     f"created surrogate 'ud_id' SERIAL PRIMARY KEY")
+                    _log(f"  PK: no qualifying candidate found for {staging_name} — "
+                         f"created surrogate 'ud_id' SERIAL PRIMARY KEY")
+            except Exception as staging_err:
+                # NEW (generalized staging cleanup, requested after the
+                # "ud_id already exists" incident): every failure point
+                # from here through the end of PK resolution used to
+                # clean up staging_name only on an ad-hoc basis -- the
+                # geometry-missing check above already dropped it before
+                # raising, but a raw Postgres error (like the original
+                # DuplicateColumn crash) or the new ud_id-rejected guard
+                # left it behind, exactly matching what showed up as a
+                # leftover 'roadnetwork_staging' table in production.
+                # This wraps the whole write+validate+PK-resolution span
+                # (Steps C through D.5) in one place: on ANY exception
+                # here, drop staging_name for THIS layer before letting
+                # the error propagate to the outer "DB PHASE FAILED"
+                # handler. Idempotent/harmless for paths that already
+                # self-clean (e.g. the geometry check) -- DROP TABLE IF
+                # EXISTS simply finds nothing left there the second time.
+                # The original exception is re-raised unchanged (bare
+                # `raise`), so the error message the user sees is exactly
+                # the same as before -- only the staging cleanup is new.
+                try:
+                    cursor.execute(
+                        f'DROP TABLE IF EXISTS "{DB_SCHEMA}"."{staging_name}" CASCADE;'
+                    )
+                    conn.connection.commit()
+                    _log(f"  cleanup: dropped staging table '{staging_name}' "
+                         f"after failure ({type(staging_err).__name__})")
+                except Exception as cleanup_err:
+                    _log(f"  WARNING: could not clean up staging table "
+                         f"'{staging_name}' after failure: {cleanup_err}")
+                raise
 
             # Soft warning: zero rows.
             cursor.execute(
@@ -3071,6 +3150,20 @@ def update_map_and_select_recorded():
             close_dialog_appeared = False
             try:
                 _dump_windows("before post-load right-click")
+                # NEW: snapshot of all visible window titles right
+                # before the right-click sequence, so that if
+                # "Close Selected Overlays?" doesn't appear below, we
+                # can tell "nothing new appeared at all" apart from
+                # "some OTHER, unexpected window appeared instead" --
+                # previously both cases logged the identical generic
+                # "did not appear within timeout" message, with no way
+                # to distinguish them without manually cross-referencing
+                # the separate _dump_windows() call further down.
+                try:
+                    _before_titles = {t for t in gw.getAllTitles() if t.strip()}
+                except Exception:
+                    _before_titles = set()
+
                 gm_window.minimize(); time.sleep(0.1)
                 gm_window.restore();  time.sleep(0.1)
                 gm_window.activate(); time.sleep(0.1)
@@ -3088,16 +3181,47 @@ def update_map_and_select_recorded():
                 pyautogui.press("enter")
                 _log(f"post-load: down x3 + enter sent | fg='{_fg_title()}'")
 
+                # _wait_and_activate() only returns True (and only then
+                # do we send the confirmation Enter below) if it found
+                # AND activated a window with this EXACT title -- so the
+                # confirmation Enter is never sent to any other,
+                # unrecognized window. This was already true before this
+                # change; kept exactly as-is.
                 close_dialog_appeared = _wait_and_activate("Close Selected Overlays?", timeout=2.0)
                 if close_dialog_appeared:
                     _log("post-load: 'Close Selected Overlays?' dialog appeared "
-                         f"| fg='{_fg_title()}'")
+                         f"and was activated | fg='{_fg_title()}'")
                     pyautogui.press("enter")
                     _log("post-load: 'Close Selected Overlays?' confirmed "
                          f"(auto Yes) | fg='{_fg_title()}'")
                 else:
-                    _log("post-load: WARNING - 'Close Selected Overlays?' dialog "
-                         f"did not appear within timeout | fg='{_fg_title()}'")
+                    # NEW: check whether some OTHER window appeared in
+                    # the meantime (still excluding GM's own main window,
+                    # which is expected to persist/reappear throughout).
+                    # No Enter is sent in either branch below -- this is
+                    # a logging-only distinction, not a new action.
+                    _unexpected_title = None
+                    try:
+                        _after_titles = {t for t in gw.getAllTitles() if t.strip()}
+                        _new_titles = [
+                            t for t in (_after_titles - _before_titles)
+                            if not t.lower().startswith("global mapper")
+                        ]
+                        if _new_titles:
+                            _unexpected_title = _new_titles[0]
+                    except Exception:
+                        pass
+
+                    if _unexpected_title:
+                        _log("post-load: WARNING - 'Close Selected Overlays?' "
+                             "dialog did not appear, but an unexpected window "
+                             f"titled '{_unexpected_title}' did -- the "
+                             "confirmation Enter was NOT sent to it (only the "
+                             "exact 'Close Selected Overlays?' title is ever "
+                             f"confirmed automatically) | fg='{_fg_title()}'")
+                    else:
+                        _log("post-load: WARNING - 'Close Selected Overlays?' dialog "
+                             f"did not appear within timeout | fg='{_fg_title()}'")
                 _dump_windows("after post-load down x3 + enter")
             except Exception as delete_err:
                 _log(f"DELETE-OLD-LAYER PHASE FAILED: {type(delete_err).__name__}: {delete_err}")
@@ -3106,22 +3230,50 @@ def update_map_and_select_recorded():
                 return
 
             if not close_dialog_appeared:
-                # Locked (Section 5): this is its own distinct, reported
-                # failure, not a silent fallthrough to a generic success
-                # message. The new data was loaded, but the old layer's
-                # removal could not be confirmed.
-                _log("Update Map FAILED: 'Close Selected Overlays?' dialog "
-                     "did not appear where expected")
-                messagebox.showerror(
-                    "Update Map Failed - Closing Old Layer",
-                    "Global Mapper did not show the 'Close Selected "
-                    "Overlays?' confirmation after loading the new data. "
-                    "The new data was loaded, but the old layer may not "
-                    "have been closed. Please check Global Mapper's "
-                    "Control Center manually before running Update Map "
-                    "again."
-                )
-                return
+                # CHANGED (was: messagebox.showerror + return, hard
+                # abort). Global Mapper can permanently suppress this
+                # confirmation per-Windows-user via its own "Don't show
+                # this again" tip mechanism (stored in the registry,
+                # HKCU\Software\Global Mapper\TipFlags -- confirmed via
+                # Blue Marble's own support forum; Global Mapper has no
+                # in-app way to reset it, only a manual registry edit).
+                # On any machine where that flag is set, this dialog
+                # will NEVER appear again, no matter how correctly this
+                # automation behaves -- so "dialog didn't appear" is no
+                # longer a reliable signal that the close actually
+                # failed. The down x3 + enter keystrokes already sent
+                # above (lines ~3087-3089) are what actually trigger
+                # the close/delete action in GM's menu; when the
+                # confirmation is suppressed, GM applies its
+                # remembered default answer (normally "Yes")
+                # immediately and silently, without ever opening a
+                # window for _wait_and_activate() to find. In other
+                # words: the old layer was most likely still closed --
+                # only the confirmation window (our one verification
+                # signal for this step) failed to appear.
+                #
+                # This is also the LAST phase before "success +
+                # cleanup" below, and there is no prior state to roll
+                # back to (the new data is already loaded into GM from
+                # the earlier Ctrl+O phase) -- so hard-aborting here
+                # bought no real safety. It only skipped the cleanup
+                # phase below (leaving save_path/new_gpkg_path on disk
+                # and, if the close truly did fail, the superseded
+                # layer sitting unclosed in Control Center with no
+                # record of it) and forced the user to manually re-run.
+                #
+                # New behavior: log the same WARNING as before (kept,
+                # for the log-trail philosophy used throughout this
+                # module), but no longer block. A one-line reminder is
+                # folded into the success dialog below instead, so the
+                # user still gets told to glance at Control Center --
+                # without losing the automatic cleanup or forcing a
+                # dead-end manual re-run for what is very likely a
+                # silent success.
+                _log("Update Map WARNING: 'Close Selected Overlays?' dialog "
+                     "did not appear where expected - the close action was "
+                     "still sent, but could not be confirmed. Continuing "
+                     "(see success dialog reminder).")
 
             # NOTE: no rename step here, by deliberate decision (Phase 1
             # v3 analysis, Section 7) - not an omission. Layer identity
@@ -3153,6 +3305,15 @@ def update_map_and_select_recorded():
                 f"  {layer_name}  \u2192  {table_name}"
                 for layer_name, table_name in matched_pairs
             )
+            # CHANGED (per team lead decision): no user-facing reminder
+            # when the close confirmation didn't appear -- the internal
+            # WARNING log a few lines above (inside the close-old-layer
+            # try block) still records this for later investigation via
+            # cama_automation.log, but the success dialog itself always
+            # shows this same message now, regardless of
+            # close_dialog_appeared. Rationale: the layer's own filename
+            # already identifies it as coming from Update Map, so a
+            # separate note isn't needed for the user to recognize it.
             messagebox.showinfo(
                 "Update Map",
                 "Update Map completed successfully.\n\n"
