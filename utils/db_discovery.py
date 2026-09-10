@@ -79,14 +79,18 @@ PURPOSE:
                                  dialogs
 
 INPUTS:
-    _get_credentials_path(): none.
+    _get_credentials_path() / get_credentials_path(): none.
     load_db_credentials(): none (reads pg_credentials.json from the path
     _get_credentials_path() resolves).
     fetch_tables(schema): schema (str) -- the PostGIS/PostgreSQL schema
     name to list tables from.
 
 OUTPUTS:
-    _get_credentials_path() -> str: absolute path to pg_credentials.json.
+    _get_credentials_path() -> str: absolute path to pg_credentials.json
+    under %APPDATA%\\CAMA-Tools.
+    get_credentials_path() -> str: public wrapper, identical output --
+    the only entry point external modules (e.g. MAIN.py) should use;
+    _get_credentials_path() stays "private" by convention/naming.
     load_db_credentials() -> dict | None: the parsed, validated
     credentials dict (host, port, database, username, password, schema),
     or None if the file is missing, malformed, or missing a required key.
@@ -95,19 +99,24 @@ OUTPUTS:
     connection/query fails.
 
 DEPENDENCIES:
-    os, sys, json, tkinter.messagebox (stdlib). psycopg2 (third-party --
-    PostgreSQL driver).
+    os, sys, json, shutil, tkinter.messagebox (stdlib). psycopg2
+    (third-party -- PostgreSQL driver).
 
 SIDE EFFECTS:
-    Reads pg_credentials.json from disk. Opens (and closes) a live
-    PostgreSQL/PostGIS network connection via psycopg2. Shows a Tkinter
-    messagebox error dialog on any credential, connection, or query
-    failure. No side effects occur at import time -- all of the above
-    happens only when these functions are actually called.
+    Reads pg_credentials.json from disk. Creates %APPDATA%\\CAMA-Tools
+    if it doesn't exist yet, and may perform a one-time, best-effort
+    copy of a legacy exe-relative/script-relative pg_credentials.json
+    into that folder (see _get_credentials_path()'s own docstring).
+    Opens (and closes) a live PostgreSQL/PostGIS network connection via
+    psycopg2. Shows a Tkinter messagebox error dialog on any
+    credential, connection, or query failure. No side effects occur at
+    import time -- all of the above happens only when these functions
+    are actually called.
 """
 import os
 import sys
 import json
+import shutil
 from tkinter import messagebox
 
 import psycopg2
@@ -115,19 +124,78 @@ import psycopg2
 
 def _get_credentials_path():
     """
-    Resolves the absolute path to pg_credentials.json, relative to the
-    running executable's own location (PyInstaller-frozen mode) or this
-    module's own location (dev mode) -- NEVER relative to the current
-    working directory, which is not guaranteed to match either of those
-    in every launch scenario (see module docstring).
+    Resolves the absolute path to pg_credentials.json under the
+    per-user %APPDATA%\\CAMA-Tools folder (NEVER relative to the
+    executable/script location or the current working directory --
+    see module docstring and task history: this file used to live
+    next to the running exe/script, which is what this function used
+    to resolve to before the %APPDATA% relocation).
+
+    Side effects:
+        - Creates %APPDATA%\\CAMA-Tools (os.makedirs(..., exist_ok=True))
+          if it doesn't exist yet.
+        - One-time, best-effort migration: if pg_credentials.json isn't
+          present yet at the new %APPDATA% location but IS present at
+          the legacy exe-relative/script-relative location this app
+          used before the relocation, it is copied (not moved) into
+          the new location, so an existing user upgrading from the old
+          version keeps their saved DB credentials instead of being
+          forced to re-enter them. An existing file at the new
+          location is NEVER overwritten by this migration. A failure
+          during the copy (permissions, locked file, etc.) is silently
+          ignored -- the caller (load_db_credentials()) then behaves
+          exactly as it would for a fresh install with no credentials
+          file yet.
+
+    Raises:
+        RuntimeError: if the APPDATA environment variable is not set.
+        No fallback location is used in that case -- the purpose of
+        this function is specifically to stop resolving to an
+        exe-relative/script-relative path, so silently falling back to
+        one would defeat that.
     """
-    if getattr(sys, "frozen", False):
-        return os.path.join(os.path.dirname(sys.executable), "pg_credentials.json")
-    else:
-        return os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "pg_credentials.json"
+    appdata = os.environ.get("APPDATA")
+    if not appdata:
+        raise RuntimeError(
+            "The Windows APPDATA environment variable is not available, "
+            "so CAMA Tools cannot determine where to store its configuration files."
         )
+    base_dir = os.path.join(appdata, "CAMA-Tools")
+    os.makedirs(base_dir, exist_ok=True)
+    new_path = os.path.join(base_dir, "pg_credentials.json")
+
+    if not os.path.exists(new_path):
+        # Legacy location this function used to resolve to, before the
+        # %APPDATA% relocation -- used here ONLY to locate a file to
+        # migrate, never returned as the live path anymore.
+        if getattr(sys, "frozen", False):
+            legacy_dir = os.path.dirname(sys.executable)
+        else:
+            legacy_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        legacy_path = os.path.join(legacy_dir, "pg_credentials.json")
+        if os.path.exists(legacy_path):
+            try:
+                shutil.copy2(legacy_path, new_path)
+            except Exception:
+                # Best-effort migration only -- see docstring. A copy
+                # failure here is not fatal; load_db_credentials() will
+                # simply treat this as a missing-credentials case.
+                pass
+
+    return new_path
+
+
+def get_credentials_path():
+    """
+    Public wrapper around _get_credentials_path(), for callers outside
+    this module (currently: MAIN.py) that need the resolved
+    pg_credentials.json path without importing a leading-underscore
+    "private" function across a module boundary. Behavior is identical
+    to _get_credentials_path() -- see its docstring for the full
+    contract (including the migration side effect and the RuntimeError
+    case).
+    """
+    return _get_credentials_path()
 
 
 def load_db_credentials():

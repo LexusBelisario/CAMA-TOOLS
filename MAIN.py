@@ -3206,9 +3206,54 @@ def update_map_and_select_recorded():
 import json, shutil
 from tkinter import filedialog
 
-_base_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
-            else os.path.dirname(os.path.abspath(__file__))
+from utils.db_discovery import get_credentials_path
+
+# _base_dir: the same %APPDATA%\CAMA-Tools folder db_discovery.py uses
+# for pg_credentials.json (Option A from the %APPDATA% relocation task
+# -- MAIN.py deliberately does NOT maintain its own independent copy of
+# the %APPDATA% lookup/creation logic; get_credentials_path() is the
+# single source of truth for that folder, including creating it via
+# os.makedirs(..., exist_ok=True) if it doesn't exist yet).
+#
+# get_credentials_path() raises RuntimeError if the APPDATA environment
+# variable itself is unavailable -- there is no fallback to an
+# exe-relative/script-relative location in that case (see its
+# docstring), since silently falling back would defeat the purpose of
+# the relocation. This happens at module import time (before any GUI
+# is shown), so it's caught here explicitly and reported via the same
+# best-effort messagebox pattern already used elsewhere in this file
+# (e.g. on_login_close()), followed by a clean exit -- rather than an
+# uncaught traceback reaching the user.
+try:
+    _base_dir = os.path.dirname(get_credentials_path())
+except RuntimeError as e:
+    try:
+        messagebox.showerror("Configuration Error", str(e))
+    except Exception:
+        pass
+    sys.exit(1)
+
 GM_PATH_FILE = os.path.join(_base_dir, "gm_exe_path.json")
+
+# One-time, best-effort migration of gm_exe_path.json from its legacy
+# exe-relative/script-relative location -- mirrors the same migration
+# policy get_credentials_path() applies to pg_credentials.json: copy
+# (never move), never overwrite an already-existing new-location file,
+# and never fail the whole app if the copy itself fails (permissions,
+# locked file, etc.) -- a copy failure here just means
+# get_global_mapper_path() below behaves as it would for a fresh
+# install with no saved Global Mapper path yet.
+if not os.path.exists(GM_PATH_FILE):
+    _legacy_gm_dir = (
+        os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
+        else os.path.dirname(os.path.abspath(__file__))
+    )
+    _legacy_gm_path = os.path.join(_legacy_gm_dir, "gm_exe_path.json")
+    if os.path.exists(_legacy_gm_path):
+        try:
+            shutil.copy2(_legacy_gm_path, GM_PATH_FILE)
+        except Exception:
+            pass
 
 def get_global_mapper_path() -> str:
     """
@@ -3409,12 +3454,14 @@ def show_login_and_connect():
 
     login_win.protocol("WM_DELETE_WINDOW", on_login_close)
 
-    # Load saved credentials if available
-    _creds_path = os.path.join(
-        os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
-        else os.path.dirname(os.path.abspath(__file__)),
-        "pg_credentials.json"
-    )
+    # Load saved credentials if available. get_credentials_path() is
+    # the same centralized %APPDATA%\CAMA-Tools resolver used for
+    # _base_dir above -- no independent path-resolution logic is
+    # duplicated here anymore. It cannot raise RuntimeError at this
+    # point in practice: the module-level _base_dir block above already
+    # succeeded (or the process already exited) before this function
+    # can run.
+    _creds_path = get_credentials_path()
     saved = {}
     if os.path.exists(_creds_path):
         try:
@@ -3476,11 +3523,9 @@ def show_login_and_connect():
         except Exception as e:
             messagebox.showerror("Login Failed", f"Could not connect:\n{e}")
 
-        _creds_path = os.path.join(
-            os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
-            else os.path.dirname(os.path.abspath(__file__)),
-            "pg_credentials.json"
-        )
+        # Same centralized %APPDATA%\CAMA-Tools resolver as the
+        # pre-fill read above -- see that call site's comment.
+        _creds_path = get_credentials_path()
         with open(_creds_path, "w") as f:
             json.dump({
                 "host": DB_HOST,
