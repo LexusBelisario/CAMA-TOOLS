@@ -1319,10 +1319,22 @@ def update_database_from_geopackage():
              f"{gm_window.width}x{gm_window.height}) "
              f"minimized={gm_window.isMinimized}")
 
+        # Capture maximized state BEFORE minimizing -- .restore() (Win32
+        # SW_RESTORE under the hood) always returns a window to its
+        # pre-maximize rectangle regardless of whether it was minimized
+        # or maximized beforehand (documented Win32 behavior; same bug
+        # already identified and fixed in window_management.py's
+        # _bring_to_foreground()). Without this guard, running this
+        # minimize/restore focus-forcing trick on an already-maximized
+        # GM window permanently shrinks it to a smaller, stale
+        # pre-maximize size that never gets restored afterward.
+        was_maximized = gm_window.isMaximized
         gm_window.minimize(); time.sleep(0.1)
         gm_window.restore(); time.sleep(0.1)
+        if was_maximized:
+            gm_window.maximize()
         gm_window.activate(); time.sleep(0.3)
-        _log(f"GM focused | fg='{_fg_title()}'")
+        _log(f"GM focused | fg='{_fg_title()}' (was_maximized={was_maximized})")
 
         # DEFENSIVE: re-verify TEMP_DIR exists right before using it,
         # not just once at app startup. The module-level os.makedirs()
@@ -2388,14 +2400,18 @@ def update_map_and_select_recorded():
         _log(f"GM window found: '{gm_window.title}' "
              f"rect=({gm_window.left}, {gm_window.top}, "
              f"{gm_window.width}x{gm_window.height})")
+        # Capture maximized state BEFORE minimizing -- see the matching
+        # comment in update_database_from_geopackage() for the full
+        # rationale (SW_RESTORE unconditionally returns a window to its
+        # pre-maximize rectangle, regardless of prior minimized/
+        # maximized state).
+        was_maximized = gm_window.isMaximized
         gm_window.minimize(); time.sleep(0.1)
         gm_window.restore();  time.sleep(0.1)
+        if was_maximized:
+            gm_window.maximize()
         gm_window.activate(); time.sleep(0.1)
-        _log(f"GM focused | fg='{_fg_title()}'")
-
-        # DEFENSIVE: re-verify TEMP_DIR exists right before using it,
-        # not just once at app startup - see the matching note in
-        # update_database_from_geopackage() for the full rationale
+        _log(f"GM focused | fg='{_fg_title()}' (was_maximized={was_maximized})")
         # (module-level os.makedirs() only runs once; this folder could
         # be deleted mid-session or simply not reliably present on a
         # given machine at this exact moment).
@@ -3020,10 +3036,16 @@ def update_map_and_select_recorded():
             #      safety ceiling in case a large load genuinely takes
             #      longer than observed so far.
             try:
+                # Capture maximized state BEFORE minimizing -- see the
+                # comment near GM's initial focus step above for the
+                # full rationale.
+                was_maximized = gm_window.isMaximized
                 gm_window.minimize(); time.sleep(0.1)
                 gm_window.restore();  time.sleep(0.1)
+                if was_maximized:
+                    gm_window.maximize()
                 gm_window.activate(); time.sleep(0.1)
-                _log(f"GM refocused before Ctrl+O | fg='{_fg_title()}'")
+                _log(f"GM refocused before Ctrl+O | fg='{_fg_title()}' (was_maximized={was_maximized})")
                 _dump_windows("before Ctrl+O")
 
                 pyautogui.hotkey("ctrl", "o")
@@ -3164,10 +3186,16 @@ def update_map_and_select_recorded():
                 except Exception:
                     _before_titles = set()
 
+                # Capture maximized state BEFORE minimizing -- see the
+                # comment near GM's initial focus step above for the
+                # full rationale.
+                was_maximized = gm_window.isMaximized
                 gm_window.minimize(); time.sleep(0.1)
                 gm_window.restore();  time.sleep(0.1)
+                if was_maximized:
+                    gm_window.maximize()
                 gm_window.activate(); time.sleep(0.1)
-                _log(f"post-load: GM refocused | fg='{_fg_title()}'")
+                _log(f"post-load: GM refocused | fg='{_fg_title()}' (was_maximized={was_maximized})")
 
                 real_mouse_pos = pyautogui.position()
                 left_panel_x = gm_window.left + 25

@@ -7,14 +7,14 @@ PURPOSE:
     Influence Map source (Point, LineString, or Polygon geometry all
     supported) and writes a dynamically-named distance column
     (CAMA_DISTANCE_TO_{layername}), plus one dynamically-named column
-    per user-checked source column (CAMA_{columnname}_{layername}) --
-    see _compute_output_column_targets() and process_parcels()'s own
-    docstring for the full naming rule. The nearest feature is always
-    selected by true geometric proximity (never a centroid/
-    representative-point approximation); only the reported distance's
-    measurement method varies by the winning feature's geometry type --
-    see process_parcels()'s own docstring for the full
-    Point/LineString-vs-Polygon distinction.
+    per user-checked source column (CAMA_DISTANCE_{layername}_
+    {columnname}) -- see _compute_output_column_targets() and
+    process_parcels()'s own docstring for the full naming rule. The
+    nearest feature is always selected by true geometric proximity
+    (never a centroid/representative-point approximation); only the
+    reported distance's measurement method varies by the winning
+    feature's geometry type -- see process_parcels()'s own docstring
+    for the full Point/LineString-vs-Polygon distinction.
 
 DISPATCH:
     Run as an isolated subprocess by MAIN.py via its `--tool` dispatch
@@ -188,11 +188,17 @@ VECTOR_FILETYPES = [
 # Design Question (confirmed with the requester): the DEFAULT output
 # is exactly one column, CAMA_DISTANCE_TO_{layername}, and each
 # user-checked source column additionally produces
-# CAMA_{columnname}_{layername}. {layername} is placed LAST in both
-# patterns (a deliberate requester decision, to avoid any output-name
-# collision with the sibling tool influence_map_to_land_parcel.py,
-# whose own convention places the source name FIRST as
-# CAMA_{layername}_{columnname}).
+# CAMA_DISTANCE_{layername}_{columnname} (changed from the original
+# CAMA_{columnname}_{layername} per a later explicit requester
+# decision). The original layername-LAST ordering existed specifically
+# to avoid an output-name collision with the sibling tool
+# influence_map_to_land_parcel.py, whose own convention places the
+# source name FIRST as CAMA_{layername}_{columnname} -- the new
+# pattern still avoids that exact collision, now via the inserted
+# "DISTANCE_" token immediately after "CAMA_" (this tool's prefix is
+# always CAMA_DISTANCE_{layername}_..., the sibling's is always
+# CAMA_{layername}_... with no "DISTANCE_" token at all), rather than
+# via layername placement.
 #
 # Both {layername} and {columnname} go through the identical
 # sanitization rule (see _sanitize_output_name_fragment() below) --
@@ -254,14 +260,15 @@ def _compute_output_column_targets(source_display_name: str, checked_raw_columns
     """
     Computes this run's full, ordered set of output column names:
     CAMA_DISTANCE_TO_{layername} ALWAYS first, followed by
-    CAMA_{columnname}_{layername} for each entry in checked_raw_columns
-    (already in checked/UI order -- this function does not reorder
-    them). Column order in the output is a hard requirement (Task
-    Prompt Section E) -- this function is the single place that
-    ordering is decided, so every caller (the Run-time conflict check
-    and process_parcels() by way of _process_one_source()) computes
-    the same ordered target list from the same inputs, never cached
-    across calls per this file's established "always fresh" convention.
+    CAMA_DISTANCE_{layername}_{columnname} for each entry in
+    checked_raw_columns (already in checked/UI order -- this function
+    does not reorder them). Column order in the output is a hard
+    requirement (Task Prompt Section E) -- this function is the single
+    place that ordering is decided, so every caller (the Run-time
+    conflict check and process_parcels() by way of
+    _process_one_source()) computes the same ordered target list from
+    the same inputs, never cached across calls per this file's
+    established "always fresh" convention.
 
     Args:
         source_display_name: the RAW (un-sanitized) Influence Map
@@ -278,7 +285,7 @@ def _compute_output_column_targets(source_display_name: str, checked_raw_columns
     layer_suffix = _sanitize_output_name_fragment(source_display_name)
     dist_col = f"CAMA_DISTANCE_TO_{layer_suffix}"
     extra_cols = tuple(
-        f"CAMA_{_sanitize_output_name_fragment(col)}_{layer_suffix}"
+        f"CAMA_DISTANCE_{layer_suffix}_{_sanitize_output_name_fragment(col)}"
         for col in checked_raw_columns
     )
     return (dist_col, *extra_cols)
