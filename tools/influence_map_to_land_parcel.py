@@ -41,12 +41,16 @@ OUTPUTS:
     Parcel/Barangay source (_write_gpkg()), then attempts to open it in
     Global Mapper (load_in_global_mapper()).
     DB output mode: writes/replaces one PostGIS table per source,
-    resolved via resolve_db_output_table(), plus an entry in the shared
-    CAMA_Transaction_Log table recording the tool name and fields
-    written. A separate, intentionally-disabled CAMA_Table write also
-    exists (commented out, not removed) -- see the large comment block
-    around it inside run_processing()'s worker() for the full record of
-    why it's disabled and why it's being kept, not deleted.
+    resolved via resolve_db_output_table(), via _write_db_output_safely()'s
+    staging-write -> verify -> atomic rename-swap sequence (D-Cancel).
+    Two separate, intentionally-disabled writes also exist in this
+    file's source (both commented out, not removed) -- a CAMA_Table
+    write and a CAMA_Transaction_Log write -- see the large comment
+    blocks around them inside worker() for the full record of why each
+    is disabled and why it's being kept, not deleted. Neither is
+    currently active; this docstring previously (incorrectly) described
+    the CAMA_Transaction_Log write as active, which no longer matches
+    the code -- corrected here.
 
 DEPENDENCIES:
     stdlib: os, re, json, argparse (imported but currently unused --
@@ -61,14 +65,14 @@ DEPENDENCIES:
     -- see the Progress Event Protocol v9 comment block further below).
 
 SIDE EFFECTS:
-    File reads/writes (.shp/.gpkg). PostGIS reads/writes, including a
-    write to the shared CAMA_Transaction_Log table on every DB-output
-    run. A live PostgreSQL connection. Tkinter GUI windows throughout,
-    including a background thread + queue.Queue-based polling loop for
-    the main processing run. A subprocess launch to Global Mapper
-    (load_in_global_mapper()) on local-output saves, plus a Win32
-    EnumWindows call to find/focus an already-open Global Mapper window
-    first.
+    File reads/writes (.shp/.gpkg). PostGIS reads/writes, including
+    staging-table writes during a DB-output run (see
+    _write_db_output_safely(), D-Cancel). A live PostgreSQL connection.
+    Tkinter GUI windows throughout, including a background thread +
+    queue.Queue-based polling loop for the main processing run. A
+    subprocess launch to Global Mapper (load_in_global_mapper()) on
+    local-output saves, plus a Win32 EnumWindows call to find/focus an
+    already-open Global Mapper window first.
 
     IMPORTANT -- this module has a genuine import-time side effect: the
     module-level call to set_app_user_model_id() (see the "FORCE
@@ -102,6 +106,7 @@ import subprocess
 import threading
 import queue
 import time
+import secrets
 import math
 import tkinter as tk
 from tkinter import filedialog, messagebox, Listbox
@@ -860,7 +865,7 @@ def _read_influence_source_columns_worker(source_type, path_or_table, engine=Non
 # ========================================
 # CORE COMPUTATION
 # ========================================
-def transfer_attributes(barangay_gdf, influence_gdfs, output_column_map=None, progress=None):
+def transfer_attributes(barangay_gdf, influence_gdfs, output_column_map=None, progress=None, cancel_flag=None):
     """
     UPDATED (per-source checklist feature): influence_gdfs is now a
     list of (infl_gdf, column_pairs) tuples -- ONE entry per Influence
@@ -905,10 +910,48 @@ def transfer_attributes(barangay_gdf, influence_gdfs, output_column_map=None, pr
     signature is unchanged for any call site that doesn't pass it --
     added as part of this tool's Progress Event Protocol v9 migration
     (see run_processing() below).
+
+    cancel_flag : optional dict from utils.progress_framework.
+    new_cancel_flag() (added for D-Cancel). Checked directly, once per
+    influence SOURCE, at the top of the loop below, via the same
+    explicit-True-only check (`cancel_flag["stop"] is True`) this
+    project's other process_*() functions already use, so a cancel_flag
+    of None (the default) or one that's never had "stop" set behaves
+    identically to not passing it at all. Returns None immediately if
+    Cancel fires -- the caller (worker(), below) treats a None return
+    as a full-discard signal, same convention as every other tool's
+    processing function.
+
+    IMPORTANT -- coarse Cancel granularity (Document 1 finding #5): this
+    loop runs once per CHECKED INFLUENCE SOURCE, not once per parcel.
+    With the common case of only one source checked, there is exactly
+    ONE iteration, and that iteration's only real work is a single,
+    non-interruptible gpd.sjoin() call -- this checkpoint (evaluated
+    only at the top of each iteration, before that iteration's sjoin())
+    has virtually no opportunity to fire before that vectorized join
+    completes on its own. This is a materially coarser Cancel boundary
+    than any other tool sharing progress_framework.py; it is not a bug
+    in this checkpoint's placement, it is the honest limit of where a
+    control-flow check can go without altering transfer_attributes()'s
+    join logic itself (out of scope -- see Section D of this task's
+    governing instructions). A Cancel click during that one sjoin() is
+    instead caught at the NEXT checkpoint -- either the following
+    influence-source iteration here (if more than one source was
+    checked), or worker()'s own per-Land-Parcel-source checkpoint on
+    the next source in run_processing()'s loop.
     """
     output_column_map = output_column_map or {}
     total = len(influence_gdfs)
     for i, (infl_gdf, column_pairs) in enumerate(influence_gdfs, start=1):
+        # Cancel (coarse, per-influence-source checkpoint): see this
+        # function's own docstring for the full granularity caveat.
+        # Explicit-True-only check, matching this project's other
+        # process_*() functions -- a cancel_flag of None (the default)
+        # or one that's never had "stop" set is functionally identical
+        # to not passing it at all.
+        if cancel_flag is not None and cancel_flag["stop"] is True:
+            return None
+
         if progress:
             names = ", ".join(final_col for _raw_col, final_col in column_pairs)
             progress(f"Transferring attribute(s) {i}/{total}: {names}", i, total)
@@ -929,18 +972,575 @@ def transfer_attributes(barangay_gdf, influence_gdfs, output_column_map=None, pr
 
 
 # ========================================
+# ATOMIC DB WRITE (D-Cancel)
+# ========================================
+# Eighth tool to receive this mechanism, after landmarks_within_meters.py
+# (pilot), lot_location.py, road_frontage.py, terrain.py, road_surface.py,
+# road_density.py, and land_shape.py. Ported from terrain.py/
+# road_surface.py/land_shape.py -- all three already ship this exact
+# block, byte-identical. Nothing here is source-agnostic-generalized
+# into a shared utils/ module -- Rule of Three (Section G.5): this is
+# the eighth occurrence, still not yet its own separate decision. Each
+# tool keeps its own copy.
+#
+# STAGING_WRITE -> VERIFY -> FINAL_SWAP -> (DISCARDING on failure) ->
+# post-swap backup drop -- the real destination table (resolved_table_name)
+# is never touched before FINAL_SWAP, and FINAL_SWAP is a single
+# PostgreSQL transaction: either both renames inside it commit, or
+# PostgreSQL rolls back both and the destination is exactly as it was
+# before the call. A run that is hard-killed (process kill, computer
+# shutdown/power loss, lost DB connection) between STAGING_WRITE and the
+# post-swap backup drop leaves a `_camastg_*`/`_camabak_*` table behind;
+# _scan_orphaned_cama_tables() below surfaces it to a FUTURE run via
+# resolve_db_output_table(), since normal completion, normal Cancel, and
+# normal failure all clean up after themselves here and never reach that
+# scan.
+#
+# This file has no active CAMA_Transaction_Log write to coordinate with
+# (see Document 1 finding #3 -- confirmed disabled, matching CAMA_Table's
+# own already-disabled state) -- so, unlike an earlier draft of this
+# task's own documentation once anticipated, _write_db_output_safely()
+# below needs NO file-specific cama_log_info parameter or FINAL_SWAP
+# extension. It is ported exactly as shipped in the closest all-or-
+# nothing precedent tools, with no file-specific extension.
+def _gen_id():
+    """
+    12 lowercase hex characters (48 bits) of cryptographically random
+    entropy, used for both staging and backup table names. Independently
+    generated each time it's called -- a staging table and its paired
+    backup table get two SEPARATE calls to this function, not one value
+    reused with different prefixes.
+    """
+    return secrets.token_hex(6)
+
+
+def _advisory_lock_key(run_id):
+    """
+    Deterministic signed-bigint PostgreSQL advisory-lock key derived from
+    a run id. Must produce the IDENTICAL key from the same run_id every
+    time: the owning run derives it once (_acquire_run_lock()) to acquire
+    the lock, and _scan_orphaned_cama_tables() independently re-derives it
+    later from only the run_id text recorded in a table's own COMMENT --
+    there is no other channel between the two. run_id is 12 hex chars (48
+    bits), always well under pg_try_advisory_lock()'s signed-64-bit range,
+    so no overflow/wraparound handling is needed at the current id length.
+    """
+    return int(run_id, 16)
+
+
+def _table_exists(conn, schema, table_name):
+    """
+    True if schema.table_name currently exists as a real relation, via
+    PostgreSQL's own to_regclass() -- authoritative against the live
+    catalog, not any caller-side cache or an earlier information_schema
+    snapshot. Used both for FINAL_SWAP's create-new race re-check and
+    inside _write_db_output_safely()'s own outcome-detection fallback.
+    """
+    result = conn.execute(
+        text("SELECT to_regclass(:qualified) IS NOT NULL"),
+        {"qualified": f'"{schema}"."{table_name}"'}
+    ).scalar()
+    return bool(result)
+
+
+def _get_spatial_index_name(conn, schema, table_name, column_name="geometry"):
+    """
+    Looks up the actual name of the GIST spatial index attached to a
+    column via PostgreSQL's own catalogs (pg_class, pg_index, pg_am,
+    pg_attribute), never assuming any naming convention such as
+    "idx_<table>_geometry". column_name defaults to "geometry" -- this
+    file's own to_postgis() writes never rename the geometry column, so
+    this default matches this file's own convention out of the box.
+
+    Returns None if no spatial index exists on this column (e.g. a
+    brand-new staging table before to_postgis() has created one). Raises
+    RuntimeError if more than one GIST index is found on the same column
+    -- this should never happen in this pipeline's normal single-index
+    case, so silently picking one would hide a genuinely unexpected schema
+    state instead of surfacing it.
+    """
+    rows = conn.execute(text(
+        """
+        SELECT ix.relname AS index_name
+        FROM pg_class t
+        JOIN pg_namespace n ON n.oid = t.relnamespace
+        JOIN pg_index idx ON idx.indrelid = t.oid
+        JOIN pg_class ix ON ix.oid = idx.indexrelid
+        JOIN pg_am am ON am.oid = ix.relam
+        JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(idx.indkey)
+        WHERE n.nspname = :schema AND t.relname = :table_name
+          AND a.attname = :column_name AND am.amname = 'gist';
+        """
+    ), {"schema": schema, "table_name": table_name,
+        "column_name": column_name}).fetchall()
+
+    if len(rows) == 0:
+        return None
+    elif len(rows) == 1:
+        return rows[0][0]
+    else:
+        raise RuntimeError(
+            f"Expected at most one GIST spatial index on "
+            f"\"{schema}\".\"{table_name}\".\"{column_name}\", but found "
+            f"{len(rows)}: {[r[0] for r in rows]}. Schema is in an "
+            f"unexpected state -- aborting rather than guessing which "
+            f"index to rename."
+        )
+
+
+def _index_exists(conn, schema, index_name):
+    """True if an index of this exact name already exists in the given
+    schema -- pre-flight check before a rename, so a collision produces a
+    clear diagnostic instead of a generic PostgreSQL duplicate-object
+    error."""
+    result = conn.execute(
+        text("SELECT 1 FROM pg_indexes WHERE schemaname = :schema "
+             "AND indexname = :index_name"),
+        {"schema": schema, "index_name": index_name}
+    ).fetchone()
+    return result is not None
+
+
+def _rename_spatial_index(conn, schema, table_name, desired_name,
+                           column_name="geometry"):
+    """
+    Finds the actual spatial index on table_name/column_name via
+    _get_spatial_index_name() and renames it to desired_name. No-op if no
+    spatial index exists yet. Raises a clear diagnostic (rather than
+    letting PostgreSQL fail with a generic duplicate-object error) if
+    desired_name is already taken by something else in the schema.
+
+    This step exists because PostgreSQL does NOT rename a table's index
+    just because the table itself was renamed. Without it, a table
+    promoted by FINAL_SWAP below would keep carrying its staging table's
+    auto-generated index name indefinitely.
+    """
+    current_name = _get_spatial_index_name(conn, schema, table_name, column_name)
+    if current_name is None:
+        return
+    if current_name == desired_name:
+        return
+    if _index_exists(conn, schema, desired_name):
+        raise RuntimeError(
+            f"Cannot rename spatial index on \"{schema}\".\"{table_name}\" "
+            f"to \"{desired_name}\" -- an index with that name already "
+            f"exists in schema \"{schema}\". Aborting rather than "
+            f"colliding with an unrelated index."
+        )
+    conn.execute(text(
+        f'ALTER INDEX "{schema}"."{current_name}" RENAME TO "{desired_name}";'
+    ))
+
+
+def _drop_table_best_effort(engine, schema, table_name):
+    """
+    Drops table_name (schema-qualified) without raising. Used for staging
+    cleanup after a failed/cancelled write and for the post-swap backup
+    drop -- in both cases the property being protected (the real
+    destination table's integrity) is already settled by the time this
+    runs, so a failure here only means a leftover table for a future run
+    to surface. table_name is always a caller-supplied staging_name or
+    backup_name here -- never resolved_table_name.
+    """
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(
+                f'DROP TABLE IF EXISTS "{schema}"."{table_name}" CASCADE;'
+            ))
+    except Exception as drop_err:
+        print(f"  ⚠ Could not drop '{schema}.{table_name}': {drop_err}. "
+              f"This does not affect the live table -- it will be surfaced "
+              f"as a recoverable leftover item on a future run.")
+
+
+def _comment_cama_table(conn, schema, table_name, role, dest, run_id,
+                         started_at_iso):
+    """
+    Attaches recovery metadata to a staging or backup table via
+    COMMENT ON TABLE. This is metadata ONLY: it plays no role in
+    collision safety (the random id in the table name is the entire
+    collision-safety mechanism) and no role in proving ownership by
+    itself (the advisory lock, re-derived from the run_id recorded here,
+    is what _scan_orphaned_cama_tables() actually uses to decide whether
+    a run is still alive).
+
+    Format (parsed back by _parse_cama_comment()):
+        "cama-run-id: <12-hex>; role: staging|backup; dest: <schema>.<table>; started: <iso8601>"
+    """
+    comment = (
+        f"cama-run-id: {run_id}; role: {role}; "
+        f"dest: {schema}.{dest}; started: {started_at_iso}"
+    )
+    conn.execute(text(f'COMMENT ON TABLE "{schema}"."{table_name}" IS :c'),
+                 {"c": comment})
+
+
+def _parse_cama_comment(comment):
+    """
+    Parses _comment_cama_table()'s own format back out. Returns
+    (run_id, dest), or (None, None) if comment is missing or doesn't match
+    the expected format -- e.g. a table that predates this mechanism, or
+    one whose comment step never ran because the process died before it
+    (STAGING_WRITE succeeded, but the connection was lost before VERIFY's
+    own _comment_cama_table() call). _scan_orphaned_cama_tables() treats
+    that case as unverifiable and always surfaces it, rather than silently
+    skipping a table it can't positively identify.
+    """
+    if not comment:
+        return None, None
+    m = re.search(r"cama-run-id:\s*([0-9a-f]{12});.*?dest:\s*([^;]+)", comment)
+    if not m:
+        return None, None
+    return m.group(1).strip(), m.group(2).strip()
+
+
+def _acquire_run_lock(creds, run_id):
+    """
+    Opens ONE dedicated, non-pooled psycopg2 connection -- deliberately
+    NOT taken from the SQLAlchemy engine's connection pool, see this
+    section's own header comment for why -- and acquires a session-level
+    advisory lock on it, keyed by _advisory_lock_key(run_id). The
+    connection must be kept open, unused for anything else, for the
+    entire DB-output portion of this run, and released via
+    _release_run_lock() exactly once -- see run_processing()'s worker(),
+    which does this in a try/finally so the lock is always released
+    (success, failure, or Cancel).
+
+    Returns the open connection (holding the lock) on success, or None if
+    the connection itself could not be opened or the lock could not be
+    acquired for any reason -- the caller treats None as a hard abort: no
+    staging write is ever attempted without a held lock, since the lock is
+    what lets a future run's orphan scan tell this run's own artifacts
+    apart from a genuinely abandoned one.
+    """
+    try:
+        conn = psycopg2.connect(
+            host=creds["host"], port=creds["port"],
+            dbname=creds["database"], user=creds["username"],
+            password=creds["password"],
+        )
+        cur = conn.cursor()
+        cur.execute("SELECT pg_advisory_lock(%s);", (_advisory_lock_key(run_id),))
+        conn.commit()
+        cur.close()
+        return conn
+    except Exception as lock_err:
+        print(f"  ⚠ Could not acquire DB run lock: {lock_err}")
+        return None
+
+
+def _release_run_lock(lock_conn):
+    """
+    Releases the advisory lock held by _acquire_run_lock() and closes that
+    dedicated connection. Closing the connection is sufficient by itself
+    -- PostgreSQL releases all of a session's advisory locks automatically
+    when that session ends, so no explicit pg_advisory_unlock() call is
+    needed first. Best-effort: a failure here does not affect any
+    already-committed table data -- it only means this run's advisory
+    lock lingers until PostgreSQL notices the connection is actually gone,
+    so a subsequent _scan_orphaned_cama_tables() correctly continues to
+    treat this run's own staging/backup artifacts as still "live" until
+    then, rather than as newly-orphaned.
+    """
+    try:
+        lock_conn.close()
+    except Exception:
+        pass
+
+
+def _write_db_output_safely(engine, schema, gdf, resolved_table_name,
+                             resolved_outcome, run_id, started_at_iso):
+    """
+    The D-Cancel replacement for the direct
+    `b_gdf.to_postgis(..., if_exists="replace")` call this file's
+    worker() previously used. Implements STAGING_WRITE -> VERIFY ->
+    FINAL_SWAP -> (DISCARDING on failure) -> post-swap backup cleanup.
+    The real destination table (resolved_table_name) is never touched
+    before FINAL_SWAP, and FINAL_SWAP is a single PostgreSQL transaction
+    -- either both renames inside it commit, or PostgreSQL rolls back
+    both and the destination is exactly as it was before this call. This
+    function is only ever called from worker() AFTER the run's Cancel
+    checkpoints have already passed (see this section's own header
+    comment on this file's Cancel granularity) -- nothing inside this
+    function is cancelable, by design.
+
+    Args:
+        engine: SQLAlchemy engine.
+        schema (str): destination schema.
+        gdf (GeoDataFrame): the processed result to write.
+        resolved_table_name (str): destination table name, from
+            resolve_db_output_table() (via on_run()/run_processing()).
+        resolved_outcome (str | None): "overwritten" or "created", from
+            the same source. If it's anything else (the documented
+            defensive-fallback case in worker(), where resolved_table_name
+            itself was somehow None), the real outcome is determined here
+            directly via _table_exists() rather than guessed.
+        run_id (str): this run's _gen_id() value, recorded in the staging/
+            backup tables' comments for _scan_orphaned_cama_tables().
+        started_at_iso (str): human-readable run start time, for the same
+            comment metadata.
+
+    Raises:
+        Exception: on any failure at any step. The caller (worker()'s own
+        try/except) turns this into the run's error dialog. By the time
+        any exception reaches the caller, the staging table has already
+        been dropped (best-effort) here, and the destination table is
+        guaranteed untouched if the failure happened before FINAL_SWAP's
+        transaction committed.
+    """
+    if resolved_outcome not in ("overwritten", "created"):
+        with engine.begin() as conn:
+            resolved_outcome = (
+                "overwritten" if _table_exists(conn, schema, resolved_table_name)
+                else "created"
+            )
+
+    is_overwrite = (resolved_outcome == "overwritten")
+    staging_name = f"_camastg_{_gen_id()}"
+    backup_name = f"_camabak_{_gen_id()}" if is_overwrite else None
+
+    # STAGING_WRITE -- the real destination table is completely untouched
+    # at this point. Uses `conn` (not the bare engine), matching this
+    # file's own pre-existing to_postgis()-inside-engine.begin() pattern
+    # -- a failure partway through this call rolls back cleanly rather
+    # than leaving a half-written staging table.
+    with engine.begin() as conn:
+        gdf.to_postgis(staging_name, conn, schema=schema,
+                        if_exists="replace", index=False)
+
+    # VERIFY -- confirm the staging write actually landed, and that its
+    # row count matches what we intended to write, before this table is
+    # ever eligible for promotion.
+    with engine.begin() as conn:
+        try:
+            actual_count = conn.execute(text(
+                f'SELECT COUNT(*) FROM "{schema}"."{staging_name}"'
+            )).scalar()
+        except Exception as verify_err:
+            raise RuntimeError(
+                f"Staging table '{staging_name}' could not be verified "
+                f"after write -- it may not have been created. Existing "
+                f"table '{resolved_table_name}' was not modified. "
+                f"Cause: {verify_err}"
+            ) from verify_err
+
+        if actual_count != len(gdf):
+            _drop_table_best_effort(engine, schema, staging_name)
+            raise RuntimeError(
+                f"Staging table '{staging_name}' row count "
+                f"({actual_count}) does not match the processed result "
+                f"({len(gdf)}). Aborting before promotion -- existing "
+                f"table '{resolved_table_name}' was not modified."
+            )
+
+        _comment_cama_table(conn, schema, staging_name, "staging",
+                             resolved_table_name, run_id, started_at_iso)
+
+    # FINAL_SWAP -- one transaction, never cancelable. Either both renames
+    # commit, or PostgreSQL rolls back both and resolved_table_name is
+    # exactly as it was before this call.
+    try:
+        with engine.begin() as conn:
+            exists_now = _table_exists(conn, schema, resolved_table_name)
+            if is_overwrite:
+                if not exists_now:
+                    raise RuntimeError(
+                        f"Expected an existing table '{resolved_table_name}' "
+                        f"to overwrite, but it no longer exists. Aborting -- "
+                        f"nothing was promoted. The processed data is still "
+                        f"available in staging table '{staging_name}'."
+                    )
+                conn.execute(text(
+                    f'ALTER TABLE "{schema}"."{resolved_table_name}" '
+                    f'RENAME TO "{backup_name}";'
+                ))
+                _rename_spatial_index(conn, schema, backup_name,
+                                       f"idx_{backup_name}_geometry")
+                _comment_cama_table(conn, schema, backup_name, "backup",
+                                     resolved_table_name, run_id,
+                                     started_at_iso)
+            else:
+                if exists_now:
+                    raise RuntimeError(
+                        f"A table named '{resolved_table_name}' now exists, "
+                        f"but this run was resolved as a new table. "
+                        f"Aborting -- nothing was promoted. The processed "
+                        f"data is still available in staging table "
+                        f"'{staging_name}'."
+                    )
+            conn.execute(text(
+                f'ALTER TABLE "{schema}"."{staging_name}" '
+                f'RENAME TO "{resolved_table_name}";'
+            ))
+            _rename_spatial_index(conn, schema, resolved_table_name,
+                                   f"idx_{resolved_table_name}_geometry")
+    except Exception:
+        # DISCARDING -- staging was never promoted. This DROP only ever
+        # targets staging_name, per this section's own invariant -- never
+        # resolved_table_name or backup_name.
+        _drop_table_best_effort(engine, schema, staging_name)
+        raise
+
+    # Backup is now redundant -- the swap committed, so the new data is
+    # confirmed live. Drop immediately, best-effort: never treated as a
+    # long-term retention artifact. Normally transient; retained only if
+    # this post-commit cleanup itself fails, or the process crashes
+    # before it runs -- either way, _scan_orphaned_cama_tables() surfaces
+    # it on a future run. A failed drop here does not affect the live
+    # table, which is already safely promoted.
+    if is_overwrite:
+        _drop_table_best_effort(engine, schema, backup_name)
+
+
+def _scan_orphaned_cama_tables(schema, creds):
+    """
+    Looks for every _camastg_*/_camabak_* table currently in `schema` and
+    returns the ones whose owning run is NOT currently alive. Relies on
+    pg_try_advisory_lock() on the SAME key the owning run acquired (see
+    _advisory_lock_key()/_acquire_run_lock()), re-derived here from the
+    run_id recorded in each table's own COMMENT ON TABLE -- succeeding
+    means no live session currently holds that key, i.e. the run that
+    created this table is provably gone (a hard process kill, a computer
+    shutdown/power loss, or a lost DB connection -- normal completion,
+    normal Cancel, and normal failure all clean up after themselves via
+    _write_db_output_safely()/_drop_table_best_effort() and never reach
+    this scan). A table whose comment is missing or doesn't match the
+    expected format (something failed before the comment step itself ever
+    ran) is treated as unverifiable and always included, rather than
+    silently skipped -- see _parse_cama_comment().
+
+    Read-only with respect to table data: this function only tests locks
+    (releasing each one immediately after testing -- it must never itself
+    end up holding one) and reads catalog metadata. It never drops
+    anything -- see _prompt_orphaned_cama_tables() for the user-driven
+    removal step, called from resolve_db_output_table() before its
+    existing fuzzy-match logic runs.
+    """
+    engine = create_engine(
+        f"postgresql://{creds['username']}:{creds['password']}@"
+        f"{creds['host']}:{creds['port']}/{creds['database']}"
+    )
+    orphans = []
+    with engine.begin() as conn:
+        rows = conn.execute(text(
+            """
+            SELECT c.relname, obj_description(c.oid, 'pg_class')
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = :schema AND c.relkind = 'r'
+              AND (c.relname LIKE '\\_camastg\\_%' ESCAPE '\\'
+                   OR c.relname LIKE '\\_camabak\\_%' ESCAPE '\\')
+            """
+        ), {"schema": schema}).fetchall()
+
+        for relname, comment in rows:
+            role = "staging" if relname.startswith("_camastg_") else "backup"
+            run_id, dest = _parse_cama_comment(comment)
+            if run_id is None:
+                orphans.append({"table": relname, "role": role,
+                                 "run_id": None, "dest": dest})
+                continue
+            key = _advisory_lock_key(run_id)
+            acquired = conn.execute(
+                text("SELECT pg_try_advisory_lock(:k)"), {"k": key}
+            ).scalar()
+            if acquired:
+                conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": key})
+                orphans.append({"table": relname, "role": role,
+                                 "run_id": run_id, "dest": dest})
+            # else: a live run holds this lock -- not orphaned, skip.
+    return orphans
+
+
+def _prompt_orphaned_cama_tables(root, orphans, schema, creds):
+    """
+    Shown once, from resolve_db_output_table(), before its own normal
+    fuzzy-match flow. Presents each orphan (its destination table, role,
+    and run start time when available) and offers a per-item checkbox
+    choice: remove now, or leave for later manual review. Never deletes
+    anything the user hasn't explicitly checked -- declining to check
+    anything, or closing this dialog, is the same as choosing "leave"
+    for every item found; nothing is ever auto-deleted.
+    """
+    if not orphans:
+        return
+
+    win = tk.Toplevel(root)
+    win.title("Recovered Items From an Interrupted Run")
+    apply_icon(win, "influencemap.ico")
+    win.resizable(False, False)
+    win.transient(root)
+    win.grab_set()
+
+    intro = (
+        "The following leftover database table(s) were found. These are "
+        "normally cleaned up automatically -- they were likely left "
+        "behind by a run that was interrupted (e.g. the app or computer "
+        "was closed unexpectedly) while writing to the database. Your "
+        "existing data was never affected by this."
+    )
+    tk.Label(win, text=intro, justify="left", wraplength=460,
+             padx=14, pady=10).pack()
+
+    list_frame = tk.Frame(win)
+    list_frame.pack(fill="x", padx=14)
+    vars_by_table = {}
+    for o in orphans:
+        dest_display = o["dest"] or "unknown (no recovery metadata found)"
+        label = f'{o["table"]}   (role: {o["role"]}, destination: {dest_display})'
+        var = tk.BooleanVar(value=False)
+        vars_by_table[o["table"]] = var
+        tk.Checkbutton(list_frame, text=label, variable=var, anchor="w",
+                        justify="left", wraplength=440).pack(fill="x", anchor="w")
+
+    tk.Label(
+        win,
+        text=("Check any items you want removed now. Unchecked items are\n"
+              "left in place for manual review and will be shown again."),
+        justify="left", padx=14, pady=(6, 10)
+    ).pack()
+
+    def _on_remove_selected():
+        engine = create_engine(
+            f"postgresql://{creds['username']}:{creds['password']}@"
+            f"{creds['host']}:{creds['port']}/{creds['database']}"
+        )
+        for o in orphans:
+            if vars_by_table[o["table"]].get():
+                _drop_table_best_effort(engine, schema, o["table"])
+        win.destroy()
+
+    btn_frame = tk.Frame(win)
+    btn_frame.pack(pady=(0, 12))
+    tk.Button(btn_frame, text="Remove Checked", command=_on_remove_selected,
+              width=16).pack(side="left", padx=6)
+    tk.Button(btn_frame, text="Leave All For Now", command=win.destroy,
+              width=16).pack(side="left", padx=6)
+
+    win.update_idletasks()
+    sw = win.winfo_screenwidth()
+    win.geometry(f"+{(sw // 2) - 250}+120")
+    win.attributes("-topmost", True)
+    win.after(100, lambda: win.attributes("-topmost", False))
+    win.focus_force()
+    win.wait_window()
+
+
+
+# ========================================
 # DB OUTPUT RESOLUTION
 # ========================================
-def resolve_db_output_table(root, schema, barangay_source):
+def resolve_db_output_table(root, schema, barangay_source, creds):
     """
     Determines the DB-output destination table for the Land Parcel
     source, BEFORE any processing or writing starts -- same "resolve
     everything up front" philosophy as ask_overwrite_dialog() (see
-    run_processing()). This tool has no background worker thread --
-    this function is still called once, up front, for separation of
-    responsibilities: this function owns ALL user interaction and
-    overwrite decisions, so the processing/write logic further below
-    never has to ask any UI or overwrite question of its own.
+    run_processing()). This tool has no background worker thread of its
+    own for THIS function -- it is still called once, up front, on the
+    main thread, for separation of responsibilities: this function owns
+    ALL user interaction and overwrite decisions, so the processing/
+    write logic further below never has to ask any UI or overwrite
+    question of its own.
 
     Two cases:
       - DB-source Land Parcel (barangay_source[0] == "db"): always
@@ -954,12 +1554,28 @@ def resolve_db_output_table(root, schema, barangay_source):
         match as an overwrite target -- zero candidates skips the
         dialog entirely and creates a new table under the filename.
 
+    D-Cancel: also runs the crash-orphan recovery scan first, before any
+    of its own existing logic -- _scan_orphaned_cama_tables() plus, if
+    it finds anything, _prompt_orphaned_cama_tables(). This is the
+    natural point for it: it's the one place in this file that already
+    runs on the main thread, synchronously, with a live `root` to open a
+    dialog on, before any new staging table for THIS run could possibly
+    exist to confuse the scan. creds is a new required parameter for
+    this reason -- the caller (on_run()) already loads it to determine
+    schema before calling this function, so this is a zero-cost addition
+    at the call site. Matches terrain.py's/road_surface.py's/
+    land_shape.py's own identical addition to this same function.
+
     Returns (resolved_table_name, resolved_outcome), or (None, None) if
     the user cancelled -- caller must abort the entire run in that
     case, matching ask_overwrite_dialog()'s existing
     cancel-aborts-everything semantics (there is no "create new" choice
     for DB output).
     """
+    orphans = _scan_orphaned_cama_tables(schema, creds)
+    if orphans:
+        _prompt_orphaned_cama_tables(root, orphans, schema, creds)
+
     if barangay_source[0] == "db":
         return barangay_source[1][0], "overwritten"
 
@@ -985,24 +1601,31 @@ def resolve_db_output_table(root, schema, barangay_source):
 # ============================================================
 # This tool had NO background worker thread and NO progress dialog at
 # all -- run_processing() ran entirely synchronously on the main
-# thread. Same shape of migration as land_shape_compactness.py's,
-# road_surface.py's, and road_density.py's: reuses
-# progress_framework.py's PresentationState/ProgressPresentationPolicy/
-# TkinterProgressView directly -- no tool-local copies, no new
-# abstraction.
+# thread. Same shape of migration as land_shape.py's, road_surface.py's,
+# and road_density.py's: reuses progress_framework.py's
+# PresentationState/ProgressPresentationPolicy/TkinterProgressView
+# directly -- no tool-local copies, no new abstraction.
 #
 # The existing unified per-source loop (local/db reading merged into
 # one loop, per explicit instruction) is preserved exactly as-is --
 # not split into two separate loops like the other migrated tools.
 #
-# Deliberately NOT done in this task:
+# Deliberately NOT done in the original v9 migration:
 #   - No per-source failure isolation added.
 #   - The 3 overwrite dialogs in this file are untouched.
+#
+# D-Cancel (this task, on top of the v9 migration above): atomic
+# staging/verify/swap DB writes (_write_db_output_safely(), Part A) and
+# Cancel support (cancel_flag threaded into transfer_attributes() and
+# worker(), Part B) -- see this file's "ATOMIC DB WRITE" section above
+# and worker()'s own docstring below for the full detail. Neither
+# changes the unified-loop/no-per-source-isolation decisions above.
 # ============================================================
 from utils.progress_framework import (
     PresentationState,
     ProgressPresentationPolicy,
     TkinterProgressView,
+    new_cancel_flag,
 )
 
 
@@ -1010,35 +1633,108 @@ class ProgressWindow:
     """
     Progress dialog shown while run_processing() works on a background
     thread. Same shape as the other migrated tools' ProgressWindow --
-    status label + determinate progress bar, no cancel/stop_flag
-    support. Progress Event Protocol v9 role: ProgressWindow is the
-    host, not the decision-maker (see ProgressPresentationPolicy /
-    TkinterProgressView, imported from progress_framework.py, shared
-    with lot_location.py/road_frontage.py/land_shape_compactness.py/
-    road_surface.py/road_density.py).
+    status label + determinate progress bar. Progress Event Protocol v9
+    role: ProgressWindow is the host, not the decision-maker (see
+    ProgressPresentationPolicy / TkinterProgressView, imported from
+    progress_framework.py).
+
+    D-Cancel (this task, eighth and LAST tool to receive this mechanism,
+    after landmarks_within_meters.py's pilot, lot_location.py's/
+    road_frontage.py's/terrain.py's/road_surface.py's/road_density.py's/
+    land_shape.py's own progress_framework.py-based adoptions): an
+    OPTIONAL cancel_flag, passed straight through to TkinterProgressView,
+    wires the title-bar X as Cancel -- see __init__'s own docstring. A
+    ProgressWindow constructed WITHOUT cancel_flag has no Cancel wiring
+    at all. See run_processing() for where the cancel_flag actually
+    comes from (utils.progress_framework.new_cancel_flag(), one per run)
+    and for this tool's actual Cancel checkpoints -- transfer_attributes()'s
+    own per-influence-source checkpoint (coarse; see that function's own
+    docstring) plus worker()'s per-Land-Parcel-source checkpoint. Cancel
+    is disabled (cancelable=False) once a real, non-cancelled result
+    exists, immediately before the save that follows.
+
+    Indeterminate-mode support (this rollout, follow-up to the D-Cancel
+    rollout, per explicit user request): the "Loading influence layer
+    {i}/{total}" and "Loading {name}"/"Loading DB table {name}" messages
+    previously carried a fake-looking i/total count against the
+    determinate bar, even though each is a single, non-interruptible
+    read call with no real sub-progress to report -- indistinguishable
+    on screen from the genuinely counting phase that follows, which
+    made the bar look like it was jumping between unrelated phases.
+    Matches terrain.py's own set_indeterminate()/set_determinate()
+    mechanism (NOT handled via progress_framework.py -- that module
+    intentionally has no indeterminate-mode support, Rule of Three,
+    still not enough evidence across tools to add it there; instead,
+    set_indeterminate()/set_determinate() below toggle this class's own
+    self.progress widget directly: mode="indeterminate" + .start()
+    vs. mode="determinate" + .stop() -- a tool-local addition, not a
+    change to the shared module), but NOT terrain.py's/road_width.py's
+    animation-speed constant -- this file uses a slower .start(40),
+    per explicit user request (the shared 12ms speed looked too fast
+    here specifically; see set_indeterminate()'s own docstring).
+    TkinterProgressView.render() (used by update(), below) never
+    touches self.progress's mode -- it only sets ["value"]/["maximum"]
+    when given, which has no effect while the bar is in indeterminate
+    mode, so the two mechanisms don't conflict: set_indeterminate()/
+    set_determinate() decide which mode the bar is in; update()
+    continues to drive its determinate-mode value/maximum exactly as
+    before once set_determinate() has been called for a given phase. In
+    this file, only the "Transferring attribute(s)..." phase (a real,
+    if often small, count of checked influence sources) uses the
+    determinate X/N bar; every "Loading..." phase uses indeterminate.
+
+    This docstring previously (incorrectly) said "no cancel/stop_flag
+    support" and listed a stale, incomplete "used by" set (missing
+    terrain.py and influence_map_distance_to_land_parcel.py, and using
+    the already-corrected-elsewhere stale name
+    land_shape_compactness.py) -- both corrected here (Document 1
+    finding #9). Used by (progress_framework.py, current as of this
+    task): shared with lot_location.py, road_frontage.py, road_surface.py,
+    influence_map_distance_to_land_parcel.py, terrain.py, road_density.py,
+    and land_shape.py -- 8 tools total, this one included, and the last
+    to migrate.
     """
-    def __init__(self, root, title="Processing"):
+    def __init__(self, root, title="Processing", cancel_flag=None):
         """
         Creates and immediately shows the progress dialog.
 
         Args:
             root: the parent Tk/Toplevel window.
             title (str): window title. Defaults to "Processing".
+            cancel_flag: optional, from utils.progress_framework.
+                new_cancel_flag() -- when provided, wires the title-bar
+                X to Cancel (see class docstring). None (the default)
+                preserves the exact pre-Cancel-support behavior: no
+                Cancel wiring at all.
         """
         from tkinter import ttk
         self.win = tk.Toplevel(root)
         apply_icon(self.win, "influencemap.ico")
         self.win.title(title)
-        self.win.minsize(400, 120)
+        # Widened from the original 400x120 -- this tool's longer status
+        # messages (e.g. "Transferring attribute(s) for {name}...",
+        # D-Cancel) were narrower than their natural rendered width,
+        # so TkinterProgressView.render()'s existing geometry("") reset
+        # (progress_framework.py, unchanged -- see that module's own
+        # comment on why this call is preserved) made the window visibly
+        # grow/shrink between status updates. 460 comfortably fits this
+        # file's longest routine message without wrapping.
+        self.win.minsize(460, 120)
         self.win.resizable(False, False)
         self.status_var = tk.StringVar(master=self.win)
         self.status_var.set("Starting...")
         tk.Label(
             self.win, textvariable=self.status_var, anchor="center",
-            justify="left", wraplength=380,
+            justify="left", wraplength=440,
         ).pack(pady=10, padx=10, fill="x")
-        self.progress = ttk.Progressbar(self.win, orient="horizontal", mode="determinate", length=350)
+        self.progress = ttk.Progressbar(self.win, orient="horizontal", mode="determinate", length=410)
         self.progress.pack(pady=10)
+        # Set explicit starting geometry matching minsize, so the window
+        # opens at its final size immediately -- render()'s geometry("")
+        # calls, once this size is already the natural fit for the
+        # widgets above, then settle back to the same size on each
+        # subsequent event instead of visibly resizing into it.
+        self.win.geometry("460x120")
         self.win.attributes("-topmost", True)
         self.win.update()
 
@@ -1047,18 +1743,96 @@ class ProgressWindow:
         self.win.attributes("-topmost", True)
         self.win.after(100, lambda: self.win.attributes("-topmost", False))
 
+        # Presentation Policy + Tkinter View collaborators (Progress
+        # Event Protocol v9), via progress_framework.py. Constructed
+        # after the widgets they render into already exist.
         self._policy = ProgressPresentationPolicy()
-        self._view = TkinterProgressView(self.win, self.status_var, self.progress)
+        self._view = TkinterProgressView(self.win, self.status_var, self.progress,
+                                          cancel_flag=cancel_flag)
+        # Indeterminate-mode support (this rollout): tracks which mode
+        # self.progress is currently in, purely so set_indeterminate()/
+        # set_determinate() are safe to call repeatedly/redundantly
+        # (e.g. two consecutive indeterminate phases in a row) without
+        # calling .start() on an already-started bar or .stop() on an
+        # already-stopped one -- both are harmless in Tkinter, but
+        # tracking this keeps the intent explicit rather than relying
+        # on that harmlessness. Matches terrain.py's own field exactly.
+        self._indeterminate = False
 
-    def update(self, message, value=None, maximum=None):
+    def set_indeterminate(self, message):
+        """
+        Switches the bar to indeterminate ("bouncing") mode and updates
+        the status text -- for a phase with no known item count to
+        report a real value/maximum against (loading an influence
+        layer or a Land Parcel source: each is a single, non-
+        interruptible read call). Uses a slower animation interval
+        (.start(40)) than terrain.py's/road_width.py's own 12ms
+        constant -- per explicit user request, the 12ms speed looked
+        too fast in this file specifically. Does not touch cancelable/
+        the title-bar X state -- callers that also need to change that
+        should call update()'s cancelable argument separately, same as
+        any other update() call.
+        """
+        if not self.win.winfo_exists():
+            return
+        self.status_var.set(message)
+        if not self._indeterminate:
+            self.progress.config(mode="indeterminate")
+            self.progress.start(40)
+            self._indeterminate = True
+        self.win.update_idletasks()
+        self.win.geometry("")
+        self.win.update()
+
+    def set_determinate(self, message=None, maximum=None):
+        """
+        Switches the bar back to determinate (normal X/Y) mode -- for
+        entering a phase with a real, known total (the Transferring
+        attribute(s) phase, counting checked influence sources).
+        message is optional so a caller that only wants the mode switch
+        (letting the next update() call set the text) can pass None;
+        maximum, if given, is set immediately (value resets to 0) so
+        the bar doesn't briefly show a stale value/maximum left over
+        from a previous determinate phase.
+        """
+        if not self.win.winfo_exists():
+            return
+        if self._indeterminate:
+            self.progress.stop()
+            self.progress.config(mode="determinate")
+            self._indeterminate = False
+        if maximum is not None:
+            self.progress["maximum"] = maximum
+            self.progress["value"] = 0
+        if message is not None:
+            self.status_var.set(message)
+        self.win.update_idletasks()
+        self.win.geometry("")
+        self.win.update()
+
+    def update(self, message, value=None, maximum=None, cancelable=None):
         """Updates the progress display via the shared
         ProgressPresentationPolicy/TkinterProgressView (see class
-        docstring)."""
-        state = self._policy.compute(message, value, maximum)
+        docstring). cancelable is optional and, per
+        progress_framework.py's own convention, None means "leave the
+        title-bar X's enabled/disabled state as it currently is" --
+        only has any effect on a window constructed WITH cancel_flag.
+        Has no visible effect on the bar's position while
+        set_indeterminate() has put it in indeterminate mode (Tkinter
+        ignores ["value"]/["maximum"] writes in that mode) -- callers
+        driving a real X/Y count should call set_determinate() first."""
+        state = self._policy.compute(message, value, maximum, cancelable)
         self._view.render(state)
 
     def close(self):
-        """Closes the progress window."""
+        """Closes the progress window. Stops the bar's indeterminate
+        animation first if it's still running -- otherwise a running
+        .start() animation can outlive the widget's own destroy()."""
+        try:
+            if self._indeterminate:
+                self.progress.stop()
+        except Exception:
+            pass
         self._view.destroy()
 
 
@@ -1073,9 +1847,14 @@ def run_processing(root, overwrite_mode=None, resolved_table_name=None, resolved
     selected Influence Map layer(s), then for each selected Land
     Parcel/Barangay source, runs transfer_attributes() and saves the
     result either locally (.gpkg, optionally opened in Global Mapper)
-    or to PostGIS -- the DB-output path also writes an entry into the
-    shared CAMA_Transaction_Log table (see the disabled CAMA_Table
-    block's own comment for why a second, related write is disabled).
+    or to PostGIS via _write_db_output_safely()'s staging-write ->
+    verify -> atomic rename-swap sequence (D-Cancel). This docstring
+    previously (incorrectly) said the DB-output path writes an entry
+    into the shared CAMA_Transaction_Log table -- that write is
+    disabled (Document 1 finding #3; see the disabled CAMA_Table/
+    CAMA_Transaction_Log blocks' own comments inside worker() for why
+    each is kept, not deleted), and no longer matches the code;
+    corrected here.
 
     Args:
         root: the live top-level window, used as the parent for any
@@ -1088,8 +1867,10 @@ def run_processing(root, overwrite_mode=None, resolved_table_name=None, resolved
         output table name from resolve_db_output_table() in on_run() --
         only relevant for DB output mode.
         resolved_outcome (str | None): "created" or "overwritten" from
-        resolve_db_output_table() -- recorded into the
-        CAMA_Transaction_Log entry as part of table_action.
+        resolve_db_output_table() -- passed to _write_db_output_safely()
+        (D-Cancel) so FINAL_SWAP knows whether it needs a
+        rename-existing-aside-to-backup step (overwrite) or a plain
+        promotion (create).
     """
     # root: the live top-level window (passed from on_run(); NOT
     # `win`, which is destroyed before run_processing() is ever
@@ -1133,8 +1914,11 @@ def run_processing(root, overwrite_mode=None, resolved_table_name=None, resolved
     # output_mode[0] != "db") or a confirmed table name + outcome (DB
     # output, user already had the chance to cancel in on_run()). No
     # re-resolution or re-validation happens here. resolved_outcome
-    # specifically still matters downstream -- see table_action and the
-    # CAMA_Transaction_Log INSERT further below.
+    # specifically still matters downstream -- see _write_db_output_safely()
+    # in worker() (D-Cancel). This comment previously (incorrectly) said
+    # resolved_outcome fed a CAMA_Transaction_Log INSERT -- that write
+    # is disabled (Document 1 finding #3) and no longer exists;
+    # corrected here.
 
     # ============================================================
     # Progress Event Protocol v9 -- this tool's migration.
@@ -1149,11 +1933,28 @@ def run_processing(root, overwrite_mode=None, resolved_table_name=None, resolved
     # local/db branches like the other tools -- this tool's original
     # structure already merges local/db reading into one loop with an
     # if/else inside it, and a separate if/else for the write step;
-    # that shape is preserved exactly, not restructured), including the
-    # full CAMA_Table/CAMA_Transaction_Log transaction -- now wrapped
+    # that shape is preserved exactly, not restructured), now wrapped
     # inside a background worker() thread instead of running inline on
-    # the main thread.
-    progress = ProgressWindow(root, "Influence Map to Land Parcel — Progress")
+    # the main thread. The disabled CAMA_Table/CAMA_Transaction_Log
+    # comment blocks stay exactly where they are inside worker() below,
+    # untouched (Document 1 findings #3/#4) -- only the main table's own
+    # write (previously a direct to_postgis() call) is replaced with
+    # _write_db_output_safely()'s staging/verify/swap sequence.
+    #
+    # D-Cancel (this task): one new_cancel_flag() is created per run and
+    # passed to ProgressWindow, wiring the title-bar X as Cancel for the
+    # lifetime of this run's progress dialog -- an addition on top of
+    # the v9 migration above, not a redesign of it. The "update" event
+    # grew a 4th (cancelable) field (see progress_cb and poll_queue()
+    # below); this file's existing all-or-nothing try/except (Document 1
+    # finding #2) is untouched -- Cancel is handled entirely via the
+    # ("cancelled", ...) event branch in poll_queue(), a `return` inside
+    # worker() at the coarse per-Land-Parcel-source checkpoint below, and
+    # this same try/except's own fallthrough; no per-source isolation,
+    # no change to transfer_attributes()'s join logic.
+    cancel_flag = new_cancel_flag()
+    progress = ProgressWindow(root, "Influence Map to Land Parcel — Progress",
+                               cancel_flag=cancel_flag)
     q = queue.Queue()
 
     def worker():
@@ -1161,15 +1962,53 @@ def run_processing(root, overwrite_mode=None, resolved_table_name=None, resolved
         Background-thread body: loads the selected Influence Map
         layer(s), then for each selected Land Parcel/Barangay source
         runs transfer_attributes() and saves the result (local .gpkg or
-        PostGIS + CAMA_Transaction_Log entry), posting progress/
-        completion/error events onto q for poll_queue() to consume on
-        the main thread. Never touches Tkinter widgets directly (all
-        UI updates happen via progress_cb -> q, consumed by
-        poll_queue()).
+        PostGIS via _write_db_output_safely()'s staging/verify/swap
+        sequence), posting progress/completion/error/cancelled events
+        onto q for poll_queue() to consume on the main thread. Never
+        touches Tkinter widgets directly (all UI updates happen via
+        progress_cb -> q, consumed by poll_queue()).
+
+        D-Cancel (this task, DB-write half): acquires the DB run lock
+        (only for DB output mode) before the influence-layer load,
+        releases it in a finally: block regardless of how this function
+        exits (clean completion, a Cancel, or an exception) -- see the
+        "ATOMIC DB WRITE" section above for the full rationale.
+
+        D-Cancel (Cancel-checkpoint half): cancel_flag is checked once
+        per Land Parcel/Barangay source, immediately before
+        transfer_attributes() is called (a coarse checkpoint -- see
+        Document 1 finding #5 and transfer_attributes()'s own docstring
+        for the full granularity caveat), plus threaded into
+        transfer_attributes() itself for its own, finer per-influence-
+        source checkpoint. A None return from transfer_attributes()
+        means Cancel fired inside it -- full discard, per this task's
+        resolved decision (finding #6): the save step for that source is
+        skipped entirely and the run ends via a "cancelled" event.
         """
+        lock_conn = None
         try:
-            def progress_cb(msg, val=None, maxv=None):
-                q.put(("update", msg, val, maxv))
+            def progress_cb(msg, val=None, maxv=None, cancelable=None):
+                q.put(("update", msg, val, maxv, cancelable))
+
+            # D-Cancel: one run_id/run_started_at for the whole run --
+            # cheap to always generate, even for local output mode,
+            # which doesn't use it. The advisory lock itself is only
+            # ever acquired for DB output mode, since it exists purely
+            # to let a FUTURE run's _scan_orphaned_cama_tables() tell
+            # this run's staging/backup artifacts apart from a
+            # genuinely abandoned one. Matches terrain.py's/
+            # road_surface.py's/land_shape.py's own identical placement.
+            run_id = _gen_id()
+            run_started_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+            if output_mode[0] == "db":
+                lock_conn = _acquire_run_lock(creds, run_id)
+                if lock_conn is None:
+                    raise RuntimeError(
+                        "Could not acquire the database run lock. Another "
+                        "CAMA Tools database write may already be in "
+                        "progress, or the database connection failed. "
+                        "Aborting before any write -- no data was changed."
+                    )
 
             influence_gdfs = []
             added_fields = []
@@ -1228,7 +2067,8 @@ def run_processing(root, overwrite_mode=None, resolved_table_name=None, resolved
             total_influence = len(sources_with_columns)
             for i, (src_type, path_or_table, layer) in enumerate(sources_with_columns, start=1):
                 label = path_or_table if layer is None else f"{path_or_table} ({layer})"
-                progress_cb(f"Loading influence layer {i}/{total_influence}: {label}", i, total_influence)
+                q.put(("phase", "indeterminate",
+                       f"Loading influence layer {i}/{total_influence}: {label}", None))
                 column_pairs = columns_by_source[(src_type, path_or_table, layer)]
                 if src_type == "local":
                     # A real layer name means this is one specific
@@ -1273,11 +2113,11 @@ def run_processing(root, overwrite_mode=None, resolved_table_name=None, resolved
             for src in sources:
                 if barangay_source[0] == "local":
                     local_name = get_local_name(src)
-                    progress_cb(f"Loading {local_name}", None, None)
+                    q.put(("phase", "indeterminate", f"Loading {local_name}...", None))
                     b_gdf_raw = read_vector_file(src)
                 else:
                     local_name = src
-                    progress_cb(f"Loading DB table {local_name}", None, None)
+                    q.put(("phase", "indeterminate", f"Loading DB table {local_name}...", None))
                     geom_col = get_geom_column(engine, schema, src)
                     b_gdf_raw = gpd.read_postgis(
                         f'SELECT * FROM "{schema}"."{src}"', engine, geom_col=geom_col
@@ -1309,11 +2149,63 @@ def run_processing(root, overwrite_mode=None, resolved_table_name=None, resolved
                     final_col: src_col_overrides.get(final_col, final_col)
                     for final_col in added_fields
                 }
+
+                # Cancel (coarse, pre-processing checkpoint): checked
+                # once per Land Parcel/Barangay source, immediately
+                # before transfer_attributes() begins -- catches a
+                # Cancel clicked during the load/CRS-reprojection steps
+                # above, before transfer_attributes()'s own finer
+                # per-influence-source checkpoint could catch it (see
+                # that function's own docstring for the full
+                # granularity caveat -- Document 1 finding #5). Does
+                # NOT make the loading/reprojection steps above it
+                # individually interruptible. All-or-nothing preserved:
+                # on Cancel here, nothing is saved and no further
+                # source is attempted.
+                if cancel_flag["stop"]:
+                    q.put(("update", "Discarding run... Please wait.", None, None, False))
+                    q.put(("cancelled", None, None, None))
+                    return
+
+                q.put(("phase", "determinate", "Transferring attribute(s)...", total_influence))
+                progress_cb(f"Transferring attribute(s) for {local_name}...", cancelable=True)
                 b_gdf = transfer_attributes(
                     b_gdf, influence_gdfs,
                     output_column_map=output_column_map,
                     progress=progress_cb,
+                    cancel_flag=cancel_flag,
                 )
+
+                if b_gdf is None:
+                    # D-Cancel: Cancel fired inside transfer_attributes()
+                    # (its own per-influence-source checkpoint) -- full
+                    # discard, per this task's resolved decision
+                    # (finding #6). Nothing for this source is saved;
+                    # output_mode[1]/the DB is never touched (the save
+                    # step below is never reached), and no further Land
+                    # Parcel/Barangay source is attempted. Same-tick
+                    # "flash" of this message before the terminal
+                    # "cancelled" dialog, no artificial delay.
+                    q.put(("update", "Discarding run... Please wait.", None, None, False))
+                    q.put(("cancelled", None, None, None))
+                    return
+
+                # D-Cancel: from here through the save, Cancel is
+                # disabled -- a real result now exists and nothing past
+                # this point can be safely interrupted (the save itself
+                # is not cancelable -- see _write_db_output_safely()).
+                # Indeterminate (this rollout): the save itself
+                # (_write_gpkg() or _write_db_output_safely()) is a
+                # single, non-interruptible write with no real sub-
+                # progress -- previously this only sent a plain
+                # progress_cb() "update" with no val/maxv, which left
+                # the bar frozen at its last Transferring-phase value
+                # (a determinate bar with no new value/maximum simply
+                # doesn't move). Switching to indeterminate here keeps
+                # the bar visibly animating for the whole save, same as
+                # every "Loading..." phase above.
+                q.put(("phase", "indeterminate", f"Saving {local_name}...", None))
+                progress_cb(f"Saving {local_name}...", cancelable=False)
 
                 # Runs once per source, right after transfer_attributes() and
                 # before the local/DB save split below, so both output modes
@@ -1402,9 +2294,8 @@ def run_processing(root, overwrite_mode=None, resolved_table_name=None, resolved
                     # is somehow None here (output_mode[0] != "db" can't reach
                     # this branch, so this is just a defensive fallback).
                     target_table = resolved_table_name if resolved_table_name is not None else local_name.lower()
-                    table_action = resolved_outcome if resolved_outcome is not None else "new"
 
-                    print(f"🗂️ Saving to DB: {target_table} ({table_action})")
+                    print(f"🗂️ Saving to DB: {target_table}")
 
                     # Same restoration as the local-file save path above --
                     # b_gdf is still in the 3857 working CRS at this point.
@@ -1413,197 +2304,224 @@ def run_processing(root, overwrite_mode=None, resolved_table_name=None, resolved
                     else:
                         b_gdf = b_gdf.to_crs(epsg=4326)
 
-                    # --------------- 🟢 Main table + CAMA Table and Log --------------- #
-                    # The main table write and the CAMA_Table/log updates below
-                    # now share ONE transaction -- previously the main table
-                    # write used a bare `engine` (auto-committing on its own,
-                    # outside any transaction), while only the CAMA_Table
-                    # portion had real engine.begin() atomicity. That meant a
-                    # CAMA_Table failure could leave the main table already
-                    # committed with no rollback. Merging them closes that gap:
-                    # if ANY part fails -- the main table write, CAMA_Table, or
-                    # CAMA_Transaction_Log -- everything rolls back together as
-                    # one unit.
-                    with engine.begin() as conn:
-                        b_gdf.to_postgis(
-                            target_table,
-                            conn,
-                            schema=schema,
-                            if_exists="replace",
-                            index=False
-                        )
+                    # D-Cancel: staging-write / verify / atomic rename-swap,
+                    # replacing the previous direct
+                    # `with engine.begin() as conn: b_gdf.to_postgis(...)`
+                    # call -- see "ATOMIC DB WRITE" section above. The old
+                    # `table_action` local (previously "new"/"overwritten",
+                    # used only to build the disabled CAMA_Transaction_Log
+                    # INSERT's own table_name field further below) is no
+                    # longer needed -- resolved_outcome is passed straight
+                    # through to _write_db_output_safely() instead, which
+                    # is the function that now actually consumes it (to
+                    # decide whether FINAL_SWAP needs a rename-existing-
+                    # aside-to-backup step). The disabled CAMA_Table/
+                    # CAMA_Transaction_Log comment blocks immediately below
+                    # are untouched, verbatim -- they were already fully
+                    # commented out (inert) before this change and remain
+                    # so; only the live to_postgis() call that preceded
+                    # them, and the `with engine.begin() as conn:` wrapper
+                    # it needed, are replaced. Since both blocks below are
+                    # already 100% comments, they no longer need to sit
+                    # inside a `with` block to stay syntactically valid --
+                    # nothing about their own (disabled) content changes.
+                    _write_db_output_safely(engine, schema, b_gdf,
+                                             target_table, resolved_outcome,
+                                             run_id, run_started_at)
+                    print(f"🔄 Saved to DB: {target_table}")
 
-                        # ------------------------------------------------------------------
-                        # CAMA_Table write -- DISABLED (commented out, not removed).
-                        #
-                        # Confirmed (developer sign-off, August 2026) that no application --
-                        # including BLGF-Web-App, iGeosys-LGU-Suite, or any other known
-                        # system -- currently reads from CAMA_Table in the PostGIS database.
-                        # This is NOT a statement that the implementation below is obsolete,
-                        # broken, or wrong -- it is intentionally left fully intact so it can
-                        # be re-enabled later with no rework if a consumer for CAMA_Table
-                        # appears (e.g. a future reporting/dashboard need).
-                        #
-                        # Same convention already used for this exact table in
-                        # influence_to_map.py (its own CAMA_Table block, disabled for a
-                        # different reason -- see that file's comment) -- disabled here
-                        # independently, matching the same comment-out-not-delete style.
-                        #
-                        # Untouched by this change: the b_gdf.to_postgis() main table write
-                        # above, and the CAMA_Transaction_Log block below -- both stay inside
-                        # the same `with engine.begin() as conn:` transaction as before.
-                        # ------------------------------------------------------------------
-                        # # Ensure CAMA_Table exists
+                    # ------------------------------------------------------------------
+                    # CAMA_Table write -- DISABLED (commented out, not removed).
+                    #
+                    # Confirmed (developer sign-off, August 2026) that no application --
+                    # including BLGF-Web-App, iGeosys-LGU-Suite, or any other known
+                    # system -- currently reads from CAMA_Table in the PostGIS database.
+                    # This is NOT a statement that the implementation below is obsolete,
+                    # broken, or wrong -- it is intentionally left fully intact so it can
+                    # be re-enabled later with no rework if a consumer for CAMA_Table
+                    # appears (e.g. a future reporting/dashboard need).
+                    #
+                    # Same convention already used for this exact table in
+                    # influence_to_map.py (its own CAMA_Table block, disabled for a
+                    # different reason -- see that file's comment) -- disabled here
+                    # independently, matching the same comment-out-not-delete style.
+                    #
+                    # Untouched by this change: the disabled
+                    # CAMA_Transaction_Log block below this one -- both
+                    # stay exactly as they are. Previously both this block
+                    # and the main table write shared one
+                    # `with engine.begin() as conn:` transaction; that
+                    # wrapper no longer exists at this call site --
+                    # _write_db_output_safely() (D-Cancel) now owns its
+                    # own internal transactions for the main table write
+                    # (staging-write / verify / atomic rename-swap). This
+                    # block's own disabled SQL is unaffected either way,
+                    # since none of it currently executes.
+                    # ------------------------------------------------------------------
+                    # # Ensure CAMA_Table exists
+                    # conn.execute(
+                        # text(
+                            # f"""
+                        # CREATE TABLE IF NOT EXISTS "{schema}"."CAMA_Table" (
+                            # id SERIAL PRIMARY KEY,
+                            # PIN TEXT UNIQUE NOT NULL
+                        # );
+                    # """
+                        # )
+                    # )
+                    #
+                    # # Add missing columns as NUMERIC
+                    # for col in added_fields:
                         # conn.execute(
                             # text(
                                 # f"""
-                            # CREATE TABLE IF NOT EXISTS "{schema}"."CAMA_Table" (
-                                # id SERIAL PRIMARY KEY,
-                                # PIN TEXT UNIQUE NOT NULL
-                            # );
+                            # DO $$
+                            # BEGIN
+                                # IF NOT EXISTS (
+                                    # SELECT 1 FROM information_schema.columns
+                                    # WHERE table_schema='{schema}'
+                                      # AND table_name='CAMA_Table'
+                                      # AND column_name='{col.lower()}'
+                                # ) THEN
+                                    # EXECUTE 'ALTER TABLE "{schema}"."CAMA_Table" ADD COLUMN "{col.lower()}" NUMERIC';
+                                # END IF;
+                            # END $$;
                         # """
                             # )
                         # )
-                        #
-                        # # Add missing columns as NUMERIC
-                        # for col in added_fields:
-                            # conn.execute(
-                                # text(
-                                    # f"""
-                                # DO $$
-                                # BEGIN
-                                    # IF NOT EXISTS (
-                                        # SELECT 1 FROM information_schema.columns
-                                        # WHERE table_schema='{schema}'
-                                          # AND table_name='CAMA_Table'
-                                          # AND column_name='{col.lower()}'
-                                    # ) THEN
-                                        # EXECUTE 'ALTER TABLE "{schema}"."CAMA_Table" ADD COLUMN "{col.lower()}" NUMERIC';
-                                    # END IF;
-                                # END $$;
+                    #
+                    # # Insert or update PIN-based values using named parameters
+                    # pin_field = next((c for c in b_gdf.columns if c.lower() == "pin"), None)
+                    # if pin_field:
+                        # # Instrumentation only (per explicit instruction):
+                        # # total/enumerate(..., start=1) added purely to
+                        # # report progress -- the SQL logic and transaction
+                        # # flow inside this loop are completely unchanged.
+                        # # This loop executes one SQL statement per parcel
+                        # # row and can become the longest-running part of
+                        # # the operation, so it gets its own progress
+                        # # messages rather than leaving the dialog looking
+                        # # stalled for its whole duration.
+                        # total_rows = len(b_gdf)
+                        # for row_i, (_, row) in enumerate(b_gdf.iterrows(), start=1):
+                            # progress_cb(f"Updating CAMA_Table: {row_i}/{total_rows}", row_i, total_rows)
+                            # insert_cols = ["PIN"] + [c.lower() for c in added_fields]
+                            # insert_placeholders = [f":{c.lower()}" for c in insert_cols]
+                            # update_assignments = [f'"{c.lower()}" = :{c.lower()}_upd' for c in added_fields]
+                    #
+                            # sql = f"""
+                            # INSERT INTO "{schema}"."CAMA_Table" ({', '.join(insert_cols)})
+                            # VALUES ({', '.join(insert_placeholders)})
+                            # ON CONFLICT (PIN) DO UPDATE
+                            # SET {', '.join(update_assignments)};
                             # """
-                                # )
-                            # )
-                        #
-                        # # Insert or update PIN-based values using named parameters
-                        # pin_field = next((c for c in b_gdf.columns if c.lower() == "pin"), None)
-                        # if pin_field:
-                            # # Instrumentation only (per explicit instruction):
-                            # # total/enumerate(..., start=1) added purely to
-                            # # report progress -- the SQL logic and transaction
-                            # # flow inside this loop are completely unchanged.
-                            # # This loop executes one SQL statement per parcel
-                            # # row and can become the longest-running part of
-                            # # the operation, so it gets its own progress
-                            # # messages rather than leaving the dialog looking
-                            # # stalled for its whole duration.
-                            # total_rows = len(b_gdf)
-                            # for row_i, (_, row) in enumerate(b_gdf.iterrows(), start=1):
-                                # progress_cb(f"Updating CAMA_Table: {row_i}/{total_rows}", row_i, total_rows)
-                                # insert_cols = ["PIN"] + [c.lower() for c in added_fields]
-                                # insert_placeholders = [f":{c.lower()}" for c in insert_cols]
-                                # update_assignments = [f'"{c.lower()}" = :{c.lower()}_upd' for c in added_fields]
-                        #
-                                # sql = f"""
-                                # INSERT INTO "{schema}"."CAMA_Table" ({', '.join(insert_cols)})
-                                # VALUES ({', '.join(insert_placeholders)})
-                                # ON CONFLICT (PIN) DO UPDATE
-                                # SET {', '.join(update_assignments)};
-                                # """
-                        #
-                                # params = {}
-                                # params["pin"] = str(row[pin_field])
-                        #
-                                # for c in added_fields:
-                                    # # Source-side lookup only -- CAMA_Table's
-                                    # # OWN column names (c.lower(), used for
-                                    # # insert_cols/update_assignments/params keys
-                                    # # above and below) are UNCHANGED by this
-                                    # # fix. This only changes WHERE the value is
-                                    # # read FROM in b_gdf: prefer the new
-                                    # # CAMA_-prefixed column (the one
-                                    # # transfer_attributes() actually wrote this
-                                    # # run -- output_column_map already resolved
-                                    # # any per-source override casing), falling
-                                    # # back to the legacy unprefixed column name
-                                    # # if the new one somehow isn't present (e.g.
-                                    # # a barangay/parcel source that still has an
-                                    # # old, pre-CAMA_-prefix column from before
-                                    # # this change, and for whatever reason the
-                                    # # new column wasn't created this run).
-                                    # # Without this fallback-aware lookup, every
-                                    # # CAMA_Table value would silently become
-                                    # # NULL after the CAMA_ prefix rollout, since
-                                    # # b_gdf no longer has a column literally
-                                    # # named `c`.
-                                    # resolved_col = output_column_map.get(c, f"CAMA_{c}")
-                                    # if resolved_col in row:
-                                        # source_val = row[resolved_col]
-                                    # elif c in row:
-                                        # source_val = row[c]
-                                    # else:
-                                        # source_val = None
-                        #
-                                    # if source_val is not None:
-                                        # try:
-                                            # params[c.lower()] = float(source_val)
-                                            # params[f"{c.lower()}_upd"] = float(source_val)
-                                        # except (ValueError, TypeError):
-                                            # params[c.lower()] = None
-                                            # params[f"{c.lower()}_upd"] = None
-                                    # else:
+                    #
+                            # params = {}
+                            # params["pin"] = str(row[pin_field])
+                    #
+                            # for c in added_fields:
+                                # # Source-side lookup only -- CAMA_Table's
+                                # # OWN column names (c.lower(), used for
+                                # # insert_cols/update_assignments/params keys
+                                # # above and below) are UNCHANGED by this
+                                # # fix. This only changes WHERE the value is
+                                # # read FROM in b_gdf: prefer the new
+                                # # CAMA_-prefixed column (the one
+                                # # transfer_attributes() actually wrote this
+                                # # run -- output_column_map already resolved
+                                # # any per-source override casing), falling
+                                # # back to the legacy unprefixed column name
+                                # # if the new one somehow isn't present (e.g.
+                                # # a barangay/parcel source that still has an
+                                # # old, pre-CAMA_-prefix column from before
+                                # # this change, and for whatever reason the
+                                # # new column wasn't created this run).
+                                # # Without this fallback-aware lookup, every
+                                # # CAMA_Table value would silently become
+                                # # NULL after the CAMA_ prefix rollout, since
+                                # # b_gdf no longer has a column literally
+                                # # named `c`.
+                                # resolved_col = output_column_map.get(c, f"CAMA_{c}")
+                                # if resolved_col in row:
+                                    # source_val = row[resolved_col]
+                                # elif c in row:
+                                    # source_val = row[c]
+                                # else:
+                                    # source_val = None
+                    #
+                                # if source_val is not None:
+                                    # try:
+                                        # params[c.lower()] = float(source_val)
+                                        # params[f"{c.lower()}_upd"] = float(source_val)
+                                    # except (ValueError, TypeError):
                                         # params[c.lower()] = None
                                         # params[f"{c.lower()}_upd"] = None
-                        #
-                                # conn.execute(text(sql), params)
+                                # else:
+                                    # params[c.lower()] = None
+                                    # params[f"{c.lower()}_upd"] = None
+                    #
+                            # conn.execute(text(sql), params)
 
-                        # ------------------------------------------------------------------
-                        # CAMA_Transaction_Log write -- DISABLED (commented out, not removed).
-                        #
-                        # This entry is not currently needed -- there is no active
-                        # requirement for a per-run log of which table/tool/fields were
-                        # written. This is NOT a statement that the implementation below is
-                        # broken, obsolete, or wrong -- it is a forward-looking write that
-                        # simply isn't needed right now. It is left fully intact so it can
-                        # be re-enabled later with no rework if a future need for a
-                        # transaction log (e.g. an audit trail or run-history feature)
-                        # appears.
-                        #
-                        # Untouched by this change: the b_gdf.to_postgis() main table write
-                        # above, and the disabled CAMA_Table block above this one -- both
-                        # stay exactly as they are. The main table write remains the only
-                        # live statement inside this `with engine.begin() as conn:` block.
-                        # ------------------------------------------------------------------
-                        # # Ensure CAMA_Transaction_Log exists
-                        # conn.execute(
-                            # text(
-                                # f"""
-                            # CREATE TABLE IF NOT EXISTS "{schema}"."CAMA_Transaction_Log" (
-                                # id SERIAL PRIMARY KEY,
-                                # table_name TEXT,
-                                # cama_tool TEXT,
-                                # cama_fields TEXT,
-                                # transaction_date_time TIMESTAMP DEFAULT NOW()
-                            # );
-                        # """
-                            # )
+                    # ------------------------------------------------------------------
+                    # CAMA_Transaction_Log write -- DISABLED (commented out, not removed).
+                    #
+                    # This entry is not currently needed -- there is no active
+                    # requirement for a per-run log of which table/tool/fields were
+                    # written. This is NOT a statement that the implementation below is
+                    # broken, obsolete, or wrong -- it is a forward-looking write that
+                    # simply isn't needed right now. It is left fully intact so it can
+                    # be re-enabled later with no rework if a future need for a
+                    # transaction log (e.g. an audit trail or run-history feature)
+                    # appears.
+                    #
+                    # Untouched by this change: the disabled CAMA_Table
+                    # block above this one -- both stay exactly as they
+                    # are. Previously both this block and the main table
+                    # write shared one `with engine.begin() as conn:`
+                    # transaction; that wrapper no longer exists at this
+                    # call site -- _write_db_output_safely() (D-Cancel)
+                    # now owns its own internal transactions for the main
+                    # table write (staging-write / verify / atomic
+                    # rename-swap). This block's own disabled SQL is
+                    # unaffected either way, since none of it currently
+                    # executes. NOTE for any future re-enablement: this
+                    # block's own INSERT payload below still references
+                    # `table_action`, a local this task removed (it was
+                    # only ever used to build this string) -- a future
+                    # re-enablement will need to reintroduce that value
+                    # (or derive an equivalent from resolved_outcome)
+                    # before this block can run again.
+                    # ------------------------------------------------------------------
+                    # # Ensure CAMA_Transaction_Log exists
+                    # conn.execute(
+                        # text(
+                            # f"""
+                        # CREATE TABLE IF NOT EXISTS "{schema}"."CAMA_Transaction_Log" (
+                            # id SERIAL PRIMARY KEY,
+                            # table_name TEXT,
+                            # cama_tool TEXT,
+                            # cama_fields TEXT,
+                            # transaction_date_time TIMESTAMP DEFAULT NOW()
+                        # );
+                    # """
                         # )
-                        #
-                        # # Log transaction
-                        # conn.execute(
-                            # text(
-                                # f"""
-                            # INSERT INTO "{schema}"."CAMA_Transaction_Log" 
-                            # (table_name, cama_tool, cama_fields)
-                            # VALUES (:tbl, :tool, :details);
-                        # """
-                            # ),
-                            # {
-                                # "tbl": f"{target_table} ({table_action})",
-                                # "tool": "influence_map_to_land_parcel",
-                                # "details": ", ".join(added_fields),
-                            # },
-                        # )
+                    # )
+                    #
+                    # # Log transaction
+                    # conn.execute(
+                        # text(
+                            # f"""
+                        # INSERT INTO "{schema}"."CAMA_Transaction_Log" 
+                        # (table_name, cama_tool, cama_fields)
+                        # VALUES (:tbl, :tool, :details);
+                    # """
+                        # ),
+                        # {
+                            # "tbl": f"{target_table} ({table_action})",
+                            # "tool": "influence_map_to_land_parcel",
+                            # "details": ", ".join(added_fields),
+                        # },
+                    # )
 
             # any_overlay_found (see its own comment above the per-source
             # loop): True as soon as ANY parcel row, in ANY processed
@@ -1632,22 +2550,66 @@ def run_processing(root, overwrite_mode=None, resolved_table_name=None, resolved
             # thread: an exception on a non-main thread that nobody
             # catches is otherwise simply lost.
             q.put(("error", str(e), None, None))
+        finally:
+            # D-Cancel: released here regardless of how the try block
+            # above exits -- clean success, a Cancel (the `return`
+            # statements at either checkpoint above), or an exception
+            # (the `except` clause's own fallthrough). A lingering
+            # advisory lock past this point would make a FUTURE run's
+            # _scan_orphaned_cama_tables() wrongly treat this run's own
+            # staging/backup tables as still "live" even after this run
+            # has fully ended.
+            if lock_conn is not None:
+                _release_run_lock(lock_conn)
 
     def poll_queue():
         """
         Main-thread poller (scheduled via root.after(100, ...)): drains
         q and updates the progress dialog, opens the result in Global
-        Mapper, or shows the final success/error dialog and stops
-        polling, depending on the event kind. All Tkinter calls happen
-        here, never inside worker() itself.
+        Mapper, or shows the final success/error/cancelled dialog and
+        stops polling, depending on the event kind. All Tkinter calls
+        happen here, never inside worker() itself.
+
+        D-Cancel: "update" events now carry a 4th (cancelable) field --
+        passed straight through to progress.update(), which forwards it
+        to ProgressPresentationPolicy.compute() (None means "leave the
+        title-bar X's state as-is", per progress_framework.py's own
+        convention). A new "cancelled" event kind is handled the same
+        way as "done"/"error": closes the progress window, shows a
+        terminal dialog, and stops polling.
+
+        Indeterminate-mode support (this rollout): a new "phase" event
+        kind ("phase", "indeterminate"|"determinate", message, maximum)
+        -- distinct from "update" -- drives ProgressWindow.set_indeterminate()/
+        set_determinate() directly, matching terrain.py's own handling.
+        Coalescing: only the LATEST pending "update" seen before the
+        next event (phase or otherwise) is rendered -- prevents a burst
+        of "update" events from visually stomping on a "phase" switch,
+        or vice versa, the same class of flicker terrain.py's own
+        poll_queue() fix addresses.
         """
         if not root.winfo_exists():
             return
         try:
+            pending_update = None
             while True:
                 kind, *rest = q.get_nowait()
                 if kind == "update":
-                    progress.update(rest[0], rest[1], rest[2])
+                    pending_update = rest
+                    continue
+                # A non-"update" event follows: flush whatever the
+                # latest pending "update" was (if any) BEFORE acting on
+                # this event, so the displayed status text/bar never
+                # goes stale relative to what's about to happen.
+                if pending_update is not None:
+                    progress.update(pending_update[0], pending_update[1], pending_update[2], pending_update[3])
+                    pending_update = None
+                if kind == "phase":
+                    mode, message, maximum = rest
+                    if mode == "indeterminate":
+                        progress.set_indeterminate(message)
+                    else:
+                        progress.set_determinate(message, maximum)
                 elif kind == "open_gm":
                     load_in_global_mapper(rest[0])
                 elif kind == "done":
@@ -1658,8 +2620,13 @@ def run_processing(root, overwrite_mode=None, resolved_table_name=None, resolved
                     progress.close()
                     messagebox.showerror("Error", rest[0])
                     return
+                elif kind == "cancelled":
+                    progress.close()
+                    messagebox.showinfo("Cancelled", "The run was cancelled. No data was changed.")
+                    return
         except queue.Empty:
-            pass
+            if pending_update is not None:
+                progress.update(pending_update[0], pending_update[1], pending_update[2], pending_update[3])
         root.after(100, poll_queue)
 
     threading.Thread(target=worker, daemon=True).start()
@@ -4036,11 +5003,20 @@ def open_main_window(root):
         # call site moved here.
         #
         # Both resolved_table_name AND resolved_outcome are threaded
-        # through to run_processing() -- unlike most other migrated
-        # tools, resolved_outcome is NOT a throwaway here: it feeds
-        # table_action, which is written into the CAMA_Transaction_Log
-        # INSERT further down in worker() (see that do-not-touch block's
-        # own logic). Matches road_width.py's pattern exactly.
+        # through to run_processing() -- resolved_outcome is NOT a
+        # throwaway: it is passed to _write_db_output_safely() (D-Cancel;
+        # see that function's own docstring), which uses it to decide
+        # whether FINAL_SWAP needs a rename-existing-aside-to-backup step
+        # (overwrite) or a plain promotion (create). This comment
+        # previously (incorrectly) said resolved_outcome fed a
+        # CAMA_Transaction_Log INSERT -- that write is disabled (Document
+        # 1 finding #3) and no longer exists; corrected here.
+        #
+        # D-Cancel: _resolve_creds is now also passed as
+        # resolve_db_output_table()'s 4th argument, so its own
+        # crash-orphan recovery scan (_scan_orphaned_cama_tables()) can
+        # run before its existing fuzzy-match logic -- see that
+        # function's own docstring.
         # ------------------------------------------------------------------
         resolved_table_name = None
         resolved_outcome = None
@@ -4050,7 +5026,7 @@ def open_main_window(root):
                 return
             _resolve_schema = _resolve_creds["schema"]
             resolved_table_name, resolved_outcome = resolve_db_output_table(
-                win, _resolve_schema, barangay_source
+                win, _resolve_schema, barangay_source, _resolve_creds
             )
             if resolved_table_name is None:
                 print("Run cancelled by user (database output table not confirmed).")

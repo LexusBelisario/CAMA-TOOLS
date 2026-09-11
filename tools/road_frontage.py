@@ -27,18 +27,41 @@ INPUTS:
     utils/db_discovery.py) for any DB source or DB output.
 
 OUTPUTS:
-    Local output mode: writes one atomically-written .gpkg per
+    Local output mode: writes exactly one atomically-written .gpkg per
     processed Land Parcel source, then attempts to open it in Global
     Mapper (via load_in_global_mapper()-equivalent logic in this
-    file's GPKG overwrite safety / Global Mapper handling). An optional
-    QA layer (emit_buffer_qa) can additionally write diagnostic buffer
-    geometry for visual debugging of the frontage measurement
-    algorithm.
-    DB output mode: writes/replaces one PostGIS table per source,
-    resolved via resolve_db_output_table() -- an exact-match replace for
-    a DB Land Parcel source, or a fuzzy-match-with-confirmation flow
+    file's GPKG overwrite safety / Global Mapper handling). The
+    previously-disabled buffer-diagnostic/Visual Measurement (VM) QA
+    layers have been removed entirely (not just disabled) -- a
+    successful run now always produces exactly one output artifact per
+    source, local or DB.
+    DB output mode: writes/replaces one PostGIS table per source, via a
+    cancel-safe staging/verify/atomic-rename-swap sequence
+    (_write_db_output_safely() -- see the "DB ATOMIC WRITE / CANCEL-SAFE
+    STAGING" section below), never touching the real destination table
+    until the swap itself. The destination table is resolved via
+    resolve_db_output_table() -- an exact-match replace for a DB Land
+    Parcel source, or a fuzzy-match-with-confirmation flow
     (confirm_db_overwrite_dialog() / choose_db_overwrite_dialog()) for a
-    local-file Land Parcel source.
+    local-file Land Parcel source. That resolution step also scans for,
+    and offers to clean up, any leftover staging/backup table left
+    behind by a previous run that was interrupted before it could clean
+    up after itself (_scan_orphaned_cama_tables() /
+    _prompt_orphaned_cama_tables()).
+
+    CANCELLATION: the Run Processing progress window's title-bar close
+    button acts as a cooperative Cancel control (see ProgressWindow and
+    the "DB ATOMIC WRITE / CANCEL-SAFE STAGING" section below).
+    Cancellation is checked at explicit checkpoints between and within
+    the per-parcel processing passes in process_frontage_single() --
+    it is NOT instantaneous everywhere: a single blocking geometry
+    operation (reprojection, clipping, union, an individual Shapely
+    call) or a single blocking DB call (the staging write, the final
+    atomic rename-swap) always runs to completion once started. A
+    Cancel that lands before a real result exists discards everything
+    computed so far for that source (no partial output is ever saved,
+    locally or to the DB); nothing after the point a real result exists
+    can be interrupted.
 
 DEPENDENCIES:
     stdlib: os, re, math, subprocess, json, ctypes, sys, tkinter (+
@@ -101,6 +124,7 @@ import re
 import math
 import subprocess
 import json
+import secrets
 import tkinter as tk
 from tkinter import filedialog, messagebox, Listbox, ttk, StringVar
 
@@ -196,14 +220,6 @@ filter_by_road_type_active = False
 # value left over from a previous session can never leak into that
 # source's run.
 road_type_excluded_values = []
-
-# emit_buffer_qa: opt-in flag for the buffer diagnostic QA layer (see
-# process_frontage_single()'s docstring). Off by default -- set by
-# open_main_window()'s on_run() from a GUI checkbox, read by
-# run_processing(). A separate, unrelated concern from Road
-# Classification -- purely a visual-debugging aid for the frontage
-# measurement algorithm itself.
-emit_buffer_qa = False
 
 # overwrite_mode: "overwrite" | "new" | None (no conflicts found, or
 # output destination isn't local). Resolved ONCE, up front, in on_run(),
@@ -467,9 +483,11 @@ MIN_FRONTAGE_THRESHOLD = 0.9
 # specifically so this experiment is easy to find, adjust, and revert.
 # Original, pre-experiment value was 10 (matching the algorithm's
 # original design, in production for all of the Road Classification
-# feature's history). Use the buffer diagnostic QA layer (the
-# "Generate buffer diagnostic layer (Visual Measurement)" checkbox) to
-# visually inspect the effect of this change on real parcel data.
+# feature's history). The buffer-diagnostic QA layer previously used to
+# visually inspect the effect of this value has been removed (see the
+# module docstring's OUTPUTS section) -- effects of changing this value
+# are now only observable via the actual CAMA_ROAD_FRONTAGE/CAMA_DEPTH
+# output columns themselves.
 FRONTAGE_BUFFER_TOLERANCE = 9
 
 
@@ -545,11 +563,11 @@ ROAD_DENSIFY_INTERVAL = 1.0  # meters
 #     Tolerance") that this class of fix treats a symptom, not the root
 #     cause.
 #
-# Use the buffer diagnostic QA layer to visually inspect Stage 2's buffer
-# zones (TWO_STAGE_MEASURE_TOLERANCE) on real parcel data -- when this
-# experiment is active, the diagnostic layer shows Stage 2's buffers only,
-# not Stage 1's (Stage 1 is a pass/fail gate, not a measurement, so there
-# is nothing meaningful to visualize for it).
+# The buffer-diagnostic QA layer previously used to visually inspect
+# Stage 2's buffer zones (TWO_STAGE_MEASURE_TOLERANCE) on real parcel
+# data has been removed (see the module docstring's OUTPUTS section) --
+# effects of this experiment are now only observable via the actual
+# CAMA_ROAD_FRONTAGE/CAMA_DEPTH output columns themselves.
 TWO_STAGE_FRONTAGE_ENABLED = False
 TWO_STAGE_GATE_TOLERANCE = 5
 TWO_STAGE_MEASURE_TOLERANCE = 9
@@ -872,41 +890,19 @@ def _longest_linestring(geom):
     return None
 
 
-def _all_linestrings(geom):
-    """Return EVERY LineString piece inside LineString/MultiLineString/
-    GeometryCollection as a flat list — used to capture all road-adjacent
-    boundary segments (e.g. both sides of a corner lot) for the QA layer,
-    matching the arc-sum ROAD_FRONT total rather than just the longest piece."""
-    if geom is None or geom.is_empty:
-        return []
-    if geom.geom_type == "LineString":
-        return [geom]
-    if geom.geom_type == "MultiLineString":
-        return list(geom.geoms)
-    if geom.geom_type == "GeometryCollection":
-        out = []
-        for g in geom.geoms:
-            out.extend(_all_linestrings(g))
-        return out
-    return []
-
-
 # ========================================
 # OUTPUT FILENAME CONFLICT HANDLING
 # ========================================
 # Ported directly from road_width.py's canonical pattern (see that file's
-# resolve_output_base_name() / with_qa_suffix() for the original,
-# validated implementation this is copied from). Business decisions
-# confirmed by the project lead before porting:
-#   - QA outputs (frontage_lines, segment_buffers) always inherit the
-#     MAIN output's resolved base name/number -- they never scan the
-#     folder or resolve their own numbering independently. Filename
-#     resolution happens exactly ONCE per run, for the main output only.
-#   - "Create New File" resolves the number ONCE; every auxiliary output
-#     for that same source automatically follows the same resolved name
-#     (e.g. main "parcel_5.gpkg" -> "parcel_5_frontage_lines.gpkg",
-#     "parcel_5_segment_buffers.gpkg" -- never "parcel_6_..." or any
-#     other independently-resolved number).
+# resolve_output_base_name() for the original, validated implementation
+# this is copied from). This tool now writes exactly ONE output file per
+# source -- the previously-paired QA outputs (frontage_lines/VM,
+# segment_buffers) and the with_output_suffix() helper that derived their
+# filenames from this resolved name have been removed entirely (see the
+# module docstring's OUTPUTS section, and process_frontage_single()'s
+# docstring, for the full removal rationale). resolve_output_base_name()
+# itself is unchanged -- it still resolves the MAIN output's own
+# "Create New File" numbering exactly as before.
 def _split_trailing_number(base_name: str):
     """
     Splits a base name into (root, existing_number) if it ends with
@@ -934,10 +930,8 @@ def resolve_output_base_name(folder: str, desired_base_name: str, ext: str = "gp
     -- the highest N found ANYWHERE in the folder, not just "the source
     file's own N + 1".
 
-    This function decides the number ONCE, for the MAIN output only.
-    Every other output belonging to the same processing run (the QA
-    layers) must reuse this exact returned name as its own base -- see
-    with_output_suffix() below -- never re-run this scan independently.
+    This function decides the number ONCE, for the MAIN (and, as of
+    this tool's current output shape, only) output.
     """
     candidate_path = os.path.join(folder, f"{desired_base_name}.{ext}")
     if not os.path.exists(candidate_path):
@@ -956,25 +950,6 @@ def resolve_output_base_name(folder: str, desired_base_name: str, ext: str = "gp
         pass  # folder unreadable for some reason -- fall through with max_n=0, worst case reuses N=1
 
     return f"{root}_{max_n + 1}"
-
-
-def with_output_suffix(main_base_name: str, suffix: str) -> str:
-    """
-    Derives a QA output layer's base name from the ALREADY-FINALIZED main
-    output base name (see resolve_output_base_name()) -- never scans the
-    folder independently for its own numbering, so every output for a
-    given source stays paired: "landparcel.gpkg" + "landparcel_frontage_
-    lines.gpkg" + "landparcel_segment_buffers.gpkg", or
-    "landparcel_5.gpkg" + "landparcel_5_frontage_lines.gpkg" +
-    "landparcel_5_segment_buffers.gpkg", etc. Main output is always the
-    source of truth for the number; every QA layer just follows it.
-
-    suffix: "frontage_lines" or "segment_buffers" (road_frontage.py has
-    TWO possible QA outputs, unlike road_width.py's single "_VM" layer --
-    same underlying principle, just parameterized instead of hardcoded
-    to one fixed suffix).
-    """
-    return f"{main_base_name}_{suffix}"
 
 
 def open_in_global_mapper(output_path):
@@ -1317,18 +1292,28 @@ def _force_2d(gdf):
 # keeping its own copy. Pure extraction: no behavior change, no new
 # abstraction, no wrapper/adapter/compatibility layer.
 #
-#   Worker (worker(), inside run_processing())      -> unchanged
-#   Main-thread Message Handler (poll_queue())       -> unchanged
+#   Worker (worker(), inside run_processing())      -> owns q.put() events
+#   Main-thread Message Handler (poll_queue())       -> owns Tkinter calls
 #   ProgressWindow                                   -> owns window/widgets
 #
 # road_width.py is not part of this migration and is not touched by it
 # -- see progress_framework.py's own top-of-file comment for why.
+#
+# D-Cancel (later task, this rollout): worker()/poll_queue() are NO
+# LONGER unchanged by this file's own history -- both were updated to
+# carry a cancel_flag and a fifth `cancelable` field on every "update"
+# event, and poll_queue() gained a "cancelled" event kind. See
+# ProgressWindow's own docstring (just below) and run_processing()'s
+# own docstring for the current, accurate contract -- this block is
+# kept for the ORIGINAL migration's own history/rationale, not as a
+# claim that nothing has changed since.
 # ============================================================
 
 from utils.progress_framework import (
     PresentationState,
     ProgressPresentationPolicy,
     TkinterProgressView,
+    new_cancel_flag,
 )
 
 
@@ -1338,10 +1323,40 @@ class ProgressWindow:
     thread. Progress Event Protocol v9 role: host, not decision-maker
     (see ProgressPresentationPolicy / TkinterProgressView, imported
     from progress_framework.py, shared with lot_location.py).
-    Public interface (__init__, update, close) is byte-identical to
-    before this migration; poll_queue() requires no changes.
+
+    D-Cancel (this rollout): adapted to the same cancellation-capable
+    shape lot_location.py already uses -- an OPTIONAL cancel_flag
+    (from utils.progress_framework.new_cancel_flag(), one per run) is
+    now accepted and threaded straight through to TkinterProgressView,
+    which is what actually wires the window's title-bar close button
+    to Cancel (see progress_framework.py's own docstring for that
+    mechanism -- it is untouched here, only actually being used by this
+    file for the first time). Everything else about this class --
+    window construction, widget layout, public method names -- is
+    unchanged from before this rollout. A ProgressWindow constructed
+    WITHOUT cancel_flag (cancel_flag=None, the default) behaves exactly
+    as it did before this task: no Cancel wiring at all.
+
+    See run_processing() for where the cancel_flag actually comes from
+    and for this tool's actual Cancel checkpoints (process_frontage_
+    single()'s own per-pass checkpoints, checked via progress_cb's
+    return value) -- Cancel is disabled (cancelable=False) only once a
+    real, non-cancelled result exists for the current source,
+    immediately before that source is saved.
     """
-    def __init__(self, root, title="Processing"):
+    def __init__(self, root, title="Processing", cancel_flag=None):
+        """
+        Creates and immediately shows the progress dialog.
+
+        Args:
+            root: the parent Tk/Toplevel window.
+            title (str): window title. Defaults to "Processing".
+            cancel_flag: optional, from utils.progress_framework.
+                new_cancel_flag() -- when provided, wires the title-bar
+                X to Cancel (see class docstring). None (the default)
+                preserves the exact pre-D-Cancel behavior: no Cancel
+                wiring at all.
+        """
         self.win = tk.Toplevel(root)
         apply_icon(self.win, "roadfrontage.ico")
         self.win.title(title)
@@ -1366,12 +1381,21 @@ class ProgressWindow:
         # Presentation Policy + Tkinter View collaborators (Progress
         # Event Protocol v9), shared with lot_location.py via
         # progress_framework.py. Constructed after the widgets they
-        # render into already exist.
+        # render into already exist. cancel_flag is passed straight
+        # through -- progress_framework.py itself is unmodified; this
+        # is simply the first time this file actually supplies one.
         self._policy = ProgressPresentationPolicy()
-        self._view = TkinterProgressView(self.win, self.status_var, self.progress)
+        self._view = TkinterProgressView(self.win, self.status_var, self.progress,
+                                          cancel_flag=cancel_flag)
 
-    def update(self, message, value=None, maximum=None):
-        state = self._policy.compute(message, value, maximum)
+    def update(self, message, value=None, maximum=None, cancelable=None):
+        """Updates the progress display via the shared
+        ProgressPresentationPolicy/TkinterProgressView (see class
+        docstring). cancelable is optional and, per
+        progress_framework.py's own convention, None means "leave the
+        title-bar X's enabled/disabled state as it currently is" --
+        only has any effect on a window constructed WITH cancel_flag."""
+        state = self._policy.compute(message, value, maximum, cancelable)
         self._view.render(state)
 
     def close(self):
@@ -1400,7 +1424,7 @@ def clip_roads_to_parcels(road_gdf, parcel_gdf, pad=50):
 # FRONTAGE PROCESSING
 # ========================================
 def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, classification=None,
-                             emit_buffer_qa=False,
+                             is_cancelled=None,
                              road_frontage_col="CAMA_ROAD_FRONTAGE", depth_col="CAMA_DEPTH",
                              dwr_col="CAMA_DEPTH_WIDTH_RATIO"):
     """
@@ -1421,30 +1445,75 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
     kept, and that intersection length is the depth value. If
     frontage_total is 0 (no frontage segment found), depth falls back
     to 0.0 directly in this inline block -- there is currently no
-    centroid-to-road fallback measure wired into the live path.
+    centroid-to-road fallback measure wired into the live path. NONE of
+    this measurement logic is touched by this task -- only the QA-only
+    scaffolding that used to sit alongside it (see below) and the new
+    Cancel checkpoints (see the "D-Cancel" paragraph below) are new.
+
+    QA/VM removal (this task): the previously-computed buffer-diagnostic
+    and Visual Measurement (frontage_lines) QA layers, and the
+    emit_buffer_qa opt-in that gated one of them, have been removed
+    entirely -- they were already fully disabled (writes commented out,
+    checkbox removed from the GUI) before this task; this only finishes
+    that removal by also deleting the now-pointless computation that fed
+    them. This does NOT touch the real measurement math: frontage_total/
+    depth_val/dwr_val (and the frontage_lengths/depths/dwrs lists they
+    feed) were always computed independently of the QA-only
+    frontage_lines_data/buffer_qa_records structures -- see the PASS 3
+    comments below for exactly which locals were QA-only vs. load-bearing
+    for the real output.
+
+    D-Cancel (this task): progress, if given, is now called at three
+    kinds of checkpoints -- Pass 1's and Pass 3's existing throttled
+    per-parcel checkpoints, plus a new throttled checkpoint inside Pass
+    2's cross-parcel conflict resolution loop (see that pass's own
+    comments for the exact throttle) -- and its return value is checked
+    at each one. Cancellation is COOPERATIVE, not instantaneous: only
+    these explicit checkpoints are ever consulted; a single blocking
+    geometry operation already in progress (reprojection, the road
+    union, an individual Shapely call) always runs to completion. ONLY
+    an explicit `False` return stops processing -- None, True, or no
+    return at all (the shape every caller before this contract existed
+    already produces) is treated as "continue," so an old-style caller
+    that never returns anything keeps working exactly as before. On a
+    Cancel at any of the three passes, everything computed so far for
+    this source is discarded (no partial/padded result) and this
+    function returns None instead of a dict.
 
     Args:
         brgy_gdf (geopandas.GeoDataFrame): parcels to process.
         road_gdf (geopandas.GeoDataFrame): road network layer.
         source_name (str): label used in progress/log messages only.
         progress (callable, optional): progress(message, value=None,
-        maximum=None), called during the per-parcel loop.
+        maximum=None) -> bool | None. Called at coarse milestones
+        (return value ignored) and, throttled, at each pass's own
+        checkpoints (return value checked -- see the D-Cancel paragraph
+        above).
         classification (dict, optional): per-parcel Lot Location/Lot
         Label classification values, if the optional Road
         Classification feature is active for this source (see the
         module docstring and the RUNTIME STATE section above).
-        emit_buffer_qa (bool): if True, also returns diagnostic buffer
-        geometry layers for visual debugging of the measurement itself
-        -- a separate, unrelated concern from Road Classification.
+        is_cancelled (callable, optional): zero-argument () -> bool,
+        checked (throttled) ONLY inside Pass 2's inner candidate loop --
+        a separate, lightweight mechanism from progress()'s own
+        checkpoints, deliberately: it never touches the progress
+        queue/UI (see Pass 2's own comments for why calling progress()
+        once per candidate would be wasteful), it only exists so a
+        single outer Pass-2 iteration with an unusually large STRtree
+        candidate set can still notice a Cancel before the next %200
+        outer checkpoint. None (the default) disables this check
+        entirely -- Pass 2 then relies solely on its own outer
+        checkpoint, exactly like Pass 1/3.
         road_frontage_col, depth_col, dwr_col (str): exact output
         column names to write into -- see the preserved comment below
         for why these default to the standard CAMA_-prefixed names but
         can be overridden per-source.
 
     Returns:
-        dict with the processed GeoDataFrame and, if emit_buffer_qa is
-        True, additional QA layer GeoDataFrames -- see the "qa_layers"
-        key in the return statement below for the exact shape.
+        On normal completion: {"parcels": brgy_gdf} -- a dict (kept as
+        a dict, not a bare GeoDataFrame, to minimize the caller-side
+        diff now that the qa_layers key is gone -- see run_processing()).
+        On a Cancel at any of the three passes: None.
     """
     # road_frontage_col / depth_col / dwr_col: the exact column names to
     # write the three computed outputs into. Default to the standard
@@ -1463,18 +1532,6 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
     # pre-CAMA_-prefix version of this tool) -- per the same principle
     # already established in road_width.py, only the NEW, prefixed name
     # is ever checked for conflicts.
-    #
-    # emit_buffer_qa: when True, collects the exact seg.buffer(tol,
-    # cap_style=2) zone used by _edge_covered_portion() for every boundary
-    # segment that registered ANY coverage (i.e. contributed to
-    # frontage_total) -- purely a diagnostic aid to let the user visually
-    # inspect whether a given segment's buffer genuinely reaches a road
-    # running alongside it, or is bleeding across a thin parcel / grazing
-    # a crossing road at an angle. Does NOT change any measurement --
-    # _edge_covered_portion() itself is untouched; this only re-derives
-    # the same buffer geometry it already computes internally, for
-    # display purposes. Off by default (opt-in) so normal runs are not
-    # slowed down or cluttered with an extra output file.
     #
     # classification: dict produced by resolve_classification() -- see its
     # docstring for the exact shape. Defaults to "no gating at all"
@@ -1559,16 +1616,7 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
     road_union = unary_union(road_gdf.geometry.values)
 
     frontage_lengths, depths, dwrs = [], [], []
-    # Accumulates (frontage_line, depth_line, frontage_total, depth_val) per parcel
-    # for QA output. None entries mean no road frontage for that parcel.
-    frontage_lines_data = []
     total = len(brgy_gdf)
-
-    # Resolve parcel identifier column for QA output FEATURE_ID.
-    # Priority: PIN → pin → Pin → ARP_NO → TD_NO → PARCEL_ID → row index.
-    # Falls back to row index if none found — never crashes on missing column.
-    _PIN_CANDIDATES = ["PIN", "pin", "Pin", "ARP_NO", "TD_NO", "PARCEL_ID"]
-    _pin_col = next((c for c in _PIN_CANDIDATES if c in brgy_gdf.columns), None)
 
     # ------------------------------------------------------------------
     # Inner-Lot skip mask (Automatic mode with a usable LOT_LOCATION/
@@ -1588,14 +1636,6 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
     else:
         skip_arr = None
 
-    # buffer_qa_records: only populated when emit_buffer_qa=True. One
-    # record per boundary segment that registered coverage, holding the
-    # exact seg.buffer(FRONTAGE_BUFFER_TOLERANCE, cap_style=2) zone -- the
-    # same buffer geometry _edge_covered_portion() computes internally
-    # (called with tol=FRONTAGE_BUFFER_TOLERANCE), re-derived here purely
-    # for diagnostic display (see process_frontage_single()'s docstring).
-    buffer_qa_records = []
-
     # ✅ iterate faster over geometry series
     geoms = brgy_gdf.geometry.values
 
@@ -1610,16 +1650,22 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
     # source, exactly like the original loop did.
     # ==================================================================
     _parcel_states = []  # one entry per row, same order as `geoms`
+    cancelled_pass1 = False
 
     for i, geom_raw in enumerate(geoms, start=1):
         if progress and (i % 200 == 0 or i == 1 or i == total):
-            progress(f"{source_name}: {i}/{total}", i, total)
+            # D-Cancel: explicit False only -- see this function's own
+            # progress-contract docstring. None/True/no-return all mean
+            # "continue," so an old-style caller keeps working unchanged.
+            if progress(f"{source_name}: {i}/{total}", i, total) is False:
+                cancelled_pass1 = True
+                break
 
         geom = fix_geometry(geom_raw)
         if geom is None:
             _parcel_states.append({
-                "geom": None, "covered_pieces": [], "seg_buffer_records": [],
-                "resolved": (0.0, 0.0, 0.0, None, None, []),
+                "geom": None, "covered_pieces": [],
+                "resolved": (0.0, 0.0, 0.0),
             })
             continue
 
@@ -1638,8 +1684,8 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
             except Exception:
                 depth_val = 0.0
             _parcel_states.append({
-                "geom": geom, "covered_pieces": [], "seg_buffer_records": [],
-                "resolved": (0.0, depth_val, depth_val, None, None, []),
+                "geom": geom, "covered_pieces": [],
+                "resolved": (0.0, depth_val, depth_val),
             })
             continue
 
@@ -1663,7 +1709,6 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
         try:
             segments = split_boundary_to_segments(boundary)
             covered_pieces = []
-            seg_buffer_records = []  # (segment_index, buffer_geom), QA only
 
             if TWO_STAGE_FRONTAGE_ENABLED:
                 # Stage 1 (gate): strict/narrow tolerance. If NOT ONE
@@ -1686,14 +1731,6 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
                         pieces = _edge_covered_pieces(seg, road_union, tol=TWO_STAGE_MEASURE_TOLERANCE)
                         if pieces:
                             covered_pieces.extend(pieces)
-                            if emit_buffer_qa:
-                                # Stage 2's buffer only -- Stage 1 is a
-                                # pass/fail gate with nothing meaningful
-                                # to visualize as a measured "covered"
-                                # zone.
-                                seg_buffer_records.append(
-                                    (_seg_idx, seg.buffer(TWO_STAGE_MEASURE_TOLERANCE, cap_style=2))
-                                )
                 # else: gate rejected this parcel -- covered_pieces stays
                 # empty, frontage_total will be 0.0 in Pass 3.
             else:
@@ -1701,16 +1738,6 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
                     pieces = _edge_covered_pieces(seg, road_union, tol=FRONTAGE_BUFFER_TOLERANCE)
                     if pieces:
                         covered_pieces.extend(pieces)
-                        if emit_buffer_qa:
-                            # Explicitly passed FRONTAGE_BUFFER_TOLERANCE
-                            # above (not _edge_covered_pieces()'s own
-                            # default) -- this re-derives the identical
-                            # buffer zone actually used for this call, it
-                            # does not introduce a second, independent
-                            # tolerance value.
-                            seg_buffer_records.append(
-                                (_seg_idx, seg.buffer(FRONTAGE_BUFFER_TOLERANCE, cap_style=2))
-                            )
             # Weld consecutive covered pieces back into continuous lines.
             # _edge_covered_pieces() can already return MULTIPLE pieces per
             # elementary (vertex-to-vertex) segment (e.g. two separate
@@ -1736,7 +1763,7 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
 
             _parcel_states.append({
                 "geom": geom, "covered_pieces": covered_pieces,
-                "seg_buffer_records": seg_buffer_records, "resolved": None,
+                "resolved": None,
             })
         except Exception:
             # TEMPORARY DIAGNOSTIC -- remove after capturing frontage_error.log.
@@ -1753,9 +1780,18 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
             except Exception:
                 pass
             _parcel_states.append({
-                "geom": geom, "covered_pieces": [], "seg_buffer_records": [],
+                "geom": geom, "covered_pieces": [],
                 "resolved": None,
             })
+
+    # D-Cancel: Pass 1 was stopped early at one of its own throttled
+    # checkpoints above -- full discard, per explicit decision. Pass 2
+    # and Pass 3 never run; _parcel_states so far (necessarily partial --
+    # it only covers parcels processed before the checkpoint that
+    # triggered) is thrown away rather than padded/truncated into a
+    # partial result. There is no use for a half-computed output.
+    if cancelled_pass1:
+        return None
 
     # ==================================================================
     # PASS 2 (NEW): CROSS-PARCEL CONFLICT RESOLUTION.
@@ -1795,6 +1831,7 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
             progress(f"{source_name}: resolving cross-parcel conflicts "
                       f"({len(all_global_pieces)} candidate pieces)...")
 
+        cancelled_pass2 = False
         if all_global_pieces:
             # Smallest-parcel-total-survives greedy resolution: process
             # pieces ordered by their OWN PARCEL's preliminary total
@@ -1813,8 +1850,37 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
             ]
             tree = STRtree(buffered_geoms)
             disregarded = set()
+            n_pieces = len(all_global_pieces)
 
-            for idx in range(len(all_global_pieces)):
+            # D-Cancel: TWO SEPARATE checkpoint mechanisms in this loop,
+            # deliberately not merged into one:
+            #   - the OUTER %200 checkpoint below calls progress() (same
+            #     throttle/contract as Pass 1/3) -- this is the normal
+            #     UI-progress-reporting path, and its return value is
+            #     what actually stops the loop.
+            #   - the INNER candidate-loop check calls is_cancelled()
+            #     directly -- a cheap, non-queue-writing lookup (see this
+            #     function's own Args docstring) -- purely so a single
+            #     outer iteration with an unusually large STRtree
+            #     candidate set (a dense cluster of overlapping pieces)
+            #     can't make Cancel appear unresponsive until the NEXT
+            #     outer checkpoint. It never calls progress() and never
+            #     posts a UI message -- calling the full progress()
+            #     callback once per candidate could flood the queue with
+            #     duplicate messages for no benefit. Throttled by
+            #     _inner_checked (a running count of inner-loop
+            #     iterations across the WHOLE Pass 2, not reset per
+            #     outer idx) so the lookup itself stays cheap even when
+            #     candidate sets are individually small.
+            _inner_checked = 0
+            INNER_CANCEL_CHECK_EVERY = 2000
+
+            for idx in range(n_pieces):
+                if progress and (idx % 200 == 0 or idx == 0 or idx == n_pieces - 1):
+                    if progress(f"{source_name}: resolving cross-parcel conflicts "
+                                f"({idx}/{n_pieces})", idx, n_pieces) is False:
+                        cancelled_pass2 = True
+                        break
                 if idx in disregarded:
                     continue
                 parcel_idx_i, piece_i, len_i = all_global_pieces[idx]
@@ -1822,6 +1888,12 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
                 buf_i = buffered_geoms[idx]
                 candidate_idxs = tree.query(buf_i)
                 for cand_idx in candidate_idxs:
+                    _inner_checked += 1
+                    if (is_cancelled is not None
+                            and _inner_checked % INNER_CANCEL_CHECK_EVERY == 0
+                            and is_cancelled()):
+                        cancelled_pass2 = True
+                        break
                     cand_idx = int(cand_idx)
                     if cand_idx == idx or cand_idx in disregarded:
                         continue
@@ -1838,6 +1910,16 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
                         continue
                     if buf_i.intersects(buffered_geoms[cand_idx]):
                         disregarded.add(cand_idx)
+                if cancelled_pass2:
+                    break
+
+            if cancelled_pass2:
+                # D-Cancel: full discard, per explicit decision -- same as
+                # Pass 1. disregarded/per_parcel_kept are necessarily
+                # incomplete at this point (the conflict-resolution pass
+                # never finished), so nothing from Pass 2 is applied to
+                # _parcel_states, and Pass 3 never runs.
+                return None
 
             # Rebuild each parcel's covered_pieces list, excluding
 
@@ -1860,32 +1942,29 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
     # only the SOURCE of covered_pieces has changed (Pass 2's possibly-
     # reduced list, instead of computing it fresh inline).
     # ==================================================================
+    cancelled_pass3 = False
     for i, state in enumerate(_parcel_states, start=1):
         if progress and (i % 200 == 0 or i == 1 or i == total):
-            progress(f"{source_name}: {i}/{total}", i, total)
+            # D-Cancel: explicit False only, same contract as Pass 1.
+            # Cancellation here must occur BEFORE frontage_lengths/
+            # depths/dwrs are treated as a completed result -- see the
+            # discard check immediately after this loop, before those
+            # lists are ever assigned onto brgy_gdf.
+            if progress(f"{source_name}: {i}/{total}", i, total) is False:
+                cancelled_pass3 = True
+                break
 
         if state["resolved"] is not None:
-            frontage_total, depth_val, dwr_val, _frontage_line, _depth_line, _all_pieces = state["resolved"]
+            frontage_total, depth_val, dwr_val = state["resolved"]
             frontage_lengths.append(frontage_total)
             depths.append(depth_val)
             dwrs.append(dwr_val)
-            frontage_lines_data.append((_frontage_line, _depth_line, frontage_total, depth_val, dwr_val, _all_pieces))
             continue
 
         geom = state["geom"]
         covered_pieces = state["covered_pieces"]
 
-        if emit_buffer_qa:
-            feat_id_qa = brgy_gdf.iloc[i - 1][_pin_col] if _pin_col else (i - 1)
-            for _seg_idx, buf_geom in state["seg_buffer_records"]:
-                buffer_qa_records.append({
-                    "FEATURE_ID": feat_id_qa,
-                    "SEGMENT_IX": _seg_idx,
-                    "geometry": buf_geom,
-                })
-
         frontage_total = sum(p.length for p in covered_pieces)
-        _all_pieces = covered_pieces
         _fl = max(covered_pieces, key=lambda p: p.length) if covered_pieces else None
 
         # ------------------------------------------------------------------
@@ -1904,16 +1983,9 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
         if 0 < frontage_total <= MIN_FRONTAGE_THRESHOLD:
             frontage_total = 0.0
             _fl = None
-            _all_pieces = []
 
         frontage_lengths.append(frontage_total)
 
-        # QA: capture actual frontage geometry (_fl itself, not the chord line)
-        # so the exported layer faithfully shows the road-facing boundary
-        # portion the algorithm detected, including any real kinks or curves.
-        _frontage_line = _fl if (_fl is not None and not _fl.is_empty) else None
-
-        _depth_line = None
         if frontage_total > 0:
             # Use the longest frontage piece to define the perpendicular direction.
             frontage_ls = _fl  # already resolved above
@@ -1957,23 +2029,7 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
                                 _f.write("\n---\n")
                         except Exception:
                             pass
-                        len1, len2, depth_val = 0.0, 0.0, 0.0
-                        i1 = i2 = type("_empty", (), {"is_empty": True})()
-
-                    # QA: capture the actual chosen perpendicular ray so the
-                    # exported layer shows exactly where depth was measured.
-                    chosen_inter = i1 if len1 >= len2 else i2
-                    if not chosen_inter.is_empty:
-                        if chosen_inter.geom_type == "LineString":
-                            end_pt = chosen_inter.coords[-1]
-                        elif chosen_inter.geom_type == "MultiLineString":
-                            end_pt = max(
-                                chosen_inter.geoms, key=lambda g: g.length
-                            ).coords[-1]
-                        else:
-                            end_pt = None
-                        if end_pt:
-                            _depth_line = LineString([midpoint, end_pt])
+                        depth_val = 0.0
 
             dwr_val = round(depth_val / frontage_total, 2) if frontage_total else 0.0
         else:
@@ -1987,8 +2043,14 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
 
         depths.append(depth_val)
         dwrs.append(dwr_val)
-        frontage_lines_data.append((_frontage_line, _depth_line, frontage_total, depth_val, dwr_val, _all_pieces))
 
+    # D-Cancel: Pass 3 was stopped early at one of its own throttled
+    # checkpoints above -- full discard, per explicit decision, same as
+    # Pass 1/2. This check runs BEFORE frontage_lengths/depths/dwrs are
+    # ever assigned onto brgy_gdf below, so a cancelled run never
+    # produces a partially-populated output column.
+    if cancelled_pass3:
+        return None
 
     # 🔒 Safety check — prevents silent column mismatch on partial failures.
     if not (len(frontage_lengths) == len(brgy_gdf) == len(depths) == len(dwrs)):
@@ -2002,147 +2064,608 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
         brgy_gdf = brgy_gdf.to_crs(original_crs)
 
     if progress:
-        progress(f"Building Visual Measurement layer for {source_name}...", total, total)
-
-    # ---- Build Visual Measurement (VM) GeoDataFrame ----
-    # TWO rows per parcel that has road frontage (one Method="frontage"
-    # row, one Method="depth" row) -- NOT one combined row. This is a
-    # deliberate change from an earlier, single-row design, made after
-    # confirming (via independent research across three separate
-    # sources, converging on the same documented explanation) that
-    # Global Mapper has NO multi-part grouping support for LINE
-    # features (only for AREA/polygon features, via its "Area Group ID"
-    # mechanism) -- so a single feature whose geometry is a MultiLineString
-    # with DISJOINT parts (e.g. a frontage boundary segment and a
-    # separate, non-touching depth ray) is unavoidably split into one
-    # attribute row per disconnected part by Global Mapper's own import
-    # engine, regardless of how the geometry is combined on the writing
-    # side. The underlying .gpkg itself is unaffected and spec-compliant
-    # either way (confirmed: reading it back with geopandas always shows
-    # the true row count) -- this is purely about what Global Mapper's
-    # Attribute Editor displays.
-    #
-    # Rather than leave that split implicit (one row in the file,
-    # mysteriously appearing as two-plus rows with duplicated values in
-    # Global Mapper, with no column explaining why), it is made explicit
-    # here: two separate, real rows are written, each tagged with a
-    # Method column ("frontage" or "depth") describing which geometry
-    # that row holds, and each carrying the SAME complete set of value
-    # columns (CAMA_ROAD_FRONT, CAMA_DEPTH, CAMA_DEPTH_WIDTH_RATIO) --
-    # never blank/NaN on one side -- so every row is self-consistent and
-    # traceable back to its parcel via the PIN column, however many rows
-    # Global Mapper (or any other viewer) ends up showing for a given
-    # parcel's geometry.
-    #
-    # PIN uses the same PIN-like column already resolved for the main
-    # output (_pin_col, see _PIN_CANDIDATES above), or the zero-based row
-    # index as a fallback if no PIN-like column was found -- in that
-    # fallback case this column holds a row index, not a literal PIN,
-    # despite its name.
-    #
-    # CAMA_ROAD_FRONT / CAMA_DEPTH / CAMA_DEPTH_WIDTH_RATIO: cross-tool
-    # CAMA_ prefix standard (see OUTPUT_COLUMN_TARGETS' module-level
-    # docstring) -- these mirror the same computed values as
-    # CAMA_ROAD_FRONTAGE/CAMA_DEPTH/CAMA_DEPTH_WIDTH_RATIO in the main
-    # output (no "_M" suffix -- dropped per project-lead decision). PIN
-    # and Method do NOT get the prefix -- they are reference/descriptor
-    # fields, not computed measurement values, matching road_width.py's
-    # own PIN column staying unprefixed while only its value column
-    # (cama_road_width) gets "cama_".
-    #
-    # All numeric columns are always float64 — None cells use float("nan")
-    # so GIS software infers consistent field types from the first row.
-    line_records = []
-    for idx, (fl, dl, fval, dval, dwr_val, all_pieces) in enumerate(frontage_lines_data):
-        feat_id = brgy_gdf.iloc[idx][_pin_col] if _pin_col else idx
-        # Only emit Visual Measurement row(s) when ROAD_FRONT is greater
-        # than zero. This preserves the business rule:
-        #   ROAD_FRONT > 0  -> Visual Measurement row(s) emitted
-        #   ROAD_FRONT = 0  -> no Visual Measurement row(s)
-        if fval > 0 and all_pieces:
-            cama_road_front = float(round(fval, 2))
-            cama_depth = float(round(dval, 2)) if dval else float("nan")
-            cama_dwr = float(round(dwr_val, 2)) if dwr_val else float("nan")
-
-            # Row 1: frontage geometry -- the boundary piece(s) only.
-            # Kept as a MultiLineString (not a plain LineString) even
-            # when there's only one piece, so this layer's geometry
-            # column stays a single, consistent type across every row
-            # (GeoPackage layers expect one geometry type per layer) --
-            # matching the depth row below, which is also wrapped as a
-            # single-part MultiLineString for the same reason.
-            line_records.append({
-                "PIN":                    feat_id,
-                "Method":                 "frontage",
-                "CAMA_ROAD_FRONT":        cama_road_front,
-                "CAMA_DEPTH":             cama_depth,
-                "CAMA_DEPTH_WIDTH_RATIO": cama_dwr,
-                "geometry":               MultiLineString(list(all_pieces)),
-            })
-            # Row 2: depth geometry -- the perpendicular ray only. Only
-            # emitted if a depth ray was actually computed (dl can be
-            # None in edge cases, e.g. a degenerate perpendicular vector
-            # -- see the depth-ray computation above).
-            if dl is not None:
-                line_records.append({
-                    "PIN":                    feat_id,
-                    "Method":                 "depth",
-                    "CAMA_ROAD_FRONT":        cama_road_front,
-                    "CAMA_DEPTH":             cama_depth,
-                    "CAMA_DEPTH_WIDTH_RATIO": cama_dwr,
-                    "geometry":               MultiLineString([dl]),
-                })
-
-    _qa_crs = original_crs if original_crs else f"EPSG:{zone_epsg}"
-    if line_records:
-        lines_gdf = gpd.GeoDataFrame(line_records, crs=f"EPSG:{zone_epsg}")
-        if original_crs:
-            lines_gdf = lines_gdf.to_crs(original_crs)
-    else:
-        lines_gdf = gpd.GeoDataFrame(
-            columns=["PIN", "Method", "CAMA_ROAD_FRONT", "CAMA_DEPTH",
-                     "CAMA_DEPTH_WIDTH_RATIO", "geometry"],
-            geometry="geometry",
-            crs=_qa_crs,
-        )
-
-    if progress:
         progress(f"Finished {source_name}", total, total)
 
-    # Buffer diagnostic layer -- only built when emit_buffer_qa=True
-    # (opt-in). One polygon per boundary segment that registered coverage,
-    # tagged with FEATURE_ID and SEGMENT_IX -- the raw material for
-    # visually auditing whether a segment's buffer genuinely reaches an
-    # adjacent road or is bleeding across a thin parcel / grazing a
-    # crossing road. Same CRS handling as the frontage-lines QA layer.
-    if emit_buffer_qa and buffer_qa_records:
-        buffers_gdf = gpd.GeoDataFrame(buffer_qa_records, crs=f"EPSG:{zone_epsg}")
-        if original_crs:
-            buffers_gdf = buffers_gdf.to_crs(original_crs)
+    # Return shape (see this function's own docstring): normal
+    # completion always returns this one-key dict -- kept as a dict
+    # rather than a bare GeoDataFrame to minimize the caller-side diff
+    # now that the qa_layers key is gone (see run_processing()). A
+    # Cancel at any of the three passes above returns None instead,
+    # well before this point is ever reached.
+    return {"parcels": brgy_gdf}
+
+
+# ========================================
+# DB ATOMIC WRITE / CANCEL-SAFE STAGING  (D-Cancel)
+# ========================================
+# Ported from lot_location.py's own D4 section (itself ported from
+# landmarks_within_meters.py, the pilot for this exact mechanism --
+# staging-table-then-atomic-rename-swap, plus a genuine Cancel control,
+# plus crash/orphan recovery on a later run). This is now the THIRD
+# tool with this mechanism (landmarks_within_meters.py, lot_location.py,
+# and this file); per Section C/G.5 (Rule of Three) this is still a
+# deliberate duplication, not a shared utils/ module -- that decision is
+# for a future task, not this one. Every function below is copied from
+# lot_location.py's D4 block with only the adaptations this file's own
+# context requires: "roadfrontage.ico" for the orphan-recovery dialog,
+# and "geometry" as the default geometry column name (confirmed to
+# match this file's own convention -- read_postgis_clean() always
+# renames the geometry column to "geometry", and no to_postgis() call
+# in this file ever renames it away from that) -- no other design
+# changes.
+#
+# Replaces the single `brgy_gdf.to_postgis(..., if_exists="replace")`
+# call this file's worker() previously used with a staging-write /
+# verify / atomic-rename-swap sequence. The real destination table is
+# never touched until FINAL_SWAP, a single PostgreSQL transaction that
+# either fully commits or is fully rolled back by PostgreSQL itself.
+#
+# Naming: staging/backup identifiers are independently random
+# (_gen_id()), never derived from the destination table name -- this
+# keeps them well under PostgreSQL's 63-byte identifier limit regardless
+# of how long a user-derived destination name is. Human-readable context
+# (which destination, which run, when) lives entirely in a
+# COMMENT ON TABLE (_comment_cama_table()) -- metadata only, playing no
+# role in collision safety, which is the random id alone.
+#
+# Ownership / crash recovery: each DB-output run acquires a PostgreSQL
+# session-level advisory lock on a DEDICATED, non-pooled connection
+# (_acquire_run_lock()) for the entire DB-output portion of the run --
+# deliberately not a connection borrowed from the SQLAlchemy engine's
+# pool, since a pooled connection can be returned and reused while
+# PostgreSQL still considers the original session's lock held, which
+# would make "lock lifetime == run lifetime" false. On the next
+# DB-output run, _scan_orphaned_cama_tables() finds any leftover
+# staging/backup table, re-derives the same lock key from the run_id
+# recorded in that table's own comment, and treats it as orphaned only
+# if the lock is NOT currently held by anyone -- i.e. only if the run
+# that created it is provably no longer alive.
+#
+# THIS FILE'S CANCEL GRANULARITY: process_frontage_single() has its own
+# bool-return progress contract (see that function's own docstring),
+# checked at Pass 1's, Pass 2's, and Pass 3's own throttled checkpoints
+# -- explicit False only, full discard (returns None) on trigger. What's
+# genuinely still true, and matches lot_location.py/landmarks_within_
+# meters.py exactly: NOTHING from STAGING_WRITE through FINAL_SWAP and
+# the post-swap backup drop -- everything below this comment block -- is
+# itself cancelable, for the same reason in all three tools:
+# gdf.to_postgis() (and the DB-only steps that follow it) is a single
+# blocking library call with no hook a background thread could check a
+# flag inside of, not a stricter design choice specific to this file.
+# See run_processing()'s worker() for the actual Cancel checkpoint
+# sequence (pre-processing check, then process_frontage_single()'s own
+# internal checkpoints, then disabled once a real result exists).
+
+
+def _gen_id():
+    """
+    12 lowercase hex characters (48 bits) of cryptographically random
+    entropy, used for both staging and backup table names. Independently
+    generated each time it's called -- a staging table and its paired
+    backup table get two SEPARATE calls to this function, not one value
+    reused with different prefixes.
+    """
+    return secrets.token_hex(6)
+
+
+def _advisory_lock_key(run_id):
+    """
+    Deterministic signed-bigint PostgreSQL advisory-lock key derived from
+    a run id. Must produce the IDENTICAL key from the same run_id every
+    time: the owning run derives it once (_acquire_run_lock()) to acquire
+    the lock, and _scan_orphaned_cama_tables() independently re-derives it
+    later from only the run_id text recorded in a table's own COMMENT --
+    there is no other channel between the two. run_id is 12 hex chars (48
+    bits), always well under pg_try_advisory_lock()'s signed-64-bit range,
+    so no overflow/wraparound handling is needed at the current id length.
+    """
+    return int(run_id, 16)
+
+
+def _table_exists(conn, schema, table_name):
+    """
+    True if schema.table_name currently exists as a real relation, via
+    PostgreSQL's own to_regclass() -- authoritative against the live
+    catalog, not any caller-side cache or an earlier information_schema
+    snapshot. Used both for FINAL_SWAP's create-new race re-check and
+    inside _write_db_output_safely()'s own outcome-detection fallback.
+    """
+    result = conn.execute(
+        text("SELECT to_regclass(:qualified) IS NOT NULL"),
+        {"qualified": f'"{schema}"."{table_name}"'}
+    ).scalar()
+    return bool(result)
+
+
+def _get_spatial_index_name(conn, schema, table_name, column_name="geometry"):
+    """
+    Looks up the actual name of the GIST spatial index attached to a
+    column via PostgreSQL's own catalogs (pg_class, pg_index, pg_am,
+    pg_attribute), never assuming any naming convention such as
+    "idx_<table>_geometry". column_name defaults to "geometry" -- this
+    file's own to_postgis() writes never rename the geometry column
+    (confirmed: read_postgis_clean() always renames the source geometry
+    column to "geometry" before any further processing), so this default
+    matches this file's own convention out of the box.
+
+    Returns None if no spatial index exists on this column (e.g. a
+    brand-new staging table before to_postgis() has created one). Raises
+    RuntimeError if more than one GIST index is found on the same column
+    -- this should never happen in this pipeline's normal single-index
+    case, so silently picking one would hide a genuinely unexpected schema
+    state instead of surfacing it.
+    """
+    rows = conn.execute(text(
+        """
+        SELECT ix.relname AS index_name
+        FROM pg_class t
+        JOIN pg_namespace n ON n.oid = t.relnamespace
+        JOIN pg_index idx ON idx.indrelid = t.oid
+        JOIN pg_class ix ON ix.oid = idx.indexrelid
+        JOIN pg_am am ON am.oid = ix.relam
+        JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(idx.indkey)
+        WHERE n.nspname = :schema AND t.relname = :table_name
+          AND a.attname = :column_name AND am.amname = 'gist';
+        """
+    ), {"schema": schema, "table_name": table_name,
+        "column_name": column_name}).fetchall()
+
+    if len(rows) == 0:
+        return None
+    elif len(rows) == 1:
+        return rows[0][0]
     else:
-        buffers_gdf = gpd.GeoDataFrame(
-            columns=["FEATURE_ID", "SEGMENT_IX", "geometry"],
-            geometry="geometry",
-            crs=_qa_crs,
+        raise RuntimeError(
+            f"Expected at most one GIST spatial index on "
+            f"\"{schema}\".\"{table_name}\".\"{column_name}\", but found "
+            f"{len(rows)}: {[r[0] for r in rows]}. Schema is in an "
+            f"unexpected state -- aborting rather than guessing which "
+            f"index to rename."
         )
 
-    # Return parcels and QA layers as a structured dict so callers can
-    # access each output by name. qa_layers is a container — future QA
-    # outputs (e.g. snapped points, debug polygons) can be added here
-    # without changing the caller API again.
-    return {
-        "parcels": brgy_gdf,
-        "qa_layers": {
-            "frontage_lines": lines_gdf,
-            "segment_buffers": buffers_gdf,
-        },
-    }
+
+def _index_exists(conn, schema, index_name):
+    """True if an index of this exact name already exists in the given
+    schema -- pre-flight check before a rename, so a collision produces a
+    clear diagnostic instead of a generic PostgreSQL duplicate-object
+    error."""
+    result = conn.execute(
+        text("SELECT 1 FROM pg_indexes WHERE schemaname = :schema "
+             "AND indexname = :index_name"),
+        {"schema": schema, "index_name": index_name}
+    ).fetchone()
+    return result is not None
+
+
+def _rename_spatial_index(conn, schema, table_name, desired_name,
+                           column_name="geometry"):
+    """
+    Finds the actual spatial index on table_name/column_name via
+    _get_spatial_index_name() and renames it to desired_name. No-op if no
+    spatial index exists yet. Raises a clear diagnostic (rather than
+    letting PostgreSQL fail with a generic duplicate-object error) if
+    desired_name is already taken by something else in the schema.
+
+    This step exists because PostgreSQL does NOT rename a table's index
+    just because the table itself was renamed. Without it, a table
+    promoted by FINAL_SWAP below would keep carrying its staging table's
+    auto-generated index name indefinitely.
+    """
+    current_name = _get_spatial_index_name(conn, schema, table_name, column_name)
+    if current_name is None:
+        return
+    if current_name == desired_name:
+        return
+    if _index_exists(conn, schema, desired_name):
+        raise RuntimeError(
+            f"Cannot rename spatial index on \"{schema}\".\"{table_name}\" "
+            f"to \"{desired_name}\" -- an index with that name already "
+            f"exists in schema \"{schema}\". Aborting rather than "
+            f"colliding with an unrelated index."
+        )
+    conn.execute(text(
+        f'ALTER INDEX "{schema}"."{current_name}" RENAME TO "{desired_name}";'
+    ))
+
+
+def _drop_table_best_effort(engine, schema, table_name):
+    """
+    Drops table_name (schema-qualified) without raising. Used for staging
+    cleanup after a failed/cancelled write and for the post-swap backup
+    drop -- in both cases the property being protected (the real
+    destination table's integrity) is already settled by the time this
+    runs, so a failure here only means a leftover table for a future run
+    to surface. table_name is always a caller-supplied staging_name or
+    backup_name here -- never resolved_table_name.
+    """
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(
+                f'DROP TABLE IF EXISTS "{schema}"."{table_name}" CASCADE;'
+            ))
+    except Exception as drop_err:
+        print(f"  ⚠ Could not drop '{schema}.{table_name}': {drop_err}. "
+              f"This does not affect the live table -- it will be surfaced "
+              f"as a recoverable leftover item on a future run.")
+
+
+def _comment_cama_table(conn, schema, table_name, role, dest, run_id,
+                         started_at_iso):
+    """
+    Attaches recovery metadata to a staging or backup table via
+    COMMENT ON TABLE. This is metadata ONLY: it plays no role in
+    collision safety (the random id in the table name is the entire
+    collision-safety mechanism) and no role in proving ownership by
+    itself (the advisory lock, re-derived from the run_id recorded here,
+    is what _scan_orphaned_cama_tables() actually uses to decide whether
+    a run is still alive).
+
+    Format (parsed back by _parse_cama_comment()):
+        "cama-run-id: <12-hex>; role: staging|backup; dest: <schema>.<table>; started: <iso8601>"
+    """
+    comment = (
+        f"cama-run-id: {run_id}; role: {role}; "
+        f"dest: {schema}.{dest}; started: {started_at_iso}"
+    )
+    conn.execute(text(f'COMMENT ON TABLE "{schema}"."{table_name}" IS :c'),
+                 {"c": comment})
+
+
+def _parse_cama_comment(comment):
+    """
+    Parses _comment_cama_table()'s own format back out. Returns
+    (run_id, dest), or (None, None) if comment is missing or doesn't match
+    the expected format -- e.g. a table that predates this mechanism, or
+    one whose comment step never ran because the process died before it
+    (STAGING_WRITE succeeded, but the connection was lost before VERIFY's
+    own _comment_cama_table() call). _scan_orphaned_cama_tables() treats
+    that case as unverifiable and always surfaces it, rather than silently
+    skipping a table it can't positively identify.
+    """
+    if not comment:
+        return None, None
+    m = re.search(r"cama-run-id:\s*([0-9a-f]{12});.*?dest:\s*([^;]+)", comment)
+    if not m:
+        return None, None
+    return m.group(1).strip(), m.group(2).strip()
+
+
+def _acquire_run_lock(creds, run_id):
+    """
+    Opens ONE dedicated, non-pooled psycopg2 connection -- deliberately
+    NOT taken from the SQLAlchemy engine's connection pool, see this
+    section's own header comment for why -- and acquires a session-level
+    advisory lock on it, keyed by _advisory_lock_key(run_id). The
+    connection must be kept open, unused for anything else, for the
+    entire DB-output portion of this run, and released via
+    _release_run_lock() exactly once -- see run_processing()'s worker(),
+    which does this in a try/finally so the lock is always released
+    (success, failure, or Cancel).
+
+    Returns the open connection (holding the lock) on success, or None if
+    the connection itself could not be opened or the lock could not be
+    acquired for any reason -- the caller treats None as a hard abort: no
+    staging write is ever attempted without a held lock, since the lock is
+    what lets a future run's orphan scan tell this run's own artifacts
+    apart from a genuinely abandoned one.
+    """
+    try:
+        conn = psycopg2.connect(
+            host=creds["host"], port=creds["port"],
+            dbname=creds["database"], user=creds["username"],
+            password=creds["password"],
+        )
+        cur = conn.cursor()
+        cur.execute("SELECT pg_advisory_lock(%s);", (_advisory_lock_key(run_id),))
+        conn.commit()
+        cur.close()
+        return conn
+    except Exception as lock_err:
+        print(f"  ⚠ Could not acquire DB run lock: {lock_err}")
+        return None
+
+
+def _release_run_lock(lock_conn):
+    """
+    Releases the advisory lock held by _acquire_run_lock() and closes that
+    dedicated connection. Closing the connection is sufficient by itself
+    -- PostgreSQL releases all of a session's advisory locks automatically
+    when that session ends, so no explicit pg_advisory_unlock() call is
+    needed first. Best-effort: a failure here does not affect any
+    already-committed table data -- it only means this run's advisory
+    lock lingers until PostgreSQL notices the connection is actually gone,
+    so a subsequent _scan_orphaned_cama_tables() correctly continues to
+    treat this run's own staging/backup artifacts as still "live" until
+    then, rather than as newly-orphaned.
+    """
+    try:
+        lock_conn.close()
+    except Exception:
+        pass
+
+
+def _write_db_output_safely(engine, schema, gdf, resolved_table_name,
+                             resolved_outcome, run_id, started_at_iso):
+    """
+    The D-Cancel replacement for the direct
+    `brgy_gdf.to_postgis(..., if_exists="replace")` call this file's
+    worker() previously used. Implements STAGING_WRITE -> VERIFY ->
+    FINAL_SWAP -> (DISCARDING on failure) -> post-swap backup cleanup.
+    The real destination table (resolved_table_name) is never touched
+    before FINAL_SWAP, and FINAL_SWAP is a single PostgreSQL transaction
+    -- either both renames inside it commit, or PostgreSQL rolls back
+    both and the destination is exactly as it was before this call. This
+    function is only ever called from worker() AFTER the run's Cancel
+    checkpoints have already passed (see this section's own header
+    comment on this file's Cancel granularity) -- nothing inside this
+    function is cancelable, by design.
+
+    Args:
+        engine: SQLAlchemy engine.
+        schema (str): destination schema.
+        gdf (GeoDataFrame): the processed result to write.
+        resolved_table_name (str): destination table name, from
+            resolve_db_output_table() (via on_run()/run_processing()).
+        resolved_outcome (str | None): "overwritten" or "created", from
+            the same source. If it's anything else (the documented
+            defensive-fallback case in worker(), where resolved_table_name
+            itself was somehow None), the real outcome is determined here
+            directly via _table_exists() rather than guessed.
+        run_id (str): this run's _gen_id() value, recorded in the staging/
+            backup tables' comments for _scan_orphaned_cama_tables().
+        started_at_iso (str): human-readable run start time, for the same
+            comment metadata.
+
+    Raises:
+        Exception: on any failure at any step. The caller (worker()'s own
+        try/except) turns this into the run's error dialog. By the time
+        any exception reaches the caller, the staging table has already
+        been dropped (best-effort) here, and the destination table is
+        guaranteed untouched if the failure happened before FINAL_SWAP's
+        transaction committed.
+    """
+    if resolved_outcome not in ("overwritten", "created"):
+        with engine.begin() as conn:
+            resolved_outcome = (
+                "overwritten" if _table_exists(conn, schema, resolved_table_name)
+                else "created"
+            )
+
+    is_overwrite = (resolved_outcome == "overwritten")
+    staging_name = f"_camastg_{_gen_id()}"
+    backup_name = f"_camabak_{_gen_id()}" if is_overwrite else None
+
+    # STAGING_WRITE -- the real destination table is completely untouched
+    # at this point. Uses `conn` (not the bare engine), matching this
+    # file's own pre-existing to_postgis()-inside-engine.begin() pattern
+    # -- a failure partway through this call rolls back cleanly rather
+    # than leaving a half-written staging table.
+    with engine.begin() as conn:
+        gdf.to_postgis(staging_name, conn, schema=schema,
+                        if_exists="replace", index=False)
+
+    # VERIFY -- confirm the staging write actually landed, and that its
+    # row count matches what we intended to write, before this table is
+    # ever eligible for promotion.
+    with engine.begin() as conn:
+        try:
+            actual_count = conn.execute(text(
+                f'SELECT COUNT(*) FROM "{schema}"."{staging_name}"'
+            )).scalar()
+        except Exception as verify_err:
+            raise RuntimeError(
+                f"Staging table '{staging_name}' could not be verified "
+                f"after write -- it may not have been created. Existing "
+                f"table '{resolved_table_name}' was not modified. "
+                f"Cause: {verify_err}"
+            ) from verify_err
+
+        if actual_count != len(gdf):
+            _drop_table_best_effort(engine, schema, staging_name)
+            raise RuntimeError(
+                f"Staging table '{staging_name}' row count "
+                f"({actual_count}) does not match the processed result "
+                f"({len(gdf)}). Aborting before promotion -- existing "
+                f"table '{resolved_table_name}' was not modified."
+            )
+
+        _comment_cama_table(conn, schema, staging_name, "staging",
+                             resolved_table_name, run_id, started_at_iso)
+
+    # FINAL_SWAP -- one transaction, never cancelable. Either both renames
+    # commit, or PostgreSQL rolls back both and resolved_table_name is
+    # exactly as it was before this call.
+    try:
+        with engine.begin() as conn:
+            exists_now = _table_exists(conn, schema, resolved_table_name)
+            if is_overwrite:
+                if not exists_now:
+                    raise RuntimeError(
+                        f"Expected an existing table '{resolved_table_name}' "
+                        f"to overwrite, but it no longer exists. Aborting -- "
+                        f"nothing was promoted. The processed data is still "
+                        f"available in staging table '{staging_name}'."
+                    )
+                conn.execute(text(
+                    f'ALTER TABLE "{schema}"."{resolved_table_name}" '
+                    f'RENAME TO "{backup_name}";'
+                ))
+                _rename_spatial_index(conn, schema, backup_name,
+                                       f"idx_{backup_name}_geometry")
+                _comment_cama_table(conn, schema, backup_name, "backup",
+                                     resolved_table_name, run_id,
+                                     started_at_iso)
+            else:
+                if exists_now:
+                    raise RuntimeError(
+                        f"A table named '{resolved_table_name}' now exists, "
+                        f"but this run was resolved as a new table. "
+                        f"Aborting -- nothing was promoted. The processed "
+                        f"data is still available in staging table "
+                        f"'{staging_name}'."
+                    )
+            conn.execute(text(
+                f'ALTER TABLE "{schema}"."{staging_name}" '
+                f'RENAME TO "{resolved_table_name}";'
+            ))
+            _rename_spatial_index(conn, schema, resolved_table_name,
+                                   f"idx_{resolved_table_name}_geometry")
+    except Exception:
+        # DISCARDING -- staging was never promoted. This DROP only ever
+        # targets staging_name, per this section's own invariant -- never
+        # resolved_table_name or backup_name.
+        _drop_table_best_effort(engine, schema, staging_name)
+        raise
+
+    # Backup is now redundant -- the swap committed, so the new data is
+    # confirmed live. Drop immediately, best-effort: never treated as a
+    # long-term retention artifact. Normally transient; retained only if
+    # this post-commit cleanup itself fails, or the process crashes
+    # before it runs -- either way, _scan_orphaned_cama_tables() surfaces
+    # it on a future run. A failed drop here does not affect the live
+    # table, which is already safely promoted.
+    if is_overwrite:
+        _drop_table_best_effort(engine, schema, backup_name)
+
+
+def _scan_orphaned_cama_tables(schema, creds):
+    """
+    Looks for every _camastg_*/_camabak_* table currently in `schema` and
+    returns the ones whose owning run is NOT currently alive. Relies on
+    pg_try_advisory_lock() on the SAME key the owning run acquired (see
+    _advisory_lock_key()/_acquire_run_lock()), re-derived here from the
+    run_id recorded in each table's own COMMENT ON TABLE -- succeeding
+    means no live session currently holds that key, i.e. the run that
+    created this table is provably gone (a hard process kill, a computer
+    shutdown/power loss, or a lost DB connection -- normal completion,
+    normal Cancel, and normal failure all clean up after themselves via
+    _write_db_output_safely()/_drop_table_best_effort() and never reach
+    this scan). A table whose comment is missing or doesn't match the
+    expected format (something failed before the comment step itself ever
+    ran) is treated as unverifiable and always included, rather than
+    silently skipped -- see _parse_cama_comment().
+
+    Read-only with respect to table data: this function only tests locks
+    (releasing each one immediately after testing -- it must never itself
+    end up holding one) and reads catalog metadata. It never drops
+    anything -- see _prompt_orphaned_cama_tables() for the user-driven
+    removal step, called from resolve_db_output_table() before its
+    existing fuzzy-match logic runs.
+    """
+    engine = create_engine(
+        f"postgresql://{creds['username']}:{creds['password']}@"
+        f"{creds['host']}:{creds['port']}/{creds['database']}"
+    )
+    orphans = []
+    with engine.begin() as conn:
+        rows = conn.execute(text(
+            """
+            SELECT c.relname, obj_description(c.oid, 'pg_class')
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = :schema AND c.relkind = 'r'
+              AND (c.relname LIKE '\\_camastg\\_%' ESCAPE '\\'
+                   OR c.relname LIKE '\\_camabak\\_%' ESCAPE '\\')
+            """
+        ), {"schema": schema}).fetchall()
+
+        for relname, comment in rows:
+            role = "staging" if relname.startswith("_camastg_") else "backup"
+            run_id, dest = _parse_cama_comment(comment)
+            if run_id is None:
+                orphans.append({"table": relname, "role": role,
+                                 "run_id": None, "dest": dest})
+                continue
+            key = _advisory_lock_key(run_id)
+            acquired = conn.execute(
+                text("SELECT pg_try_advisory_lock(:k)"), {"k": key}
+            ).scalar()
+            if acquired:
+                conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": key})
+                orphans.append({"table": relname, "role": role,
+                                 "run_id": run_id, "dest": dest})
+            # else: a live run holds this lock -- not orphaned, skip.
+    return orphans
+
+
+def _prompt_orphaned_cama_tables(root, orphans, schema, creds):
+    """
+    Shown once, from resolve_db_output_table(), before its own normal
+    fuzzy-match flow. Presents each orphan (its destination table, role,
+    and run start time when available) and offers a per-item checkbox
+    choice: remove now, or leave for later manual review. Never deletes
+    anything the user hasn't explicitly checked -- declining to check
+    anything, or closing this dialog, is the same as choosing "leave"
+    for every item found; nothing is ever auto-deleted.
+    """
+    if not orphans:
+        return
+
+    win = tk.Toplevel(root)
+    win.title("Recovered Items From an Interrupted Run")
+    apply_icon(win, "roadfrontage.ico")
+    win.resizable(False, False)
+    win.transient(root)
+    win.grab_set()
+
+    intro = (
+        "The following leftover database table(s) were found. These are "
+        "normally cleaned up automatically -- they were likely left "
+        "behind by a run that was interrupted (e.g. the app or computer "
+        "was closed unexpectedly) while writing to the database. Your "
+        "existing data was never affected by this."
+    )
+    tk.Label(win, text=intro, justify="left", wraplength=460,
+             padx=14, pady=10).pack()
+
+    list_frame = tk.Frame(win)
+    list_frame.pack(fill="x", padx=14)
+    vars_by_table = {}
+    for o in orphans:
+        dest_display = o["dest"] or "unknown (no recovery metadata found)"
+        label = f'{o["table"]}   (role: {o["role"]}, destination: {dest_display})'
+        var = tk.BooleanVar(value=False)
+        vars_by_table[o["table"]] = var
+        tk.Checkbutton(list_frame, text=label, variable=var, anchor="w",
+                        justify="left", wraplength=440).pack(fill="x", anchor="w")
+
+    tk.Label(
+        win,
+        text=("Check any items you want removed now. Unchecked items are\n"
+              "left in place for manual review and will be shown again."),
+        justify="left", padx=14, pady=(6, 10)
+    ).pack()
+
+    def _on_remove_selected():
+        engine = create_engine(
+            f"postgresql://{creds['username']}:{creds['password']}@"
+            f"{creds['host']}:{creds['port']}/{creds['database']}"
+        )
+        for o in orphans:
+            if vars_by_table[o["table"]].get():
+                _drop_table_best_effort(engine, schema, o["table"])
+        win.destroy()
+
+    btn_frame = tk.Frame(win)
+    btn_frame.pack(pady=(0, 12))
+    tk.Button(btn_frame, text="Remove Checked", command=_on_remove_selected,
+              width=16).pack(side="left", padx=6)
+    tk.Button(btn_frame, text="Leave All For Now", command=win.destroy,
+              width=16).pack(side="left", padx=6)
+
+    win.update_idletasks()
+    sw = win.winfo_screenwidth()
+    win.geometry(f"+{(sw // 2) - 250}+120")
+    win.attributes("-topmost", True)
+    win.after(100, lambda: win.attributes("-topmost", False))
+    win.focus_force()
+    win.wait_window()
 
 
 # ========================================
 # DB OUTPUT RESOLUTION
 # ========================================
-def resolve_db_output_table(root, schema, barangay_source):
+def resolve_db_output_table(root, schema, barangay_source, creds):
     """
     Determines the DB-output destination table for the Land Parcel
     source, BEFORE the worker thread starts -- same "resolve everything
@@ -2162,9 +2685,22 @@ def resolve_db_output_table(root, schema, barangay_source):
       - Local-file Land Parcel: fuzzy-matches the filename against
         existing tables via find_matching_tables() (which already
         excludes CAMA_Table, CAMA_Transaction_Log, and any "_VM"
-        table), then requires user confirmation before treating a
-        match as an overwrite target -- zero candidates skips the
-        dialog entirely and creates a new table under the filename.
+        table -- that exclusion is shared, out-of-scope utils code for
+        this task and is left untouched), then requires user
+        confirmation before treating a match as an overwrite target --
+        zero candidates skips the dialog entirely and creates a new
+        table under the filename.
+
+    D-Cancel: also runs the crash-orphan recovery scan first, before any
+    of its own existing logic -- _scan_orphaned_cama_tables() plus, if
+    it finds anything, _prompt_orphaned_cama_tables(). This is the
+    natural point for it: it's the one place in this file that already
+    runs on the main thread, synchronously, with a live `root` to open a
+    dialog on, before any new staging table for THIS run could possibly
+    exist to confuse the scan. creds is a new required parameter for
+    this reason -- the caller (on_run()) already loads it to determine
+    schema before calling this function, so this is a zero-cost addition
+    at the call site.
 
     Returns (resolved_table_name, resolved_outcome), or (None, None) if
     the user cancelled -- caller must abort the entire run in that
@@ -2172,6 +2708,10 @@ def resolve_db_output_table(root, schema, barangay_source):
     cancel-aborts-everything semantics (there is no "create new" choice
     for DB output).
     """
+    orphans = _scan_orphaned_cama_tables(schema, creds)
+    if orphans:
+        _prompt_orphaned_cama_tables(root, orphans, schema, creds)
+
     if barangay_source[0] == "db":
         return barangay_source[1][0], "overwritten"
 
@@ -2195,16 +2735,41 @@ def resolve_db_output_table(root, schema, barangay_source):
 # ========================================
 # MAIN PROCESS
 # ========================================
-def run_processing(app_root, resolved_table_name=None):
+def run_processing(app_root, resolved_table_name=None, resolved_outcome=None):
     """
     Orchestrates the full run on a background thread with progress
     reported via a queue.Queue: loads the Road Network layer once,
     then for each selected Land Parcel source runs
-    process_frontage_single() (with the module-level overwrite_mode,
-    emit_buffer_qa, and parcel_output_column_overrides settings
-    already resolved by on_run() before this was called) and saves the
-    result either locally (.gpkg, optionally opened in Global Mapper,
-    with optional QA layers) or to PostGIS.
+    process_frontage_single() (with the module-level overwrite_mode
+    and parcel_output_column_overrides settings already resolved by
+    on_run() before this was called) and saves the result either
+    locally (.gpkg, optionally opened in Global Mapper) or to PostGIS.
+    The previously-optional QA layers (frontage_lines/VM,
+    segment_buffers) have been removed entirely -- a successful run now
+    always produces exactly one output artifact per source.
+
+    D-Cancel (this task): one new_cancel_flag() is created per run and
+    passed to ProgressWindow, wiring the title-bar X as Cancel for the
+    lifetime of this run's progress window. Cancel is checked at two
+    kinds of points inside worker(): once before process_frontage_
+    single() is even called (catches Cancel during "Loading road
+    data..."/"Loading {name}"), and then internally, by process_
+    frontage_single() itself, at its own three passes' throttled
+    checkpoints -- see that function's own progress-contract docstring
+    for the exact contract and for why a Cancel at any pass returns
+    None (full discard) rather than a partial result. Cancel is
+    disabled only once a real (non-cancelled) result exists,
+    immediately before the save that follows -- nothing from that
+    point on can itself be interrupted. See ProgressWindow's own
+    docstring and the "DB ATOMIC WRITE / CANCEL-SAFE STAGING" section
+    above for the full rationale. barangay_source is always a 1+-tuple
+    processed one source at a time by the existing `sources` loop below
+    (unchanged) -- Cancel applies per-run, not per-source: a Cancel
+    while processing one source in a multi-source batch discards that
+    source's own in-progress work and stops the whole batch, exactly
+    like an unhandled exception already would, rather than skipping
+    just that one source and continuing (that per-source-failure
+    isolation below is reserved for actual exceptions).
 
     Args:
         app_root: the live top-level window, used as the parent for
@@ -2212,6 +2777,13 @@ def run_processing(app_root, resolved_table_name=None):
         resolved_table_name (str | None): the already-confirmed DB
         output table name from resolve_db_output_table() in on_run() --
         only relevant for DB output mode.
+        resolved_outcome (str | None): "overwritten" or "created", the
+        other half of resolve_db_output_table()'s return value (via
+        on_run()) -- only relevant for DB output mode. Passed straight
+        through to _write_db_output_safely() so it knows whether
+        FINAL_SWAP needs a rename-existing-aside-to-backup step.
+        Previously discarded by on_run() (the call site kept only
+        resolved_table_name); now actually used -- see on_run().
     """
     global barangay_source, road_source, output_mode, overwrite_mode, parcel_output_column_overrides
     if not barangay_source or not road_source or not output_mode:
@@ -2238,17 +2810,49 @@ def run_processing(app_root, resolved_table_name=None):
     # confirmed table name (DB output, user already had the chance to
     # cancel in on_run()). No re-resolution or re-validation happens here.
 
-    progress = ProgressWindow(app_root, "Road Frontage Progress")
+    cancel_flag = new_cancel_flag()
+    progress = ProgressWindow(app_root, "Road Frontage Progress", cancel_flag=cancel_flag)
 
     q = queue.Queue()
 
     def worker():
+        """
+        Background-thread body -- see run_processing()'s own docstring
+        for the full D-Cancel checkpoint sequence. Never touches
+        Tkinter widgets directly; only puts messages on q for
+        poll_queue() (main thread) to consume.
+        """
+        lock_conn = None
         try:
-            q.put(("update", "Loading road data...", None, None))
-
             def progress_cb(msg, val=None, maxv=None):
-                q.put(("update", msg, val, maxv))
+                q.put(("update", msg, val, maxv, None))
+                # D-Cancel: a real bool every call, never None --
+                # process_frontage_single()'s three passes only stop on
+                # an explicit False (see that function's own
+                # progress-contract docstring), so this must never
+                # accidentally return None itself.
+                return not cancel_flag["stop"]
 
+            # D-Cancel: one run_id/run_started_at for the whole run --
+            # cheap to always generate, even for local output mode,
+            # which doesn't use it. The advisory lock itself is only
+            # ever acquired for DB output mode, since it exists purely
+            # to let a FUTURE run's _scan_orphaned_cama_tables() tell
+            # this run's staging/backup artifacts apart from a
+            # genuinely abandoned one.
+            run_id = _gen_id()
+            run_started_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+            if output_mode[0] == "db":
+                lock_conn = _acquire_run_lock(creds, run_id)
+                if lock_conn is None:
+                    raise RuntimeError(
+                        "Could not acquire the database run lock. Another "
+                        "CAMA Tools database write may already be in "
+                        "progress, or the database connection failed. "
+                        "Aborting before any write -- no data was changed."
+                    )
+
+            q.put(("update", "Loading road data...", None, None, None))
 
             # Reuse the road layer already read by the Road Classification
             # section's background read (see open_main_window()) when it
@@ -2277,18 +2881,34 @@ def run_processing(app_root, resolved_table_name=None):
                 sources = [("db", t) for t in barangay_source[1]]
 
             skipped = []
+            cancelled = False
             for src_type, src in sources:
                 try:
                     if src_type == "local":
                         name = os.path.basename(src)
-                        q.put(("update", f"Loading {name}", None, None))
+                        q.put(("update", f"Loading {name}", None, None, None))
                         brgy_gdf = _force_2d(gpd.read_file(src))
                         out_base = os.path.splitext(name)[0]
                     else:
                         name = src
-                        q.put(("update", f"Loading DB table {name}", None, None))
+                        q.put(("update", f"Loading DB table {name}", None, None, None))
                         brgy_gdf = _force_2d(read_postgis_clean(name, engine, schema))
                         out_base = name
+
+                    # D-Cancel: pre-processing checkpoint. Catches a
+                    # Cancel clicked during "Loading road data..."/
+                    # "Loading {name}" -- i.e. before process_frontage_
+                    # single() is even called, and before that
+                    # function's own first Pass-1 checkpoint (i == 1,
+                    # reached quickly but not instantly after
+                    # reprojection/road-union/road-type filtering) could
+                    # fire on its own. NOT the only checkpoint in this
+                    # run -- see the result-is-None check right after
+                    # the process_frontage_single() call below, and that
+                    # function's own progress-contract docstring.
+                    if cancel_flag["stop"]:
+                        cancelled = True
+                        break
 
                     # Road Classification: resolved independently for THIS
                     # parcel source. use_classification_for_source comes
@@ -2315,20 +2935,50 @@ def run_processing(app_root, resolved_table_name=None):
                     depth_col = output_col_overrides.get("CAMA_DEPTH", "CAMA_DEPTH")
                     dwr_col = output_col_overrides.get("CAMA_DEPTH_WIDTH_RATIO", "CAMA_DEPTH_WIDTH_RATIO")
 
+                    # D-Cancel: Cancel STAYS enabled through
+                    # process_frontage_single() itself -- it honors
+                    # Cancel internally, via progress_cb's return value,
+                    # at its own three passes' throttled checkpoints
+                    # (plus, in Pass 2's inner loop only, the separate
+                    # lightweight is_cancelled() check -- see that
+                    # function's own docstring).
+                    q.put(("update", f"Processing {name}", None, None, True))
+
                     result = process_frontage_single(
                         brgy_gdf,
                         road_gdf,
                         name,
                         progress=progress_cb,
                         classification=classification,
-                        emit_buffer_qa=emit_buffer_qa,
+                        is_cancelled=lambda: cancel_flag["stop"],
                         road_frontage_col=road_frontage_col,
                         depth_col=depth_col,
                         dwr_col=dwr_col
                     )
-                    brgy_gdf    = result["parcels"]
-                    lines_gdf   = result["qa_layers"]["frontage_lines"]
-                    buffers_gdf = result["qa_layers"]["segment_buffers"]
+
+                    if result is None:
+                        # D-Cancel: progress_cb returned False at one of
+                        # process_frontage_single()'s own pass
+                        # checkpoints (or its inner is_cancelled() check
+                        # fired) -- full discard, per explicit decision.
+                        # Nothing computed for this source so far is
+                        # kept; output_mode[1]/the DB is never touched
+                        # (the save step below is never reached).
+                        # Same-tick "flash" of this message before the
+                        # terminal "cancelled" message/dialog, per
+                        # explicit decision -- no artificial delay.
+                        q.put(("update", "Discarding run... Please wait.", None, None, False))
+                        cancelled = True
+                        break
+
+                    # D-Cancel: from here through the save, Cancel is
+                    # disabled -- a real result now exists and nothing
+                    # past this point can be safely interrupted (the
+                    # save itself is non-cancelable by design -- see
+                    # _write_db_output_safely()).
+                    q.put(("update", f"Saving {name}", None, None, False))
+
+                    brgy_gdf = result["parcels"]
 
                     if output_mode[0] == "local":
                         # Priority 1: filename resolution happens ONCE
@@ -2340,15 +2990,11 @@ def run_processing(app_root, resolved_table_name=None):
                         # Naming convention: the main output reuses the
                         # parcel source's own name directly, no tool-name
                         # suffix (matches road_width.py's convention
-                        # exactly). Both QA layers derive their base name
-                        # from this SAME resolved base_name via
-                        # with_output_suffix() -- never their own
-                        # independent numbering scan -- so e.g. main
-                        # "landparcel_1.gpkg" always pairs with QA lines
-                        # "landparcel_1_VM.gpkg" ("VM" = Visual
-                        # Measurement) and buffer diagnostic
-                        # "landparcel_1_segment_buffers.gpkg", never a
-                        # mismatched number.
+                        # exactly). This tool writes exactly this ONE
+                        # output file per source -- the previously-paired
+                        # QA layers have been removed entirely (see the
+                        # module docstring and process_frontage_single()'s
+                        # own docstring).
                         desired_base_name = out_base
                         candidate_path = os.path.join(output_mode[1], f"{desired_base_name}.gpkg")
                         had_conflict = os.path.exists(candidate_path)
@@ -2363,54 +3009,6 @@ def run_processing(app_root, resolved_table_name=None):
                         out = os.path.join(output_mode[1], f"{base_name}.gpkg")
                         _write_gpkg(brgy_gdf, out)
                         q.put(("open_gm", out, None, None))
-
-                        # ------------------------------------------------------------------
-                        # frontage_lines QA layer write ({base_name}_VM.gpkg) -- DISABLED
-                        # (commented out, not removed). Per-task decision: this is a
-                        # secondary/diagnostic-only output (confirmed via the comment
-                        # immediately below the DB branch further down: "frontage_lines is
-                        # a QA-only artifact -- not written to DB"), unconditional in the
-                        # ORIGINAL code (no flag gated this write) -- discovered during this
-                        # file's own Phase 1 analysis as a second, independent secondary
-                        # output alongside the checkbox-gated segment_buffers layer below.
-                        # Disabling it is required to satisfy the same goal as the other 3
-                        # files in this task: a successful Run Processing always produces
-                        # exactly ONE output file per tool. lines_gdf itself is still
-                        # computed above (unchanged) -- only this write (and the
-                        # accompanying Global Mapper auto-load) is disabled.
-                        # ------------------------------------------------------------------
-                        # if not lines_gdf.empty:
-                            # lines_base_name = with_output_suffix(base_name, "VM")
-                            # lines_out = os.path.join(
-                                # output_mode[1],
-                                # f"{lines_base_name}.gpkg"
-                            # )
-                            # _write_gpkg(lines_gdf, lines_out)
-                            # q.put(("open_gm", lines_out, None, None))
-
-                        # ------------------------------------------------------------------
-                        # segment_buffers QA layer write ({base_name}_segment_buffers.gpkg)
-                        # -- DISABLED (commented out, not removed). This is the write/
-                        # persistence boundary for the buffer-diagnostic feature; the
-                        # checkbox that used to let a user opt into this (see the disabled
-                        # Checkbutton/BooleanVar and Run-time assignment further up in this
-                        # file) is also disabled, so emit_buffer_qa is now permanently
-                        # False and this `if` condition can never be True regardless -- this
-                        # write is commented out as well, as the actual persistence
-                        # boundary, per task requirement. buffers_gdf itself is still
-                        # computed above (unchanged, always a valid GeoDataFrame -- empty
-                        # whenever emit_buffer_qa is False, which is now always) -- only
-                        # this write (and the accompanying Global Mapper auto-load) is
-                        # disabled.
-                        # ------------------------------------------------------------------
-                        # if emit_buffer_qa and not buffers_gdf.empty:
-                            # buffers_base_name = with_output_suffix(base_name, "segment_buffers")
-                            # buffers_out = os.path.join(
-                                # output_mode[1],
-                                # f"{buffers_base_name}.gpkg"
-                            # )
-                            # _write_gpkg(buffers_gdf, buffers_out)
-                            # q.put(("open_gm", buffers_out, None, None))
                     else:
                         # The actual destination table was already
                         # decided by resolve_db_output_table(), BEFORE
@@ -2423,15 +3021,14 @@ def run_processing(app_root, resolved_table_name=None):
                         # can't reach this branch, so this is just a
                         # defensive fallback).
                         db_table = resolved_table_name if resolved_table_name is not None else out_base
-                        with engine.begin() as conn:
-                            brgy_gdf.to_postgis(
-                                db_table,
-                                conn,
-                                schema=schema,
-                                if_exists="replace",
-                                index=False
-                            )
-                        # frontage_lines is a QA-only artifact — not written to DB.
+                        # D-Cancel: staging-write / verify / atomic
+                        # rename-swap, replacing the previous direct
+                        # to_postgis(..., if_exists="replace") call --
+                        # see "DB ATOMIC WRITE / CANCEL-SAFE STAGING"
+                        # above.
+                        _write_db_output_safely(engine, schema, brgy_gdf,
+                                                 db_table, resolved_outcome,
+                                                 run_id, run_started_at)
 
                 except Exception as source_err:
                     # Isolate failures per source: log/report and move on to
@@ -2439,8 +3036,13 @@ def run_processing(app_root, resolved_table_name=None):
                     # Sources already written before this one keep their
                     # output — only this one is skipped.
                     skipped.append((name, str(source_err)))
-                    q.put(("update", f"Skipped {name}: {source_err}", None, None))
+                    q.put(("update", f"Skipped {name}: {source_err}", None, None, None))
                     continue
+
+            if cancelled:
+                print("🛑 Run cancelled by user.")
+                q.put(("cancelled", None, None, None))
+                return
 
             if skipped:
                 summary = "Done, but some sources were skipped:\n" + "\n".join(
@@ -2452,27 +3054,43 @@ def run_processing(app_root, resolved_table_name=None):
 
         except Exception as e:
             q.put(("error", str(e), None, None))
+        finally:
+            # D-Cancel: released here regardless of how the try block
+            # above exits -- clean success, a Cancel (the `return` right
+            # after the cancelled check above), or an exception (the
+            # `except` clause's own fallthrough). A lingering advisory
+            # lock past this point would make a FUTURE run's
+            # _scan_orphaned_cama_tables() wrongly treat this run's own
+            # staging/backup tables as still "live" even after this run
+            # has fully ended.
+            if lock_conn is not None:
+                _release_run_lock(lock_conn)
 
     def poll_queue():
         try:
             while True:
                 msg = q.get_nowait()
-                kind = msg[0]
+                kind, *rest = msg
 
                 if kind == "update":
-                    progress.update(msg[1], msg[2], msg[3])
+                    progress.update(rest[0], rest[1], rest[2], rest[3])
 
                 elif kind == "open_gm":
-                    open_in_global_mapper(msg[1])
+                    open_in_global_mapper(rest[0])
 
                 elif kind == "done":
                     progress.close()
-                    messagebox.showinfo("Success", msg[1])
+                    messagebox.showinfo("Success", rest[0])
                     return
 
                 elif kind == "error":
                     progress.close()
-                    messagebox.showerror("Error", msg[1])
+                    messagebox.showerror("Error", rest[0])
+                    return
+
+                elif kind == "cancelled":
+                    progress.close()
+                    messagebox.showinfo("Cancelled", "The run was cancelled. No data was changed.")
                     return
 
         except queue.Empty:
@@ -2886,9 +3504,8 @@ def open_main_window(root):
     Local-file/Database-table radio toggle), a Road Classification
     section (per-source Lot Location/Lot Label checkboxes, mutually
     exclusive with the Road Type exclusion filter -- see the module
-    docstring and the RUNTIME STATE section), a QA-layer checkbox
-    (emit_buffer_qa), an Output destination picker, and a Run button
-    gated by _update_run_button_state().
+    docstring and the RUNTIME STATE section), an Output destination
+    picker, and a Run button gated by _update_run_button_state().
 
     Runs TWO independent background detect-on-select systems (each its
     own daemon thread + win.after()-polled queue.Queue): one for Land
@@ -3112,21 +3729,99 @@ def open_main_window(root):
         container's reference to it and destroys the old one -- the old
         checklist is never cleared/destroyed before the new one is fully
         built, so the GUI never passes through an empty intermediate
-        state. Deliberately does NOT pack the new container or call
-        _reflow_window() here -- every caller of this function calls
-        _update_road_classification_visibility() immediately afterward,
-        which owns all packing/positioning decisions for whichever
-        container is current at that moment.
+        state. Deliberately does NOT pack the new container, resize the
+        scroll box, or call _reflow_window() here -- every caller of
+        this function calls _update_road_classification_visibility()
+        immediately afterward, which owns all packing/sizing/
+        positioning decisions for whichever container is current at
+        that moment.
+
+        D-Scrollbar (this task): the new container is now built as a
+        child of road_type_checklist_canvas (not road_frame directly --
+        road_frame's own direct children are road_filter_checkbox and
+        road_type_checklist_outer, see the widget construction below),
+        and the swap itself additionally re-points the canvas's own
+        embedded window item (_road_type_canvas_window) at the new
+        container via itemconfig -- the SAME window item id is reused
+        across every rebuild, only which Frame it displays changes, so
+        the canvas's scroll position/scrollregion machinery never needs
+        to be torn down and rebuilt. The new container's own
+        <Configure> binding (for scrollregion updates) is re-established
+        here too, since binding follows the widget instance, not the
+        window item id.
         """
         nonlocal road_type_checklist_container
-        new_container = tk.Frame(road_frame)
+        new_container = tk.Frame(road_type_checklist_canvas)
         for display_text in sorted(road_type_value_vars.keys()):
             real_value, var = road_type_value_vars[display_text]
             tk.Checkbutton(new_container, text=display_text,
                            variable=var).pack(anchor="w")
+
+        def _on_road_type_content_configure(_event=None):
+            road_type_checklist_canvas.configure(
+                scrollregion=road_type_checklist_canvas.bbox("all"))
+        new_container.bind("<Configure>", _on_road_type_content_configure)
+
         old_container = road_type_checklist_container
         road_type_checklist_container = new_container
+        road_type_checklist_canvas.itemconfig(_road_type_canvas_window, window=new_container)
         old_container.destroy()
+
+    def _resize_road_type_checklist_box():
+        """
+        Recomputes road_type_checklist_canvas's own height/width handling
+        to fit its current content. Ported from lot_location.py's own
+        _resize_road_type_checklist_box() (itself ported from meters_
+        from_school_shop_transport_church.py's _resize_other_landmarks_
+        checklist_box()) -- re-traced against this file's OWN widget
+        tree (road_action_row is a Label(width=42) + a Browse button
+        here too, confirmed matching) rather than assumed to be a
+        drop-in port.
+
+        Vertical scrollbar trigger is an ITEM COUNT (> 8 distinct
+        ROAD_TYPE values), not a fixed-pixel cap -- the per-row pixel
+        height is measured from the container's actual current content
+        (content_height / n_items) so the 8-item cap is translated into
+        an accurate pixel height regardless of font/theme.
+
+        Horizontal overflow handling: the canvas's own displayed WIDTH
+        is explicitly pinned here to a FIXED value on every call --
+        derived from road_action_row's own already-established requested
+        width, MINUS both the vertical scrollbar's width (whenever
+        shown) AND ROAD_TYPE_CHECKLIST_LEFT_INDENT (the same left indent
+        already applied when road_type_checklist_outer itself is packed
+        below). Pinning the canvas's width here means overflow is
+        handled ENTIRELY by the horizontal scrollbar appearing -- this
+        configuration window itself only ever grows taller (to fit new
+        checklist rows, up to the 8-item cap), never wider.
+        """
+        road_type_checklist_container.update_idletasks()
+        n_items = len(road_type_value_vars)
+        content_height = road_type_checklist_container.winfo_reqheight()
+        content_width = road_type_checklist_container.winfo_reqwidth()
+
+        show_vscroll = n_items > ROAD_TYPE_MAX_ITEMS_BEFORE_VSCROLL and n_items > 0
+        vscroll_width = road_type_vscroll.winfo_reqwidth() if show_vscroll else 0
+        fixed_row_width = road_action_row.winfo_reqwidth()
+        canvas_width = max(
+            fixed_row_width - vscroll_width - ROAD_TYPE_CHECKLIST_LEFT_INDENT, 1)
+        road_type_checklist_canvas.configure(width=canvas_width)
+
+        if n_items <= ROAD_TYPE_MAX_ITEMS_BEFORE_VSCROLL or n_items == 0:
+            road_type_checklist_canvas.configure(height=content_height)
+            road_type_vscroll.pack_forget()
+        else:
+            row_height = content_height / n_items
+            capped_height = int(round(row_height * ROAD_TYPE_MAX_ITEMS_BEFORE_VSCROLL))
+            road_type_checklist_canvas.configure(height=capped_height)
+            road_type_vscroll.pack(side="right", fill="y")
+
+        if content_width > canvas_width:
+            road_type_checklist_canvas.itemconfig(_road_type_canvas_window, width=content_width)
+            road_type_hscroll.pack(side="bottom", fill="x")
+        else:
+            road_type_checklist_canvas.itemconfig(_road_type_canvas_window, width=canvas_width)
+            road_type_hscroll.pack_forget()
 
     def _on_parcel_classification_checkbox_changed(*_args):
         """
@@ -3308,6 +4003,37 @@ def open_main_window(root):
                 anchor="w", fill="x", pady=(2, 0), after=parcel_action_row)
         _reflow_window()
 
+    def _check_all_road_types():
+        """
+        Sets every discovered ROAD_TYPE value's BooleanVar to True --
+        iterates road_type_value_vars directly (the full dictionary
+        populated by _rebuild_road_type_checklist() for every distinct
+        value this read found), never the Tkinter Checkbutton widgets
+        currently rendered inside the Canvas viewport -- so every value
+        is checked regardless of whether its row is currently scrolled
+        into view. Each Checkbutton is bound to its own BooleanVar, so
+        this automatically and correctly updates every widget's
+        displayed check-state too, including off-screen ones, the
+        moment they're scrolled into view. Mirrors lot_location.py's
+        own _check_all_road_types() exactly (itself ported from
+        meters_from_school_shop_transport_church.py's
+        _check_all_other_landmarks()).
+
+        Checking/unchecking individual ROAD_TYPE values never gates the
+        Run button here either (same as lot_location.py) -- so there is
+        no _update_run_button_state() call needed.
+        """
+        for real_value, var in road_type_value_vars.values():
+            var.set(True)
+
+    def _uncheck_all_road_types():
+        """Mirror of _check_all_road_types() -- sets every discovered
+        value's BooleanVar to False, same off-screen-safe approach
+        (iterates the variable dict directly, never the currently-
+        rendered widgets)."""
+        for real_value, var in road_type_value_vars.values():
+            var.set(False)
+
     def _update_road_classification_visibility():
         """
         Shows the "Filter by Road Type" checkbox plus (if checked) its
@@ -3328,23 +4054,60 @@ def open_main_window(root):
         intermediate state just because a background refresh is in
         progress. The checkbox/checklist's own pack state/position is
         entirely decided HERE (not by _rebuild_road_type_checklist(),
-        which only swaps which Frame object is current) -- while
-        reading, this function does not touch road_filter_checkbox's or
-        road_type_checklist_container's pack state at all, so both stay
-        exactly as they were.
+        which only swaps which Frame object is embedded in the canvas)
+        -- while reading, this function does not touch road_filter_
+        checkbox's or road_type_checklist_outer's pack state at all, so
+        both stay exactly as they were.
+
+        D-Scrollbar (this task): road_type_checklist_container itself
+        (the actual Checkbutton parent) is no longer packed/unpacked
+        directly -- it lives inside road_type_checklist_canvas, which
+        lives inside road_type_checklist_outer alongside the vertical/
+        horizontal scrollbars. road_type_checklist_outer is what gets
+        packed/unpacked here now. _resize_road_type_checklist_box() is
+        called whenever the checklist has content, immediately before
+        _reflow_window(), so the window's own size is always computed
+        from the checklist's current (possibly just-resized) box.
+
+        D-CheckAll (this task): road_filter_checkbox itself is no
+        longer packed/unpacked directly either -- it now lives inside
+        road_type_header_row alongside road_type_links_frame (the
+        "Check All"/"Uncheck All" group). road_type_header_row is what
+        gets packed/unpacked here now, and its WIDTH is pinned every
+        call (via pack_propagate(False), to road_action_row's own
+        established width -- the same reference _resize_road_type_
+        checklist_box() already uses for the canvas) so the combined
+        checkbox+links text on one line never grows the window wider.
+        road_type_checklist_outer's own `after=` anchor is updated to
+        road_type_header_row (its actual sibling within road_frame now
+        -- road_filter_checkbox is no longer road_type_checklist_
+        outer's sibling, it is nested one level deeper inside road_
+        type_header_row). road_type_links_frame itself is shown only
+        when the checklist itself would be shown (checked AND has
+        content) -- the exact same condition as the checklist below.
         """
         if road_is_reading:
             return
         if road_type_value_vars:
-            road_filter_checkbox.pack(anchor="w", pady=(2, 0))
+            win.update_idletasks()
+            fixed_row_width = road_action_row.winfo_reqwidth()
+            row_height = road_filter_checkbox.winfo_reqheight()
+            road_type_header_row.configure(width=fixed_row_width, height=row_height)
+            road_type_header_row.pack_propagate(False)
+            road_type_header_row.pack(fill="x", pady=(2, 0))
             if filter_road_type_var.get():
-                road_type_checklist_container.pack(
-                    fill="x", padx=(20, 0), pady=(2, 0), after=road_filter_checkbox)
+                road_type_links_frame.pack(side="right")
+                road_type_checklist_outer.pack(
+                    fill="x", padx=(ROAD_TYPE_CHECKLIST_LEFT_INDENT, 0), pady=(2, 0),
+                    after=road_type_header_row)
+                _resize_road_type_checklist_box()
             else:
-                road_type_checklist_container.pack_forget()
+                road_type_links_frame.pack_forget()
+                road_type_checklist_outer.pack_forget()
         else:
-            road_filter_checkbox.pack_forget()
-            road_type_checklist_container.pack_forget()
+            road_type_header_row.pack_forget()
+            road_type_links_frame.pack_forget()
+            road_type_checklist_outer.pack_forget()
         _reflow_window()
 
     def _on_filter_road_type_changed(*_args):
@@ -4235,19 +4998,136 @@ def open_main_window(root):
     road_btn = tk.Button(road_action_row, text="Browse…", width=10, cursor="hand2")
     road_btn.pack(side="left", **PAD)
 
-    # "Filter by Road Type" checkbox -- created once, only packed/unpacked
-    # (never destroyed) by _update_road_classification_visibility(). Same
-    # static label as lot_location.py's own Filter by Road Type checkbox
-    # (the text itself never needs to change, unlike the parcel side).
+    # road_type_header_row: shared row holding "Filter by Road Type"
+    # (left) AND the "Check All" / "Uncheck All" hyperlink-style links
+    # (right, grouped in road_type_links_frame) -- no extra row, no
+    # extra vertical space. Its own pack()/pack_forget() is owned
+    # entirely by _update_road_classification_visibility() below (same
+    # single packing authority the checkbox alone used to be packed
+    # by directly -- see that function's own docstring). road_type_
+    # links_frame is NOT gated by this row's own visibility alone --
+    # it has its own independent, narrower pack/pack_forget (checked
+    # AND has content -- the exact same condition the checklist itself
+    # uses), since "Check All"/"Uncheck All" are only meaningful once
+    # the checklist they operate on is actually visible. Ported from
+    # lot_location.py's own version of this same fix, re-verified
+    # against this file's own widget tree first: no separate
+    # road_filter_frame wrapper exists here -- road_type_header_row is
+    # a direct child of road_frame, same as road_type_checklist_outer
+    # itself, matching how road_filter_checkbox alone used to be a
+    # direct child of road_frame before this fix.
+    road_type_header_row = tk.Frame(road_frame)
+
     road_filter_checkbox = tk.Checkbutton(
-        road_frame, text="Filter by Road Type", variable=filter_road_type_var)
+        road_type_header_row, text="Filter by Road Type", variable=filter_road_type_var)
+    road_filter_checkbox.pack(side="left")
+
+    # road_type_links_frame: groups "Check All" / "|" / "Uncheck All"
+    # together and packs the GROUP to the far right edge of the header
+    # row (side="right") -- rather than appending them after the
+    # checkbox text, which would grow the row (and therefore the
+    # window) wider than intended. Hyperlink-style labels: plain
+    # tk.Label styled to look clickable (blue, underlined, hand
+    # cursor), bound to <Button-1> -- there is no native Tkinter
+    # "link" widget. Text is static Title Case in both states (never
+    # toggles to reflect current selection) -- "Check All" always
+    # checks every ROAD_TYPE value, "Uncheck All" always unchecks
+    # every value, regardless of the checklist's current state.
+    road_type_links_frame = tk.Frame(road_type_header_row)
+
+    check_all_road_type_link = tk.Label(
+        road_type_links_frame, text="Check All",
+        fg="#1a73e8", cursor="hand2", font=("Segoe UI", 8, "underline"))
+    check_all_road_type_link.pack(side="left")
+    check_all_road_type_link.bind("<Button-1>", lambda e: _check_all_road_types())
+
+    road_type_links_separator = tk.Label(
+        road_type_links_frame, text=" | ", fg="gray", font=("Segoe UI", 8))
+    road_type_links_separator.pack(side="left")
+
+    uncheck_all_road_type_link = tk.Label(
+        road_type_links_frame, text="Uncheck All",
+        fg="#1a73e8", cursor="hand2", font=("Segoe UI", 8, "underline"))
+    uncheck_all_road_type_link.pack(side="left")
+    uncheck_all_road_type_link.bind("<Button-1>", lambda e: _uncheck_all_road_types())
+
+    # Content-adaptive height with a vertical scrollbar ONLY once more
+    # than 8 distinct ROAD_TYPE values are found -- matching
+    # lot_location.py's own ROAD_TYPE_MAX_ITEMS_BEFORE_VSCROLL threshold
+    # (itself matching meters_from_school_shop_transport_church.py's
+    # OTHER_LANDMARKS_MAX_ITEMS_BEFORE_VSCROLL), for consistency across
+    # tools. A horizontal scrollbar appears only when a label is wider
+    # than the box -- never truncated or wrapped, only ever scrolled
+    # into view.
+    ROAD_TYPE_MAX_ITEMS_BEFORE_VSCROLL = 8
+    # Left indent used when packing road_type_checklist_outer below
+    # (visually nests the checklist under the "Filter by Road Type"
+    # checkbox -- matches this checklist's own pre-existing
+    # padx=(20, 0)). Named here so _resize_road_type_checklist_box() can
+    # subtract this exact same value from its available-width budget --
+    # see that function's own docstring for why omitting it would let
+    # the checklist's canvas+vertical-scrollbar combined width extend
+    # past road_action_row's own right edge.
+    ROAD_TYPE_CHECKLIST_LEFT_INDENT = 20
+
     # Holds one Checkbutton per unique ROAD_TYPE value found in the
-    # currently selected road layer. Only packed while the checkbox above
-    # is checked AND a usable ROAD_TYPE-like column was found (see
-    # _update_road_classification_visibility()).
-    road_type_checklist_container = tk.Frame(road_frame)
-    # All three start unpacked; _update_road_classification_visibility()
-    # (via _refresh_road_classification()) decides what to show.
+    # currently selected road layer. Rebuilt from scratch on every new
+    # successful read (see _rebuild_road_type_checklist()). Only packed
+    # while road_filter_checkbox is checked AND a usable ROAD_TYPE-like
+    # column was found (see _update_road_classification_visibility()).
+    # road_type_checklist_container (the actual Checkbutton parent) lives
+    # INSIDE road_type_checklist_canvas, which itself lives inside
+    # road_type_checklist_outer alongside the vertical/horizontal
+    # scrollbars -- road_type_checklist_outer is what
+    # _update_road_classification_visibility() actually packs/
+    # pack_forgets now; road_type_checklist_container's own pack()/
+    # pack_forget() calls from before this fix are gone, since its
+    # visibility is entirely governed by its parent outer frame's
+    # visibility. Unlike lot_location.py, this file has no separate
+    # road_filter_frame wrapper -- road_type_checklist_outer is a direct
+    # child of road_frame, same as road_filter_checkbox itself (re-
+    # verified against this file's own widget tree, not assumed to match
+    # lot_location.py's shape).
+    road_type_checklist_outer = tk.Frame(road_frame)
+    road_type_checklist_canvas = tk.Canvas(
+        road_type_checklist_outer, highlightthickness=0, bd=0)
+    road_type_vscroll = tk.Scrollbar(
+        road_type_checklist_outer, orient="vertical",
+        command=road_type_checklist_canvas.yview)
+    road_type_hscroll = tk.Scrollbar(
+        road_type_checklist_outer, orient="horizontal",
+        command=road_type_checklist_canvas.xview)
+    road_type_checklist_canvas.configure(
+        yscrollcommand=road_type_vscroll.set,
+        xscrollcommand=road_type_hscroll.set)
+    road_type_checklist_canvas.pack(side="left", fill="both", expand=True)
+    # Both scrollbars packed/unpacked dynamically by
+    # _resize_road_type_checklist_box() -- only shown when content
+    # actually exceeds the box in that direction.
+
+    road_type_checklist_container = tk.Frame(road_type_checklist_canvas)
+    _road_type_canvas_window = road_type_checklist_canvas.create_window(
+        (0, 0), window=road_type_checklist_container, anchor="nw")
+
+    def _on_road_type_content_configure(_event=None):
+        road_type_checklist_canvas.configure(
+            scrollregion=road_type_checklist_canvas.bbox("all"))
+    road_type_checklist_container.bind(
+        "<Configure>", _on_road_type_content_configure)
+
+    def _on_road_type_mousewheel(event):
+        road_type_checklist_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+    road_type_checklist_canvas.bind(
+        "<Enter>", lambda e: road_type_checklist_canvas.bind_all(
+            "<MouseWheel>", _on_road_type_mousewheel))
+    road_type_checklist_canvas.bind(
+        "<Leave>", lambda e: road_type_checklist_canvas.unbind_all("<MouseWheel>"))
+
+    # All three (road_type_header_row -- which now holds road_filter_
+    # checkbox and road_type_links_frame -- road_type_checklist_outer,
+    # and by extension road_type_checklist_container inside it) start
+    # unpacked; _update_road_classification_visibility() (via
+    # _refresh_road_classification()) decides what to show.
 
     def browse_road_file():
         f = filedialog.askopenfilename(filetypes=[
@@ -4351,34 +5231,12 @@ def open_main_window(root):
 
     out_btn.config(command=browse_output_dir)
 
-    # ------------------------------------------------------------------
-    # Buffer diagnostic checkbox -- DISABLED (commented out, not removed).
-    # Per-task decision: the "Generate buffer diagnostic layer (Visual
-    # Measurement)" opt-in and everything it could produce (segment_buffers,
-    # see process_frontage_single()'s return dict) is a secondary/diagnostic
-    # output, out of scope for a normal Run Processing result. Removing
-    # this widget entirely (not just disabling it) means it no longer
-    # occupies layout space -- the window's existing dynamic sizing
-    # (_reflow_window() / the initial update_idletasks() pass) already
-    # measures whatever is actually packed, so no separate window-size
-    # adjustment is needed here. emit_buffer_qa (module-level global,
-    # declared above, still active/False) can no longer be set to True by
-    # any code path now that this is the only widget that ever read from
-    # it via emit_buffer_qa_var -- see the Run-time assignment below,
-    # also disabled.
-    # ------------------------------------------------------------------
-    # emit_buffer_qa_var = tk.BooleanVar(master=win, value=False)
-    # tk.Checkbutton(
-        # output_frame, text="Generate buffer diagnostic layer (Visual Measurement)",
-        # variable=emit_buffer_qa_var
-    # ).pack(anchor="w", pady=(4, 0))
-
     # ── RUN BUTTON ───────────────────────────────────────────────
     ttk.Separator(win, orient="horizontal").pack(
         fill="x", padx=10, pady=(12, 4))
 
     def on_run():
-        global barangay_source, road_source, output_mode, parcel_classification_selection, filter_by_road_type_active, road_type_excluded_values, emit_buffer_qa, overwrite_mode, parcel_output_column_overrides
+        global barangay_source, road_source, output_mode, parcel_classification_selection, filter_by_road_type_active, road_type_excluded_values, overwrite_mode, parcel_output_column_overrides
 
         if parcel_source_type.get() == "local":
             if not parcel_local_path:
@@ -4416,23 +5274,6 @@ def open_main_window(root):
             output_mode = ("local", output_local_dir.get())
         else:
             output_mode = ("db", None)
-
-        # ------------------------------------------------------------------
-        # emit_buffer_qa Run-time assignment -- DISABLED (commented out, not
-        # removed). Previously read the buffer-diagnostic checkbox's
-        # BooleanVar (see the now-disabled Checkbutton above) into the
-        # module-level emit_buffer_qa global. With this line inert, that
-        # global (declared active/False at module level) is never
-        # reassigned by anything in this file, so it stays permanently
-        # False -- guaranteeing every `if emit_buffer_qa:` check downstream
-        # (inside process_frontage_single(), and the segment_buffers write
-        # block below) never activates. Left permanently `= False` at its
-        # own declaration site rather than also commenting that line out,
-        # since this call's `emit_buffer_qa=emit_buffer_qa` keyword
-        # argument to process_frontage_single() still reads that name --
-        # commenting the declaration too would raise NameError there.
-        # ------------------------------------------------------------------
-        # emit_buffer_qa = emit_buffer_qa_var.get()
 
         # Road Classification: resolved mode + excluded values are read
         # here and stored as module globals, same pattern as
@@ -4520,9 +5361,12 @@ def open_main_window(root):
         # Matches road_width.py's own convention exactly: the main output
         # reuses the parcel source's own name directly, no tool-name
         # suffix appended (confirmed/changed by the project lead -- the
-        # "_road_frontage" suffix that used to be appended here is gone;
-        # only the QA lines layer gets a suffix now, "_VM" for Visual
-        # Measurement -- see with_output_suffix() usage below).
+        # "_road_frontage" suffix that used to be appended here is gone).
+        # This tool now writes exactly one output file per source -- the
+        # previously-paired QA layers (and the with_output_suffix()
+        # helper that derived their filenames) have been removed
+        # entirely -- see the module docstring and process_frontage_
+        # single()'s own docstring.
         # ------------------------------------------------------------------
         overwrite_mode = None
         if output_mode[0] == "local":
@@ -4559,21 +5403,28 @@ def open_main_window(root):
         # road_surface.py, road_density.py, and land_shape_compactness.py.
         # overwrite_mode above is left exactly as-is (module-level global,
         # unique to this file) -- not refactored to match. resolved_outcome
-        # is not threaded through (same as road_surface.py/road_density.py/
-        # land_shape_compactness.py) because nothing downstream in this
-        # file's worker() consumes it -- only resolved_table_name is read
-        # (see the db_table fallback near "Falls back to out_base only
-        # if...").
+        # IS threaded through as of this task (D-Cancel): unlike road_
+        # surface.py/road_density.py/land_shape_compactness.py, this file
+        # now has a _write_db_output_safely()-style write (see the "DB
+        # ATOMIC WRITE / CANCEL-SAFE STAGING" section above), which needs
+        # to know whether FINAL_SWAP requires a rename-existing-aside-to-
+        # backup step -- so both halves of resolve_db_output_table()'s
+        # return value are kept and passed into run_processing() below.
+        # resolve_db_output_table()'s own matching logic also now runs
+        # the crash-orphan-recovery scan first (see that function's own
+        # docstring) -- creds is loaded here regardless (already was, to
+        # determine _resolve_schema) and passed straight through.
         # ------------------------------------------------------------------
         resolved_table_name = None
+        resolved_outcome = None
         if output_mode[0] == "db":
             _resolve_creds = load_db_credentials()
             if not _resolve_creds:
                 messagebox.showerror("Error", "Missing pg_credentials.json")
                 return
             _resolve_schema = _resolve_creds["schema"]
-            resolved_table_name, _resolved_outcome = resolve_db_output_table(
-                win, _resolve_schema, barangay_source
+            resolved_table_name, resolved_outcome = resolve_db_output_table(
+                win, _resolve_schema, barangay_source, _resolve_creds
             )
             if resolved_table_name is None:
                 print("Run cancelled by user (database output table not confirmed).")
@@ -4583,7 +5434,7 @@ def open_main_window(root):
         if _app_root is None:
             messagebox.showerror("Error", "No root window available. Please restart the tool.")
             return
-        run_processing(_app_root, resolved_table_name)
+        run_processing(_app_root, resolved_table_name, resolved_outcome)
 
     run_btn = tk.Button(win, text="▶  Run Processing", command=on_run,
               bg="#2e7d32", fg="white",

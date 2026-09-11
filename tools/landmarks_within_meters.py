@@ -649,7 +649,7 @@ def create_progress_window(root, total, title="Landmarks Within Meters in progre
         # dialog's audience (e.g. "bank:0, department_store:0").
         PROG_LABEL = tk.Label(
             PROG_WIN,
-            text=f"Counting nearby landmarks...\n0 / {total} parcels processed",
+            text=f"Counting nearby landmarks...\nParcel 0 / {total}",
             justify="center")
         PROG_LABEL.pack(fill="x", padx=12, pady=(12, 6))
 
@@ -740,7 +740,7 @@ def _configure_progress_window_for_counting(total):
     PROG_BAR.stop()
     PROG_BAR.config(mode="determinate", maximum=total, value=0)
     PROG_LABEL.config(
-        text=f"Counting nearby landmarks...\n0 / {total} parcels processed")
+        text=f"Counting nearby landmarks...\nParcel 0 / {total}")
     PROG_WIN.update_idletasks()
 
 
@@ -771,7 +771,7 @@ def update_progress(current, total, msg=None):
     # for this dialog; see create_progress_window()'s own comment on the
     # same decision.
     PROG_LABEL.config(
-        text=f"Counting nearby landmarks...\n{current} / {total} parcels processed")
+        text=f"Counting nearby landmarks...\nParcels {current} / {total}")
 
     if current == 1 or current == total or current % 5 == 0:
         PROG_WIN.update_idletasks()
