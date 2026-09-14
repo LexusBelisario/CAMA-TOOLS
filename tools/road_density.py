@@ -414,9 +414,55 @@ def process_density(brgy_gdf, road_gdf, source_name="", output_column_name="CAMA
 
         print(f"🟡 Feature {idx}: Length={round(total_length,2)} m, Density={dens}")
 
-    # ✅ Reproject back to original CRS
+    # ------------------------------------------------------------------
+    # OUTPUT GEOMETRY -- pristine, never round-tripped.
+    #
+    # This used to be `brgy_proj = brgy_proj.to_crs(orig_crs)`: take the
+    # geometry that had ALREADY been transformed once (brgy_gdf ->
+    # brgy_proj, above) and transform it a second time, back again. That
+    # forward+inverse round trip is not lossless. Measured on
+    # influence_map_distance_to_land_parcel.py's real LandParcel data: a
+    # uniform ~4.5mm Hausdorff displacement on every one of 11,911
+    # parcels, independent of geometry validity and independent of which
+    # PRS92 zone was chosen -- inherent floating-point precision loss in
+    # the transformation pair itself, visible to the developer at close
+    # zoom in both Global Mapper and QGIS.
+    #
+    # The fix does not shrink that error, it removes the cause: the
+    # untouched source geometry is still in memory as brgy_gdf (a
+    # parameter, only ever READ in this function -- never reassigned,
+    # never mutated), so the computed density column is carried on THAT
+    # geometry instead. Only the geometry column is swapped; the density
+    # values written by the loop above are kept exactly as computed.
+    #
+    # ROW ALIGNMENT -- matched on INDEX, not position. Unlike
+    # lot_location.py's equivalent fix, this function DOES drop rows:
+    # the geometry-type filter above
+    # (`brgy_proj[brgy_proj.geometry.type.isin([...])]`) removes any
+    # non-Polygon parcel, so brgy_proj can be shorter than brgy_gdf and
+    # positional alignment would silently pair the wrong rows. That
+    # filter is a boolean mask with no reset_index, so the surviving
+    # rows keep their ORIGINAL index labels, and .reindex() on those
+    # labels recovers exactly the right source geometry for each one.
+    # The dropped parcels stay dropped -- this does not resurrect them.
+    #
+    # Both preconditions for that are asserted rather than assumed:
+    # source index labels must be unique (otherwise a label could match
+    # more than one source row), and every surviving label must actually
+    # exist in the source. If either fails, this falls back to the old
+    # round-trip instead of emitting misaligned geometry.
+    # ------------------------------------------------------------------
     if orig_crs:
-        brgy_proj = brgy_proj.to_crs(orig_crs)
+        if (brgy_gdf.index.is_unique
+                and brgy_proj.index.isin(brgy_gdf.index).all()):
+            brgy_proj[brgy_proj.geometry.name] = brgy_gdf.geometry.reindex(
+                brgy_proj.index)
+            brgy_proj = brgy_proj.set_crs(orig_crs, allow_override=True)
+        else:
+            print(f"⚠️ [{source_name}] Parcel index is not a stable subset of "
+                  f"the source — falling back to reprojecting the output "
+                  f"geometry.")
+            brgy_proj = brgy_proj.to_crs(orig_crs)
 
     return brgy_proj
 

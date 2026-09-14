@@ -113,7 +113,7 @@ from utils.resource_path import resource_path
 from utils.db_discovery import load_db_credentials, fetch_tables
 from utils.column_detection import detect_existing_output_columns
 from utils.window_icon import apply_icon
-from utils.gpkg_io import write_gpkg_atomic as _write_gpkg
+from utils.gpkg_io import write_gpkg_atomic as _write_gpkg, GpkgWriteError
 
 # ========================================
 # CONFIGURATION
@@ -1510,6 +1510,53 @@ def process(barangay_gdf, road_gdf, source_name="", progress_cb=None, classifica
 
     original_crs = barangay_gdf.crs
 
+    # ------------------------------------------------------------------
+    # OUTPUT GEOMETRY, part 1 of 3 -- capture the pristine, untransformed
+    # parcel geometry HERE, before the reprojection below overwrites the
+    # `barangay_gdf` name with a transformed copy.
+    #
+    # Necessary in this file for the same reason as in road_surface.py
+    # and road_frontage.py: this function REBINDS THE PARAMETER ITSELF
+    # (`barangay_gdf = barangay_gdf.to_crs(...)`) rather than projecting
+    # into a separate name, so from that line onward the untouched source
+    # is unreachable and there would be nothing left to attach the output
+    # to.
+    #
+    # WHY: reprojecting forward and then back again is not lossless.
+    # Measured on influence_map_distance_to_land_parcel.py's real
+    # LandParcel data: a uniform ~4.5mm Hausdorff displacement on every
+    # one of 11,911 parcels, independent of geometry validity and
+    # independent of which PRS92 zone was chosen -- inherent
+    # floating-point precision loss in the transformation pair itself,
+    # visible to the developer at close zoom in both Global Mapper and
+    # QGIS. Attaching the computed column to the pristine geometry does
+    # not shrink that error, it removes the cause: the exported parcel
+    # geometry is then never subjected to any projection math at all.
+    #
+    # Row alignment: this function never drops or reorders parcel rows.
+    # `barangay_gdf` is assigned in exactly three places -- the
+    # reprojection below and the two former round trips (parts 2 and 3) --
+    # and the per-parcel loop writes a value for every row, including
+    # invalid ones (see the row-count comment immediately below, and the
+    # loop's own "no longer drops rows at all" note). Index equality is
+    # asserted at each site anyway rather than assumed, falling back to
+    # the old round trip rather than emitting misaligned geometry.
+    #
+    # .copy() rather than a bare reference: cheap (it copies the Series
+    # container, not the shapely geometries, which are immutable and
+    # shared either way) and makes this independent of anything the
+    # caller does with the GeoDataFrame it passed in.
+    #
+    # NOTE -- qa_gdf (the Visual Measurement layer) deliberately does NOT
+    # get this treatment at either site. It is built fresh from
+    # qa_records, whose measurement lines are COMPUTED in the projected
+    # CRS, so it has no pre-reprojection state to restore. Its single
+    # .to_crs(original_crs) is a one-way forward transformation into the
+    # output CRS, not a forward+inverse round trip, so it is not affected
+    # by this class of error and is left exactly as it was.
+    # ------------------------------------------------------------------
+    original_geometry = barangay_gdf.geometry.copy()
+
     # Row-count check happens BEFORE any geometry validity handling --
     # deliberately independent of it, since a parcel source with zero
     # rows to begin with is a different situation from one where every
@@ -1595,8 +1642,21 @@ def process(barangay_gdf, road_gdf, source_name="", progress_cb=None, classifica
                 progress_cb(1)
         barangay_gdf[output_column_name] = None
         qa_gdf = gpd.GeoDataFrame(columns=qa_columns, geometry="geometry", crs=barangay_gdf.crs)
+        # OUTPUT GEOMETRY, part 2 of 3 -- pristine, never round-tripped.
+        # See part 1 at the top of this function for the full rationale.
+        # This is the no-usable-roads early return: every parcel gets a
+        # NULL width, but it still exports parcel geometry, so it still
+        # needs the pristine original rather than a round trip.
+        # qa_gdf is untouched here -- it is empty on this path, and its
+        # to_crs is a one-way forward transform either way.
         if original_crs:
-            barangay_gdf = barangay_gdf.to_crs(original_crs)
+            if original_geometry.index.equals(barangay_gdf.index):
+                barangay_gdf[barangay_gdf.geometry.name] = original_geometry
+                barangay_gdf = barangay_gdf.set_crs(original_crs, allow_override=True)
+            else:
+                print(f"⚠️ [{source_name}] Parcel index changed during processing — "
+                      f"falling back to reprojecting the output geometry.")
+                barangay_gdf = barangay_gdf.to_crs(original_crs)
             qa_gdf = qa_gdf.to_crs(original_crs)
         return barangay_gdf, qa_gdf
 
@@ -1824,8 +1884,20 @@ def process(barangay_gdf, road_gdf, source_name="", progress_cb=None, classifica
     else:
         qa_gdf = gpd.GeoDataFrame(columns=qa_columns, geometry="geometry", crs=barangay_gdf.crs)
 
+    # OUTPUT GEOMETRY, part 3 of 3 -- pristine, never round-tripped.
+    # See part 1 at the top of this function for the full rationale. The
+    # road-width values assigned above are kept exactly as computed; only
+    # the geometry column is swapped. qa_gdf keeps its own one-way
+    # forward .to_crs() -- it has no pristine original to restore, being
+    # built from measurement lines computed in the projected CRS.
     if original_crs:
-        barangay_gdf = barangay_gdf.to_crs(original_crs)
+        if original_geometry.index.equals(barangay_gdf.index):
+            barangay_gdf[barangay_gdf.geometry.name] = original_geometry
+            barangay_gdf = barangay_gdf.set_crs(original_crs, allow_override=True)
+        else:
+            print(f"⚠️ [{source_name}] Parcel index changed during processing — "
+                  f"falling back to reprojecting the output geometry.")
+            barangay_gdf = barangay_gdf.to_crs(original_crs)
         qa_gdf = qa_gdf.to_crs(original_crs)
 
     return barangay_gdf, qa_gdf
@@ -5144,7 +5216,37 @@ def _translate_exception(e, source_label):
             "The file could not be found.\n"
             "It may have been moved, renamed, or deleted."
         )
+    if isinstance(e, GpkgWriteError):
+        # MUST come before the PermissionError check below -- first
+        # matching case wins, and these two now cover DIFFERENT
+        # failures.
+        #
+        # utils/gpkg_io.py catches a PermissionError from its final
+        # os.replace() (the destination .gpkg being open elsewhere) and
+        # re-raises it as GpkgWriteError with its own already-
+        # user-facing, filename-specific wording. That case therefore no
+        # longer arrives here AS a PermissionError; without this branch
+        # it would fall through every category below and land in the
+        # generic "An unexpected error occurred" fallback -- strictly
+        # worse than the message that works today.
+        #
+        # Returned via str(e) with no class-name prefix: the text was
+        # written for the end user in gpkg_io.py and names the exact
+        # file to close, so it is more specific than anything this
+        # function could reconstruct. It is also deliberately NOT
+        # grouped-friendly in the sense described above -- it embeds a
+        # filename -- but that is correct here: a lock is inherently
+        # per-file, so per-source grouping would be misleading anyway.
+        return str(e)
     if isinstance(e, PermissionError):
+        # Still reachable, and still needed -- verified rather than
+        # assumed. gpkg_io.py only converts the PermissionError from its
+        # swap step; a permission failure BEFORE that point still
+        # arrives here raw: removing a stale, locked .tmp at the top of
+        # write_gpkg_atomic(), the .to_file() write of the temp file
+        # itself (e.g. an output folder with no write permission), and a
+        # locked or unreadable INPUT file during the parcel/road read.
+        # This wording stays general for exactly those cases.
         return (
             "The output could not be saved.\n"
             "Make sure it is not open in another program and\n"

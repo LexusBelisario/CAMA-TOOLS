@@ -719,8 +719,47 @@ def process_lot_location(barangay_gdf, road_gdf, source_name="", excluded_road_t
     if progress:
         progress(f"Finished {source_name}", total, total)
 
+    # ------------------------------------------------------------------
+    # OUTPUT GEOMETRY -- pristine, never round-tripped.
+    #
+    # This used to be `result = result.to_crs(orig_crs)`: take the
+    # geometry that had ALREADY been transformed once (barangay_gdf ->
+    # brgy_proj, at the top of this function) and transform it a second
+    # time, back again. That forward+inverse round trip is not lossless.
+    # Measured on influence_map_distance_to_land_parcel.py's real
+    # LandParcel data: a uniform ~4.5mm Hausdorff displacement on every
+    # one of 11,911 parcels, independent of geometry validity and
+    # independent of which PRS92 zone was chosen. It is inherent
+    # floating-point precision loss in the transformation pair itself,
+    # not a zone-selection or repair artifact, and it was visible to the
+    # developer at close zoom in both Global Mapper and QGIS.
+    #
+    # The fix does not shrink that error, it removes the cause: the
+    # untouched source geometry is still in memory as barangay_gdf (a
+    # parameter, only ever READ in this function -- never reassigned,
+    # never mutated), so the computed column is attached to THAT instead.
+    # The exported geometry is then never subjected to any projection
+    # math at all. Only the geometry column is swapped; every attribute
+    # column on `result`, including the classification written just
+    # above, is kept exactly as computed.
+    #
+    # Row-order safety: brgy_proj comes from barangay_gdf.to_crs(), which
+    # preserves both row order and index, and `result` is a plain .copy()
+    # of brgy_proj with no filtering, reindexing, sorting or concat in
+    # between -- the same invariant this function already relies on for
+    # brgy_fixed_geom.loc[idx] in the classification loop above. The
+    # index equality is asserted here rather than assumed, and if it ever
+    # stops holding, this falls back to the old round-trip behavior
+    # instead of silently emitting misaligned geometry.
+    # ------------------------------------------------------------------
     if orig_crs:
-        result = result.to_crs(orig_crs)
+        if barangay_gdf.index.equals(result.index):
+            result[result.geometry.name] = barangay_gdf.geometry
+            result = result.set_crs(orig_crs, allow_override=True)
+        else:
+            print(f"⚠️  [{source_name}] Parcel index changed during processing — "
+                  f"falling back to reprojecting the output geometry.")
+            result = result.to_crs(orig_crs)
     return result
 
 # ========================================
@@ -3769,6 +3808,51 @@ def run_processing(app_root, overwrite_mode=None, resolved_table_name=None,
                 return
 
             if skipped:
+                if len(skipped) == len(sources):
+                    # EVERY source failed -- nothing was written at all.
+                    #
+                    # This used to fall through to q.put(("done", summary,
+                    # ...)) like a partial failure, and "done" always
+                    # lands in messagebox.showinfo("Success", ...) -- a
+                    # Success title and an info icon for a run that
+                    # produced no output whatsoever, with only the body
+                    # text hinting that nothing worked. That framing is
+                    # worst exactly where it matters most: this tool is
+                    # normally run against a single Land Parcel source,
+                    # so one failure IS a total failure.
+                    #
+                    # Routed through this file's own existing "error"
+                    # event kind (messagebox.showerror("Error", ...))
+                    # rather than any new UI. len(skipped) ==
+                    # len(sources) is an exact test, not an
+                    # approximation: the loop's only `continue` is
+                    # immediately preceded by skipped.append(), and its
+                    # two `break`s both set cancelled=True and are
+                    # handled by the early return above, so no source can
+                    # leave the loop unaccounted for.
+                    #
+                    # `return` here (not a fall-through) so the "done"
+                    # event below can never also fire -- and the finally
+                    # block still runs, releasing the run lock exactly as
+                    # on the cancelled path above.
+                    if len(skipped) == 1:
+                        failed_name, failed_reason = skipped[0]
+                        failure_text = (
+                            f'Could not process "{failed_name}".\n\n'
+                            f'{failed_reason}'
+                        )
+                    else:
+                        failure_text = (
+                            "Processing failed -- no output was produced.\n\n"
+                            + "\n".join(f"- {n}: {err}" for n, err in skipped)
+                        )
+                    print("❌ Every source failed -- no output produced.")
+                    q.put(("error", failure_text, None, None))
+                    return
+
+                # Genuine mix: at least one source succeeded. Unchanged
+                # -- "done" with the skipped-sources summary is the right
+                # framing here, since real output WAS produced.
                 summary = "Done, but some sources were skipped:\n" + "\n".join(
                     f"- {n}: {err}" for n, err in skipped
                 )

@@ -1548,6 +1548,30 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
         }
 
     original_crs = brgy_gdf.crs
+
+    # ------------------------------------------------------------------
+    # OUTPUT GEOMETRY, part 1 of 2 -- capture the pristine, untransformed
+    # parcel geometry HERE, before the reprojection below overwrites the
+    # `brgy_gdf` name with a transformed copy.
+    #
+    # Necessary in this file for the same reason as in road_surface.py:
+    # this function REBINDS THE PARAMETER ITSELF
+    # (`brgy_gdf = brgy_gdf.to_crs(...)`, a few lines down) rather than
+    # projecting into a separate name the way lot_location.py and
+    # road_density.py do, so from that line onward the untouched source
+    # is unreachable and there would be nothing left to attach the
+    # output to.
+    #
+    # .copy() rather than a bare reference: cheap (it copies the Series
+    # container, not the shapely geometries, which are immutable and
+    # shared either way) and it makes this independent of anything the
+    # caller does with the GeoDataFrame it passed in.
+    #
+    # See part 2 at the end of this function for why the round trip is
+    # being avoided at all.
+    # ------------------------------------------------------------------
+    original_geometry = brgy_gdf.geometry.copy()
+
     zone_epsg, crs_warning = detect_prs92_zone([("Land Parcel", brgy_gdf), ("Road Network", road_gdf)])
 
     if crs_warning and progress:
@@ -2060,8 +2084,46 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
     brgy_gdf[depth_col] = depths
     brgy_gdf[dwr_col] = dwrs
 
+    # ------------------------------------------------------------------
+    # OUTPUT GEOMETRY, part 2 of 2 -- pristine, never round-tripped.
+    #
+    # This used to be `brgy_gdf = brgy_gdf.to_crs(original_crs)`: take
+    # the geometry that had ALREADY been transformed once at the top of
+    # this function and transform it a second time, back again. That
+    # forward+inverse round trip is not lossless. Measured on
+    # influence_map_distance_to_land_parcel.py's real LandParcel data: a
+    # uniform ~4.5mm Hausdorff displacement on every one of 11,911
+    # parcels, independent of geometry validity and independent of which
+    # PRS92 zone was chosen -- inherent floating-point precision loss in
+    # the transformation pair itself, visible to the developer at close
+    # zoom in both Global Mapper and QGIS.
+    #
+    # The fix does not shrink that error, it removes the cause: the three
+    # columns computed above are carried on the pristine geometry
+    # captured in part 1, so the exported geometry is never subjected to
+    # any projection math at all. Only the geometry column is swapped;
+    # the frontage/depth/DWR values assigned just above are kept exactly
+    # as computed.
+    #
+    # Row alignment: this function never drops or reorders parcel rows.
+    # `brgy_gdf` is assigned in exactly two places -- the reprojection at
+    # the top and (formerly) this round trip -- and all three passes
+    # accumulate into plain parallel lists rather than filtering the
+    # frame. Rows skipped by classification["skip_mask"] still contribute
+    # a placeholder entry, which is what the length safety check
+    # immediately above this block already enforces. The index equality
+    # is asserted here anyway rather than assumed, and on failure this
+    # falls back to the old round-trip rather than emitting misaligned
+    # geometry.
+    # ------------------------------------------------------------------
     if original_crs:
-        brgy_gdf = brgy_gdf.to_crs(original_crs)
+        if original_geometry.index.equals(brgy_gdf.index):
+            brgy_gdf[brgy_gdf.geometry.name] = original_geometry
+            brgy_gdf = brgy_gdf.set_crs(original_crs, allow_override=True)
+        else:
+            print(f"⚠️ [{source_name}] Parcel index changed during processing — "
+                  f"falling back to reprojecting the output geometry.")
+            brgy_gdf = brgy_gdf.to_crs(original_crs)
 
     if progress:
         progress(f"Finished {source_name}", total, total)
@@ -3045,6 +3107,51 @@ def run_processing(app_root, resolved_table_name=None, resolved_outcome=None):
                 return
 
             if skipped:
+                if len(skipped) == len(sources):
+                    # EVERY source failed -- nothing was written at all.
+                    #
+                    # This used to fall through to q.put(("done", summary,
+                    # ...)) like a partial failure, and "done" always
+                    # lands in messagebox.showinfo("Success", ...) -- a
+                    # Success title and an info icon for a run that
+                    # produced no output whatsoever, with only the body
+                    # text hinting that nothing worked. That framing is
+                    # worst exactly where it matters most: this tool is
+                    # normally run against a single Land Parcel source,
+                    # so one failure IS a total failure.
+                    #
+                    # Routed through this file's own existing "error"
+                    # event kind (messagebox.showerror("Error", ...))
+                    # rather than any new UI. len(skipped) ==
+                    # len(sources) is an exact test, not an
+                    # approximation: the loop's only `continue` is
+                    # immediately preceded by skipped.append(), and its
+                    # two `break`s both set cancelled=True and are
+                    # handled by the early return above, so no source can
+                    # leave the loop unaccounted for.
+                    #
+                    # `return` here (not a fall-through) so the "done"
+                    # event below can never also fire -- and the finally
+                    # block still runs, releasing the run lock exactly as
+                    # on the cancelled path above.
+                    if len(skipped) == 1:
+                        failed_name, failed_reason = skipped[0]
+                        failure_text = (
+                            f'Could not process "{failed_name}".\n\n'
+                            f'{failed_reason}'
+                        )
+                    else:
+                        failure_text = (
+                            "Processing failed -- no output was produced.\n\n"
+                            + "\n".join(f"- {n}: {err}" for n, err in skipped)
+                        )
+                    print("❌ Every source failed -- no output produced.")
+                    q.put(("error", failure_text, None, None))
+                    return
+
+                # Genuine mix: at least one source succeeded. Unchanged
+                # -- "done" with the skipped-sources summary is the right
+                # framing here, since real output WAS produced.
                 summary = "Done, but some sources were skipped:\n" + "\n".join(
                     f"- {n}: {err}" for n, err in skipped
                 )

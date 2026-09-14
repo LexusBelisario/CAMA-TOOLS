@@ -401,6 +401,29 @@ def process_surface(brgy_gdf, road_gdf, output_column_name="CAMA_RD_SURFACE", pr
     # Save original CRS
     orig_crs = brgy_gdf.crs
 
+    # ------------------------------------------------------------------
+    # OUTPUT GEOMETRY, part 1 of 2 -- capture the pristine, untransformed
+    # parcel geometry HERE, before the reprojection two lines below.
+    #
+    # This capture is necessary in THIS file specifically, and is the one
+    # structural difference from the equivalent fix in lot_location.py
+    # and road_density.py. Those two reproject into a NEW name
+    # (brgy_proj = brgy_gdf.to_crs(...)), so the untouched source stays
+    # reachable as brgy_gdf all the way to the end. This function instead
+    # REBINDS THE PARAMETER ITSELF (`brgy_gdf = brgy_gdf.to_crs(...)`),
+    # so from that line onward the original is unreachable -- there is
+    # nothing left to attach the output to unless it is kept now.
+    #
+    # .copy() rather than a bare reference: cheap (it copies the Series
+    # container, not the shapely geometries, which are immutable and
+    # shared either way) and it makes this independent of anything the
+    # caller might do with the GeoDataFrame it passed in.
+    #
+    # See part 2 at the end of this function for why the round trip is
+    # being avoided at all.
+    # ------------------------------------------------------------------
+    orig_geometry = brgy_gdf.geometry.copy()
+
     # Temporary reproject to PRS92 (combined parcel + road extent)
     zone_epsg = get_prs92_zone([("Land Parcel", brgy_gdf), ("Road Network", road_gdf)])
     print(f"🌍 Reprojecting layers to EPSG:{zone_epsg} for processing...")
@@ -492,9 +515,44 @@ def process_surface(brgy_gdf, road_gdf, output_column_name="CAMA_RD_SURFACE", pr
         lambda surfaces: "/".join(sorted(set(surfaces))) if surfaces else None
     )
 
-    # Reproject back to original CRS
+    # ------------------------------------------------------------------
+    # OUTPUT GEOMETRY, part 2 of 2 -- pristine, never round-tripped.
+    #
+    # This used to be `brgy_gdf = brgy_gdf.to_crs(orig_crs)`: take the
+    # geometry that had ALREADY been transformed once at the top of this
+    # function and transform it a second time, back again. That
+    # forward+inverse round trip is not lossless. Measured on
+    # influence_map_distance_to_land_parcel.py's real LandParcel data: a
+    # uniform ~4.5mm Hausdorff displacement on every one of 11,911
+    # parcels, independent of geometry validity and independent of which
+    # PRS92 zone was chosen -- inherent floating-point precision loss in
+    # the transformation pair itself, visible to the developer at close
+    # zoom in both Global Mapper and QGIS.
+    #
+    # The fix does not shrink that error, it removes the cause: the
+    # surface column computed above is carried on the pristine geometry
+    # captured in part 1, so the exported geometry is never subjected to
+    # any projection math at all. Only the geometry column is swapped;
+    # every attribute column, including the surface string just built, is
+    # kept exactly as computed.
+    #
+    # Row alignment: this function never drops or reorders parcel rows
+    # between the capture and here. Both loops mutate in place via
+    # .at[idx, ...]; `unmatched` is a separate filtered view that is only
+    # iterated, never assigned back over brgy_gdf; and the final
+    # list-to-string .apply() is elementwise. So the index is unchanged
+    # from the captured original. That is asserted rather than assumed,
+    # and on failure this falls back to the old round-trip rather than
+    # emitting misaligned geometry.
+    # ------------------------------------------------------------------
     if orig_crs:
-        brgy_gdf = brgy_gdf.to_crs(orig_crs)
+        if orig_geometry.index.equals(brgy_gdf.index):
+            brgy_gdf[brgy_gdf.geometry.name] = orig_geometry
+            brgy_gdf = brgy_gdf.set_crs(orig_crs, allow_override=True)
+        else:
+            print("⚠️ Parcel index changed during processing — falling back "
+                  "to reprojecting the output geometry.")
+            brgy_gdf = brgy_gdf.to_crs(orig_crs)
 
     return brgy_gdf
 
