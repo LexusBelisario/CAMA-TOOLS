@@ -9,12 +9,40 @@ PURPOSE:
     (CAMA_DISTANCE_TO_{layername}), plus one dynamically-named column
     per user-checked source column (CAMA_DISTANCE_{layername}_
     {columnname}) -- see _compute_output_column_targets() and
-    process_parcels()'s own docstring for the full naming rule. The
-    nearest feature is always selected by true geometric proximity
-    (never a centroid/representative-point approximation); only the
-    reported distance's measurement method varies by the winning
-    feature's geometry type -- see process_parcels()'s own docstring
-    for the full Point/LineString-vs-Polygon distinction.
+    process_parcels()'s own docstring for the full naming rule.
+
+    MEASUREMENT RULE (Overlap-Priority + Vertex-to-Vertex task): every
+    parcel is evaluated in two ordered parts, both implemented in
+    process_parcels() -- see that function's own docstring for the full
+    decided design.
+      - Part A, overlap-priority: if ANY Influence Map feature
+        intersects the parcel, the distance column receives the fixed
+        placeholder value 1 (never a computed distance), and exactly
+        one "winning" intersecting feature supplies every checked
+        column's value, chosen by an explicit four-level cascade
+        (business-priority column -> geometry-type hierarchy ->
+        same-dimension intersection magnitude -> lowest read-order
+        index).
+      - Part B, geometry-to-geometry: reached ONLY when no feature
+        intersects. Both the SELECTION of the nearest feature and the
+        MEASUREMENT of the distance use the same metric -- shapely's
+        true distance between the FULL geometries, not restricted to
+        vertices on either side.
+        NOTE: an earlier round of this task restricted Part B to
+        vertex-to-vertex distance, with holes deliberately excluded.
+        That was reverted against real data: when the true nearest
+        point between two boundaries falls in the MIDDLE of an edge
+        rather than on a corner, a vertex-restricted metric can only
+        reach the nearest corner, which reported ~800-999m for parcels
+        visibly adjacent to a water body. Holes need no special-casing
+        under the current metric -- Polygon.distance() and
+        nearest_points() already treat a point inside a hole as outside
+        the polygon, so that decision no longer has anything to apply
+        to.
+    The original behavior (representative-point selection, plus a
+    centre-to-centre distance for Polygon winners and a true geometric
+    distance for Point/LineString winners) is fully replaced by the
+    above.
 
 DISPATCH:
     Run as an isolated subprocess by MAIN.py via its `--tool` dispatch
@@ -121,7 +149,7 @@ from utils.resource_path import resource_path
 from utils.db_discovery import load_db_credentials, fetch_tables
 from utils.column_detection import detect_existing_output_columns
 from utils.window_icon import apply_icon
-from utils.gpkg_io import write_gpkg_atomic as _write_gpkg
+from utils.gpkg_io import write_gpkg_atomic as _write_gpkg, GpkgWriteError
 
 # ============================
 # FORCE WINDOWS APP ICON
@@ -687,52 +715,507 @@ parcel_output_column_overrides = {}
 
 
 # ========================================
+# OVERLAP-PRIORITY + VERTEX-DISTANCE SUPPORT
+# ========================================
+# Support helpers for process_parcels()'s two-part measurement rule --
+# Part A (overlap-priority check) and Part B (vertex-to-vertex
+# distance). Module-level rather than nested inside process_parcels()
+# for readability and so each piece can be exercised on its own; none
+# of this is shared with, exported to, or imported from any other tool
+# file -- per this project's Rule-of-Three policy this file keeps its
+# own copy of everything it needs, exactly as it already does for the
+# duplicated D-Cancel/atomic-write machinery further below.
+
+# The fixed placeholder written to the distance column for ANY parcel
+# that an Influence Map feature intersects (Part A). A deliberate
+# placeholder value, NOT a computed distance: it is the same 1 whether
+# the intersecting feature covers 1% or 99% of the parcel, and the same
+# 1 whether that feature is a polygon, a line, or a point. Confirmed by
+# the team lead -- chosen over NULL or 0 so the field always carries
+# something. (pandas stores the output column as float64 because the
+# same column also carries computed floats and None, so this surfaces
+# as 1.0 in the written output -- the value, not the dtype, is what was
+# specified.)
+INTERSECTING_DISTANCE_VALUE = 1
+
+# Floor for Part B's computed distance. A genuinely non-intersecting
+# parcel whose true distance is small enough that round(x, 4) collapses
+# it to exactly 0.0000 is reported as this value instead.
+#
+# This is NOT a rounding/display nicety. The downstream CAMA valuation
+# system (external to CAMA Tools) reads this column directly as a
+# valuation factor and treats 0 as "no Influence Map applies to this
+# parcel" -- semantically the same as absent. So a parcel sitting a
+# real but sub-centimetre gap away from a hazard feature, reported as
+# exactly 0, would be silently recorded as having NO exposure at all --
+# the exact opposite of the truth. Real output showed such rows sitting
+# next to neighbours reading 0.0019 / 0.0022 / 0.0026, differing only in
+# how close each parcel happened to fall.
+#
+# Deliberately distinct from INTERSECTING_DISTANCE_VALUE above: 1 means
+# "a feature is ON this parcel" (Part A), 0.0001 means "measured, not
+# touching, but closer than this column's 4-decimal resolution can
+# express" (Part B). The two must stay visibly different values in the
+# output and never interact -- the floor is applied only on the Part B
+# path and can never reach, override, or be confused with Part A's
+# constant.
+#
+# Universal: applies to every Influence Map source, not just the one
+# that surfaced the problem. No distance this function emits should
+# ever be exactly 0.0000.
+NEAR_ZERO_DISTANCE_FLOOR = 0.0001
+
+# Business/hazard priority ordering -- Part A cascade level (a).
+#
+# HIGHER rank number == HIGHER priority == wins. Keys are normalized
+# (see _normalize_priority_value()): lower-cased, every run of
+# non-alphanumeric characters collapsed to a single space.
+#
+# This ordering is explicit and hand-defined ON PURPOSE. It is NOT
+# inferred from string sort order (alphabetically "High" < "Low" <
+# "Moderate", which is meaningless here) and NOT inferred from the
+# data. The values are the ones actually present in the real Influence
+# Map sources inspected while this task was designed: the
+# "... Susceptibility" family (CLN_LANDSLIDE_RISK, CLN_LANDSLIDE_HAZARD,
+# CLN_FLOOD_HAZARD, and CLN_FLOOD_RISK's own `rating` column) and the
+# bare High/Moderate/Low family (CLN_FLOOD_RISK's `Flood_Risk` column).
+# The two families deliberately share rank numbers where they mean the
+# same thing; they are never actually compared against each other,
+# since exactly ONE priority column is ever resolved per Influence Map
+# source (see _resolve_priority_column()).
+#
+# JUDGEMENT CALL, isolated here on purpose so it can be re-ordered in a
+# single edit: "Possible Landslide Debris Accumulation Zone" (seen only
+# on CLN_FLOOD_HAZARD) is ranked ABOVE "Moderate Susceptibility" and
+# BELOW "High Susceptibility" -- it is an explicitly flagged hazard
+# call-out rather than a plain susceptibility grade, so it is treated as
+# more significant than a moderate grading but not as the single most
+# severe class.
+INFLUENCE_PRIORITY_RANKS = {
+    "not susceptible": 0,
+    "low": 1,
+    "low susceptibility": 1,
+    "moderate": 2,
+    "moderate susceptibility": 2,
+    "possible landslide debris accumulation zone": 3,
+    "high": 4,
+    "high susceptibility": 4,
+}
+
+# Rank for a value that is NULL/blank or simply absent from
+# INFLUENCE_PRIORITY_RANKS -- deliberately LOWER than every ranked
+# value, so an unrecognized value can never out-rank a real hazard
+# grade. This is also what makes cascade level (a) a harmless no-op for
+# a source whose matched column turns out to hold bare numbers rather
+# than hazard classes (CALAUAN_SLOPE's SLOPE column,
+# CALAUAN_ELEVATION's ELEVATION column): every feature scores UNRANKED,
+# every feature ties, and the cascade falls straight through to level
+# (b), which is exactly the intended outcome for those sources.
+INFLUENCE_PRIORITY_UNRANKED = -1
+
+# Geometry-type hierarchy -- Part A cascade level (b). Polygon >
+# Line > Point, by dimension. Anything not listed here (most plausibly
+# a GeometryCollection produced by make_valid()) has no defined place
+# in the hierarchy and is silently skipped as a candidate, per this
+# task's confirmed error handling.
+_GEOMETRY_DIMENSION_RANKS = {
+    "Polygon": 2,
+    "MultiPolygon": 2,
+    "LineString": 1,
+    "MultiLineString": 1,
+    "LinearRing": 1,
+    "Point": 0,
+    "MultiPoint": 0,
+}
+
+
+def _normalize_priority_value(value):
+    """
+    Normalizes one raw priority-column cell value into the key form
+    used by INFLUENCE_PRIORITY_RANKS: lower-cased, with every run of
+    non-alphanumeric characters collapsed to a single space and the
+    result stripped. None and NaN both normalize to "" (which is not a
+    key in the table, so they score UNRANKED).
+    """
+    if value is None:
+        return ""
+    if isinstance(value, float) and value != value:   # NaN
+        return ""
+    return re.sub(r"[^0-9a-z]+", " ", str(value).lower()).strip()
+
+
+def _priority_rank(value):
+    """Rank for one raw priority-column cell value; UNRANKED if the
+    value is missing or not in the explicit table above."""
+    return INFLUENCE_PRIORITY_RANKS.get(
+        _normalize_priority_value(value), INFLUENCE_PRIORITY_UNRANKED)
+
+
+def _column_has_ranked_values(fault_gdf, column):
+    """
+    CONTENT GUARD for _resolve_priority_column(): True only if at least
+    ONE value in `column` normalizes (via _normalize_priority_value(),
+    the exact same normalization the ranking itself uses) to a key that
+    actually exists in INFLUENCE_PRIORITY_RANKS.
+
+    Why this exists: name matching alone is a coincidence test, and a
+    real one bit. CLN_SOIL_TYPE's `TYPE` column matches the source name
+    "CLN_SOIL_TYPE" under the ends-with rule, but it holds soil
+    classifications ("Lipa Loam", "Macolod Clay Loam", ...) -- a
+    classification field, not a hazard severity field. Today that is
+    harmless, because none of those values is in the rank table, so
+    every feature scores UNRANKED and level (a) is a silent no-op. The
+    latent danger is a FUTURE dataset whose column matches by name
+    coincidence AND happens to carry values that do rank: it would
+    silently become the priority column and quietly drive the cascade
+    with meaningless severities. Requiring evidence in the DATA, not
+    just in the name, closes that off.
+
+    Scans lazily and stops at the first ranked value, so the usual cost
+    is a handful of cells even on an 11,908-row source. Runs once per
+    Influence Map source, never per parcel.
+    """
+    try:
+        values = fault_gdf[column]
+    except Exception:
+        return False
+    try:
+        for value in values:
+            if _normalize_priority_value(value) in INFLUENCE_PRIORITY_RANKS:
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _resolve_priority_column(fault_gdf, influence_source_display_name):
+    """
+    Resolves, ONCE per Influence Map source (never per parcel -- this is
+    a property of the source, not of any individual feature), which of
+    that source's own columns acts as its business/hazard priority
+    column for Part A's cascade level (a). Returns the column's real
+    name, or None when the source has no such column at all -- in which
+    case level (a) is a no-op for every parcel processed against this
+    source and the cascade starts effectively at level (b).
+
+    Resolution is TWO tests, both of which a column must pass:
+
+    (1) NAME, in this preference order --
+          a. a column matching the Influence Map source's OWN display
+             name (influence_source_display_name), case- and
+             underscore/space-insensitive;
+          b. failing that, a column literally named "rating"
+             (case-insensitive).
+
+    (2) CONTENT -- see _column_has_ranked_values(). A name match alone
+        is NOT enough: the column must actually contain at least one
+        value that ranks in INFLUENCE_PRIORITY_RANKS. A name-matched
+        column whose content does not rank is rejected and resolution
+        continues with the next candidate; if no candidate passes both
+        tests, this returns None rather than a column that merely
+        looked right.
+
+        Note this means a name match that fails the content test does
+        not block the "rating" fallback -- a source carrying both a
+        coincidentally-named non-hazard column and a genuine `rating`
+        column still resolves to `rating`, which is strictly safer than
+        giving up. Returning None is reserved for the case where
+        NOTHING qualifies.
+
+    On the leniency of step (1a): the confirmed worked example is source
+    "CLN_FLOOD_RISK" -> column "Flood_Risk", which a strict normalized
+    EQUALITY test cannot satisfy, because the source name carries a
+    dataset prefix ("CLN_") that the column name does not. So step (1a)
+    tries three tests in descending order of strength -- exact
+    normalized match, then source-name-ENDS-WITH-column-name, then
+    column-name-appears-anywhere-inside-source-name. The two looser
+    tests additionally require a normalized column name of at least 4
+    characters, so a one- or two-letter column name cannot match
+    essentially any source name by accident. The exact test has no such
+    length floor. This leniency is exactly what makes the content test
+    above load-bearing rather than belt-and-braces: it is also what
+    matched CLN_SOIL_TYPE's `TYPE` and CALAUAN_SLOPE's `SLOPE`.
+
+    The active geometry column is never a candidate.
+    """
+    try:
+        geom_col = fault_gdf.geometry.name
+    except Exception:
+        geom_col = "geometry"
+
+    def _norm(name):
+        return re.sub(r"[^0-9a-z]+", "", str(name).lower())
+
+    candidates = [c for c in fault_gdf.columns if c != geom_col]
+
+    # Ordered shortlist of NAME matches, strongest first. Built in full
+    # before any content test runs, so the content test can simply walk
+    # it in preference order.
+    shortlist = []
+
+    def _shortlist(col):
+        if col not in shortlist:
+            shortlist.append(col)
+
+    source_norm = _norm(influence_source_display_name or "")
+    if source_norm:
+        for col in candidates:
+            if _norm(col) == source_norm:
+                _shortlist(col)
+        for col in candidates:
+            col_norm = _norm(col)
+            if len(col_norm) >= 4 and source_norm.endswith(col_norm):
+                _shortlist(col)
+        for col in candidates:
+            col_norm = _norm(col)
+            if len(col_norm) >= 4 and col_norm in source_norm:
+                _shortlist(col)
+
+    for col in candidates:
+        if str(col).lower() == "rating":
+            _shortlist(col)
+
+    for col in shortlist:
+        if _column_has_ranked_values(fault_gdf, col):
+            return col
+        print(f"ℹ️ Ignoring Influence Map column '{col}' as a priority "
+              f"column: it matches by name but holds no recognized "
+              f"priority values.")
+    return None
+
+
+def _geometry_dimension_rank(geom):
+    """
+    Part A cascade level (b): 2 for Polygon/MultiPolygon, 1 for
+    Line-like, 0 for Point/MultiPoint, None for anything unrecognized.
+    A None result means the caller silently drops that candidate --
+    no dialog, no warning, no report entry, per this task's confirmed
+    error handling.
+    """
+    if geom is None:
+        return None
+    return _GEOMETRY_DIMENSION_RANKS.get(geom.geom_type)
+
+
+def _intersection_magnitude(parcel_geom, fault_geom, dimension_rank):
+    """
+    Part A cascade level (c): the magnitude of the actual INTERSECTION
+    between the parcel and one intersecting feature. Only ever compared
+    against other candidates of the SAME dimension -- level (b) has
+    already separated the dimensions, so an area number is never
+    compared against a length number.
+
+      - dimension 2 (Polygon/MultiPolygon): intersection AREA.
+      - dimension 1 (Line-like): LENGTH of the intersecting segment.
+      - dimension 0 (Point/MultiPoint): no magnitude exists -- a point
+        either intersects or it does not -- so every point candidate
+        scores 0.0 and this level resolves nothing for them, falling
+        through to level (d).
+
+    Returns 0.0 when the intersection cannot be computed or carries no
+    meaningful area/length -- silently, per this task's confirmed error
+    handling. Scoring 0.0 rather than dropping the candidate keeps it in
+    the running and lets level (d) decide it.
+    """
+    if dimension_rank == 0:
+        return 0.0
+    try:
+        piece = parcel_geom.intersection(fault_geom)
+        if piece is None or piece.is_empty:
+            return 0.0
+        return float(piece.area if dimension_rank == 2 else piece.length)
+    except Exception:
+        return 0.0
+
+
+def _select_intersecting_winner(parcel_geom, candidate_indices, fault_geoms,
+                                fault_priority_ranks):
+    """
+    Part A's winner cascade, evaluated top to bottom, each level a
+    tie-break for the level above it:
+
+      (a) business/hazard priority rank (see _resolve_priority_column()
+          / INFLUENCE_PRIORITY_RANKS) -- higher wins;
+      (b) geometry-type hierarchy Polygon > Line > Point -- higher
+          dimension wins;
+      (c) same-dimension intersection magnitude -- larger wins;
+      (d) lowest fault_idx (the feature's own read-order position
+          within this run) -- always present, always unique, never a
+          data column. No `fid`/`id`/`objectid` column is consulted:
+          every real Influence Map source checked during this task's
+          design had such a column and NONE of them was actually unique
+          per feature.
+
+    The whole cascade is a single lexicographic max() over the tuple
+    (priority, dimension, magnitude, -fault_idx). Negating fault_idx is
+    what turns "largest tuple wins" into "lowest fault_idx wins" at the
+    final level while leaving levels (a)-(c) as plain largest-wins.
+
+    Returns the winning index into fault_geoms, or None when every
+    candidate was silently dropped for having an unrecognized geometry
+    type -- in which case the caller falls through to Part B for this
+    parcel rather than surfacing anything to the user.
+    """
+    scored = []
+    for fi in candidate_indices:
+        dimension_rank = _geometry_dimension_rank(fault_geoms[fi])
+        if dimension_rank is None:
+            continue
+        magnitude = _intersection_magnitude(parcel_geom, fault_geoms[fi],
+                                            dimension_rank)
+        scored.append((fault_priority_ranks[fi], dimension_rank, magnitude, -fi))
+    if not scored:
+        return None
+    return -max(scored)[3]
+
+
+def _tree_query_indices(tree, geom, tree_geoms):
+    """
+    Bounding-box candidate pre-filter against an STRtree, normalized to
+    a list of integer indices into tree_geoms regardless of shapely
+    version: shapely 2.x's STRtree.query() returns an index array, while
+    older shapely returns the matching geometries themselves. Mirrors
+    the dual return-shape handling this file already applies to
+    STRtree.nearest().
+
+    This is a BOUNDING-BOX filter only -- the caller is responsible for
+    the exact .intersects() test on each candidate it returns.
+    """
+    try:
+        raw = tree.query(geom)
+    except Exception:
+        return []
+    indices = []
+    for item in raw:
+        if isinstance(item, (int, np.integer)):
+            indices.append(int(item))
+        else:
+            try:
+                indices.append(tree_geoms.index(item))
+            except ValueError:
+                continue
+    return indices
+
+
+# ========================================
 # MEASUREMENT ENGINE
 # ========================================
 def process_parcels(parcel_gdf, fault_gdf, dist_col, extra_column_specs, source_name,
-                     progress_cb=None, output_column_map=None, cancel_flag=None):
+                     progress_cb=None, output_column_map=None, cancel_flag=None,
+                     influence_source_display_name=None):
     """
-    Core measurement engine. For each parcel: representative_point() ->
-    single nearest-feature STRtree lookup against the Influence Map
-    layer -> the distance column, every checked extra column, and the
-    VM line all derived from that SAME lookup result (single-nearest-
-    feature-query rule -- see Task Prompt / Instructions Section E;
-    this is a hard architectural requirement, not a style preference).
+    Core measurement engine. Every parcel is evaluated in TWO ordered
+    parts. Exactly one Influence Map feature ultimately "wins" for each
+    parcel, and the distance column, every checked extra column, and the
+    VM line are all derived from that SAME single winner (the
+    single-winning-feature rule -- a hard architectural requirement of
+    this tool, unchanged in spirit by this task; only HOW the winner is
+    found has changed).
 
-    Selection metric vs. measurement metric (approved design):
-    The nearest feature is ALWAYS selected by true geometric proximity
-    -- shapely's STRtree.nearest() already ranks candidates by real
-    .distance() (point-to-point, point-to-line, or point-to-polygon,
-    whichever applies), never by a centroid/representative-point
-    approximation, and this holds even when Point, LineString, and
-    Polygon features are mixed within the same Influence Map layer.
-    This selection step is NEVER changed by geometry type -- "nearest
-    feature" means the same thing regardless of what wins. UNCHANGED
-    by this task.
+    ---- Part A: overlap-priority check (evaluated FIRST) ----
+    Before any distance work, every Influence Map feature that
+    INTERSECTS this parcel is found -- STRtree bounding-box .query()
+    pre-filter (the same tree already built over fault_geoms, never a
+    second tree and never an unfiltered all-pairs scan), then an exact
+    .intersects() test on each candidate.
 
-    Only AFTER a winner is chosen does geometry type affect anything,
-    and only the REPORTED distance value / VM line, never which
-    feature won -- UNCHANGED by this task:
-      - Point / LineString (and Multi- variants): the distance column
-        is the true geometric distance from parcel_point to the
-        feature, and the VM line runs to the exact nearest_points()
-        endpoint on that feature -- this is this tool's original,
-        LineString-validated behavior.
-      - Polygon / MultiPolygon: the distance column is instead the
-        distance from parcel_point to the winning feature's OWN
-        representative_point() (center-to-center), and the VM line
-        runs to that same representative_point() -- NOT standard
-        boundary distance (which would read 0 whenever the parcel
-        falls inside a fault/influence zone polygon, an unhelpful
-        value for a hazard-distance metric).
-    See the geometry-type switch in the per-parcel loop below for the
-    exact implementation.
+    "intersects", not "overlaps", is deliberate and is the term used
+    throughout this code: strict GIS "overlap" excludes pure
+    boundary-touching and some containment cases, whereas .intersects()
+    covers interior overlap, boundary touching, containment, crossing,
+    and a point or line lying exactly on the parcel boundary. The
+    business rule is that ANY of those means the feature is on the
+    parcel.
+
+    If one or more features intersect, the distance column receives the
+    fixed placeholder INTERSECTING_DISTANCE_VALUE (1) -- never a
+    computed distance, and the same value regardless of geometry type
+    or how much of the parcel is covered -- and exactly ONE winner
+    supplies every checked column's value. Every other intersecting
+    feature is discarded for this parcel; values are never merged or
+    averaged across them. The winner is chosen by the four-level
+    cascade in _select_intersecting_winner(): business/hazard priority
+    column, then geometry-type hierarchy, then same-dimension
+    intersection magnitude, then lowest fault_idx.
+
+    If nothing intersects, Part A contributes nothing for this parcel
+    and Part B runs.
+
+    ---- Part B: geometry-to-geometry distance (only when Part A found
+    nothing) ----
+    SELECTION and MEASUREMENT use the SAME metric here -- this is the
+    point of the design, and it survives unchanged from the earlier
+    vertex-based round even though the metric itself does not.
+    Selecting by one metric and measuring by another was explicitly
+    considered and rejected: a representative-point-selected "nearest"
+    feature is not guaranteed to be the feature that is actually
+    nearest under the metric the tool then reports (an elongated
+    polygon whose representative point is far away can easily lie
+    closer than a compact polygon whose representative point is
+    nearer).
+
+    The metric is shapely's true distance between the FULL geometries.
+    The parcel geometry is queried against the same STRtree Part A
+    uses, which ranks candidates by that same real distance, so the
+    selected feature is by construction the one the reported distance
+    belongs to.
+
+    WHY NOT VERTEX-TO-VERTEX: an earlier round of this task restricted
+    both halves of Part B to the minimum distance over (parcel exterior
+    vertex, feature exterior vertex) pairs, as an intentional domain
+    convention. Real-run screenshots disproved it. When two boundaries
+    run near-parallel and their true nearest point falls in the MIDDLE
+    of an edge rather than on a corner, a vertex-restricted metric can
+    only ever reach the nearest corner -- which reported ~767-999m for
+    parcels sitting visually flush against CLN_SURFACE_WATER. That is
+    the structural failure mode of the metric, not a tuning problem, so
+    the metric was replaced rather than adjusted. All of the vertex
+    machinery it needed (vertex extraction, a second per-call STRtree
+    over vertices, vertex-pair nearest matching) has been deleted, not
+    left unused.
+
+    HOLES: no longer a question. The exterior-only vertex rule that
+    once governed interior rings has nothing left to apply to --
+    Polygon.distance() and nearest_points() already account for holes
+    correctly on their own, since a point inside a hole is not inside
+    the polygon and therefore has a real, correct distance to the
+    boundary.
+
+    Efficiency: ONE STRtree per process_parcels() call, over
+    fault_geoms, shared by Part A's .intersects() pre-filter and Part
+    B's nearest-feature selection -- one fewer tree than the vertex
+    design needed. Built once, never inside the per-parcel loop.
+
+    NEAR-ZERO FLOOR: a Part B distance that rounds to exactly 0.0000 is
+    reported as NEAR_ZERO_DISTANCE_FLOOR (0.0001) instead, because the
+    downstream CAMA valuation system reads 0 as "no Influence Map
+    applies". See that constant for the full rationale. Part A's
+    INTERSECTING_DISTANCE_VALUE is untouched by this and the two values
+    stay distinct.
+
+    The original behavior this replaces, for the record: the winner was
+    chosen by STRtree.nearest() from the parcel's representative_point(),
+    then the reported distance was centre-to-centre
+    (representative point to representative point) for a Polygon/
+    MultiPolygon winner and a true geometric .distance() for a Point/
+    LineString winner. Part B now queries the full parcel geometry
+    rather than its representative point, and applies one measurement
+    rule regardless of the winner's geometry type.
 
     Duplicate feature attribute values are acceptable and require no
-    special handling: the nearest feature is selected purely by
-    spatial proximity, never by uniqueness of any attribute, and every
-    checked column's value is copied verbatim from the SAME winning
-    feature.
+    special handling: the winner is chosen spatially (and, on a tie, by
+    read-order position), never by uniqueness of any attribute, and
+    every checked column's value is copied verbatim from the SAME
+    winning feature.
+
+    Per-parcel and per-shape problems are SILENTLY skipped throughout
+    both parts -- an unrepairable geometry, an intersection with no
+    meaningful area/length, an unrecognized geometry type reaching the
+    hierarchy comparison, or no usable candidate feature found for a
+    parcel. No
+    dialog, no warning, no report entry; the parcel simply receives
+    NULL output and processing continues, matching this function's
+    pre-existing silent-skip behavior for unrepairable geometry.
 
     Args:
         dist_col: this run's final distance column name (already
@@ -758,6 +1241,27 @@ def process_parcels(parcel_gdf, fault_gdf, dist_col, extra_column_specs, source_
         scope) so a Cancel clicked while THAT loop is running -- which
         has no progress_cb of its own to report against -- is not
         missed until the main loop starts.
+        influence_source_display_name: the INFLUENCE MAP source's own
+        human-readable display name, from
+        _influence_source_display_name(), threaded down from on_run()
+        through run_processing() -> worker() -> _process_one_source().
+        Used for exactly one thing: resolving this source's
+        business/hazard priority column for Part A cascade level (a)
+        (see _resolve_priority_column()), once per call, never per
+        parcel. DISTINCT from this function's `source_name` parameter,
+        which is the LAND PARCEL source's label and is used only in
+        console diagnostics -- the two must never be conflated. None
+        (the default) simply means level (a) falls back to looking for
+        a "rating" column only.
+
+    Raises _NoUsableInfluenceGeometry when NO Influence Map feature
+    survives geometry repair. Previously this case printed to a console
+    the end user never sees and then completed "successfully" with every
+    parcel NULL; it is now a run-blocking, GUI-visible condition,
+    handled in run_processing()'s worker(). Note this is a property of
+    the run-wide Influence Map source, not of any one Land Parcel
+    source, which is why it aborts the run rather than being isolated as
+    a single failed source.
 
     Returns (parcel_gdf, vm_gdf) -- both still in the CALLER's current
     (projected) CRS; CRS restoration to the original CRS is the
@@ -801,6 +1305,18 @@ def process_parcels(parcel_gdf, fault_gdf, dist_col, extra_column_specs, source_
     # below. Every parcel's nearest-feature lookup reuses this same
     # tree. UNCHANGED by this task.
     # ------------------------------------------------------------------
+    # Part A cascade level (a): which column (if any) carries this
+    # Influence Map source's business/hazard priority. Resolved EXACTLY
+    # ONCE here, before any parcel is touched -- it is a property of the
+    # source, not of an individual feature, so re-resolving it per parcel
+    # would be both wasteful and meaningless. None means this source has
+    # no such column and level (a) is a no-op for every parcel.
+    priority_column = _resolve_priority_column(fault_gdf,
+                                               influence_source_display_name)
+    if priority_column:
+        print(f"ℹ️ Influence Map priority column resolved to "
+              f"'{priority_column}'.")
+
     fault_geoms = []
     # fault_attrs[i] is a dict of {raw_column_name: value} for
     # fault_geoms[i] -- carries EVERY checked column's value per
@@ -809,6 +1325,12 @@ def process_parcels(parcel_gdf, fault_gdf, dist_col, extra_column_specs, source_
     # single-value pattern this replaced, just generalized to an
     # arbitrary set of columns.
     fault_attrs = []
+    # fault_priority_ranks[i] is the Part A level-(a) rank for
+    # fault_geoms[i] -- captured in THIS loop so it stays index-parallel
+    # with fault_geoms/fault_attrs even though this loop skips
+    # unrepairable features. INFLUENCE_PRIORITY_UNRANKED for every
+    # feature when this source has no priority column at all.
+    fault_priority_ranks = []
     for fault_idx, (_, row) in enumerate(fault_gdf.iterrows()):
         # D-Cancel (this task -- extended checkpoint coverage, confirmed
         # with the developer): this loop (fault-geometry cleanup, before
@@ -832,20 +1354,33 @@ def process_parcels(parcel_gdf, fault_gdf, dist_col, extra_column_specs, source_
             raw_col: (row.get(raw_col) if raw_col in fault_gdf.columns else None)
             for raw_col, _ in resolved_extra_specs
         })
-
-    all_target_cols = [dist_col] + [final_col for _, final_col in resolved_extra_specs]
+        fault_priority_ranks.append(
+            _priority_rank(row.get(priority_column)) if priority_column
+            else INFLUENCE_PRIORITY_UNRANKED
+        )
 
     if not fault_geoms:
+        # CHANGED by this task: this case used to print to a console the
+        # end user never sees and then complete "successfully" with every
+        # parcel's output NULL -- no GUI signal whatsoever. It is now
+        # run-blocking and GUI-visible: the console line is kept as an
+        # audit trail, and the raise is caught in run_processing()'s
+        # worker(), which posts the user-facing message. Aborting (rather
+        # than completing with an all-NULL output plus a warning) was
+        # chosen because the Influence Map source is loaded ONCE for the
+        # whole run and shared by every Land Parcel source -- if none of
+        # its shapes is usable, every source in the run would produce
+        # nothing but NULLs, which makes this the same class of problem
+        # as the already-existing "source has no features" fatal_error
+        # rather than a per-source failure.
         print(f"⚠️ [{source_name}] No usable Influence Map geometry -- "
-              f"every parcel will receive NULL output values.")
-        if progress_cb:
-            for _ in range(len(parcel_gdf)):
-                progress_cb(1)
-        for col in all_target_cols:
-            parcel_gdf[col] = None
-        vm_gdf = gpd.GeoDataFrame(columns=vm_columns, geometry="geometry", crs=parcel_gdf.crs)
-        return parcel_gdf, vm_gdf
+              f"aborting the run.")
+        raise _NoUsableInfluenceGeometry()
 
+    # ONE STRtree for this whole call, over the Influence Map geometries.
+    # Part A uses it for its .intersects() candidate pre-filter; Part B
+    # uses it for nearest-feature selection. Built EXACTLY ONCE here,
+    # never inside the per-parcel loop.
     tree = STRtree(fault_geoms)
 
     dists_out = []
@@ -888,57 +1423,147 @@ def process_parcels(parcel_gdf, fault_gdf, dist_col, extra_column_specs, source_
                 extras_out[final_col].append(None)
             continue
 
-        parcel_point = poly.representative_point()
-
-        # ---- SINGLE nearest-feature lookup for this parcel ----
-        # UNCHANGED selection logic -- only the attribute-carrying
-        # shape (a dict of many values instead of one scalar) differs.
-        res = tree.nearest(parcel_point)
-        if isinstance(res, (int, np.integer)):
-            nearest_geom = fault_geoms[int(res)]
-            nearest_attrs = fault_attrs[int(res)]
-        else:
-            # Newer shapely returns the geometry directly; recover its
-            # index for the parallel attribute lookup.
+        # ---- Part A: overlap-priority check, BEFORE any distance work ----
+        # STRtree bounding-box .query() pre-filter followed by an exact
+        # .intersects() test on each candidate -- never an unfiltered
+        # every-feature-against-every-parcel scan. This reuses the SAME
+        # tree built once above; no tree is built inside this loop.
+        intersecting_indices = []
+        for candidate_idx in _tree_query_indices(tree, poly, fault_geoms):
             try:
-                nearest_idx = fault_geoms.index(res)
-            except ValueError:
-                nearest_idx = None
-            nearest_geom = res
-            nearest_attrs = fault_attrs[nearest_idx] if nearest_idx is not None else {}
+                if poly.intersects(fault_geoms[candidate_idx]):
+                    intersecting_indices.append(candidate_idx)
+            except Exception:
+                # Silent skip (confirmed error handling): a pathological
+                # geometry that raises inside the predicate simply is not
+                # a candidate. No dialog, no warning, no report entry.
+                continue
 
-        # ---- Measurement metric (decided AFTER the winner is chosen --
-        # see process_parcels()'s docstring for the full rationale). The
-        # winning feature itself is never re-selected here; only how its
-        # distance/VM-line are computed changes. UNCHANGED by this task. ----
-        if nearest_geom.geom_type in ("Polygon", "MultiPolygon"):
-            # Polygon Influence Map feature (e.g. a fault hazard zone):
-            # center-to-center, NOT boundary distance -- boundary
-            # distance would read 0 whenever the parcel falls inside
-            # the zone, which is not a useful hazard-distance value.
-            fault_ref_point = nearest_geom.representative_point()
-            distance = round(float(parcel_point.distance(fault_ref_point)), 4)
-            vm_line = LineString([parcel_point, fault_ref_point])
+        winner_idx = None
+        if intersecting_indices:
+            winner_idx = _select_intersecting_winner(
+                poly, intersecting_indices, fault_geoms, fault_priority_ranks)
+
+        if winner_idx is not None:
+            # At least one Influence Map feature is ON this parcel: the
+            # fixed placeholder value, never a computed distance, and the
+            # single cascade winner supplies every checked column.
+            distance = INTERSECTING_DISTANCE_VALUE
+            nearest_attrs = fault_attrs[winner_idx]
+            # The VM layer's write is disabled/out of scope, but this
+            # line is still constructed, so it is kept meaningful:
+            # parcel representative point -> the winning feature's own
+            # representative point. There is no "winning vertex pair"
+            # in the intersecting case, because no vertex distance was
+            # measured. A degenerate (zero-length) line is dropped
+            # rather than recorded -- see the vm_line guard below.
+            vm_line = None
+            try:
+                parcel_point = poly.representative_point()
+                fault_ref_point = fault_geoms[winner_idx].representative_point()
+                if not parcel_point.equals(fault_ref_point):
+                    vm_line = LineString([parcel_point, fault_ref_point])
+            except Exception:
+                vm_line = None
         else:
-            # Point / LineString (and Multi- variants): unchanged --
-            # true geometric distance, VM endpoint is the exact
-            # nearest_points() point ON the feature, matching the
-            # distance value exactly. This is this tool's original,
-            # LineString-validated behavior.
-            distance = round(float(parcel_point.distance(nearest_geom)), 4)
-            _, pt_on_fault = nearest_points(parcel_point, nearest_geom)
-            vm_line = LineString([parcel_point, pt_on_fault])
+            # ---- Part B: geometry-to-geometry SELECTION and MEASUREMENT ----
+            # Reached when nothing intersects this parcel (or, rarely,
+            # when every intersecting candidate was silently dropped for
+            # having an unrecognized geometry type -- see
+            # _select_intersecting_winner()). Selection and measurement
+            # use the one same metric; see this function's docstring for
+            # why splitting them was rejected.
+            #
+            # The FULL parcel geometry is queried against the SAME tree
+            # Part A uses -- shapely ranks candidates by true
+            # geometry-to-geometry distance, so the feature selected here
+            # is by construction the feature the reported distance is
+            # measured to. No separate vertex index exists any more.
+            res = tree.nearest(poly)
+            if res is None:
+                # Empty tree -- no usable candidate at all. Silent skip,
+                # same NULL-fill pattern as the unrepairable-parcel skip
+                # above. No user-facing message.
+                dists_out.append(None)
+                for _, final_col in resolved_extra_specs:
+                    extras_out[final_col].append(None)
+                continue
+
+            # Return-shape handling, verified against the installed
+            # shapely (2.1.x): STRtree.nearest() returns a numpy integer
+            # index -- NOT a plain Python int, so a bare
+            # isinstance(res, int) test would silently fall through to
+            # the wrong branch. Older shapely returns the geometry
+            # itself; both are handled, matching this file's
+            # pre-existing dual-shape convention.
+            if isinstance(res, (int, np.integer)):
+                nearest_idx = int(res)
+            else:
+                try:
+                    nearest_idx = fault_geoms.index(res)
+                except ValueError:
+                    dists_out.append(None)
+                    for _, final_col in resolved_extra_specs:
+                        extras_out[final_col].append(None)
+                    continue
+
+            nearest_geom = fault_geoms[nearest_idx]
+            distance = round(float(poly.distance(nearest_geom)), 4)
+            # Near-zero floor -- see NEAR_ZERO_DISTANCE_FLOOR. This is the
+            # ONLY place in this function where a Part B distance value is
+            # produced; every other dists_out.append() on this path appends
+            # None (a silent skip), and Part A's value is its own constant,
+            # so flooring here covers the whole Part B output.
+            #
+            # The guard is `not (distance > 0.0)` rather than the narrower
+            # `distance == 0.0` on purpose. shapely's .distance() returns
+            # NaN (it does not raise) when either operand is an empty
+            # geometry, and NaN == 0.0 is False, so a narrow equality check
+            # would let NaN through unfloored and straight into the output
+            # column. In practice both operands are already guarded --
+            # fix_geometry() rejects empty geometry on the parcel side and
+            # on every fault feature, before and after repair -- so NaN
+            # should be unreachable here; the broader guard costs nothing
+            # and means a future change upstream cannot quietly reintroduce
+            # it.
+            #
+            # NaN/negative is NOT floored to 0.0001, though: that would
+            # fabricate a plausible-looking near-adjacent measurement out
+            # of a broken geometry, which is worse than reporting nothing.
+            # It takes the same silent-skip/NULL path as every other
+            # unusable-geometry case in this function.
+            if not (distance > 0.0):
+                if distance == 0.0:
+                    distance = NEAR_ZERO_DISTANCE_FLOOR
+                else:
+                    dists_out.append(None)
+                    for _, final_col in resolved_extra_specs:
+                        extras_out[final_col].append(None)
+                    continue
+            nearest_attrs = fault_attrs[nearest_idx]
+            # VM endpoints are the true nearest point pair, which may lie
+            # partway along an edge rather than on a corner -- so the line
+            # matches the reported distance exactly.
+            pt_on_parcel, pt_on_fault = nearest_points(poly, nearest_geom)
+            vm_line = (None if pt_on_parcel.equals(pt_on_fault)
+                       else LineString([pt_on_parcel, pt_on_fault]))
 
         dists_out.append(distance)
         for raw_col, final_col in resolved_extra_specs:
             extras_out[final_col].append(nearest_attrs.get(raw_col))
 
-        record = {dist_col: distance, "geometry": vm_line}
-        for raw_col, final_col in resolved_extra_specs:
-            record[final_col] = nearest_attrs.get(raw_col)
-        if id_col:
-            record["PIN"] = parcel_gdf.iloc[idx][id_col]
-        vm_records.append(record)
+        # A parcel whose VM line came out degenerate still gets its full
+        # main-output row above; only the VM record is dropped. vm_records
+        # was already non-parallel to parcel_gdf before this task (the
+        # unrepairable-parcel skip above `continue`s without appending
+        # one), so this adds no new coupling.
+        if vm_line is not None:
+            record = {dist_col: distance, "geometry": vm_line}
+            for raw_col, final_col in resolved_extra_specs:
+                record[final_col] = nearest_attrs.get(raw_col)
+            if id_col:
+                record["PIN"] = parcel_gdf.iloc[idx][id_col]
+            vm_records.append(record)
 
     parcel_gdf[dist_col] = dists_out
     for _, final_col in resolved_extra_specs:
@@ -973,6 +1598,29 @@ class _RunCancelled(Exception):
     Carries no message -- the user-facing "Discarding run... Please
     wait." / "cancelled" wording is posted separately, by worker(),
     once it observes the loop broke out this way.
+    """
+    pass
+
+
+class _NoUsableInfluenceGeometry(Exception):
+    """
+    Internal signal raised by process_parcels() when NO Influence Map
+    feature survives geometry repair, so every parcel of every source
+    would receive nothing but NULL output.
+
+    Modelled deliberately on _RunCancelled above, including the
+    except-clause ordering discipline: worker()'s per-source loop
+    catches THIS class in its own dedicated clause placed BEFORE the
+    existing `except Exception as e:`, so it can never be swallowed and
+    logged as an ordinary failed source. The distinction matters more
+    here than it might look: the Influence Map source is loaded ONCE for
+    the whole run and shared by every Land Parcel source, so an unusable
+    one is a run-wide input problem, not a per-source failure -- which is
+    why worker() posts a "fatal_error" and ends the run instead of
+    recording a failure and moving to the next source.
+
+    Carries no message; the plain-English, non-technical user-facing
+    wording lives at the single point where it is caught.
     """
     pass
 
@@ -1641,9 +2289,9 @@ class ProgressWindow:
         tk.Label(
             self.win, textvariable=self.status_var, anchor="center",
             justify="center", wraplength=380,
-        ).pack(pady=10, padx=10, fill="x")
+        ).pack(pady=(10, 4), padx=10, fill="x")
         self.progress = ttk.Progressbar(self.win, orient="horizontal", mode="determinate", length=350)
-        self.progress.pack(pady=10)
+        self.progress.pack(pady=(4, 10))
         self.win.attributes("-topmost", True)
         self.win.update()
         self.win.focus_force()
@@ -2004,9 +2652,25 @@ def load_in_global_mapper(path):
 
 
 def _translate_exception(e, source_label):
-    """Formats an exception as "ExceptionType: message" for display in
-    the failed-sources list (source_label is accepted for signature
-    consistency but not currently used in the formatted text)."""
+    """Formats an exception for display in the failed-sources list
+    (source_label is accepted for signature consistency but not
+    currently used in the formatted text).
+
+    GpkgWriteError is special-cased and shown AS-IS, via str(e), with no
+    class-name prefix. Those messages are hand-written in
+    utils/gpkg_io.py FOR the end user -- e.g. "Could not overwrite
+    LandParcel.gpkg. Please make sure LandParcel.gpkg is not open in
+    another app, then try again." -- and prefixing them would turn a
+    plain, actionable instruction into something that reads like a
+    crash ("GpkgWriteError: Could not overwrite...").
+
+    Every other exception keeps the "ExceptionType: message" form. That
+    is deliberate rather than an oversight: for a genuinely unexpected
+    failure the class name is real troubleshooting information, and
+    there is no user-facing wording to preserve.
+    """
+    if isinstance(e, GpkgWriteError):
+        return str(e)
     return f"{type(e).__name__}: {e}"
 
 
@@ -2019,6 +2683,7 @@ def _process_one_source(
     progress_cb, status_cb, on_total=None,
     resolved_table_name=None, resolved_outcome=None,
     cancel_flag=None, run_id=None, started_at_iso=None,
+    influence_source_display_name=None,
 ):
     """
     Fully processes ONE Land Parcel source: load, measure (single
@@ -2071,6 +2736,12 @@ def _process_one_source(
         _write_db_output_safely() for its staging/backup table comment
         metadata. Only meaningful for DB output mode; unused for local
         output.
+        influence_source_display_name: the INFLUENCE MAP source's
+        display name, passed straight through to process_parcels() for
+        its Part A priority-column resolution. Deliberately NOT named
+        source_name/source_label -- those already mean the LAND PARCEL
+        source here, and conflating the two is the exact naming
+        collision this parameter was introduced to avoid.
     """
     if is_db_source:
         parcel_gdf = read_postgis_clean(source_id, engine, schema)
@@ -2119,6 +2790,7 @@ def _process_one_source(
         parcel_gdf_proj, fault_gdf_proj, dist_col, extra_column_specs, source_label,
         progress_cb=progress_cb, output_column_map=output_column_map,
         cancel_flag=cancel_flag,
+        influence_source_display_name=influence_source_display_name,
     )
     if parcel_gdf_proj is None:
         # D-Cancel: process_parcels() detected a Cancel mid-measurement
@@ -2138,10 +2810,61 @@ def _process_one_source(
     # vm_gdf always carries a defined CRS from process_parcels() (set at
     # construction time in both the empty and non-empty branches), so
     # .to_crs() is safe here without special-casing the empty case.
+    # ------------------------------------------------------------------
+    # OUTPUT GEOMETRY -- pristine, never round-tripped (main output).
+    #
+    # This used to be `parcel_gdf_out = parcel_gdf_proj.to_crs(original_crs)`:
+    # take the geometry that had ALREADY been transformed once
+    # (parcel_gdf -> parcel_gdf_proj, above) and transform it a second
+    # time, back again. That forward+inverse round trip is not lossless.
+    # Measured on this very tool's real LandParcel.shp vs. its real
+    # tool-produced LandParcel.gpkg: a uniform ~4.5mm Hausdorff
+    # displacement across all 11,911 parcels, present regardless of
+    # geometry validity and regardless of which PRS92 zone was used --
+    # inherent floating-point precision loss in the transformation pair
+    # itself, visible to the developer at close zoom in both Global
+    # Mapper and QGIS.
+    #
+    # The fix does not shrink that error, it removes the cause: the
+    # untouched source geometry is still in memory as parcel_gdf (read
+    # once near the top of this function and never reassigned after),
+    # so the computed columns are carried on THAT instead. Only the
+    # geometry column is swapped; every value process_parcels() wrote --
+    # including Part A's intersecting placeholder and Part B's floored
+    # near-zero distances -- is kept exactly as computed.
+    #
+    # Row alignment: process_parcels() only ever ASSIGNS COLUMNS onto the
+    # frame it was handed (see its dist_col/extra-column assignments); it
+    # never filters, sorts, reindexes or drops rows -- a parcel it cannot
+    # measure gets a None appended, not removed -- so parcel_gdf_proj
+    # comes back with exactly parcel_gdf's rows and index. Asserted here
+    # rather than assumed, falling back to the old round trip rather than
+    # emitting misaligned geometry.
+    #
+    # vm_gdf deliberately does NOT get this treatment, for the same
+    # reason road_width.py's qa_gdf doesn't: its lines are COMPUTED in
+    # the projected CRS (constructed with crs=<projected frame>.crs
+    # inside process_parcels()), so it has no pre-reprojection state to
+    # restore. Its .to_crs() is a one-way forward transform into the
+    # output CRS, not a forward+inverse pair, so it is unaffected by this
+    # class of error and is left exactly as it was.
+    # ------------------------------------------------------------------
     if original_crs is not None:
-        parcel_gdf_out = parcel_gdf_proj.to_crs(original_crs)
+        if parcel_gdf.index.equals(parcel_gdf_proj.index):
+            parcel_gdf_out = parcel_gdf_proj.copy()
+            parcel_gdf_out[parcel_gdf_out.geometry.name] = parcel_gdf.geometry
+            parcel_gdf_out = parcel_gdf_out.set_crs(original_crs, allow_override=True)
+        else:
+            print(f"⚠️ [{source_label}] Parcel index changed during processing — "
+                  f"falling back to reprojecting the output geometry.")
+            parcel_gdf_out = parcel_gdf_proj.to_crs(original_crs)
         vm_gdf_out = vm_gdf.to_crs(original_crs)
     else:
+        # Unreachable in practice: a parcel source with no CRS at all
+        # would already have failed at the .to_crs(epsg=zone_epsg)
+        # reprojection above. Left exactly as it was rather than
+        # speculatively rewritten -- with no source CRS there is also no
+        # meaningful "pristine CRS" to restore.
         parcel_gdf_out = parcel_gdf_proj.to_crs(epsg=4326)
         vm_gdf_out = vm_gdf.to_crs(epsg=4326)
 
@@ -2184,7 +2907,42 @@ def _process_one_source(
         out = os.path.join(output_mode[1], f"{base_name}.gpkg")
 
         status_cb(f"Writing output file: {source_label}...")
-        _write_gpkg(parcel_gdf_out, out)
+
+        # D-Cancel: narrow the inert window to the SWAP ITSELF, rather
+        # than making the whole write phase non-cancelable.
+        #
+        # write_gpkg_atomic() calls before_swap after it has written and
+        # verified its temp file but before os.replace() touches `out`.
+        # Everything up to that point -- the write, the read-back, the
+        # row-count verify -- is still fully cancelable, and safely so:
+        # the real destination has not been touched, so abandoning there
+        # costs nothing but a temp file, which write_gpkg_atomic()
+        # removes itself when this callback raises. Only from the moment
+        # the cancelable=False update below is posted is Cancel inert,
+        # i.e. from immediately before os.replace() onward.
+        #
+        # Raising _RunCancelled from in here is safe and cannot produce a
+        # second dialog, traced rather than assumed:
+        #   - this call site has no try/except around it, so the
+        #     exception propagates out of _process_one_source() unmodified
+        #     (write_gpkg_atomic() re-raises the SAME object, deliberately
+        #     unwrapped, for exactly this reason);
+        #   - worker()'s per-source loop has `except _RunCancelled:`
+        #     placed BEFORE `except Exception as e:`, and Python runs at
+        #     most one matching except clause, so this can never ALSO be
+        #     logged as a failed source;
+        #   - after that loop, the `if cancelled: ... else: ...` branches
+        #     are mutually exclusive, so the "cancelled" event and the
+        #     "done" event can never both fire for one run;
+        #   - poll_queue()'s "cancelled" branch returns immediately after
+        #     its single messagebox, stopping the poller, so no later
+        #     queue item can surface another dialog.
+        def _before_swap():
+            if cancel_flag is not None and cancel_flag["stop"] is True:
+                raise _RunCancelled()
+            status_cb(f"Saving: {source_label}...", cancelable=False)
+
+        _write_gpkg(parcel_gdf_out, out, before_swap=_before_swap)
 
         vm_out = None
         # ------------------------------------------------------------------
@@ -2351,7 +3109,8 @@ def _process_one_source(
 # ========================================
 # RUN PROCESSING
 # ========================================
-def run_processing(app_root, dist_col, extra_column_specs, overwrite_mode=None, per_source_resolution=None):
+def run_processing(app_root, dist_col, extra_column_specs, overwrite_mode=None,
+                   per_source_resolution=None, influence_source_display_name=None):
     """
     Orchestrates the full run on a background thread (worker(), defined
     below): loads DB credentials unconditionally (even for an all-local
@@ -2378,6 +3137,14 @@ def run_processing(app_root, dist_col, extra_column_specs, overwrite_mode=None, 
         per_source_resolution: {source_id: (resolved_table_name, resolved_outcome)}
         -- resolved once, up front, per Land Parcel source, on the main
         thread, BEFORE win.destroy() -- see on_run()'s PRIORITY 3.
+        influence_source_display_name: the INFLUENCE MAP source's own
+        display name, computed once in on_run() via
+        _influence_source_display_name() (the same value that already
+        feeds _compute_output_column_targets()) and threaded down
+        through worker() -> _process_one_source() -> process_parcels(),
+        where it resolves that source's business/hazard priority column
+        for the Part A cascade. Passed down rather than recomputed here
+        so there is exactly one definition of this name per run.
 
     Notes:
         DB credentials are loaded and an engine created unconditionally
@@ -2533,7 +3300,7 @@ def run_processing(app_root, dist_col, extra_column_specs, overwrite_mode=None, 
                 current_step[0] += 1
                 count_line = (f"Parcel {current_step[0]}"
                                + (f" / {current_total[0]}" if current_total[0] else ""))
-                q.put(("update", f"{count_line}\nMeasuring influence map distance...",
+                q.put(("update", f"Measuring influence map distance...\n{count_line}",
                        current_step[0], current_total[0], None))
 
             def status_cb(message, value=None, total=None, cancelable=None):
@@ -2560,6 +3327,7 @@ def run_processing(app_root, dist_col, extra_column_specs, overwrite_mode=None, 
                         resolved_table_name=resolved_table_name,
                         resolved_outcome=resolved_outcome,
                         cancel_flag=cancel_flag, run_id=run_id, started_at_iso=run_started_at,
+                        influence_source_display_name=influence_source_display_name,
                     )
                     success_count += 1
 
@@ -2586,6 +3354,34 @@ def run_processing(app_root, dist_col, extra_column_specs, overwrite_mode=None, 
                     cancelled = True
                     print(f"⚠️ Run cancelled by user while processing '{source_label}'.")
                     break
+
+                except _NoUsableInfluenceGeometry:
+                    # Run-blocking, GUI-visible (NEW this task -- this
+                    # case used to be console-only and otherwise
+                    # silent). Must sit BEFORE the sibling
+                    # `except Exception as e:` below, same first-matching
+                    # -except reasoning as the _RunCancelled clause
+                    # above, or it would be logged as an ordinary failed
+                    # source and the user would see a generic
+                    # per-source failure instead of the real cause.
+                    #
+                    # `return`, not `break`: the Influence Map source is
+                    # loaded once for the WHOLE run and shared by every
+                    # Land Parcel source, so no remaining source could
+                    # fare any better. Nothing has been written for this
+                    # source at this point (process_parcels() raises
+                    # before returning anything to write), and the
+                    # `finally:` block below still runs, so the run lock
+                    # and engine are released exactly as on any other
+                    # exit path.
+                    q.put((
+                        "fatal_error",
+                        "None of the shapes in this Influence Map source "
+                        "could be used, so every parcel would receive no "
+                        "measurement. Please pick a different source.",
+                        None, None,
+                    ))
+                    return
 
                 except Exception as e:
                     reason = _translate_exception(e, source_label)
@@ -4099,7 +4895,9 @@ def open_main_window(root):
                 per_source_resolution[source_id] = (table_name, outcome)
 
         win.destroy()
-        run_processing(root, dist_col, extra_column_specs, overwrite_mode, per_source_resolution)
+        run_processing(root, dist_col, extra_column_specs, overwrite_mode,
+                       per_source_resolution,
+                       influence_source_display_name=fault_display_name)
 
     # Single source of truth for the Run button's enabled/disabled
     # colors -- same convention as influence_to_barangay.py.
