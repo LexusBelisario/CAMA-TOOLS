@@ -13,7 +13,7 @@
 
 ; Change this to the actual folder where dist\CAMA-Tools.exe lives
 ; Example: E:\Work\CAMA-TOOLS\dist
-#define SourceDistFolder "E:\Work\CAMA-TOOLS\dist"
+#define SourceDistFolder "C:\IGEOSYS\CAMA-TOOLS\dist"
 
 ; -------------------------------------------------------------
 ; SECTION: Setup Configuration
