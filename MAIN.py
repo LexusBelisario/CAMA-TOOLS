@@ -148,6 +148,11 @@ from core.window_management import (
     should_repin_topmost,
 )
 
+from core.tool_exclusivity import (
+    build_grayscale_icons,
+    activate_tool,
+)
+
 # ========================================
 # ICON HELPERS
 # ========================================
@@ -3589,22 +3594,45 @@ def run_tool_by_label(label: str):
         t = threading.Thread(target=run_in_thread, daemon=True)
         t.start()
 
-        # Return a dummy object so callers that check .pid / .poll() don't crash
+        # Return a dummy object so callers that check .pid / .poll() don't crash.
+        # poll() now reflects the REAL thread status instead of a hardcoded
+        # None (Part A fix) -- confirmed safe against the one other .poll()
+        # call site in this file, is_relevant_window_focused() (~line 3945):
+        # that check filters on p.poll() is None but then compares
+        # p.pid == fg_pid, and pid stays hardcoded -1 here, which can never
+        # equal a real foreground window's PID -- so that comparison is
+        # always False regardless of what poll() reports, before or after
+        # this fix. This makes p.poll() is not None a reliable "tool
+        # finished" signal in BOTH frozen and dev mode, with no mode-
+        # specific branching needed in core/tool_exclusivity.py.
         class _FakeProcess:
-            pid = -1
-            def poll(self): return None   # pretend still running
+            def __init__(self, thread):
+                self._thread = thread
+                self.pid = -1
+            def poll(self):
+                return None if self._thread.is_alive() else 0
 
-        fake = _FakeProcess()
+        fake = _FakeProcess(t)
         TOOL_PROCESSES.append(fake)
         return fake
 
 def on_button_click(label):
-    """Tool-grid button handler: increments popup_windows[label] and
-    calls run_tool_by_label() to launch that tool as a subprocess."""
+    """Tool-grid button handler: increments popup_windows[label],
+    calls run_tool_by_label() to launch that tool, then hands its
+    returned process/fake-process to core/tool_exclusivity.py's
+    activate_tool() so every icon (including this one) grays out/locks
+    until that tool finishes -- see core/tool_exclusivity.py for the
+    full mechanism. popup_windows[label]'s own counting behavior is
+    unchanged (track_popup_close(), the only code that would ever
+    decrement it, is not currently called anywhere in this file -- this
+    change does not touch that)."""
     print(f"▶ Launching tool: {label}", flush=True)  # debug line
     if label in TOOL_MODULES:
         popup_windows[label] += 1
-        run_tool_by_label(label)
+        proc = run_tool_by_label(label)
+        if proc is not None:
+            activate_tool(label, proc, canvas_refs, icon_img_ids, icons,
+                          grayscale_icons, hover_bg, root)
     else:
         messagebox.showerror("Unknown Tool", f"No module mapped for: {label}")
 
@@ -4176,8 +4204,17 @@ _icon_files = {
 }
 
 icon_paths = {k: str(ICONS_DIR / v) for k, v in _icon_files.items()}
-icons = {label: ImageTk.PhotoImage(Image.open(path).resize((39, 39), Image.Resampling.LANCZOS))
-         for label, path in icon_paths.items()}
+# icons_pil kept alongside icons (same resize, pre-PhotoImage) solely so
+# build_grayscale_icons() has real pixel data to convert from --
+# ImageTk.PhotoImage has no pixel-level API of its own. Not otherwise
+# used or exposed beyond this.
+icons_pil = {label: Image.open(path).resize((39, 39), Image.Resampling.LANCZOS)
+             for label, path in icon_paths.items()}
+icons = {label: ImageTk.PhotoImage(img) for label, img in icons_pil.items()}
+# Grayscale cache, built once here (same lifetime/timing as `icons`
+# itself) -- see core/tool_exclusivity.py's build_grayscale_icons() for
+# the alpha-preservation handling.
+grayscale_icons = build_grayscale_icons(icons_pil)
 
 
 # === TOOLBAR BUTTONS PANEL (blue area) ===
@@ -4228,6 +4265,18 @@ buttons_2nd_row = [
 
 popup_windows = {}
 canvas_refs = {}
+# label -> canvas item id of the ICON layer (distinct from bg_img_id,
+# the background/highlight layer canvas_refs already tracks) -- new,
+# for core/tool_exclusivity.py's activate_tool()/deactivate_all() to
+# swap between color/grayscale. Only populated for labels whose icon
+# is a real create_image() item; a label that falls into the text-
+# fallback branch below (no bundled icon yet) is deliberately NOT
+# added here -- itemconfig(..., image=...) on a create_text() item
+# raises TclError ("unknown option -image"), confirmed empirically.
+# No button currently hits that branch (every wired label has a real
+# icon today), but the loop doesn't know that, so this guards for a
+# future icon-less button the existing fallback already anticipates.
+icon_img_ids = {}
 
 
 
@@ -4263,6 +4312,8 @@ for label in buttons_1st_row:
 
     canvas_refs[label] = (canvas, bg_img_id)
     popup_windows[label] = 0
+    if label in icons:
+        icon_img_ids[label] = icon_img_id
 
     def make_bindings(c, lbl, bg_id):
         def on_enter(e):
@@ -4305,6 +4356,7 @@ for label in buttons_2nd_row:
 
     canvas_refs[label] = (canvas, bg_img_id)
     popup_windows[label] = 0
+    icon_img_ids[label] = icon_img_id
 
     def make_bindings(c, lbl, bg_id):
         def on_enter(e):
