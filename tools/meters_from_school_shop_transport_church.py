@@ -1257,6 +1257,7 @@ def run_cpu_parallel_with_progress(
     progress_queue,
     stop_flag,
     original_crs=None,
+    original_geometry=None,
 ):
     """
     Builds the road graph once, then runs worker_process() sequentially
@@ -1301,6 +1302,17 @@ def run_cpu_parallel_with_progress(
         Notes).
         original_crs: the parcel layer's CRS before reprojection, used
         to reproject the result back before saving.
+        original_geometry (geopandas.GeoSeries, optional): the parcel
+        layer's PRISTINE geometry, captured by the caller BEFORE it
+        reprojected gdf to the working CRS. Threaded in the same way
+        original_crs already is, and for the same reason: by the time
+        gdf reaches this function it has already been transformed once,
+        so the untouched source is not reachable from in here and has
+        to be handed down. Used to give the saved output its original
+        geometry back WITHOUT a second (inverse) transformation -- see
+        the local-save block below for why that matters. None (the
+        default) preserves the old reproject-back behavior exactly, so
+        any caller that doesn't pass it keeps working unchanged.
 
     Returns:
         None always, currently. See the disabled poi_routes.gpkg
@@ -1373,7 +1385,48 @@ def run_cpu_parallel_with_progress(
         progress_queue.put(("count", i, total))
 
     if output_path:
-        if original_crs is not None:
+        # ------------------------------------------------------------------
+        # OUTPUT GEOMETRY -- pristine, never round-tripped (local save).
+        #
+        # This used to be an unconditional `gdf = gdf.to_crs(original_crs)`:
+        # take the geometry the caller had ALREADY transformed once (into
+        # the PRS92 working CRS) and transform it a second time, back
+        # again. That forward+inverse round trip is not lossless. Measured
+        # on influence_map_distance_to_land_parcel.py's real LandParcel
+        # data: a uniform ~4.5mm Hausdorff displacement on every one of
+        # 11,911 parcels, independent of geometry validity and independent
+        # of which PRS92 zone was chosen -- inherent floating-point
+        # precision loss in the transformation pair itself, visible to the
+        # developer at close zoom in both Global Mapper and QGIS.
+        #
+        # The fix does not shrink that error, it removes the cause: the
+        # distance columns computed above are carried on the caller's
+        # pristine geometry, so the exported geometry is never subjected
+        # to any projection math at all. Only the geometry column is
+        # swapped; every computed CAMA_* value stays exactly as written.
+        #
+        # Row alignment: the per-parcel loop above writes results in place
+        # via `gdf.at[idx, k] = v` and never filters, sorts or reindexes,
+        # and gdf is not reassigned anywhere between the caller's capture
+        # and here. Index equality is asserted rather than assumed; on
+        # failure (or when the caller passed no original_geometry at all)
+        # this falls back to the old reproject-back behavior rather than
+        # emitting misaligned geometry.
+        #
+        # NOTE: projected_crs (captured at the top of this function) is
+        # deliberately untouched by this. The disabled poi_routes block
+        # below relies on it to tag route geometries that really are
+        # still in the working CRS.
+        # ------------------------------------------------------------------
+        if original_geometry is not None and original_geometry.index.equals(gdf.index):
+            gdf = gdf.copy()
+            gdf[gdf.geometry.name] = original_geometry
+            if original_crs is not None:
+                gdf = gdf.set_crs(original_crs, allow_override=True)
+        elif original_crs is not None:
+            if original_geometry is not None:
+                print("⚠️ Parcel index changed during processing — falling back "
+                      "to reprojecting the output geometry.")
             gdf = gdf.to_crs(original_crs)
         _write_gpkg(gdf, output_path)
 
@@ -4016,6 +4069,20 @@ def run_with_progress(app_root, overwrite_mode=None, resolved_table_name=None,
             # this each time.
             original_crs = gdf.crs if gdf.crs is not None else None
 
+            # OUTPUT GEOMETRY -- capture the pristine, untransformed parcel
+            # geometry HERE, at the same point and for the same reason
+            # original_crs is captured just above: the very next lines
+            # rebind `gdf` to a reprojected copy, after which the untouched
+            # source is unreachable. Both save paths need it -- the local
+            # .gpkg write inside run_cpu_parallel_with_progress() (passed
+            # down as the original_geometry argument) and the PostGIS write
+            # further below -- so it is captured once here rather than
+            # twice. .copy() keeps this independent of any later in-place
+            # column work on gdf; it copies the Series container only, not
+            # the shapely geometries, which are immutable and shared either
+            # way.
+            original_geometry = gdf.geometry.copy()
+
             layers_for_zone = [
                 ("Land Parcel", gdf),
                 ("POI", poi_gdf),
@@ -4233,6 +4300,7 @@ def run_with_progress(app_root, overwrite_mode=None, resolved_table_name=None,
                 q,
                 stop_flag,
                 original_crs=original_crs,
+                original_geometry=original_geometry,
             )
 
             if not stop_flag["stop"]:
@@ -4262,12 +4330,30 @@ def run_with_progress(app_root, overwrite_mode=None, resolved_table_name=None,
                 else:
                     all_tables = fetch_tables(schema)
                     table_action = "replaced" if target_table in all_tables else "new"
-                    # Restore the parcel layer's original CRS before
+                    # Restore the parcel layer's original geometry before
                     # writing to PostGIS -- same reasoning as the local
-                    # .to_file() save path in
+                    # .gpkg save path in
                     # run_cpu_parallel_with_progress(): PRS92 was only
-                    # the working CRS for the distance computation.
-                    if original_crs is not None:
+                    # the working CRS for the distance computation. This
+                    # used to be `gdf = gdf.to_crs(original_crs)`, a
+                    # second (inverse) transformation of geometry that
+                    # had already been transformed once, which is not
+                    # lossless -- a uniform ~4.5mm displacement on every
+                    # parcel, measured on real LandParcel data. Attaching
+                    # the computed columns to the pristine geometry
+                    # captured before reprojection removes the cause
+                    # rather than shrinking the error. Index equality is
+                    # asserted, not assumed; on failure this falls back
+                    # to the old reproject-back behavior.
+                    if original_geometry is not None and \
+                            original_geometry.index.equals(gdf.index):
+                        gdf = gdf.copy()
+                        gdf[gdf.geometry.name] = original_geometry
+                        if original_crs is not None:
+                            gdf = gdf.set_crs(original_crs, allow_override=True)
+                    elif original_crs is not None:
+                        print("⚠️ Parcel index changed during processing — "
+                              "falling back to reprojecting the output geometry.")
                         gdf = gdf.to_crs(original_crs)
                     # D-Cancel: staging-write / verify / atomic rename-
                     # swap, replacing the previous direct

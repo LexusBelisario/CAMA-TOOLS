@@ -754,7 +754,7 @@ def process_parcels_fast(parcels, roads, dtm, parcels_crs,
                           slope_col="CAMA_SLOPE", terrain_col="CAMA_TERRAIN",
                           prcl_elev_col="CAMA_PRCL_ELEV", road_elev_col="CAMA_ROAD_ELEV",
                           prcl_road_col="CAMA_PRCL_ROAD", topo_lvl_col="CAMA_TOPO_LVL",
-                          progress=None):
+                          progress=None, parcels_geometry=None):
     """
     slope_col, terrain_col, prcl_elev_col, road_elev_col, prcl_road_col,
     topo_lvl_col : str -- the column names this tool's six computed
@@ -812,6 +812,21 @@ def process_parcels_fast(parcels, roads, dtm, parcels_crs,
     (`ValueError: Length of values does not match length of index`) is
     never reached. There is no partial/truncated result to return or
     save -- see that column-assignment block, below.
+
+    parcels_geometry : optional geopandas.GeoSeries -- the parcel
+    layer's PRISTINE geometry, captured by the caller BEFORE it
+    reprojected `parcels` to the working PRS92 CRS. Threaded in
+    alongside parcels_crs, and for the same reason: by the time
+    `parcels` reaches this function it has already been transformed
+    once, so the untouched source is not reachable from in here and has
+    to be handed down. Used to give the returned GeoDataFrame its
+    original geometry back WITHOUT a second (inverse) transformation --
+    see the return statement at the end of this function for why that
+    matters. Deliberately placed LAST in the signature rather than
+    beside parcels_crs, so no existing positional argument shifts
+    position. None (the default) preserves the old reproject-back
+    behavior exactly, so any call site that doesn't pass it keeps
+    working unchanged.
     """
     # NOTE (Part A3 investigation, resolved as NOT needed): like
     # road_density.py, this function only reads parcels.geometry.centroid
@@ -915,6 +930,44 @@ def process_parcels_fast(parcels, roads, dtm, parcels_crs,
     parcels[prcl_road_col] = diffs
     parcels[topo_lvl_col] = topos
 
+    # ------------------------------------------------------------------
+    # OUTPUT GEOMETRY -- pristine, never round-tripped.
+    #
+    # This used to be `return parcels.to_crs(parcels_crs)`: take the
+    # geometry the caller had ALREADY transformed once (into the PRS92
+    # working CRS) and transform it a second time, back again. That
+    # forward+inverse round trip is not lossless. Measured on
+    # influence_map_distance_to_land_parcel.py's real LandParcel data: a
+    # uniform ~4.5mm Hausdorff displacement on every one of 11,911
+    # parcels, independent of geometry validity and independent of which
+    # PRS92 zone was chosen -- inherent floating-point precision loss in
+    # the transformation pair itself, visible to the developer at close
+    # zoom in both Global Mapper and QGIS.
+    #
+    # The fix does not shrink that error, it removes the cause: the six
+    # columns assigned just above are carried on the caller's pristine
+    # geometry, so the returned geometry is never subjected to any
+    # projection math at all. Only the geometry column is swapped; the
+    # slope/terrain/elevation values stay exactly as computed.
+    #
+    # Row alignment: this function never drops, filters, sorts or
+    # reindexes `parcels` -- it is never even reassigned here, only
+    # column-assigned -- and the caller does not touch it between its own
+    # capture and this call. Index equality is asserted rather than
+    # assumed; on failure, or when the caller passed no parcels_geometry
+    # at all, this falls back to the old reproject-back behavior rather
+    # than returning misaligned geometry.
+    # ------------------------------------------------------------------
+    if parcels_geometry is not None and parcels_geometry.index.equals(parcels.index):
+        parcels = parcels.copy()
+        parcels[parcels.geometry.name] = parcels_geometry
+        if parcels_crs is not None:
+            parcels = parcels.set_crs(parcels_crs, allow_override=True)
+        return parcels
+
+    if parcels_geometry is not None:
+        print("⚠️ Parcel index changed during processing — falling back to "
+              "reprojecting the output geometry.")
     return parcels.to_crs(parcels_crs)
 
 
@@ -2988,6 +3041,20 @@ def run_processing(app_root, overwrite_mode=None, resolved_table_name=None,
                 target_epsg = detect_prs92_zone([("Land Parcel", parcels), ("Road Network", road_gdf)])
                 parcels_crs = parcels.crs
 
+                # OUTPUT GEOMETRY -- capture the pristine, untransformed
+                # parcel geometry HERE, at the same point and for the same
+                # reason parcels_crs is captured just above: the
+                # reprojection two lines down rebinds `parcels` to a
+                # transformed copy, after which the untouched source is
+                # unreachable. Passed into process_parcels_fast() below as
+                # parcels_geometry, so the result it returns carries the
+                # original geometry rather than a round-tripped copy of
+                # it. .copy() keeps this independent of anything done to
+                # `parcels` later; it copies the Series container only,
+                # not the shapely geometries, which are immutable and
+                # shared either way.
+                parcels_geometry = parcels.geometry.copy()
+
                 q.put(("phase", "indeterminate", "Reprojecting parcel data...", None))
                 parcels = parcels.to_crs(epsg=target_epsg)
 
@@ -3064,6 +3131,7 @@ def run_processing(app_root, overwrite_mode=None, resolved_table_name=None,
                     prcl_elev_col=prcl_elev_col, road_elev_col=road_elev_col,
                     prcl_road_col=prcl_road_col, topo_lvl_col=topo_lvl_col,
                     progress=progress_cb,
+                    parcels_geometry=parcels_geometry,
                 )
 
                 if result is None:

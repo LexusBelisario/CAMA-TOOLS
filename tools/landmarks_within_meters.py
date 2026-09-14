@@ -1950,6 +1950,67 @@ def process_poi_counts_dynamic(gdf, poi_gdf, checked_categories, aerial_radius_m
           f"(aerial radius = {aerial_radius_m}m, road radius = {road_radius_m}m)...")
 
     original_crs = gdf.crs
+
+    # OUTPUT GEOMETRY -- capture the pristine, untransformed parcel
+    # geometry HERE, before the very next line rebinds `gdf` to a
+    # reprojected copy, after which the untouched source is unreachable.
+    #
+    # WHY: reprojecting forward and then back again is not lossless.
+    # Measured on influence_map_distance_to_land_parcel.py's real
+    # LandParcel data: a uniform ~4.5mm Hausdorff displacement on every
+    # one of 11,911 parcels, independent of geometry validity -- inherent
+    # floating-point precision loss in the transformation pair itself,
+    # visible to the developer at close zoom in both Global Mapper and
+    # QGIS. Attaching the computed columns to the pristine geometry does
+    # not shrink that error, it removes the cause: the returned geometry
+    # is then never subjected to any projection math at all.
+    #
+    # Note the magnitude here depends on the SOURCE CRS rather than on a
+    # working CRS chosen by this file: the hop is original -> 4326 ->
+    # original, so a source on a different datum (PRS92 / Luzon 1911,
+    # which is what this project's real parcel data uses) pays a full
+    # datum transformation in each direction, while a source already on
+    # WGS84 barely moves at all.
+    #
+    # .copy() rather than a bare reference: cheap (it copies the Series
+    # container, not the shapely geometries, which are immutable and
+    # shared either way) and makes this independent of anything the
+    # caller does with the GeoDataFrame it passed in.
+    #
+    # Used at BOTH return paths below -- the mid-loop cancel return and
+    # the normal completion -- via _restore_original_geometry().
+    original_geometry = gdf.geometry.copy()
+
+    def _restore_original_geometry(result_gdf):
+        """Attaches the pristine geometry captured above onto
+        result_gdf, in place of reprojecting its already-transformed
+        geometry a second time.
+
+        Defined locally, and deliberately NOT promoted to a shared
+        utils/ helper: this project's Rule-of-Three policy keeps each
+        tool's copy of this kind of machinery local (same policy that
+        governs the duplicated D-Cancel/atomic-write code across the
+        tools). It exists only because THIS file has two return paths
+        that both need it, so a local closure avoids duplicating the
+        same block twice within one function.
+
+        Row alignment: this function never drops, filters, sorts or
+        reindexes rows -- `gdf` is assigned only at the reprojection
+        above and at the two return paths, and per-parcel results are
+        written in place via gdf.at[idx, ...]. Asserted rather than
+        assumed; on failure it falls back to the old reproject-back
+        behavior rather than returning misaligned geometry.
+        """
+        if original_crs is None:
+            return result_gdf
+        if original_geometry.index.equals(result_gdf.index):
+            result_gdf = result_gdf.copy()
+            result_gdf[result_gdf.geometry.name] = original_geometry
+            return result_gdf.set_crs(original_crs, allow_override=True)
+        print("⚠️ Parcel index changed during processing — falling back to "
+              "reprojecting the output geometry.")
+        return result_gdf.to_crs(original_crs)
+
     gdf = gdf.to_crs(4326)
     poi_gdf = poi_gdf.to_crs(4326)
 
@@ -2107,13 +2168,12 @@ def process_poi_counts_dynamic(gdf, poi_gdf, checked_categories, aerial_radius_m
             )
             if should_continue is False:
                 print("⛔ Processing cancelled by user.")
-                if original_crs is not None:
-                    gdf = gdf.to_crs(original_crs)
-                return gdf
+                # Cancel returns a PARTIAL gdf here, not None -- unlike
+                # most other tools in this project. That contract is
+                # unchanged; only how its geometry is produced changes.
+                return _restore_original_geometry(gdf)
 
-    if original_crs is not None:
-        gdf = gdf.to_crs(original_crs)
-    return gdf
+    return _restore_original_geometry(gdf)
 
 
 # ========================================

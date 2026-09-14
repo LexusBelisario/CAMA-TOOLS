@@ -2242,12 +2242,49 @@ def run_processing(root, overwrite_mode=None, resolved_table_name=None, resolved
                     if b_gdf.crs is None:
                         raise RuntimeError("❌ Cannot write file: CRS is None")
 
-                    # 2️⃣ Restore the parcel layer's original CRS (captured
-                    # above, before the 3857 working-CRS reprojection). Falls
-                    # back to WGS84 only if the source itself had no CRS to
-                    # begin with -- there's nothing to "restore" in that case.
+                    # 2️⃣ Restore the parcel layer's original geometry AND CRS.
+                    #
+                    # This used to be `b_gdf = b_gdf.to_crs(original_crs)`:
+                    # take geometry that had ALREADY been transformed once
+                    # (b_gdf_raw -> 3857, above) and transform it a second
+                    # time, back again. That forward+inverse round trip is
+                    # not lossless -- measured on real LandParcel data as a
+                    # uniform ~4.5mm Hausdorff displacement on every parcel,
+                    # independent of geometry validity and of which working
+                    # CRS was used. Attaching the computed columns to the
+                    # pristine geometry removes the cause rather than
+                    # shrinking the error: b_gdf_raw is still in memory,
+                    # never reassigned after its single read above, and the
+                    # exported geometry is then never touched by projection
+                    # math at all.
+                    #
+                    # Row alignment: nothing between the capture and here
+                    # drops or reorders parcel rows. ensure_geometry_column()
+                    # only renames a column, and transfer_attributes()
+                    # returns the same frame with output columns assigned
+                    # onto it. Asserted rather than assumed, falling back to
+                    # the old round trip otherwise.
+                    #
+                    # NOTE the geometry column name is read from b_gdf, not
+                    # b_gdf_raw: ensure_geometry_column() may have renamed a
+                    # "geom" column to "geometry" on b_gdf, so the two frames
+                    # can legitimately disagree on the name while holding the
+                    # same rows.
+                    #
+                    # Falls back to WGS84 only if the source itself had no CRS
+                    # to begin with -- there's nothing to "restore" in that
+                    # case, and it is unreachable anyway since a CRS-less
+                    # source would already have failed the 3857 reprojection.
                     if original_crs is not None:
-                        b_gdf = b_gdf.to_crs(original_crs)
+                        if b_gdf_raw.index.equals(b_gdf.index):
+                            b_gdf = b_gdf.copy()
+                            b_gdf[b_gdf.geometry.name] = b_gdf_raw.geometry.values
+                            b_gdf = b_gdf.set_crs(original_crs, allow_override=True)
+                        else:
+                            print(f"⚠️ [{local_name}] Parcel index changed during "
+                                  f"processing — falling back to reprojecting the "
+                                  f"output geometry.")
+                            b_gdf = b_gdf.to_crs(original_crs)
                     else:
                         b_gdf = b_gdf.to_crs(epsg=4326)
                     print("🧭 CRS before save:", b_gdf.crs)
@@ -2298,9 +2335,21 @@ def run_processing(root, overwrite_mode=None, resolved_table_name=None, resolved
                     print(f"🗂️ Saving to DB: {target_table}")
 
                     # Same restoration as the local-file save path above --
-                    # b_gdf is still in the 3857 working CRS at this point.
+                    # b_gdf is still in the 3857 working CRS at this point,
+                    # and this branch is mutually exclusive with that one, so
+                    # exactly one of the two runs per source. See the local
+                    # path above for the full rationale on why the pristine
+                    # geometry is attached instead of round-tripping.
                     if original_crs is not None:
-                        b_gdf = b_gdf.to_crs(original_crs)
+                        if b_gdf_raw.index.equals(b_gdf.index):
+                            b_gdf = b_gdf.copy()
+                            b_gdf[b_gdf.geometry.name] = b_gdf_raw.geometry.values
+                            b_gdf = b_gdf.set_crs(original_crs, allow_override=True)
+                        else:
+                            print(f"⚠️ [{local_name}] Parcel index changed during "
+                                  f"processing — falling back to reprojecting the "
+                                  f"output geometry.")
+                            b_gdf = b_gdf.to_crs(original_crs)
                     else:
                         b_gdf = b_gdf.to_crs(epsg=4326)
 

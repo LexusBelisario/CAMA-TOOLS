@@ -1295,6 +1295,29 @@ def compute_ppr_and_lot_shape_gdf(gdf,
     # Save the original CRS
     original_crs = gdf.crs
 
+    # OUTPUT GEOMETRY -- capture the pristine, untransformed parcel
+    # geometry HERE, before either of the two lines below can rebind
+    # `gdf` (set_crs for a CRS-less source, to_crs for a geographic
+    # one). From that point on the untouched source is unreachable,
+    # and there would be nothing left to attach the output to.
+    #
+    # WHY: reprojecting forward and then back again is not lossless.
+    # Measured on influence_map_distance_to_land_parcel.py's real
+    # LandParcel data: a uniform ~4.5mm Hausdorff displacement on every
+    # one of 11,911 parcels, independent of geometry validity and of
+    # which projected CRS was chosen -- inherent floating-point
+    # precision loss in the transformation pair itself, visible to the
+    # developer at close zoom in both Global Mapper and QGIS. Attaching
+    # the computed columns to the pristine geometry does not shrink that
+    # error, it removes the cause: the exported geometry is then never
+    # subjected to any projection math at all.
+    #
+    # .copy() rather than a bare reference: cheap (it copies the Series
+    # container, not the shapely geometries, which are immutable and
+    # shared either way) and makes this independent of anything the
+    # caller does with the GeoDataFrame it passed in.
+    original_geometry = gdf.geometry.copy()
+
     # Ensure we work in projected CRS
     if gdf.crs is None:
         gdf = gdf.set_crs(epsg=4326, allow_override=True)
@@ -1427,9 +1450,38 @@ def compute_ppr_and_lot_shape_gdf(gdf,
         gdf.at[idx, vtx_count_col] = len(angles)
         gdf.at[idx, angs_txt_col] = ",".join(map(str, angles))
 
-    # ✅ Reproject back to original CRS before returning
+    # ------------------------------------------------------------------
+    # OUTPUT GEOMETRY -- pristine, never round-tripped. See the capture
+    # near the top of this function for the full rationale.
+    #
+    # This used to be `gdf = gdf.to_crs(original_crs)`: transform, a
+    # second time, geometry that had already been transformed once. Only
+    # the geometry column is swapped here; every computed column above
+    # (PP ratio, the four shape flags, lot shape, vertex count, angle
+    # text) is kept exactly as written.
+    #
+    # Row alignment: this function never drops, filters, sorts or
+    # reindexes rows. The classification loop mutates in place via
+    # gdf.at[idx, ...] using label-based indexing, and the geometry
+    # repair above is explicitly scoped to a local Series that is never
+    # written back into gdf's geometry column. Asserted rather than
+    # assumed, falling back to the old round trip otherwise.
+    #
+    # The `if original_crs:` guard is unchanged and still load-bearing:
+    # a source that arrived with NO CRS at all gets set_crs(4326) and is
+    # then projected to UTM above, and today's behavior deliberately
+    # leaves that output in the projected CRS rather than inventing an
+    # original to return to. There is likewise no meaningful pristine
+    # CRS to restore in that case, so that path stays exactly as it was.
+    # ------------------------------------------------------------------
     if original_crs:
-        gdf = gdf.to_crs(original_crs)
+        if original_geometry.index.equals(gdf.index):
+            gdf[gdf.geometry.name] = original_geometry
+            gdf = gdf.set_crs(original_crs, allow_override=True)
+        else:
+            print("⚠️ Parcel index changed during processing — falling back "
+                  "to reprojecting the output geometry.")
+            gdf = gdf.to_crs(original_crs)
 
     return gdf
 
