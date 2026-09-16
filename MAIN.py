@@ -3570,6 +3570,97 @@ def run_tool_by_label(label: str):
             messagebox.showerror("Tool Error", f"No module mapped for: {label}")
             return None
 
+        # Confirmed root cause (see this task's own history): every real
+        # tool's main(parent) returns almost immediately after building
+        # its config window -- it deliberately does NOT call its own
+        # mainloop() in dev mode, relying on THIS root's mainloop
+        # (already running) to keep pumping that window's events. That
+        # means run_in_thread()'s own lifetime (and _active_tool_titles'
+        # add/discard, which mirrors it) ends within a fraction of a
+        # second of the thread starting -- long before the user has
+        # closed the tool -- so neither is an accurate "is the tool
+        # still open" signal on its own. Confirmed via Phase 1 on this
+        # sub-problem, across all 11 tool files' actual source: each
+        # one's main(parent), in the parent-is-not-None branch, calls
+        # exactly one function (open_main_window(root)/(parent)), which
+        # itself creates exactly one Toplevel parented directly on root,
+        # unconditionally, synchronously, with no reuse/singleton guard
+        # -- so a before/after diff of root.winfo_children() taken
+        # immediately around that one call reliably finds the tool's
+        # real config window, with no exceptions found across the 11
+        # files (including two files that also create a second,
+        # persistent Toplevel each -- confirmed parented on the first
+        # Toplevel, not on root, so it never appears in this diff; and
+        # one file whose only other Toplevel(root)-parented site is a
+        # progress dialog confirmed only instantiated later, from its
+        # Run-button handler, never during this synchronous window).
+        #
+        # SECOND confirmed finding (this task's own later round): the
+        # config window is NOT the tool's whole lifetime. Traced every
+        # one of the 11 files' own on_run() (the Run-button handler):
+        # ALL 11, uniformly, call win.destroy() BEFORE handing off to a
+        # run_processing()/run_with_progress()-style function -- zero
+        # files ever withdraw() the config window instead. That handoff
+        # function then creates a SEPARATE progress window, parented
+        # directly on root/app_root (never on the now-destroyed config
+        # window) -- confirmed for all 11 (9 via a ProgressWindow class,
+        # 2 via a plain tk.Toplevel(root) + module-global pattern, same
+        # underlying shape). And tracing road_width.py's own terminal
+        # dispatch (structurally shared across the family) confirmed a
+        # THIRD window follows: the progress window is close()'d, then
+        # a success/cancelled/error dialog -- itself a fresh
+        # tk.Toplevel(parent) -- appears, on the very next line, no
+        # blocking call in between. So a tool's real lifetime is a
+        # CHAIN of sequential root-parented Toplevels (config -> destroy
+        # -> progress -> close -> terminal dialog -> dismissed), not a
+        # single window -- tracking only the first one (as an earlier
+        # version of this fix did) would report "finished" the instant
+        # Run Processing is clicked, before any real work happens: the
+        # same underlying class of bug this whole fix exists to solve,
+        # just surfacing at a later, different trigger.
+        #
+        # THE BOUND IS TICK-COUNT-BASED, NOT THREAD-LIVENESS-BASED:
+        # the ORIGINAL thread (t, below) that calls mod.main(root) has
+        # already finished by the time this chain even starts -- on_run()
+        # is a Tkinter <Button> command callback, dispatched on the MAIN
+        # thread whenever the user actually clicks Run (seconds or
+        # minutes later, or never), completely disconnected from t's own
+        # lifetime, which ended the moment mod.main(root) first returned.
+        # Any run_processing() background thread the tool itself spawns
+        # later is ALSO a different, unrelated thread. So "keep
+        # re-diffing until t ends" would stop re-diffing almost
+        # immediately -- wrong, confirmed by tracing the actual call
+        # relationship, not assumed. The real bound instead is
+        # _WINDOW_GAP_GRACE_TICKS consecutive poll ticks (see constant
+        # below) with NO tracked window and NO replacement found -- long
+        # enough to comfortably survive the one-line, same-callback gap
+        # between one window's close() and the next Toplevel() call
+        # (confirmed negligible, well under one tick, by reading the
+        # actual dispatch code), short enough to still resolve promptly
+        # on a genuine crash/no-more-windows case.
+        #
+        # This diff/re-diff happens on the SAME background thread that
+        # already calls mod.main(root) directly for the FIRST window
+        # (an existing, pre-existing Tkinter thread-safety hazard this
+        # task did not introduce and is not in scope to fix -- see
+        # Section C, no tool file is touched here) -- reading
+        # root.winfo_children() immediately before/after that
+        # already-unsafe call adds no NEW cross-thread hazard beyond
+        # what already existed. Every SUBSEQUENT re-diff (chasing the
+        # progress window, then the terminal dialog) happens entirely
+        # from WindowTrackingProcess.poll(), which only ever runs on the
+        # MAIN thread (it is called from core/tool_exclusivity.py's
+        # root.after()-scheduled poll loop) -- so those re-diffs carry
+        # no cross-thread risk at all, only the original first-window
+        # diff does, and that risk is unchanged from before.
+        _tool_window = [None]  # [value] slot: None until the FIRST
+                                # window is found by run_in_thread(), or
+                                # stays None forever if the tool crashed
+                                # before creating one. WindowTrackingProcess
+                                # takes over from here, re-diffing for
+                                # replacements as each tracked window
+                                # disappears.
+
         def run_in_thread():
             _active_tool_titles.add(label)
             try:
@@ -3582,7 +3673,21 @@ def run_tool_by_label(label: str):
                     import inspect
                     sig = inspect.signature(mod.main)
                     if sig.parameters:
+                        _before = set(root.winfo_children())
                         mod.main(root)   # tool accepts a parent root
+                        _after = set(root.winfo_children())
+                        _new_children = _after - _before
+                        if _new_children:
+                            # Exactly one is expected (confirmed above);
+                            # if a future tool ever creates more than
+                            # one, picking any single one still gives a
+                            # real, live signal (that window's own
+                            # close ends exclusivity, or triggers a
+                            # re-diff same as any other) rather than
+                            # none at all -- degrades gracefully instead
+                            # of silently reverting to the old, provably
+                            # wrong thread-liveness signal.
+                            _tool_window[0] = next(iter(_new_children))
                     else:
                         mod.main()       # fallback for tools not yet updated
             except Exception:
@@ -3605,6 +3710,14 @@ def run_tool_by_label(label: str):
         # this fix. This makes p.poll() is not None a reliable "tool
         # finished" signal in BOTH frozen and dev mode, with no mode-
         # specific branching needed in core/tool_exclusivity.py.
+        #
+        # _FakeProcess is kept EXACTLY as before and still appended to
+        # TOOL_PROCESSES -- is_relevant_window_focused()'s existing,
+        # already-confirmed-safe use of TOOL_PROCESSES is a different,
+        # coarser signal (thread-alive, for a pid-matching check that
+        # can never match a fake pid anyway) than what exclusivity needs
+        # (this specific tool's window CHAIN's lifetime), so it is left
+        # untouched rather than repurposed.
         class _FakeProcess:
             def __init__(self, thread):
                 self._thread = thread
@@ -3614,7 +3727,117 @@ def run_tool_by_label(label: str):
 
         fake = _FakeProcess(t)
         TOOL_PROCESSES.append(fake)
-        return fake
+
+        # Separate object, NOT appended to TOOL_PROCESSES, returned only
+        # to this call's own caller (on_button_click -> activate_tool)
+        # for the exclusivity-specific "is THIS tool's window CHAIN
+        # still going" signal.
+        #
+        # _WINDOW_GAP_GRACE_TICKS: consecutive poll()s (at
+        # core/tool_exclusivity.py's existing EXCLUSIVITY_POLL_MS == 300
+        # interval) allowed to find NEITHER a still-alive tracked window
+        # NOR a replacement before finally declaring the tool finished.
+        # 3 ticks == up to ~900ms -- comfortably longer than the
+        # confirmed-negligible single-callback gap between one window's
+        # close() and the next Toplevel() call, short enough to resolve
+        # promptly on a genuine crash/no-more-windows case. This is a
+        # tick-count bound, deliberately NOT tied to thread (t) liveness
+        # -- see the large comment above run_in_thread() for why thread
+        # liveness was confirmed the wrong signal for this specific
+        # purpose (t has always already finished by the time Run
+        # Processing could ever be clicked).
+        _WINDOW_GAP_GRACE_TICKS = 3
+
+        class WindowTrackingProcess:
+            def __init__(self, thread, window_slot):
+                self._thread = thread          # kept only for the
+                                                # crash-before-any-window
+                                                # fallback below; NOT used
+                                                # as a bound for the
+                                                # window-chain re-diffing.
+                self._window_slot = window_slot
+                # Seeded HERE, at construction time -- i.e. immediately
+                # after run_tool_by_label() returns, before the tool's
+                # OWN thread has necessarily even started, let alone
+                # created anything -- NOT lazily the first time the
+                # tracked window is found dead. Confirmed by testing
+                # (this task's own round) that seeding lazily is wrong:
+                # since window destruction and the next window's
+                # creation happen back-to-back in the SAME synchronous
+                # callback (e.g. on_run()'s win.destroy() immediately
+                # followed by creating the progress window), a snapshot
+                # taken only once the death is first noticed can already
+                # include that replacement, making it look "already
+                # known" instead of "new" -- causing a false "finished"
+                # after exactly _WINDOW_GAP_GRACE_TICKS ticks even though
+                # the replacement window is genuinely still open.
+                # Seeding here instead guarantees the baseline predates
+                # every window this tool will ever create.
+                self._known_children = set(root.winfo_children())
+                self._gap_ticks = 0             # consecutive ticks with
+                                                # no live window and no
+                                                # replacement found yet.
+                self.pid = -1
+
+            def poll(self):
+                win = self._window_slot[0]
+
+                if win is None:
+                    # First window not found yet (still starting up) --
+                    # fall back to thread liveness ONLY for this specific
+                    # case (crash-before-any-window-was-ever-created),
+                    # exactly as before. Once t ends with still no
+                    # window, the tool crashed before building anything
+                    # -- correctly finished, nothing to chase.
+                    return None if self._thread.is_alive() else 0
+
+                try:
+                    still_alive = win.winfo_exists()
+                except Exception:
+                    still_alive = False
+
+                if still_alive:
+                    self._gap_ticks = 0  # tracked window is fine; reset
+                    # Keep _known_children current even while the tracked
+                    # window is still alive, so that IF a re-diff is
+                    # needed later (this window dies), the baseline
+                    # reflects everything that already existed up to
+                    # THIS tick -- not some earlier, now-stale tick.
+                    self._known_children = set(root.winfo_children())
+                    return None
+
+                # The tracked window is gone -- it may have been
+                # destroyed as part of an ordinary handoff to the NEXT
+                # window in the chain (config -> progress -> terminal
+                # dialog) rather than the tool actually finishing.
+                # self._known_children was last updated on the most
+                # recent tick where win was confirmed alive (or at
+                # construction, if it died before ever being seen
+                # alive) -- i.e. a snapshot that predates whatever
+                # replaced it -- so a genuine replacement always shows
+                # up as a real diff here, never masked by its own
+                # creation timing.
+                current_children = set(root.winfo_children())
+                candidates = current_children - self._known_children
+                if candidates:
+                    self._window_slot[0] = next(iter(candidates))
+                    self._known_children = current_children
+                    self._gap_ticks = 0
+                    return None  # found the replacement -- still running
+
+                # No replacement yet -- this is either the brief,
+                # confirmed-negligible gap between one window closing and
+                # the next opening, or the tool has genuinely finished
+                # (no more windows coming). Give it a few ticks before
+                # deciding it is really over.
+                self._gap_ticks += 1
+                if self._gap_ticks >= _WINDOW_GAP_GRACE_TICKS:
+                    return 0
+                return None
+
+        return WindowTrackingProcess(t, _tool_window)
+
+
 
 def on_button_click(label):
     """Tool-grid button handler: increments popup_windows[label],
@@ -3625,14 +3848,17 @@ def on_button_click(label):
     full mechanism. popup_windows[label]'s own counting behavior is
     unchanged (track_popup_close(), the only code that would ever
     decrement it, is not currently called anywhere in this file -- this
-    change does not touch that)."""
+    change does not touch that). Also passes _active_tooltips through
+    so activate_tool() can withdraw any tooltip still visible at the
+    moment of activation -- fixes a confirmed stuck-tooltip regression
+    (see core/tool_exclusivity.py, STUCK TOOLTIP FIX)."""
     print(f"▶ Launching tool: {label}", flush=True)  # debug line
     if label in TOOL_MODULES:
         popup_windows[label] += 1
         proc = run_tool_by_label(label)
         if proc is not None:
             activate_tool(label, proc, canvas_refs, icon_img_ids, icons,
-                          grayscale_icons, hover_bg, root)
+                          grayscale_icons, hover_bg, root, _active_tooltips)
     else:
         messagebox.showerror("Unknown Tool", f"No module mapped for: {label}")
 

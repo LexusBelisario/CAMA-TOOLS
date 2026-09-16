@@ -18,10 +18,11 @@ PURPOSE:
     not a general-purpose shared utility other tool files import. This
     module does NOT import from MAIN.py -- every piece of MAIN.py
     state it needs (canvas references, icon images, the hover-highlight
-    image, the Tk root, the active tool's tracked process/fake-process)
-    is passed in explicitly by the caller, mirroring
-    window_management.py's should_repin_topmost(foreground_pid,
-    locked_gm_pid) pattern of pure arguments over implicit globals.
+    image, the Tk root, the active tool's tracked process/fake-process,
+    MAIN.py's own _active_tooltips set) is passed in explicitly by the
+    caller, mirroring window_management.py's
+    should_repin_topmost(foreground_pid, locked_gm_pid) pattern of pure
+    arguments over implicit globals.
     MAIN.py's own add_tooltip() and its button-construction loops are
     never modified by this module or its callers -- every behavior
     change described below happens entirely inside activate_tool()/
@@ -30,13 +31,19 @@ PURPOSE:
 
 MECHANISM:
     activate_tool(label, process, canvas_refs, icon_img_ids, icons,
-    grayscale_icons, hover_bg, root, on_finished) is the single entry
-    point MAIN.py's launcher boundary calls once a tool has just been
-    launched (frozen subprocess or dev-mode thread -- this module does
-    not care which; it only ever calls .poll() on whatever process-like
-    object it is given, matching the unified poll() contract MAIN.py's
-    own _FakeProcess fix establishes). It:
+    grayscale_icons, hover_bg, root, active_tooltips, on_finished) is
+    the single entry point MAIN.py's launcher boundary calls once a
+    tool has just been launched (frozen subprocess or dev-mode thread
+    -- this module does not care which; it only ever calls .poll() on
+    whatever process-like object it is given, matching the unified
+    poll() contract MAIN.py's own _FakeProcess fix establishes). It:
 
+    0. Withdraws and discards every tooltip currently in
+       active_tooltips (MAIN.py's own _active_tooltips set) -- see
+       STUCK TOOLTIP FIX below. Order relative to steps 1-4 does not
+       matter for correctness (withdrawing a Toplevel is independent
+       of what is bound to any canvas), so this runs first as the
+       simplest place to put an unconditional, one-time cleanup step.
     1. Records label as the sole active tool (_active_label[0]).
     2. For every OTHER tracked canvas (grayed-out): swaps its icon
        layer's image for the cached grayscale version, makes its
@@ -73,6 +80,52 @@ MECHANISM:
 
     build_grayscale_icons(icons) builds the grayscale cache described
     below, once, at startup.
+
+STUCK TOOLTIP FIX (confirmed regression, fixed this round):
+    Before this fix, activate_tool() fully overrode the ACTIVE icon's
+    <Leave> binding (step 3 above) without regard for whether
+    add_tooltip()'s own tooltip Toplevel happened to already be visible
+    at that exact moment -- an entirely ordinary sequence (hover long
+    enough for the tooltip to appear, then click while still hovering).
+    Since add_tooltip()'s leave() closure is the ONLY code that ever
+    calls tooltip.withdraw() for that specific tooltip instance, and
+    step 3 replaces that closure with a no-op, the tooltip was left
+    indefinitely visible -- confirmed via the developer's own
+    reproduction (a tool window open, its launching icon's tooltip
+    still stuck on screen, cleared only by an incidental OS-level
+    redraw such as alt-tab or a screenshot tool, never by this
+    module's own logic). Grayed-out icons were never affected: their
+    <Leave> binding is deliberately left untouched (see GRAYED-OUT
+    HOVER BEHAVIOR below), so add_tooltip()'s real leave() -- and its
+    tooltip.withdraw() call -- still fires normally for them.
+
+    THE FIX: rather than requiring a way to identify which specific
+    tooltip Toplevel belongs to the active canvas (add_tooltip() never
+    exposes that mapping outside its own closure), activate_tool() now
+    withdraws and discards EVERY tooltip in active_tooltips
+    unconditionally, as step 0. This is deliberately broader than
+    "just the active icon's own tooltip": by the time a tool is
+    actually launching, any tooltip still technically tracked as
+    visible belongs to a hover state that is now stale regardless of
+    which icon it was for, so clearing the whole set is simpler and
+    exactly as correct.
+
+    Withdraws AND discards, not withdraw-only: MAIN.py's own
+    add_tooltip() leave() closure and its existing CAMA-visibility-
+    change handler (~line 4719) both always pair
+    tooltip.withdraw() with _active_tooltips.discard(tooltip) --
+    confirmed by reading both call sites and _repin_active_tooltips()'s
+    own docstring, which states _active_tooltips "is expected to
+    contain only currently-visible tooltip(s)". Withdrawing without
+    discarding would leave a stale, invisible Toplevel in the set for
+    _repin_active_tooltips() to keep calling .lift()/-topmost on every
+    repin cycle -- confirmed empirically (in this sandbox) that doing
+    so does NOT make a withdrawn Toplevel visible again (lift() and
+    -topmost have no effect on a withdrawn window; only deiconify()
+    would), so this was never a visible-reappearance risk -- but it
+    would still violate that documented invariant and waste a repin
+    cycle's worth of calls on a window nobody can see. Discarding too
+    keeps the set consistent with what every other consumer expects.
 
 GRAYED-OUT HOVER BEHAVIOR (revised -- see module changelog at the
 bottom of this docstring for what changed and why):
@@ -241,17 +294,27 @@ writes these):
                                       <Leave> was overridden.
 
 CHANGELOG:
-    v2 (this version): grayed-out icons now keep their tooltip on hover
-    but no longer show the yellow background (previously they kept
-    BOTH, per the original GRAYED-OUT HOVER BEHAVIOR resolution, which
-    was explicitly flagged there as revisitable). Added a "no" cursor
-    on every tracked canvas while a tool is active. Active icon's own
-    behavior is unchanged. _saved_hover_bindings (a single (enter,
-    leave) tuple keyed by label, active-icon-only) was split into
+    v2: grayed-out icons now keep their tooltip on hover but no longer
+    show the yellow background (previously they kept BOTH, per the
+    original GRAYED-OUT HOVER BEHAVIOR resolution, which was explicitly
+    flagged there as revisitable). Added a "no" cursor on every tracked
+    canvas while a tool is active. Active icon's own behavior is
+    unchanged. _saved_hover_bindings (a single (enter, leave) tuple
+    keyed by label, active-icon-only) was split into
     _saved_enter_bindings (now populated for every canvas, since every
     canvas's <Enter> is now touched in some way) and
     _saved_leave_binding (still active-icon-only, since <Leave> is
     still only touched for that one canvas).
+
+    v3 (this version): fixed a confirmed regression where a tooltip
+    already visible at the moment a tool launches could be left stuck
+    on screen indefinitely (see STUCK TOOLTIP FIX above).
+    activate_tool() gained a new required parameter, active_tooltips
+    (MAIN.py's own _active_tooltips set, passed in by reference), and a
+    new step 0 that withdraws and discards every tooltip in it. No
+    other parameter's meaning changed; deactivate_all()'s signature is
+    unaffected (the fix is entirely in activate_tool(), since the
+    problem only ever occurs at activation time).
 
 WHY A DEDICATED POLL LOOP:
     MAIN.py already has monitor_gm_state(), a self-rescheduling
@@ -340,7 +403,8 @@ def build_grayscale_icons(icons_pil):
 # ACTIVATION
 # ============================================================
 def activate_tool(label, process, canvas_refs, icon_img_ids, icons,
-                   grayscale_icons, hover_bg, root, on_finished=None):
+                   grayscale_icons, hover_bg, root, active_tooltips,
+                   on_finished=None):
     """
     Marks label as the sole active tool and grays out/disables every
     other tracked icon, per the module docstring's MECHANISM section.
@@ -369,6 +433,12 @@ def activate_tool(label, process, canvas_refs, icon_img_ids, icons,
             to bg_img_id).
         root: the Tk root, for scheduling and later cancelling this
             module's poll loop.
+        active_tooltips: MAIN.py's own _active_tooltips set (passed by
+            reference, mutated in place) -- every tooltip Toplevel
+            currently tracked as visible is withdrawn and removed from
+            this set as the first step of activation, fixing a
+            confirmed stuck-tooltip regression (see module docstring,
+            STUCK TOOLTIP FIX).
         on_finished: optional zero-arg callback invoked once, after
             this module's own restore work completes, so MAIN.py can
             hook additional cleanup without this module needing to know
@@ -390,6 +460,22 @@ def activate_tool(label, process, canvas_refs, icon_img_ids, icons,
             f"activate_tool({label!r}) called while {_active_label[0]!r} "
             "is still active — mutual exclusivity invariant violated."
         )
+
+    # Step 0 -- see module docstring, STUCK TOOLTIP FIX. Unconditional:
+    # withdrawing an already-withdrawn Toplevel is a safe no-op, so
+    # there is no need to check visibility first. Withdraws AND
+    # discards together (matching every existing consumer's own
+    # pairing of the two calls) so active_tooltips stays consistent
+    # with _repin_active_tooltips()'s documented invariant that it
+    # holds only currently-visible tooltips.
+    for _tip in list(active_tooltips):
+        try:
+            _tip.withdraw()
+        except Exception:
+            # Already destroyed at the Tcl level -- nothing left to
+            # withdraw, just make sure it's dropped from the set below.
+            pass
+        active_tooltips.discard(_tip)
 
     _active_label[0] = label
 
