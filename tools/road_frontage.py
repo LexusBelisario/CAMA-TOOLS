@@ -1442,13 +1442,32 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
     vector rotated 90 degrees. Two probe rays of length max_depth are
     cast from the midpoint in both directions along that perpendicular;
     whichever ray's intersection with the parcel polygon is longer is
-    kept, and that intersection length is the depth value. If
-    frontage_total is 0 (no frontage segment found), depth falls back
-    to 0.0 directly in this inline block -- there is currently no
-    centroid-to-road fallback measure wired into the live path. NONE of
-    this measurement logic is touched by this task -- only the QA-only
-    scaffolding that used to sit alongside it (see below) and the new
-    Cancel checkpoints (see the "D-Cancel" paragraph below) are new.
+    kept, and that intersection length is the depth value.
+
+    INNER LOT (no road frontage): depth and depth-to-width ratio are
+    both written as a flat 0.0 -- a deliberate placeholder, not a
+    measurement -- rather than any computed proxy distance. This
+    applies identically at the two places a parcel can be determined
+    to have no frontage: the general case (frontage_total == 0 after
+    the main per-parcel measurement below finds no covered frontage
+    segment at all), and the Automatic-mode short-circuit where an
+    externally-provided Road Classification source (lot_location.py's
+    own Inner/Road/Corner Lot output, consumed here via skip_arr) has
+    already marked a parcel Inner Lot, skipping the boundary/edge-
+    adjacency measurement entirely as a performance optimization. An
+    earlier version of this code computed geom.centroid.distance(
+    road_union) as a depth substitute in both places instead -- removed,
+    not just left unused, since 0.0 needs no distance computed at all.
+    Rationale: the Mass Appraisal Guidebook instructs recording "Nil"
+    for no-frontage properties specifically because a nil frontage has
+    a serious influence on value on its own (p.298/337); its Table 7
+    (p.97) and sample SMV ordinance (p.375) both handle Interior Lot as
+    its own separate valuation adjustment/classification, never as a
+    computed depth substitute. NONE of the frontage/depth measurement
+    logic for parcels that DO have frontage is touched by this task --
+    only the QA-only scaffolding that used to sit alongside it (see
+    below) and the new Cancel checkpoints (see the "D-Cancel" paragraph
+    below) are new.
 
     QA/VM removal (this task): the previously-computed buffer-diagnostic
     and Visual Measurement (frontage_lines) QA layers, and the
@@ -1695,21 +1714,17 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
 
         # --- Road Classification: Inner Lot skip (Automatic mode only) ---
         # Bypasses the entire boundary/edge-adjacency measurement for rows
-        # the classification source has already marked Inner Lot. Lands in
-        # exactly the same depth fallback (centroid-to-road distance) that
-        # a parcel with genuinely zero frontage already receives, just
-        # without spending time running _edge_covered_portion() over its
-        # boundary first. Marked "resolved" -- has no covered_pieces of
-        # its own, so it does not participate in Pass 2's cross-parcel
-        # comparison at all.
+        # the classification source has already marked Inner Lot. Depth
+        # and depth-to-width ratio are not meaningful without a frontage
+        # to measure from or divide by -- 0.0 is a deliberate placeholder,
+        # not a measurement (see process_frontage_single()'s own docstring
+        # for the Mass Appraisal Guidebook basis). Marked "resolved" --
+        # has no covered_pieces of its own, so it does not participate in
+        # Pass 2's cross-parcel comparison at all.
         if skip_arr is not None and skip_arr[i - 1]:
-            try:
-                depth_val = geom.centroid.distance(road_union)
-            except Exception:
-                depth_val = 0.0
             _parcel_states.append({
                 "geom": geom, "covered_pieces": [],
-                "resolved": (0.0, depth_val, depth_val),
+                "resolved": (0.0, 0.0, 0.0),
             })
             continue
 
@@ -2057,13 +2072,15 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
 
             dwr_val = round(depth_val / frontage_total, 2) if frontage_total else 0.0
         else:
-            # Inner lot fallback: no road frontage — store centroid-to-road
-            # distance as depth so the attribute is still meaningful.
-            try:
-                depth_val = geom.centroid.distance(road_union)
-            except Exception:
-                depth_val = 0.0
-            dwr_val = depth_val
+            # Inner lot: no road frontage. Depth and depth-to-width ratio
+            # are not meaningful without a frontage to measure from or
+            # divide by -- 0.0 is a deliberate placeholder, not a
+            # measurement. See this function's own docstring (INNER LOT
+            # paragraph) for the Mass Appraisal Guidebook rationale and
+            # the other call site (skip_arr, above) that applies the
+            # same fix.
+            depth_val = 0.0
+            dwr_val = 0.0
 
         depths.append(depth_val)
         dwrs.append(dwr_val)
