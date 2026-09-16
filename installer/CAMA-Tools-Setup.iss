@@ -6,14 +6,20 @@
 ; -------------------------------------------------------------
 ; SECTION: App Info
 ; -------------------------------------------------------------
-#define MyAppName "CAMA-Tools"
+#define MyAppName "CAMA Tools for Global Mapper"
 #define MyAppVersion "1.0.0"
 #define MyAppPublisher "CAMA-Tools"
 #define MyAppExeName "CAMA-Tools.exe"
 
-; Change this to the actual folder where dist\CAMA-Tools.exe lives
-; Example: E:\Work\CAMA-TOOLS\dist
-#define SourceDistFolder "C:\IGEOSYS\CAMA-TOOLS\dist"
+; Folder where the built CAMA-Tools.exe lives.
+; Resolved relative to this .iss file's location, so no machine-specific path is hardcoded.
+; Expected layout: <this .iss file's folder>\..\dist\CAMA-Tools.exe
+#define SourceDistFolder SourcePath + "..\dist"
+
+; Folder containing the wizard images (wizard_sidebar.bmp, wizard_header.bmp).
+; Resolved relative to this .iss file's location, so no machine-specific path is hardcoded.
+; Expected layout: <this .iss file's folder>\resources\wizard_sidebar.bmp / wizard_header.bmp
+#define ResourcesFolder SourcePath + "resources"
 
 ; -------------------------------------------------------------
 ; SECTION: Setup Configuration
@@ -33,6 +39,14 @@ SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=admin
 ArchitecturesInstallIn64BitMode=x64compatible
+
+; Wizard sidebar image (large, left side of wizard pages) and header image (small, top-right).
+; Both are .bmp files pulled from the resources folder defined above.
+WizardImageFile={#ResourcesFolder}\wizard_sidebar.bmp
+WizardSmallImageFile={#ResourcesFolder}\wizard_header.bmp
+
+; Title bar / taskbar icon for the setup window and uninstaller.
+SetupIconFile={#ResourcesFolder}\installer.ico
 
 ; -------------------------------------------------------------
 ; SECTION: Languages
