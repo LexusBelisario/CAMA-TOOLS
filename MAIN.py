@@ -3515,6 +3515,217 @@ def track_popup_close(popup, label):
     popup.protocol("WM_DELETE_WINDOW", on_close)
 
 # Launcher: re-run this same EXE with --tool "<LABEL>"
+
+# ============================================================
+# FROZEN-MODE WINDOW-CHAIN TRACKING (confirmed root cause and fix,
+# this task's own history)
+#
+# CONFIRMED ROOT CAUSE: a PyInstaller onefile build re-invoking ITSELF
+# via subprocess.Popen([sys.executable, ...]) -- exactly what
+# run_tool_by_label()'s frozen branch does below -- is a documented
+# PyInstaller pattern (see e.g. github.com/pyinstaller/pyinstaller
+# issue #9016, "Dangling process after bundling application with
+# --onefile option and running it as a child process") where the
+# Popen object returned does not reliably track the actual GUI-owning
+# process's lifetime, AND the resulting process(es) can remain in
+# Task Manager indefinitely after the tool's window is closed --
+# confirmed directly by the developer (Task Manager > Details still
+# showed a lingering "CAMA-Tools.exe" entry after closing both the
+# tool window AND Global Mapper itself). This is a genuinely different
+# failure than the dev-mode one this task fixed earlier (thread
+# liveness =/= window liveness): here, the underlying OS process
+# itself does not reliably exit, not just a misleading signal about
+# an already-finished one.
+#
+# THE FIX has two parts, mirroring the dev-mode WindowTrackingProcess
+# design (chained re-diffing across a config -> progress -> terminal
+# dialog window sequence, confirmed to be every tool's real shape --
+# see that class's own comments) but adapted for a genuinely SEPARATE
+# process rather than a shared Tkinter root:
+#   1. Track the FULL PROCESS TREE rooted at the subprocess.Popen
+#      PID, not just that one PID -- confirmed necessary because a
+#      PyInstaller onefile launch is itself a 2-process split (an
+#      outer bootloader wrapper + an inner Python interpreter), and
+#      the tool's actual window(s) may belong to either one depending
+#      on PyInstaller version/config; scoping the check to only the
+#      outer PID would miss windows owned by the inner process.
+#   2. Once the poll loop determines (via the tree-wide window check,
+#      not just Popen.poll()) that the tool has genuinely finished,
+#      FORCE-TERMINATE the underlying process if it hasn't already
+#      exited on its own -- rather than trusting the OS/PyInstaller
+#      bootloader to clean it up unprompted, which is exactly the
+#      confirmed bug. This is what actually stops the lingering
+#      Task Manager entry; the window-tracking above is what tells us
+#      WHEN it's safe to do so.
+# ============================================================
+
+# Toolhelp32 (kernel32) bindings -- process-tree enumeration. Not
+# already present anywhere else in this file or in
+# core/window_management.py (that module explicitly keeps its own
+# Win32 bindings separate from MAIN.py's -- see its LOW-LEVEL WIN32
+# HELPERS section comment), so declared fresh here, following the same
+# ctypes.windll.<dll>.<Func> calling convention this file already uses
+# throughout (get_hwnd_by_title(), get_foreground_pid(), etc.) rather
+# than the ctypes.WinDLL object-oriented style window_management.py
+# uses -- consistency with THIS file's own existing convention, since
+# this is new code being added to MAIN.py, not to that module.
+_TH32CS_SNAPPROCESS = 0x00000002
+_MAX_PATH = 260
+_PROCESS_TERMINATE = 0x0001  # PROCESS_TERMINATE access right -- required
+                              # to call TerminateProcess() on a handle
+                              # opened via OpenProcess(); confirmed
+                              # against Microsoft's own Process Security
+                              # and Access Rights documentation.
+
+
+class _PROCESSENTRY32W(ctypes.Structure):
+    """Mirrors the real Win32 PROCESSENTRY32W struct exactly (field
+    names, order, and types) -- verified against Microsoft's own
+    tlhelp32.h documentation. dwSize MUST be set to sizeof(this struct)
+    by the caller before the first Process32FirstW call, or that call
+    fails outright (documented Win32 requirement, not optional)."""
+    _fields_ = [
+        ("dwSize", ctypes.wintypes.DWORD),
+        ("cntUsage", ctypes.wintypes.DWORD),
+        ("th32ProcessID", ctypes.wintypes.DWORD),
+        ("th32DefaultHeapID", ctypes.POINTER(ctypes.wintypes.ULONG)),
+        ("th32ModuleID", ctypes.wintypes.DWORD),
+        ("cntThreads", ctypes.wintypes.DWORD),
+        ("th32ParentProcessID", ctypes.wintypes.DWORD),
+        ("pcPriClassBase", ctypes.wintypes.LONG),
+        ("dwFlags", ctypes.wintypes.DWORD),
+        ("szExeFile", ctypes.c_wchar * _MAX_PATH),
+    ]
+
+
+def _get_descendant_pids(root_pid):
+    """
+    Returns a set containing root_pid and every one of its descendant
+    process IDs (children, grandchildren, etc.), via a single
+    CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS) pass and a BFS over
+    th32ParentProcessID -- confirmed by isolated testing (this task's
+    own verification) to correctly walk an arbitrary-depth chain, to
+    exclude unrelated sibling processes, and to degrade to {root_pid}
+    alone (no crash) if root_pid isn't found in the snapshot at all
+    (e.g. it already exited).
+
+    Not scoped to depth 2 specifically (even though the confirmed real
+    shape is a 2-level bootloader/inner split) -- the BFS keeps
+    expanding until a full pass finds nothing new, so it also covers
+    any deeper split a future PyInstaller version might introduce.
+
+    Best-effort: returns {root_pid} alone (not an empty set -- the
+    caller always at least has the pid it started with) on any Win32
+    failure, never raises.
+    """
+    known = {root_pid}
+    try:
+        snapshot = ctypes.windll.kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
+        if snapshot == -1 or not snapshot:
+            return known
+
+        try:
+            entry = _PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+            all_procs = []  # (pid, parent_pid) pairs from the snapshot
+            if ctypes.windll.kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+                while True:
+                    all_procs.append((entry.th32ProcessID, entry.th32ParentProcessID))
+                    if not ctypes.windll.kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                        break
+
+            changed = True
+            while changed:
+                changed = False
+                for pid, ppid in all_procs:
+                    if ppid in known and pid not in known:
+                        known.add(pid)
+                        changed = True
+        finally:
+            ctypes.windll.kernel32.CloseHandle(snapshot)
+    except Exception:
+        pass
+    return known
+
+
+def _get_pids_visible_windows(pids):
+    """
+    Returns the set of HWNDs, among every current top-level window
+    (via a raw EnumWindows scan, same pattern as this file's own
+    get_hwnd_by_title()), owned by any PID in `pids`, AND for which
+    IsWindowVisible() reports True.
+
+    CONFIRMED ROOT CAUSE of a real "grid stays disabled forever" bug
+    (this file's own history -- see the two-round diagnostic
+    instrumentation test and its log analysis): EnumWindows enumerates
+    every top-level window system-wide, including windows a process
+    creates for its own internal, never-user-facing purposes. A single
+    --tool subprocess running exactly one visible config window was
+    confirmed, via that diagnostic's captured GetClassNameW/
+    GetWindowTextW/IsWindowVisible data, to ALSO own 6 further hidden
+    windows for the ~30+ seconds observed after the real config window
+    was confirmed destroyed:
+      - Several blank-titled ("tk") TkTopLevel windows -- from a
+        second, separate tk.Tk() instance dispatch_tool_if_requested()
+        creates and never destroys (used only for one-off icon
+        application before the tool's own real root is created).
+      - "MSCTFIME UI" and "IME" (title "Default IME") -- Windows Text
+        Services Framework windows, created automatically for any
+        process with text-input-capable widgets (e.g. Tkinter Entry).
+      - "TtkMonitorClass" (title "TtkMonitorWindow") -- an internal
+        window ttk's own theming engine uses to detect Windows display/
+        theme-change events.
+      - "MenuWindowClass" / "EmbeddedMenuWindowClass" -- confirmed to
+        appear as a side effect of the system close-button gesture
+        itself (present only in the scan taken right after closing the
+        window, absent before), not tied to the tool's own UI at all.
+    None of these are ever visible to the user, and IsWindowVisible()
+    reports False for every one of them (confirmed in the same
+    diagnostic capture) -- but without a visibility filter, finding
+    ANY of them was enough for poll() to keep reporting "still
+    running" indefinitely, even with the real window long gone.
+
+    This intentionally reverses this function's own earlier
+    documented reasoning (borrowed from a DIFFERENT function,
+    core/window_management.py's snapshot_gm_hwnds(), which is safe
+    without an IsWindowVisible() filter only because it ALSO filters
+    by a specific known window title -- a narrowing this generic,
+    PID-only function never had). Minimized windows are NOT excluded
+    by this change: IsWindowVisible() reports True for a minimized
+    window (it still carries the WS_VISIBLE style; minimized is a
+    separate show-state), so a user who minimizes a tool's config
+    window instead of closing it is still correctly treated as "tool
+    still running" -- only genuinely hidden/message-only windows are
+    now excluded.
+    """
+    found = set()
+    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+    def _cb(hwnd, _):
+        pid = ctypes.wintypes.DWORD()
+        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value in pids:
+            try:
+                is_visible = bool(ctypes.windll.user32.IsWindowVisible(hwnd))
+            except Exception:
+                # Can't determine visibility -- err on the side of
+                # treating it as still running rather than risking an
+                # early false-finished report on an unexpected Win32
+                # failure; matches this function's existing best-effort,
+                # never-raise posture (the EnumWindows call itself is
+                # already wrapped the same way, below).
+                is_visible = True
+            if is_visible:
+                found.add(hwnd)
+        return True
+
+    try:
+        ctypes.windll.user32.EnumWindows(WNDENUMPROC(_cb), 0)
+    except Exception:
+        pass
+    return found
+
+
 def run_tool_by_label(label: str):
     """
     Launches the tool named by label as a subprocess: re-invokes this
@@ -3562,7 +3773,196 @@ def run_tool_by_label(label: str):
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
         )
         TOOL_PROCESSES.append(p)
-        return p
+
+        # Separate object, NOT the same as what's appended to
+        # TOOL_PROCESSES above -- p itself is left completely
+        # unmodified there for is_relevant_window_focused()'s existing,
+        # unrelated pid-matching use (same separation already
+        # established for dev mode's _FakeProcess vs. the
+        # WindowTrackingProcess actually returned to the caller).
+        #
+        # _WINDOW_GAP_GRACE_TICKS: same value and meaning as dev mode's
+        # constant of the same name -- consecutive poll()s (at
+        # core/tool_exclusivity.py's EXCLUSIVITY_POLL_MS == 300ms
+        # interval) allowed to find NO window anywhere in the process
+        # tree, once at least one window has genuinely been seen
+        # before, before declaring the tool finished. Covers the brief
+        # gap between one window in the chain closing and the next
+        # opening (config -> progress -> terminal dialog), same
+        # reasoning as dev mode.
+        #
+        # _WINDOW_STARTUP_GRACE_TICKS: a SEPARATE, more generous
+        # allowance for the case where NO window has EVER been seen
+        # yet -- i.e. the subprocess is still starting up. Confirmed
+        # with the developer that real observed startup (click to
+        # first visible window) is fast, well under 1 second -- but
+        # this is still genuine OS-level process-spawn overhead (a
+        # fresh interpreter start, not a same-process thread start like
+        # dev mode's near-instant case), so a slightly longer, distinct
+        # allowance is used here rather than reusing the gap-tick
+        # threshold: 5 ticks == up to ~1.5s, comfortably covering the
+        # confirmed <1s real startup with margin, while still resolving
+        # a genuine startup crash reasonably promptly.
+        _WINDOW_GAP_GRACE_TICKS = 3
+        _WINDOW_STARTUP_GRACE_TICKS = 5
+
+        class FrozenToolProcess:
+            def __init__(self, popen):
+                self._popen = popen
+                self.pid = popen.pid
+                self._known_hwnds = set()
+                self._ever_seen_window = False
+                self._gap_ticks = 0
+                self._startup_ticks = 0
+
+            def poll(self):
+                # NOTE: deliberately does NOT check self._popen.poll()
+                # here as a shortcut before the tree-wide window check.
+                # An earlier version of this method did (a "fast path":
+                # trust self._popen.poll() immediately if it reports
+                # exited) -- confirmed, via the developer's own Task
+                # Manager evidence after an on-machine test, to be the
+                # actual bug: the outer bootloader wrapper (the PID
+                # self._popen tracks) can report itself finished while
+                # the REAL, still-running tool process elsewhere in the
+                # same tree (confirmed by memory-size differences
+                # between the several CAMA-Tools.exe entries the
+                # developer observed) still has a visible window open.
+                # The fast path returned "finished" the instant
+                # self._popen.poll() went non-None, without ever
+                # reaching the tree-wide check below that would have
+                # caught this -- exactly the class of bug this whole
+                # mechanism exists to prevent, just moved one level
+                # up. Window-tracking (the tree-wide check below) is
+                # now the SOLE basis for the running/finished decision;
+                # self._popen.poll() is consulted only inside
+                # _finish(), see there for why that use is safe (it's
+                # a "do we still need to call kill()" question, not a
+                # decision about whether the tool is done).
+                tree_pids = _get_descendant_pids(self._popen.pid)
+                current_hwnds = _get_pids_visible_windows(tree_pids)
+
+                if current_hwnds:
+                    # Something in the tree (outer wrapper or inner
+                    # process, whichever actually owns the window --
+                    # this check doesn't need to know which) still has
+                    # a visible window -- still running. Reset both
+                    # grace counters and remember this snapshot.
+                    #
+                    # No diffing against a "known children" baseline is
+                    # needed here (unlike dev mode's WindowTrackingProcess,
+                    # which diffs root.winfo_children() because that ONE
+                    # shared Tkinter root also owns the launcher's own
+                    # windows and any other tool's windows across the
+                    # app's lifetime) -- this process tree is rooted at
+                    # THIS specific --tool subprocess.Popen call and
+                    # nothing else, freshly spawned for this one launch,
+                    # so there is no "sibling" window to accidentally
+                    # count: ANY window anywhere in this tree can only
+                    # belong to this one tool.
+                    self._known_hwnds = current_hwnds
+                    self._ever_seen_window = True
+                    self._gap_ticks = 0
+                    self._startup_ticks = 0
+                    return None
+
+                if not self._ever_seen_window:
+                    # No window has EVER been seen yet -- still in the
+                    # startup window, or a genuine crash before showing
+                    # anything. Use the more generous startup allowance.
+                    self._startup_ticks += 1
+                    if self._startup_ticks >= _WINDOW_STARTUP_GRACE_TICKS:
+                        return self._finish()
+                    return None
+
+                # At least one window was seen before, but none exist
+                # right now -- either the brief chain-transition gap
+                # (config -> progress -> terminal dialog) or genuine
+                # completion. Same grace-tick bound as dev mode.
+                self._gap_ticks += 1
+                if self._gap_ticks >= _WINDOW_GAP_GRACE_TICKS:
+                    return self._finish()
+                return None
+
+            def _finish(self):
+                # Genuinely declared finished -- but per the confirmed
+                # PyInstaller onefile dangling-process bug, the
+                # underlying OS process(es) may not have actually
+                # exited even though no window remains. Force-terminate
+                # rather than trust the OS/bootloader to clean up
+                # unprompted, which is exactly what was observed NOT
+                # happening (a lingering Task Manager entry even after
+                # the tool window AND Global Mapper were both closed).
+                #
+                # Kill EVERY pid still in this tool's process tree, not
+                # just self._popen -- confirmed this matters: Popen.kill()
+                # (== TerminateProcess() on Windows) only ever affects
+                # the one PID it's called on, it does not cascade to
+                # child/descendant processes on its own (no Job Object
+                # with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE is set up
+                # anywhere in this code -- that's the actual Windows
+                # mechanism that would make a single kill() cascade; and
+                # CREATE_NEW_PROCESS_GROUP at the original Popen(...)
+                # call site affects CTRL_BREAK_EVENT signal delivery
+                # grouping, not process-tree termination, so it doesn't
+                # help here either). If the confirmed PyInstaller
+                # onefile split has already let the outer wrapper exit
+                # on its own -- the common case per the developer's own
+                # Task Manager evidence, and the entire reason this
+                # mechanism exists -- self._popen.poll() is already
+                # non-None by the time _finish() runs, so a bare
+                # self._popen.kill() call would silently do nothing
+                # (skipped by "if still alive" logic, or a no-op/error
+                # on an already-dead pid) while the actual lingering
+                # process, elsewhere in the tree, is never touched.
+                #
+                # Re-fetching _get_descendant_pids(self._popen.pid) HERE
+                # (rather than reusing self._known_hwnds' pids from the
+                # last poll()) is deliberate: the tree may have changed
+                # shape in the ~300ms since that last tick, and this is
+                # the last chance to catch anything still alive before
+                # this tool is reported finished.
+                #
+                # self._popen.kill() is no longer called separately --
+                # if self._popen's own pid is still alive, it's already
+                # included in _get_descendant_pids(self._popen.pid)
+                # (that function always returns at least {root_pid}), so
+                # the loop below covers it too; a separate explicit call
+                # would be redundant.
+                for _pid in _get_descendant_pids(self._popen.pid):
+                    try:
+                        _handle = ctypes.windll.kernel32.OpenProcess(
+                            _PROCESS_TERMINATE, False, _pid
+                        )
+                        # OpenProcess() on a pid that no longer exists
+                        # returns a NULL/falsy handle rather than raising
+                        # (confirmed against documented Win32 behavior)
+                        # -- the "if _handle:" guard below is the actual
+                        # handling for that case, not a hope that it
+                        # never happens. A pid that dies in the narrow
+                        # window between this OpenProcess() call and the
+                        # TerminateProcess() call below makes
+                        # TerminateProcess() itself fail (documented:
+                        # ERROR_ACCESS_DENIED on an already-terminated
+                        # process) -- a return-value failure, not an
+                        # exception, so no special handling is needed
+                        # for that race beyond what's already here.
+                        if _handle:
+                            try:
+                                ctypes.windll.kernel32.TerminateProcess(_handle, 1)
+                            finally:
+                                ctypes.windll.kernel32.CloseHandle(_handle)
+                    except Exception:
+                        # Per-pid, not wrapping the whole loop -- one
+                        # pid's failure (already exited, access denied,
+                        # whatever else) must not stop the rest of the
+                        # tree from being attempted.
+                        pass
+
+                _rc = self._popen.poll()
+                return _rc if _rc is not None else -1
+
+        return FrozenToolProcess(p)
     else:
         # ── Dev / VS Code: import and run the tool on a thread ──
         mod_path = TOOL_MODULES.get(label)
