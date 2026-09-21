@@ -1,7 +1,7 @@
 @echo off
 :: =============================================================
-:: build.bat  —  CAMA-Tools EXE builder
-:: Place this file in the SAME folder as MAIN.py + CAMA-Tools.spec
+:: build.bat  —  Land Valuation Tools EXE builder
+:: Place this file in the SAME folder as MAIN.py + Land Valuation Tools.spec
 :: Double-click OR run from cmd inside that folder.
 :: =============================================================
 
@@ -17,10 +17,10 @@ if not exist "MAIN.py" (
     exit /b 1
 )
 
-if not exist "CAMA-Tools.spec" (
+if not exist "Land Valuation Tools.spec" (
     echo.
-    echo  ERROR: CAMA-Tools.spec not found in this folder.
-    echo  Please copy CAMA-Tools.spec here alongside MAIN.py.
+    echo  ERROR: Land Valuation Tools.spec not found in this folder.
+    echo  Please copy Land Valuation Tools.spec here alongside MAIN.py.
     echo.
     pause
     exit /b 1
@@ -36,8 +36,8 @@ if not exist "utils_paths.py" (
 
 :: ── 2. Kill any running instance + clean build artifacts ───────
 echo.
-echo  [1/4] Killing any running CAMA-Tools instance...
-taskkill /f /im "CAMA-Tools.exe" >nul 2>&1
+echo  [1/4] Killing any running Land Valuation Tools instance...
+taskkill /f /im "Land Valuation Tools.exe" >nul 2>&1
 timeout /t 2 /nobreak >nul
 
 echo  Cleaning previous build...
@@ -52,7 +52,7 @@ echo  [2/4] Running PyInstaller...
 echo  (this may take several minutes on first run)
 echo.
 
-pyinstaller CAMA-Tools.spec --clean --noconfirm
+pyinstaller "Land Valuation Tools.spec" --clean --noconfirm
 
 if errorlevel 1 (
     echo.
@@ -63,7 +63,7 @@ if errorlevel 1 (
     echo  Common fixes:
     echo   - Run:  pip install pyinstaller  (if not installed)
     echo   - If a package is missing, install it then rebuild
-    echo   - If UPX errors appear, open CAMA-Tools.spec and
+    echo   - If UPX errors appear, open "Land Valuation Tools.spec" and
     echo     set  upx=False
     echo.
     pause
@@ -91,12 +91,12 @@ if exist "gm_exe_path.json" (
 echo.
 echo  [4/4] Build complete!
 echo.
-echo  Output:  dist\CAMA-Tools.exe
+echo  Output:  dist\Land Valuation Tools.exe
 echo.
 echo  -------------------------------------------------------
 echo  DEPLOYMENT — copy these to the target machine (same folder):
 echo.
-echo    dist\CAMA-Tools.exe        <- the application
+echo    dist\Land Valuation Tools.exe        <- the application
 echo    pg_credentials.json        <- DB connection config
 echo.
 echo  On first run on a new machine the app will ask the user
