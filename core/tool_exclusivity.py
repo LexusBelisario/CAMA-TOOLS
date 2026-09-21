@@ -12,6 +12,19 @@ PURPOSE:
     identically, there is no "stay locked" state), every icon is
     restored together.
 
+    A second, narrower entry point -- activate_manual() (see MECHANISM
+    below) -- engages this same "something is busy" grid-graying state
+    for a caller-managed busy period that has no subprocess to poll at
+    all (currently: the Configure Database dialog being open). Unlike
+    activate_tool(), it grays out EVERY tracked icon, including what
+    would otherwise be "the active one," since a Configure Database
+    session has no tool icon of its own to leave in color. The two
+    entry points share the same re-entrancy invariant (only one of
+    activate_tool()/activate_manual() may be engaged at a time) and the
+    same restore path (deactivate_all()) -- see MECHANISM and MUTABLE
+    STATE below for how this is implemented without duplicating the
+    per-canvas swap logic.
+
     Same architectural role as core/window_management.py (see that
     module's own docstring for the precedent this follows): a focused,
     self-contained module the MAIN.py launcher boundary calls into,
@@ -72,6 +85,35 @@ MECHANISM:
        The moment poll() returns non-None, the tool is treated as
        finished -- regardless of exit code or how its window closed --
        and deactivate_all() runs automatically.
+
+    Steps 0-3 above (reentrancy check, tooltip withdrawal, recording
+    the "active" identity, the per-canvas swap loop) are implemented in
+    a private helper, _activate_common(active_marker, canvas_refs,
+    icon_img_ids, icons, grayscale_icons, hover_bg, root,
+    active_tooltips), which activate_tool() calls with active_marker=
+    label -- the per-canvas loop's own "is this the active one?" check
+    (originally `if lbl == label:`) now reads `if lbl == active_marker:`,
+    with identical behavior when active_marker is a real tool label.
+    activate_tool() then layers its own poll-loop setup (step 4) on top,
+    exactly as before this extraction -- see MUTABLE STATE below for
+    what changed.
+
+    activate_manual(canvas_refs, icon_img_ids, icons, grayscale_icons,
+    hover_bg, root, active_tooltips) is the second entry point (see
+    PURPOSE above): it calls _activate_common(_MANUAL_ACTIVE_MARKER,
+    ...) and nothing else -- no process to track, so no step 4. Because
+    _MANUAL_ACTIVE_MARKER (see MUTABLE STATE) never equals any real
+    canvas label, _activate_common()'s per-canvas loop takes the
+    "grayed-out" branch for every single tracked canvas, which is
+    exactly the desired visual (the whole tool grid grays out; there is
+    no "active tool icon" of its own to leave in color, since Configure
+    Database is not one of the tracked tool icons at all). Raises the
+    same RuntimeError, under the same re-entrancy rule, as
+    activate_tool() -- both go through the same reentrancy check inside
+    _activate_common(). The caller (MAIN.py) is responsible for calling
+    deactivate_all() itself once the busy period ends -- there is no
+    on_finished here, since there is no process whose completion this
+    module could ever detect on activate_manual()'s own behalf.
 
     deactivate_all(canvas_refs, icon_img_ids, icons) is also exposed
     directly so MAIN.py can call it defensively (e.g. on its own
@@ -248,7 +290,29 @@ writes these):
                                       None when no tool is active. A
                                       single slot, not a set, since only
                                       one tool may ever be active by
-                                      design.
+                                      design. While a Configure Database
+                                      (activate_manual()) session is
+                                      active, this holds
+                                      _MANUAL_ACTIVE_MARKER instead of a
+                                      real label -- is_any_tool_active()
+                                      only ever checks "is not None", so
+                                      it correctly reports True for
+                                      either kind of session without
+                                      needing to know which.
+    _MANUAL_ACTIVE_MARKER          -- a private sentinel object()
+                                      (module-level, defined once,
+                                      constant for the process lifetime)
+                                      used as activate_manual()'s own
+                                      "active_marker" value. An object()
+                                      identity, not a string like
+                                      "__manual__", specifically so it
+                                      can never collide with a real tool
+                                      label (which are always plain
+                                      strings from MAIN.py's own
+                                      TOOL_MODULES keys) -- no naming
+                                      convention to accidentally violate,
+                                      no chance of an actual tool one day
+                                      being labelled the same thing.
     _poll_job = [None]            -- the current root.after() job id for
                                       the active poll loop, so
                                       deactivate_all() can cancel a
@@ -306,15 +370,29 @@ CHANGELOG:
     _saved_leave_binding (still active-icon-only, since <Leave> is
     still only touched for that one canvas).
 
-    v3 (this version): fixed a confirmed regression where a tooltip
-    already visible at the moment a tool launches could be left stuck
-    on screen indefinitely (see STUCK TOOLTIP FIX above).
-    activate_tool() gained a new required parameter, active_tooltips
-    (MAIN.py's own _active_tooltips set, passed in by reference), and a
-    new step 0 that withdraws and discards every tooltip in it. No
-    other parameter's meaning changed; deactivate_all()'s signature is
+    v3: fixed a confirmed regression where a tooltip already visible at
+    the moment a tool launches could be left stuck on screen
+    indefinitely (see STUCK TOOLTIP FIX above). activate_tool() gained
+    a new required parameter, active_tooltips (MAIN.py's own
+    _active_tooltips set, passed in by reference), and a new step 0
+    that withdraws and discards every tooltip in it. No other
+    parameter's meaning changed; deactivate_all()'s signature is
     unaffected (the fix is entirely in activate_tool(), since the
     problem only ever occurs at activation time).
+
+    v4 (this version): activate_tool()'s own steps 0-3 (everything
+    except its poll-loop setup) were extracted, verbatim, into a new
+    private helper, _activate_common(), so a second entry point,
+    activate_manual(), could reuse them for a caller-managed busy
+    period with no process to poll (the Configure Database dialog being
+    open -- see PURPOSE/MECHANISM above). activate_tool()'s own
+    signature, parameter meanings, and observable behavior are
+    unchanged by this refactor -- it is a pure extraction, not a
+    redesign. deactivate_all() required no changes at all: it already
+    treats whatever _active_label[0] held as an opaque value to compare
+    canvas labels against, so it restores correctly regardless of
+    whether that value came from activate_tool() (a real label) or
+    activate_manual() (_MANUAL_ACTIVE_MARKER).
 
 WHY A DEDICATED POLL LOOP:
     MAIN.py already has monitor_gm_state(), a self-rescheduling
@@ -346,6 +424,11 @@ _grayscale_cache = {}
 _saved_click_bindings = {}
 _saved_enter_bindings = {}
 _saved_leave_binding = [None]
+
+# Sentinel "active_marker" value used by activate_manual() -- see
+# module docstring, MUTABLE STATE. A plain object() so it can never
+# equal any real tool label (always a string).
+_MANUAL_ACTIVE_MARKER = object()
 
 
 # ============================================================
@@ -403,12 +486,22 @@ def build_grayscale_icons(icons_pil):
 # QUERY (read-only)
 # ============================================================
 def is_any_tool_active() -> bool:
-    """Read-only query: True if a Feature Management Tool is currently
-    active (activate_tool() has run and deactivate_all() has not yet
-    restored it), False otherwise. The only intended external use is
-    the DB-gate deciding whether it is safe to apply/refresh its own
-    grayscale overlay on the shared canvas icons without racing this
-    module's own swap. Does not mutate any state."""
+    """Read-only query: True if EITHER a Feature Management Tool
+    (activate_tool()) OR a caller-managed busy period with no process
+    to poll (activate_manual() -- currently: the Configure Database
+    dialog being open) is currently active and deactivate_all() has not
+    yet restored it, False otherwise. Deliberately does not distinguish
+    which of the two is active -- every known consumer (the Feature
+    Management Tools icon grid's own gating, DBGate's Update Map/
+    Update Database gating, the hub button's own busy visual/click-
+    gating, and each entry point's own re-entrancy check) treats the
+    two kinds of session identically: everything stays grayed for the
+    Configure Database dialog's entire lifetime, ungraying only once it
+    actually closes, regardless of whether a CHANGE CONNECTION inside
+    it succeeded, failed, or was never attempted -- the eventual status
+    is checked at close time, not used to release anything early.
+
+    Does not mutate any state."""
     return _active_label[0] is not None
 
 
@@ -474,6 +567,58 @@ def activate_tool(label, process, canvas_refs, icon_img_ids, icons,
             "is still active — mutual exclusivity invariant violated."
         )
 
+    # Steps 0-3 (tooltip withdrawal, _active_label bookkeeping, and the
+    # per-canvas swap loop) are shared with activate_manual() -- see
+    # _activate_common()'s own docstring below and the module
+    # docstring's MECHANISM section. This call is a pure, byte-for-byte
+    # extraction of what used to be inline here: active_marker=label
+    # makes _activate_common()'s `if lbl == active_marker:` check behave
+    # exactly as the original `if lbl == label:` check did.
+    _activate_common(label, canvas_refs, icon_img_ids, icons,
+                      grayscale_icons, hover_bg, root, active_tooltips)
+
+    _poll_root[0] = root
+    _poll_job[0] = root.after(
+        EXCLUSIVITY_POLL_MS,
+        lambda: _poll_tick(process, canvas_refs, icon_img_ids, icons, root, on_finished),
+    )
+
+
+def _activate_common(active_marker, canvas_refs, icon_img_ids, icons,
+                      grayscale_icons, hover_bg, root, active_tooltips):
+    """
+    Private helper shared by activate_tool() and activate_manual() --
+    see module docstring, MECHANISM. Performs the STUCK TOOLTIP FIX
+    withdrawal (step 0), records active_marker as the sole "active"
+    identity (_active_label[0]), and runs the per-canvas swap loop
+    (steps 1-3: cursor, click-block, and the active-vs-grayed-out
+    branch) exactly as activate_tool() used to run them inline, before
+    this extraction. Does NOT perform the re-entrancy check (each
+    caller does its own, so each can raise its own, correctly-worded
+    RuntimeError) and does NOT touch the poll loop (_poll_job/
+    _poll_root) -- starting/not-starting a poll loop is entirely
+    activate_tool()'s/activate_manual()'s own concern, since only
+    activate_tool() ever has a process to poll.
+
+    Args:
+        active_marker: the value to record into _active_label[0] and to
+            compare each tracked canvas's own label against. A canvas
+            whose label equals active_marker is treated as "the active
+            one" (stays in color, persistent hover highlight, tooltip
+            suppressed); every other canvas is grayed out (grayscale
+            icon, tooltip still shows on hover, yellow background
+            suppressed). activate_tool() passes its own `label` here
+            (a real tool label, so exactly one canvas matches);
+            activate_manual() passes _MANUAL_ACTIVE_MARKER (which no
+            real canvas label can ever equal, so every canvas takes the
+            grayed-out branch -- there is no "active tool icon" for a
+            Configure Database session, since it isn't one of the
+            tracked tool icons at all).
+        canvas_refs, icon_img_ids, icons, grayscale_icons, hover_bg,
+        root, active_tooltips: identical in meaning to activate_tool()'s
+            own parameters of the same names -- see that function's
+            docstring.
+    """
     # Step 0 -- see module docstring, STUCK TOOLTIP FIX. Unconditional:
     # withdrawing an already-withdrawn Toplevel is a safe no-op, so
     # there is no need to check visibility first. Withdraws AND
@@ -490,7 +635,7 @@ def activate_tool(label, process, canvas_refs, icon_img_ids, icons,
             pass
         active_tooltips.discard(_tip)
 
-    _active_label[0] = label
+    _active_label[0] = active_marker
 
     for lbl, (canvas, bg_img_id) in canvas_refs.items():
         canvas.config(cursor=DISABLED_CURSOR)  # both active and grayed-out
@@ -498,7 +643,7 @@ def activate_tool(label, process, canvas_refs, icon_img_ids, icons,
         _saved_click_bindings[lbl] = canvas.bind("<Button-1>")
         canvas.bind("<Button-1>", lambda e: "break")
 
-        if lbl == label:
+        if lbl == active_marker:
             # --- The active icon itself: stays in color, persistent
             # hover highlight, click inert, tooltip suppressed.
             # UNCHANGED from the prior version of this module. ---
@@ -528,11 +673,55 @@ def activate_tool(label, process, canvas_refs, icon_img_ids, icons,
 
             canvas.bind("<Enter>", _suppress_hover_bg, add="+")
 
-    _poll_root[0] = root
-    _poll_job[0] = root.after(
-        EXCLUSIVITY_POLL_MS,
-        lambda: _poll_tick(process, canvas_refs, icon_img_ids, icons, root, on_finished),
-    )
+
+def activate_manual(canvas_refs, icon_img_ids, icons, grayscale_icons,
+                     hover_bg, root, active_tooltips):
+    """
+    Engages the same "something is busy" grayscale/click-block state
+    activate_tool() applies, for a caller-managed busy period with no
+    subprocess to poll (currently: the Configure Database dialog being
+    open). Grays out EVERY tracked canvas -- there is no single "active
+    icon" left in color, unlike activate_tool(), since a Configure
+    Database session is not itself one of the tracked tool icons (see
+    _activate_common()'s own docstring for the mechanics of how passing
+    _MANUAL_ACTIVE_MARKER, which never equals a real canvas label,
+    produces this).
+
+    Raises RuntimeError under the same re-entrancy rule activate_tool()
+    already enforces -- nothing else (another tool, or another
+    Configure Database session) may be active at the same time.
+
+    The caller releases this the same way an activate_tool() session is
+    released: by calling deactivate_all() itself once the busy period
+    ends. There is no automatic on_finished here, and no poll loop is
+    started -- there is no process whose completion this module could
+    ever detect on its own; the caller (MAIN.py) knows exactly when the
+    busy period ends (the Configure Database dialog closing) and is
+    responsible for calling deactivate_all() at that point, on every
+    exit path.
+
+    Args:
+        canvas_refs, icon_img_ids, icons, grayscale_icons, hover_bg,
+        root, active_tooltips: identical in meaning to activate_tool()'s
+            own parameters of the same names -- see that function's
+            docstring.
+
+    Raises:
+        RuntimeError: if called while another activate_tool()/
+            activate_manual() session is already active.
+    """
+    if _active_label[0] is not None:
+        # Re-entrancy guard, mirroring activate_tool()'s own (see that
+        # function's inline comment for the full rationale) -- worded
+        # for this entry point rather than reusing activate_tool()'s
+        # exact text, since the caller here was never a tool label.
+        raise RuntimeError(
+            f"activate_manual() called while {_active_label[0]!r} is "
+            "still active — mutual exclusivity invariant violated."
+        )
+
+    _activate_common(_MANUAL_ACTIVE_MARKER, canvas_refs, icon_img_ids, icons,
+                      grayscale_icons, hover_bg, root, active_tooltips)
 
 
 def _poll_tick(process, canvas_refs, icon_img_ids, icons, root, on_finished):

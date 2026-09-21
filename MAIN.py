@@ -151,17 +151,20 @@ from core.window_management import (
 from core.tool_exclusivity import (
     build_grayscale_icons,
     activate_tool,
+    activate_manual,
+    deactivate_all,
     is_any_tool_active,
 )
 
 from core.startup_and_db_ui import (
     show_startup_dialog,
-    create_hub_icon,
-    draw_hub_connectors,
+    create_hub_button,
     show_configure_db_dialog,
     set_secondary_button_enabled,
     bind_secondary_button_hover,
     is_db_verified,
+    try_restore_saved_connection,
+    test_live_connection,
 )
 
 # ========================================
@@ -482,8 +485,8 @@ stored_username = DEFAULT_DB_USERNAME
 stored_password = DEFAULT_DB_PASSWORD
 
 # The DBGate instance (core/startup_and_db_ui.py), constructed once
-# alongside the hub icon after update_btn/update_map_btn exist -- see
-# create_hub_icon()'s call site near the button-grid construction
+# alongside the hub button after update_btn/update_map_btn exist -- see
+# create_hub_button()'s call site near the button-grid construction
 # below. Starts as None (no gate exists yet during startup); looked up
 # as a global at CALL time by _db_gate_refresh_if_ready(), matching the
 # same "looked up as globals at CALL time" pattern
@@ -504,7 +507,17 @@ if not IS_TOOL_RUN:
     root.geometry("1x1+-9999+-9999")
     root.update_idletasks()               # flush any pending window creation events
     apply_icon(root)                      # safe to call now — window is invisible
-    root.minsize(340, 200)
+    # Height lowered from 200 to 150: empirically measured (headless Tk
+    # run against this exact panel layout -- icon grid + Update Map /
+    # hub / Update Database row) that the packed content's own natural
+    # height is ~190px, so a 200px floor was forcing ~10px of visible
+    # blank space below the button row that the content itself never
+    # asked for. 150 stays comfortably below that natural height (so it
+    # never actually binds against current content -- the window still
+    # renders at its natural ~190px, "content determines size" per the
+    # comment below), while still keeping a modest explicit minimum
+    # rather than removing height enforcement entirely.
+    root.minsize(340, 150)
     # No fixed geometry — content determines size
     root.title("Land Valuation Tools")
 
@@ -1256,6 +1269,129 @@ def _gm_export_guard(func):
     return wrapper
 
 
+def _check_live_db_connection(title_prefix):
+    """
+    Pre-flight-tests the session's CURRENTLY STORED credentials
+    (stored_username, stored_password, DB_HOST, DB_PORT, DB_NAME --
+    the same globals _on_credentials_changed() sets, read fresh here
+    as module-level globals at call time) on a background thread,
+    before update_database_from_geopackage() / update_map_and_select_recorded()
+    attempt any of their own real work (local GM export, PostGIS
+    reads/writes). Shows a small, non-focus-stealing "Checking Database
+    connection..." status toast while the test runs, using the exact
+    same visual style this file's other _status_win instances already
+    use elsewhere (e.g. the GeoPackage-export-wait toast in
+    update_database_from_geopackage() itself) -- dark background,
+    anchored near the Global Mapper window when it can be located,
+    falling back to a position near this app's own window otherwise.
+
+    The actual probe runs via core.startup_and_db_ui.test_live_connection()
+    -- the SAME non-technical error wording the Configure Database
+    dialog's own Test Connection already produces -- on a daemon
+    background thread, since psycopg2.connect() can block for up to 60
+    seconds; this function's own while-loop below keeps pumping
+    root.update() until that thread finishes, matching the same
+    "blocking call that keeps the Tk event loop pumped" idiom this
+    file's own _wait_for_gpkg_export() poll loop already uses
+    elsewhere, rather than introducing a different, callback-based
+    async pattern into what are otherwise long, sequential, step-by-
+    step functions.
+
+    Confirmed motivation (this task's own bug report): without this
+    pre-check, a bad or unreachable connection previously surfaced only
+    much later, as a RAW, technical SQLAlchemy/psycopg2 exception
+    dumped verbatim into a messagebox by whichever phase happened to
+    first attempt to actually use the connection (e.g. "Update Map
+    Failed - Matching" showing a multi-line
+    "(psycopg2.OperationalError) connection to server... FATAL:
+    password authentication failed..." message) -- catching this
+    upfront, with friendly wording, closes that off for the specific
+    case of the connection itself being bad; it does not change how any
+    LATER phase (matching, reading, writing) reports its own distinct
+    failures, which remains exactly as it already was.
+
+    Args:
+        title_prefix: e.g. "Update Map" / "Update Database" -- used
+            only in the failure dialog's own title ("{title_prefix} Failed").
+
+    Returns:
+        bool: True if the connection test succeeded (caller should
+        proceed with its own real work); False if it failed (a
+        non-technical error dialog has already been shown here; the
+        caller should abort/return immediately, matching how every
+        other phase-specific failure in these two functions already
+        aborts on its own first sign of trouble).
+    """
+    import threading
+    import time
+
+    _status_win = None
+    try:
+        import pygetwindow as gw
+        _gm_win_for_status = None
+        for _w in gw.getWindowsWithTitle("Global Mapper Pro"):
+            if "global mapper" in _w.title.lower():
+                _gm_win_for_status = _w
+                break
+        if _gm_win_for_status is not None:
+            _status_x = _gm_win_for_status.left + 20
+            _status_y = _gm_win_for_status.top + 20
+        else:
+            _status_x = root.winfo_x() + 40
+            _status_y = root.winfo_y() + 40
+
+        _status_win = tk.Toplevel(root)
+        _status_win.overrideredirect(True)
+        _status_win.attributes("-topmost", True)
+        _status_win.configure(bg="#2b2b2b")
+        tk.Label(
+            _status_win,
+            text="Checking Database connection...",
+            bg="#2b2b2b", fg="white", font=("Segoe UI", 9),
+            padx=12, pady=8
+        ).pack()
+        _status_win.geometry(f"+{_status_x}+{_status_y}")
+        _status_win.update_idletasks()
+    except Exception as status_win_err:
+        _log(f"connection-check status window could not be created (non-fatal): "
+             f"{type(status_win_err).__name__}: {status_win_err}")
+        _status_win = None
+
+    result = {"ok": None, "error": None}
+
+    def _worker():
+        ok, err = test_live_connection(DB_HOST, DB_PORT, DB_NAME, stored_username, stored_password)
+        result["ok"] = ok
+        result["error"] = err
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+    while thread.is_alive():
+        try:
+            root.update()
+        except tk.TclError:
+            # Main window was closed while this poll was running -- stop
+            # waiting; the background thread will simply finish on its
+            # own and be discarded (daemon=True), matching how other
+            # window-closed races in this file are already handled.
+            break
+        time.sleep(0.05)
+
+    if _status_win is not None:
+        try:
+            _status_win.destroy()
+        except Exception:
+            pass
+
+    if result["ok"]:
+        return True
+
+    error_message = result["error"] or "Could not connect to the database."
+    _log(f"{title_prefix}: connection pre-check failed: {error_message}")
+    messagebox.showerror(f"{title_prefix} Failed", error_message)
+    return False
+
+
 @_gm_export_guard
 def update_database_from_geopackage():
     """
@@ -1317,6 +1453,13 @@ def update_database_from_geopackage():
     if not all([stored_username, stored_password]):
         _log("ABORT: not logged in")
         messagebox.showerror("Error", "You must log in first before updating the database.")
+        return
+
+    if not _check_live_db_connection("Update Database"):
+        # Non-technical error already shown inside the helper above --
+        # abort before any local GM automation or export work is even
+        # attempted, matching this task's own requirement that the
+        # connection be tested FIRST.
         return
 
     # ── Manual pre-flight confirmation ──────────────────────────────────
@@ -2391,6 +2534,13 @@ def update_map_and_select_recorded():
         messagebox.showerror("Error", "You must log in first before updating the map.")
         return
 
+    if not _check_live_db_connection("Update Map"):
+        # Non-technical error already shown inside the helper above --
+        # abort before any local GM automation work is even attempted,
+        # matching this task's own requirement that the connection be
+        # tested FIRST.
+        return
+
     # ── Manual pre-flight confirmation ──────────────────────────────────
     # Update Map has one required precondition that this automation
     # cannot verify programmatically (no scripting API is used here —
@@ -2827,6 +2977,30 @@ def update_map_and_select_recorded():
                     )]
 
                 db_lower = {t.lower(): t for t in db_tables}
+                if not db_tables:
+                    # Business validation failure, not a technical one --
+                    # the query itself succeeded, there simply are no
+                    # tables in this schema to match against. Raising
+                    # here (a) gives a clear, specific message instead of
+                    # letting every layer fall through to the generic
+                    # "could not be matched" list below, and (b) is what
+                    # makes the process.extractOne() call further down
+                    # inherently safe: db_tables is guaranteed non-empty
+                    # for the rest of this try block once this check has
+                    # passed. Without this guard, process.extractOne()
+                    # against an EMPTY choices list returns None, and the
+                    # unguarded "match, score, _ = process.extractOne(...)"
+                    # unpacking below then raises TypeError: cannot
+                    # unpack non-iterable NoneType object -- confirmed,
+                    # genuinely happened, and a confusing, technical-
+                    # looking message for what is really just an empty
+                    # schema.
+                    raise RuntimeError(
+                        f"No tables were found in schema '{DB_SCHEMA}'. "
+                        "There is nothing to match the exported layer(s) "
+                        "against, so Update Map was aborted before any "
+                        "changes were made to Global Mapper."
+                    )
                 schema_prefix = DB_SCHEMA + "_"
                 matched_pairs = []      # [(original_layer_name, matched_table_name), ...]
                 unmatched_layers = []   # layers with no usable match at all
@@ -4349,44 +4523,85 @@ def _db_gate_refresh_if_ready():
 # ========================================
 # LOGIN / DB CONNECTION
 # ========================================
-# show_login_and_connect() (the old separate login Toplevel) is
-# REPLACED by the combined startup dialog in
-# core/startup_and_db_ui.show_startup_dialog(), wired via
-# startup_sequence() below. The two small callbacks below are what
-# that dialog calls once the user has either verified a connection or
-# explicitly chosen to continue without one -- they own committing the
-# result into MAIN.py's own session globals (DB_HOST, stored_username,
-# etc.), the one thing core/startup_and_db_ui.py deliberately does NOT
-# do itself (see that module's own docstring: it never mutates these
-# MAIN.py globals directly, only its own internal _db_state).
-def _on_startup_verified(workspace_path, credentials):
-    """Called by show_startup_dialog() once Start is clicked with a
-    VERIFIED session (a Test Connection just succeeded against the
-    current field values). Commits those credentials into MAIN.py's
+# show_login_and_connect() (the old separate login Toplevel) was
+# REPLACED by a combined startup dialog in an earlier version of this
+# task; as of THIS task, the startup dialog no longer collects
+# credentials at all -- see core/startup_and_db_ui.show_startup_dialog()'s
+# own docstring. The session's DB connection is now established or
+# changed EXCLUSIVELY through the mid-session Configure Database
+# dialog's CHANGE CONNECTION action, which is what _on_credentials_changed()
+# below commits into MAIN.py's own session globals (DB_HOST,
+# stored_username, etc.) -- the one thing core/startup_and_db_ui.py
+# deliberately does NOT do itself (see that module's own docstring: it
+# never mutates these MAIN.py globals directly, only its own internal
+# _db_state). This is also this task's own bug fix (Prompt Section 1.4):
+# these globals used to be set in exactly one place, a startup-only
+# callback, so a mid-session Configure Database connection (the ONLY
+# path left, now that startup collects no credentials) left them
+# permanently unset and update_map_and_select_recorded()/
+# update_database_from_geopackage() would refuse with "You must log in
+# first..." even after a successful CHANGE CONNECTION. Wiring this
+# callback into show_configure_db_dialog() (see its call site below)
+# is the fix.
+def _on_credentials_changed(credentials):
+    """Called by show_configure_db_dialog() at CHANGE CONNECTION's own
+    commit step, with the exact field values just committed -- fired
+    identically whether the commit followed a successful connectivity
+    test or a "continue anyway" choice on a failed one (see that
+    function's own docstring). Commits those credentials into MAIN.py's
     own session globals -- the same globals launch_global_mapper()'s
-    regex-patch step already reads -- then proceeds through the
-    EXISTING, unchanged launch_global_mapper() -> wait_for_global_mapper()
-    -> launch_main_window() chain, DB-enabled (patching) path."""
-    global stored_username, stored_password, DB_HOST, DB_PORT, DB_NAME, DB_SCHEMA, selected_gmw_file
-    selected_gmw_file = workspace_path
+    regex-patch step and update_map_and_select_recorded()/
+    update_database_from_geopackage()'s own login gate both read --
+    WITHOUT calling launch_global_mapper(): Global Mapper is already
+    running by the time this fires (this dialog is only ever reachable
+    mid-session, via the hub button), so this callback's only job is
+    updating the in-process globals those two functions read on their
+    next run. Does NOT touch selected_gmw_file -- that is set once, at
+    startup, by _on_start() below, and is unrelated to a database
+    connection change.
+
+    Does NOT touch the tool-exclusivity busy-lock or db_gate at all --
+    per this task's own explicit requirement, Update Map / Update
+    Database, the Feature Management Tools icon grid, and the hub
+    button itself all stay grayed for the Configure Database dialog's
+    ENTIRE lifetime regardless of what happens inside it, ungraying
+    only once that dialog actually closes (see
+    _open_configure_db_dialog()'s own finally block, below, and
+    show_configure_db_dialog()'s own docstring for the "restore to
+    last known-good state on close" logic that runs at that point).
+
+    SCOPE LIMITATION (stated here so it is not mistaken for an
+    oversight later): this does NOT retroactively notify any Feature
+    Management Tool window that was ALREADY OPEN before this fires --
+    each tool runs as a genuinely separate OS process in the frozen
+    build and reads its own db_verified snapshot once, at its own
+    launch time (see core/startup_and_db_ui.is_db_verified()'s own
+    docstring). A tool launched AFTER this callback correctly sees the
+    new credentials; one already open at that moment does not, until it
+    is closed and reopened. This is an accepted limitation of the
+    existing snapshot-based design, not something this task adds a
+    push-update mechanism for."""
+    global stored_username, stored_password, DB_HOST, DB_PORT, DB_NAME, DB_SCHEMA
     stored_username = credentials.get("username", "")
     stored_password = credentials.get("password", "")
     DB_HOST = credentials.get("host", "")
     DB_PORT = credentials.get("port", "")
     DB_NAME = credentials.get("database", "")
     DB_SCHEMA = credentials.get("schema", "")
-    launch_global_mapper(db_less=False)
 
 
-def _on_startup_dbless(workspace_path):
-    """Called by show_startup_dialog() once the user has explicitly
-    confirmed continuing without a database (either the all-five-
-    fields-filled or the partial/empty Yes/No branch). Proceeds
-    through the EXISTING launch_global_mapper() chain with db_less=True
-    -- the .gmw patch step is skipped entirely (see
-    launch_global_mapper()'s own db_less handling above); the session
-    DB credential globals are deliberately left untouched here (there
-    is nothing verified to commit)."""
+def _on_start(workspace_path):
+    """Called by show_startup_dialog() once Start is clicked (only
+    reachable once a workspace path has been chosen). Proceeds through
+    the EXISTING launch_global_mapper() chain with db_less=True --
+    the .gmw patch step is skipped entirely (see launch_global_mapper()'s
+    own db_less handling above) -- unconditionally now, since no
+    credentials are ever available at startup time in any session (see
+    core/startup_and_db_ui.show_startup_dialog()'s own docstring). The
+    session's DB credential globals are left untouched here; they are
+    set later, if and when the user commits a connection via the
+    mid-session Configure Database dialog (see _on_credentials_changed()
+    above)."""
     global selected_gmw_file
     selected_gmw_file = workspace_path
     launch_global_mapper(db_less=True)
@@ -4854,7 +5069,7 @@ grayscale_icons = build_grayscale_icons(icons_pil)
 
 # === TOOLBAR BUTTONS PANEL (blue area) ===
 button_frame = tk.Frame(root, bg="#afd0f7", width=310)
-button_frame.pack(padx=8, pady=(6, 6))
+button_frame.pack(padx=8, pady=(6, 3))
 # No pack_propagate(False) — let it size naturally to its content
 
 # === Tooltip descriptions for icon buttons ===
@@ -5021,17 +5236,18 @@ for label in buttons_2nd_row:
 
 # Create a frame to hold both buttons
 btn_frame = tk.Frame(root)
-btn_frame.pack(pady=(6, 6))
+btn_frame.pack(pady=(3, 6))
 
 
 
 # === UPDATE MAP BUTTON ===
 UPDATE_MAP_BTN_NORMAL_BG = "#6a9f2f"
 update_map_btn = tk.Button(
-    btn_frame, text="Update Map",
-    width=14,
+    btn_frame, text="Update\nMap",
+    width=12,
     fg="white",
     relief="flat",
+    justify="center",
     # DB-gate ordering rule: _gm_export_guard's own finally block
     # (see its docstring) unconditionally restores state="normal" on
     # this button before this lambda's second element runs -- Python
@@ -5045,16 +5261,17 @@ update_map_btn = tk.Button(
     command=lambda: (update_map_and_select_recorded(), _db_gate_refresh_if_ready())
 )
 # Starts disabled/gray -- the session starts with no verified DB
-# connection (VERIFIED is only reached via a successful Test
-# Connection), so this button's initial appearance must already
-# reflect that, not the enabled green it would otherwise default to.
-# db_gate.refresh() (called once db_gate exists, right after
-# create_hub_icon() below) re-asserts the correct state/color anyway,
-# but starting it already-gray avoids a one-frame flash of green
-# before that first refresh() runs.
+# connection (VERIFIED is only reached via a successful CHANGE
+# CONNECTION commit in the Configure Database dialog), so this
+# button's initial appearance must already reflect that, not the
+# enabled green it would otherwise default to. db_gate.refresh()
+# (called once db_gate exists, right after create_hub_button() below)
+# re-asserts the correct state/color anyway, but starting it
+# already-gray avoids a one-frame flash of green before that first
+# refresh() runs.
 set_secondary_button_enabled(update_map_btn, False, UPDATE_MAP_BTN_NORMAL_BG)
 bind_secondary_button_hover(update_map_btn, UPDATE_MAP_BTN_NORMAL_BG)
-# NOTE: not packed yet -- create_hub_icon() below needs BOTH Button
+# NOTE: not packed yet -- create_hub_button() below needs BOTH Button
 # objects to already exist (it wires their state/cursor into the
 # constructed DBGate), but Tk's pack() geometry manager lays widgets
 # out in the ORDER pack() is CALLED, not the order they're constructed.
@@ -5062,15 +5279,16 @@ bind_secondary_button_hover(update_map_btn, UPDATE_MAP_BTN_NORMAL_BG)
 # packed between them, and only then are update_map_btn/update_btn
 # themselves packed -- giving the visual order
 # [Update Map] [hub] [Update Database] while still letting
-# create_hub_icon() receive two fully-constructed Button widgets.
+# create_hub_button() receive two fully-constructed Button widgets.
 
 # === UPDATE DB BUTTON ===
 UPDATE_DB_BTN_NORMAL_BG = "#007acc"
 update_btn = tk.Button(
-    btn_frame, text="Update Database",
-    width=14,
+    btn_frame, text="Update\nDatabase",
+    width=12,
     fg="white",
     relief="flat",
+    justify="center",
     # Same DB-gate ordering rule as update_map_btn above.
     command=lambda: (update_database_from_geopackage(), _db_gate_refresh_if_ready())
 )
@@ -5080,35 +5298,65 @@ bind_secondary_button_hover(update_btn, UPDATE_DB_BTN_NORMAL_BG)
 # Also not packed yet -- see the note above update_map_btn.
 
 
-# === DB STATUS HUB ICON ===
+# === DB STATUS HUB BUTTON ===
 # Placed BETWEEN the two Update buttons, on the same row inside
-# btn_frame. See core/startup_and_db_ui.py's create_hub_icon() for
+# btn_frame. See core/startup_and_db_ui.py's create_hub_button() for
 # what it builds and why it needs update_btn/update_map_btn to already
 # exist as real widgets -- both were constructed (not yet packed)
 # immediately above for exactly this reason.
 def _open_configure_db_dialog():
-    show_configure_db_dialog(root, apply_icon, get_credentials_path, db_gate)
+    """The hub button's own on_click target. Brackets
+    show_configure_db_dialog()'s entire lifetime (it blocks via its own
+    win.wait_window() -- see that function's docstring) with
+    core/tool_exclusivity.py's activate_manual()/deactivate_all(), per
+    this task's own Section 1.5: this is what makes is_any_tool_active()
+    correctly report True for as long as the Configure Database dialog
+    is open (graying the Feature Management Tools grid, Update Map /
+    Update Database via db_gate's own busy computation, and the hub
+    button itself), and False again the instant it closes, on every
+    exit path -- ALL of these stay grayed together for the dialog's
+    entire lifetime, regardless of whether a CHANGE CONNECTION inside
+    it was committed (successfully or otherwise) partway through; only
+    the dialog actually closing releases any of them (see
+    show_configure_db_dialog()'s own docstring for what state it
+    restores at that point). The try/finally guarantees
+    deactivate_all() runs exactly once per open, even if
+    show_configure_db_dialog() itself ever raised, matching this
+    section's own "no path that skips it" requirement.
 
-db_gate, _hub_canvas = create_hub_icon(
-    btn_frame, ICONS_DIR, update_btn, update_map_btn,
+    db_gate.refresh() is called explicitly right after activate_manual()
+    and right after deactivate_all() -- neither of those two
+    core/tool_exclusivity.py functions calls back into db_gate on its
+    own (activate_tool()'s own on_finished hook is the only existing
+    precedent for that, and it only fires when a REAL tool's process
+    exits, which activate_manual() has no equivalent of), so without
+    these two explicit calls the hub button's own busy color would
+    never visibly update for the duration of this dialog being open.
+    """
+    activate_manual(canvas_refs, icon_img_ids, icons, grayscale_icons,
+                     hover_bg, root, _active_tooltips)
+    _db_gate_refresh_if_ready()
+    try:
+        show_configure_db_dialog(
+            root, apply_icon, get_credentials_path, db_gate,
+            _on_credentials_changed,
+        )
+    finally:
+        deactivate_all(canvas_refs, icon_img_ids, icons)
+        _db_gate_refresh_if_ready()
+
+db_gate, _hub_btn = create_hub_button(
+    btn_frame, update_btn, update_map_btn,
     UPDATE_DB_BTN_NORMAL_BG, UPDATE_MAP_BTN_NORMAL_BG,
     is_any_tool_active, lambda: _gm_automation_in_flight,
     _open_configure_db_dialog,
 )
 
 # Now pack all three widgets, left to right, in the intended visual
-# order: Update Map, hub icon, Update Database.
+# order: Update Map, hub button, Update Database.
 update_map_btn.pack(side="left", padx=5)
-_hub_canvas.pack(side="left", padx=5)
+_hub_btn.pack(side="left", padx=5)
 update_btn.pack(side="left", padx=5)
-
-
-# Connector-line routing needs real winfo_* values, which only exist
-# once the widgets above have actually been laid out -- see
-# draw_hub_connectors()'s own docstring for why this is a one-time
-# post-layout call, not something done inside create_hub_icon() itself.
-root.update_idletasks()
-draw_hub_connectors(_hub_canvas, button_frame, update_map_btn, update_btn)
 
 
 
@@ -5128,15 +5376,37 @@ def launch_main_window():
     cama_w = root.winfo_reqwidth()
     cama_h = root.winfo_reqheight()
 
+    # NOTE on cama_w/cama_h and the geometry() calls below: an earlier
+    # root.geometry("1x1+-9999+-9999") call (near this module's own
+    # root = tk.Tk() construction) freezes Tk's automatic content-based
+    # auto-resizing for this toplevel -- confirmed empirically (a
+    # headless reproduction of this exact startup sequence showed the
+    # window rendering at whatever minsize() enforced, e.g. 340x150,
+    # even though winfo_reqwidth/reqheight() correctly reported a
+    # larger, accurate 468x190 needed for the actual packed content).
+    # A position-only geometry("+X+Y") call, as this function used to
+    # make below, does NOT release that freeze -- so the window was
+    # being shown at a stale/frozen size, clipping whatever content
+    # (most visibly the Update Map / Configure Database / Update
+    # Database button row) didn't fit within it. Passing an explicit
+    # "{cama_w}x{cama_h}+{x}+{y}" geometry string here -- WxH together
+    # with position, using the cama_w/cama_h just computed fresh above
+    # -- fixes this: the window is always sized to exactly what its
+    # real content needs at this moment, on every launch, with no
+    # magic constant to keep in sync by hand. minsize() (see this
+    # module's own root.minsize() call) goes back to being a pure
+    # floor, exactly as its own "No fixed geometry -- content
+    # determines size" comment always intended, rather than the
+    # de-facto fixed size it had actually become.
     if snap and snap[4]:  # snap[4] = visible - preserves old .visible filter
         gm_left, gm_top, gm_width, gm_height, _visible, _minimized = snap
         new_x = gm_left + gm_width - cama_w - 10
         new_y = gm_top + gm_height - cama_h - 40
-        root.geometry(f"+{new_x}+{new_y}")
+        root.geometry(f"{cama_w}x{cama_h}+{new_x}+{new_y}")
     else:
         sw = root.winfo_screenwidth()
         sh = root.winfo_screenheight()
-        root.geometry(f"+{(sw - cama_w) // 2}+{(sh - cama_h) // 2}")
+        root.geometry(f"{cama_w}x{cama_h}+{(sw - cama_w) // 2}+{(sh - cama_h) // 2}")
 
     root.update_idletasks()
     root.attributes("-alpha", 1)
@@ -5542,23 +5812,48 @@ def startup_sequence():
     First thing that runs once the Tkinter event loop starts (scheduled
     via root.after(0, startup_sequence) at the very end of this file):
     hands off entirely to core/startup_and_db_ui.show_startup_dialog(),
-    which now owns BOTH the .gmw workspace picker AND the credential/
-    Test-Connection UI that used to be the separate
-    show_login_and_connect() dialog (see that function's own docstring
-    -- it has been removed; its logic is superseded by the combined
-    dialog). resize_file_dialog is passed straight through as the
-    background-thread target the Browse button uses, unchanged. The
-    two small callbacks this module supplies
-    (_on_startup_verified/_on_startup_dbless, defined above) are what
-    the combined dialog calls once the user reaches VERIFIED or an
-    explicit DB-less confirmation -- both ultimately proceed through
-    the EXISTING, unchanged launch_global_mapper() ->
-    wait_for_global_mapper() -> launch_main_window() chain.
+    which owns the .gmw workspace picker only -- as of this task, it no
+    longer collects any credentials at all (an earlier version of this
+    dialog also had a credential/Test-Connection section, itself already
+    a replacement for the separate old show_login_and_connect() dialog;
+    both are gone now -- see show_startup_dialog()'s own docstring).
+    resize_file_dialog is passed straight through as the background-
+    thread target the Browse button uses, unchanged. The single callback
+    this module supplies (_on_start, defined above) is what the dialog
+    calls once Start is clicked, and proceeds through the EXISTING,
+    unchanged launch_global_mapper() -> wait_for_global_mapper() ->
+    launch_main_window() chain, always with db_less=True now (see
+    _on_start()'s own docstring).
+
+    Immediately AFTER show_startup_dialog() (which itself unconditionally
+    resets the session to UNVERIFIED at its own construction time -- see
+    that function's own docstring), calls
+    try_restore_saved_connection(get_credentials_path): if
+    pg_credentials.json already holds a complete, six-field connection,
+    this overrides that reset back to VERIFIED right away, and the
+    returned dict is passed to _on_credentials_changed() (the SAME
+    callback a normal CHANGE CONNECTION commit uses) so the session's
+    stored_username/stored_password/DB_HOST/DB_PORT/DB_NAME/DB_SCHEMA
+    globals are set together with core/startup_and_db_ui.py's own
+    _db_state -- exactly the way a real commit already keeps the two in
+    sync, just triggered here by a saved file instead of a fresh test.
+    _db_gate_refresh_if_ready() is called right after so the Update Map
+    / Update Database buttons (already constructed, module-level, by
+    this point) immediately reflect the restored state rather than
+    waiting for some other, later refresh() call to catch up -- without
+    this, a complete saved connection would silently exist in
+    _db_state/the session globals while the buttons still LOOKED
+    disabled from their own construction-time appearance. Without a
+    complete saved connection, this is a no-op: the session stays
+    UNVERIFIED exactly as show_startup_dialog() already left it, and the
+    Configure Database dialog remains the only way to establish one, as
+    before this task's own addition.
     """
-    show_startup_dialog(
-        root, apply_icon, get_credentials_path, resize_file_dialog,
-        _on_startup_verified, _on_startup_dbless,
-    )
+    show_startup_dialog(root, apply_icon, resize_file_dialog, _on_start)
+    restored = try_restore_saved_connection(get_credentials_path)
+    if restored is not None:
+        _on_credentials_changed(restored)
+        _db_gate_refresh_if_ready()
 
 root.after(0, startup_sequence)
 root.mainloop()
