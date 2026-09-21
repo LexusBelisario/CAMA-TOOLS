@@ -400,6 +400,19 @@ def build_grayscale_icons(icons_pil):
 
 
 # ============================================================
+# QUERY (read-only)
+# ============================================================
+def is_any_tool_active() -> bool:
+    """Read-only query: True if a Feature Management Tool is currently
+    active (activate_tool() has run and deactivate_all() has not yet
+    restored it), False otherwise. The only intended external use is
+    the DB-gate deciding whether it is safe to apply/refresh its own
+    grayscale overlay on the shared canvas icons without racing this
+    module's own swap. Does not mutate any state."""
+    return _active_label[0] is not None
+
+
+# ============================================================
 # ACTIVATION
 # ============================================================
 def activate_tool(label, process, canvas_refs, icon_img_ids, icons,

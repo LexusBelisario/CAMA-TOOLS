@@ -190,7 +190,7 @@ DIALOG_GUARD_MUTEX_NAME = r"Global\CAMA_Tools_DuplicateDialog_Mutex"
 # and already looks up via FindWindowW(None, "CAMA Tools") elsewhere
 # (get_cama_size(), install_wm_moving_hook() vicinity) -- proven,
 # already-working pattern, not a new risk.
-CAMA_WINDOW_TITLE = "CAMA Tools"
+CAMA_WINDOW_TITLE = "Land Valuation Tools"
 
 # Owning-process verification for a CAMA_WINDOW_TITLE match (see
 # _find_cama_hwnd_with_retry()): a bare exact-title match is NOT
@@ -201,7 +201,7 @@ CAMA_WINDOW_TITLE = "CAMA Tools"
 # its owning process's executable name (case-insensitive) is one of
 # these -- CAMA-Tools.exe (frozen/production build) or python.exe /
 # pythonw.exe (dev-mode `python MAIN.py`).
-EXPECTED_CAMA_PROCESS_NAMES = {"cama-tools.exe", "python.exe", "pythonw.exe"}
+EXPECTED_CAMA_PROCESS_NAMES = {"land valuation tools.exe", "python.exe", "pythonw.exe"}
 
 # Substring used only by this module's OWN raw EnumWindows scan
 # (snapshot_gm_hwnds()) -- this module does not import pygetwindow.
@@ -571,7 +571,7 @@ def _fail_closed_startup_error(message):
     try:
         r = tk.Tk()
         r.withdraw()
-        messagebox.showerror("CAMA Tools - Startup Error", message)
+        messagebox.showerror("Land Valuation Tools - Startup Error", message)
         r.destroy()
     except Exception:
         # If Tk itself can't initialize, there is nothing further this
@@ -602,7 +602,7 @@ def _show_duplicate_launch_error(traceback_text):
         r = tk.Tk()
         r.withdraw()
         messagebox.showerror(
-            "CAMA Tools - Duplicate Launch Error (diagnostic)",
+            "Land Valuation Tools - Duplicate Launch Error (diagnostic)",
             "An unexpected error occurred while handling a duplicate "
             "launch. Full traceback:\n\n" + traceback_text
         )
@@ -670,8 +670,8 @@ def acquire_singleton(temp_dir):
 
     if not handle:
         _fail_closed_startup_error(
-            "Could not create the CAMA Tools single-instance lock "
-            f"(Win32 error {last_error}). CAMA Tools cannot verify "
+            "Could not create the Land Valuation Tools single-instance lock "
+            f"(Win32 error {last_error}). Land Valuation Tools cannot verify "
             "whether another instance is already running, so it will "
             "not start."
         )
@@ -1168,7 +1168,7 @@ def handle_duplicate_launch(temp_dir):
         # z-order, ownership, mutex, or foreground-activation logic --
         # it only makes the two windows distinguishable during testing
         # (and for the user, going forward).
-        top.title("CAMA Tools - Already Running")
+        top.title("Land Valuation Tools - Already Running")
         top.resizable(False, False)
         # OK-only dialog -- clicking the window's own close button
         # behaves the same as clicking OK (same pattern as MAIN.py's
@@ -1179,7 +1179,7 @@ def handle_duplicate_launch(temp_dir):
         top.protocol("WM_DELETE_WINDOW", _on_ok)
 
         tk.Label(
-            top, text="CAMA Tools is already running.",
+            top, text="Land Valuation Tools is already running.",
             padx=24, pady=16
         ).pack()
         tk.Button(top, text="OK", width=10, command=_on_ok).pack(pady=(0, 16))
