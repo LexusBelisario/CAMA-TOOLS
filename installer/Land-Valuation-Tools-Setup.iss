@@ -1,12 +1,12 @@
 ; =============================================================
-;  CAMA-Tools Installer Script
+;  Land Valuation Tools Installer Script
 ;  Built with Inno Setup
 ; =============================================================
 
 ; -------------------------------------------------------------
 ; SECTION: App Info
 ; -------------------------------------------------------------
-#define MyAppName "Land Valuation Tools"
+#define MyAppName "Land Valuation Tools for Global Mapper"
 #define MyAppVersion "1.0.1"
 #define MyAppPublisher "Integrated Geosys Development, Inc."
 #define MyAppExeName "Land Valuation Tools.exe"
