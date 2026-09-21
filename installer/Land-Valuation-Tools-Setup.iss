@@ -6,14 +6,14 @@
 ; -------------------------------------------------------------
 ; SECTION: App Info
 ; -------------------------------------------------------------
-#define MyAppName "CAMA Tools for Global Mapper"
+#define MyAppName "Land Valuation Tools"
 #define MyAppVersion "1.0.1"
-#define MyAppPublisher "CAMA-Tools"
-#define MyAppExeName "CAMA-Tools.exe"
+#define MyAppPublisher "Integrated Geosys Development, Inc."
+#define MyAppExeName "Land Valuation Tools.exe"
 
-; Folder where the built CAMA-Tools.exe lives.
+; Folder where the built Land Valuation Tools.exe lives.
 ; Resolved relative to this .iss file's location, so no machine-specific path is hardcoded.
-; Expected layout: <this .iss file's folder>\..\dist\CAMA-Tools.exe
+; Expected layout: <this .iss file's folder>\..\dist\Land Valuation Tools.exe
 #define SourceDistFolder SourcePath + "..\dist"
 
 ; Folder containing the wizard images (wizard_sidebar.bmp, wizard_header.bmp).
@@ -33,7 +33,7 @@ DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 OutputDir=.\Output
-OutputBaseFilename=CAMA-Tools-Setup
+OutputBaseFilename=Land-Valuation-Tools-Setup
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern

@@ -119,7 +119,7 @@ import sys
 # module is loaded (see module docstring SIDE EFFECTS). Not moved or
 # deferred; see module docstring for why.
 def set_app_user_model_id():
-    appid = u"BLGF.CAMA.Tools.2025"
+    appid = u"BLGF.LandValuationTools"
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(appid)
 
 set_app_user_model_id()
@@ -151,6 +151,17 @@ from core.window_management import (
 from core.tool_exclusivity import (
     build_grayscale_icons,
     activate_tool,
+    is_any_tool_active,
+)
+
+from core.startup_and_db_ui import (
+    show_startup_dialog,
+    create_hub_icon,
+    draw_hub_connectors,
+    show_configure_db_dialog,
+    set_secondary_button_enabled,
+    bind_secondary_button_hover,
+    is_db_verified,
 )
 
 # ========================================
@@ -321,6 +332,7 @@ def dispatch_tool_if_requested():
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("--tool", default=None)
     ap.add_argument("--icon", default=None)
+    ap.add_argument("--db-verified", default="0")
     args, _ = ap.parse_known_args()
 
     # ✅ If no tool specified, do normal launcher flow
@@ -372,7 +384,22 @@ def dispatch_tool_if_requested():
                     except Exception:
                         pass
 
-                mod.main(_tool_root)
+                # "db_verified" in sig.parameters guards against an
+                # older/partially-updated tool module whose main(parent)
+                # does not yet accept this keyword -- same guard as the
+                # dev-mode run_in_thread() branch above, passed only
+                # when the tool's own signature actually declares it.
+                # args.db_verified is the "--db-verified" CLI flag this
+                # same dispatch function parses above, itself computed
+                # by run_tool_by_label()'s frozen branch reading
+                # is_db_verified() at the moment this subprocess was
+                # spawned (see that call site's own comment for why a
+                # CLI flag, not a live read, is used across this
+                # process boundary).
+                if "db_verified" in sig.parameters:
+                    mod.main(_tool_root, db_verified=(args.db_verified == "1"))
+                else:
+                    mod.main(_tool_root)
                 _tool_root.mainloop()
             else:
                 mod.main()
@@ -454,6 +481,17 @@ selected_gmw_file = None
 stored_username = DEFAULT_DB_USERNAME
 stored_password = DEFAULT_DB_PASSWORD
 
+# The DBGate instance (core/startup_and_db_ui.py), constructed once
+# alongside the hub icon after update_btn/update_map_btn exist -- see
+# create_hub_icon()'s call site near the button-grid construction
+# below. Starts as None (no gate exists yet during startup); looked up
+# as a global at CALL time by _db_gate_refresh_if_ready(), matching the
+# same "looked up as globals at CALL time" pattern
+# _gm_export_guard's own docstring already documents for
+# update_btn/update_map_btn (both are also created after the functions
+# that reference them are defined).
+db_gate = None
+
 # NOTE: import-time side effect -- creates the application's real root
 # window at module level. Always executes when reached (IS_TOOL_RUN is
 # only ever False here -- see the comment above dispatch_tool_if_
@@ -468,7 +506,7 @@ if not IS_TOOL_RUN:
     apply_icon(root)                      # safe to call now — window is invisible
     root.minsize(340, 200)
     # No fixed geometry — content determines size
-    root.title("CAMA Tools")
+    root.title("Land Valuation Tools")
 
 
 from geoalchemy2 import Geometry
@@ -3767,8 +3805,17 @@ def run_tool_by_label(label: str):
     if IS_FROZEN:
         # ── Production: spawn a new process (existing behaviour) ──
         exe_path = sys.executable
+        # Snapshot the session's DB-verified state at this exact
+        # launch moment and hand it across the process boundary as a
+        # CLI flag -- a frozen tool subprocess cannot read this
+        # process's in-memory _db_state at all (see
+        # core.startup_and_db_ui.is_db_verified()'s own docstring for
+        # why this snapshot approach, not a live cross-process signal,
+        # is the whole point here).
+        db_verified_flag = "1" if is_db_verified() else "0"
         p = subprocess.Popen(
-            [exe_path, "--tool", label, "--icon", icon_name],
+            [exe_path, "--tool", label, "--icon", icon_name,
+             "--db-verified", db_verified_flag],
             shell=False,
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
         )
@@ -4074,7 +4121,21 @@ def run_tool_by_label(label: str):
                     sig = inspect.signature(mod.main)
                     if sig.parameters:
                         _before = set(root.winfo_children())
-                        mod.main(root)   # tool accepts a parent root
+                        # In-process, same-Python-process launch --
+                        # is_db_verified() reads this process's own
+                        # live _db_state directly (no cross-process
+                        # boundary to cross, unlike the frozen
+                        # subprocess.Popen() path above, which instead
+                        # passes the same snapshot as a --db-verified
+                        # CLI flag). "db_verified" in sig.parameters
+                        # guards against an older/partially-updated
+                        # tool module whose main(parent) does not yet
+                        # accept this keyword -- passed only when the
+                        # tool's own signature actually declares it.
+                        if "db_verified" in sig.parameters:
+                            mod.main(root, db_verified=is_db_verified())
+                        else:
+                            mod.main(root)   # tool accepts a parent root
                         _after = set(root.winfo_children())
                         _new_children = _after - _before
                         if _new_children:
@@ -4258,133 +4319,81 @@ def on_button_click(label):
         proc = run_tool_by_label(label)
         if proc is not None:
             activate_tool(label, proc, canvas_refs, icon_img_ids, icons,
-                          grayscale_icons, hover_bg, root, _active_tooltips)
+                          grayscale_icons, hover_bg, root, _active_tooltips,
+                          on_finished=_db_gate_refresh_if_ready)
     else:
         messagebox.showerror("Unknown Tool", f"No module mapped for: {label}")
+
+
+def _db_gate_refresh_if_ready():
+    """Passed as activate_tool()'s on_finished argument (see
+    on_button_click() above), so db_gate re-checks the Update Map /
+    Update Database buttons' busy state the instant a Feature
+    Management Tool finishes (a tool running and an Update-button
+    automation running are still mutually exclusive with each other,
+    via the busy computation inside DBGate.refresh() -- see that
+    class's own docstring). db_gate does NOT touch the Feature
+    Management Tools icon grid at all -- that grid's own restoration
+    is entirely core/tool_exclusivity.py's responsibility, unaffected
+    by db_gate either way. db_gate is looked up as a global at CALL
+    time (not at on_button_click()'s definition time), since it is
+    only constructed later, alongside the hub icon -- same pattern
+    _gm_export_guard already uses for update_btn/update_map_btn. A
+    None guard covers the (should-not-happen-by-click-time) case where
+    a tool somehow finishes before the hub/gate has been constructed."""
+    if db_gate is not None:
+        db_gate.refresh()
 
 
 
 # ========================================
 # LOGIN / DB CONNECTION
 # ========================================
-def show_login_and_connect():
-    """
-    Shows the PostGIS database login dialog (host/port/database/schema/
-    username/password, pre-filled from stored_username/stored_password
-    where available), validates the connection on submit, ensures
-    PostGIS is enabled (ensure_postgis()), and on success proceeds to
-    get_global_mapper_path() + launch_global_mapper(). Blocks
-    (grab_set()) until the user connects or cancels.
-    """
-    login_win = tk.Toplevel()
-    apply_icon(login_win)
-    login_win.title("Database Login")
-    login_win.geometry("260x220")
-    login_win.grab_set()
-    login_win.resizable(False, False)
-
-    def on_login_close():
-        try:
-            messagebox.showwarning("Cancelled", "Login cancelled. Exiting.")
-        except Exception:
-            pass
-        try:
-            root.quit()
-            root.destroy()
-        except Exception:
-            pass
-        sys.exit(0)
-
-    login_win.protocol("WM_DELETE_WINDOW", on_login_close)
-
-    # Load saved credentials if available. get_credentials_path() is
-    # the same centralized %APPDATA%\CAMA-Tools resolver used for
-    # _base_dir above -- no independent path-resolution logic is
-    # duplicated here anymore. It cannot raise RuntimeError at this
-    # point in practice: the module-level _base_dir block above already
-    # succeeded (or the process already exited) before this function
-    # can run.
-    _creds_path = get_credentials_path()
-    saved = {}
-    if os.path.exists(_creds_path):
-        try:
-            with open(_creds_path, "r") as f:
-                saved = json.load(f)
-        except Exception:
-            saved = {}
-
-    tk.Label(login_win, text="Host:").grid(row=0, column=0, sticky="e", padx=5, pady=3)
-    host_entry = tk.Entry(login_win, width=25)
-    host_entry.grid(row=0, column=1)
-    host_entry.insert(0, saved.get("host", DB_HOST))
-
-    tk.Label(login_win, text="Port:").grid(row=1, column=0, sticky="e", padx=5, pady=3)
-    port_entry = tk.Entry(login_win, width=25)
-    port_entry.grid(row=1, column=1)
-    port_entry.insert(0, saved.get("port", DB_PORT))
-
-    tk.Label(login_win, text="Database:").grid(row=2, column=0, sticky="e", padx=5, pady=3)
-    db_entry = tk.Entry(login_win, width=25)
-    db_entry.grid(row=2, column=1)
-    db_entry.insert(0, saved.get("database", DB_NAME))
-
-    tk.Label(login_win, text="Schema:").grid(row=3, column=0, sticky="e", padx=5, pady=3)
-    schema_entry = tk.Entry(login_win, width=25)
-    schema_entry.grid(row=3, column=1)
-    schema_entry.insert(0, saved.get("schema", DB_SCHEMA))
-
-    tk.Label(login_win, text="Username:").grid(row=4, column=0, sticky="e", padx=5, pady=3)
-    user_entry = tk.Entry(login_win, width=25)
-    user_entry.grid(row=4, column=1)
-    user_entry.insert(0, saved.get("username", stored_username or ""))
-
-    tk.Label(login_win, text="Password:").grid(row=5, column=0, sticky="e", padx=5, pady=3)
-    pass_entry = tk.Entry(login_win, width=25, show="*")
-    pass_entry.grid(row=5, column=1)
-    pass_entry.insert(0, saved.get("password", stored_password or ""))
-
-    def try_connect():
-        username = user_entry.get()
-        password = pass_entry.get()
-
-        global stored_username, stored_password, DB_HOST, DB_PORT, DB_NAME, DB_SCHEMA
-        stored_username = username
-        stored_password = password
-        DB_HOST = host_entry.get()
-        DB_PORT = port_entry.get()
-        DB_NAME = db_entry.get()
-        DB_SCHEMA = schema_entry.get()
-
-        try:
-            conn = psycopg2.connect(
-                host=DB_HOST, port=DB_PORT, database=DB_NAME,
-                user=username, password=password
-            )
-            conn.close()
-            login_win.destroy()
-            launch_global_mapper()
-        except Exception as e:
-            messagebox.showerror("Login Failed", f"Could not connect:\n{e}")
-
-        # Same centralized %APPDATA%\CAMA-Tools resolver as the
-        # pre-fill read above -- see that call site's comment.
-        _creds_path = get_credentials_path()
-        with open(_creds_path, "w") as f:
-            json.dump({
-                "host": DB_HOST,
-                "port": DB_PORT,
-                "database": DB_NAME,
-                "schema": DB_SCHEMA,
-                "username": stored_username,
-                "password": stored_password
-            }, f)
+# show_login_and_connect() (the old separate login Toplevel) is
+# REPLACED by the combined startup dialog in
+# core/startup_and_db_ui.show_startup_dialog(), wired via
+# startup_sequence() below. The two small callbacks below are what
+# that dialog calls once the user has either verified a connection or
+# explicitly chosen to continue without one -- they own committing the
+# result into MAIN.py's own session globals (DB_HOST, stored_username,
+# etc.), the one thing core/startup_and_db_ui.py deliberately does NOT
+# do itself (see that module's own docstring: it never mutates these
+# MAIN.py globals directly, only its own internal _db_state).
+def _on_startup_verified(workspace_path, credentials):
+    """Called by show_startup_dialog() once Start is clicked with a
+    VERIFIED session (a Test Connection just succeeded against the
+    current field values). Commits those credentials into MAIN.py's
+    own session globals -- the same globals launch_global_mapper()'s
+    regex-patch step already reads -- then proceeds through the
+    EXISTING, unchanged launch_global_mapper() -> wait_for_global_mapper()
+    -> launch_main_window() chain, DB-enabled (patching) path."""
+    global stored_username, stored_password, DB_HOST, DB_PORT, DB_NAME, DB_SCHEMA, selected_gmw_file
+    selected_gmw_file = workspace_path
+    stored_username = credentials.get("username", "")
+    stored_password = credentials.get("password", "")
+    DB_HOST = credentials.get("host", "")
+    DB_PORT = credentials.get("port", "")
+    DB_NAME = credentials.get("database", "")
+    DB_SCHEMA = credentials.get("schema", "")
+    launch_global_mapper(db_less=False)
 
 
-    tk.Button(login_win, text="Login", command=try_connect, bg="#007acc", fg="white").grid(row=6, columnspan=2, pady=10)
+def _on_startup_dbless(workspace_path):
+    """Called by show_startup_dialog() once the user has explicitly
+    confirmed continuing without a database (either the all-five-
+    fields-filled or the partial/empty Yes/No branch). Proceeds
+    through the EXISTING launch_global_mapper() chain with db_less=True
+    -- the .gmw patch step is skipped entirely (see
+    launch_global_mapper()'s own db_less handling above); the session
+    DB credential globals are deliberately left untouched here (there
+    is nothing verified to commit)."""
+    global selected_gmw_file
+    selected_gmw_file = workspace_path
+    launch_global_mapper(db_less=True)
 
 
 # Hide minimize/maximize, show in taskbar, and disable close
-root.title("CAMA Tools")
+root.title("Land Valuation Tools")
 
 # Hide from taskbar using tool window style
 import ctypes
@@ -4424,7 +4433,7 @@ GM_LEFT_PANEL_W = 240
 def get_cama_size():
     """Returns the CAMA Tools window's (width, height) via its Win32
     window rect, or None if the window can't be found."""
-    cama_hwnd = ctypes.windll.user32.FindWindowW(None, "CAMA Tools")
+    cama_hwnd = ctypes.windll.user32.FindWindowW(None, "Land Valuation Tools")
     if cama_hwnd:
         r = ctypes.wintypes.RECT()
         ctypes.windll.user32.GetWindowRect(cama_hwnd, ctypes.byref(r))
@@ -4749,7 +4758,7 @@ def install_wm_moving_hook():
     for _new_wnd_proc() to delegate to.
     """
     global _old_wnd_proc
-    cama_hwnd = ctypes.windll.user32.FindWindowW(None, "CAMA Tools")
+    cama_hwnd = ctypes.windll.user32.FindWindowW(None, "Land Valuation Tools")
     if not cama_hwnd:
         root.after(300, install_wm_moving_hook)
         return
@@ -4762,7 +4771,7 @@ def install_wm_moving_hook():
 
 root.after(400, install_wm_moving_hook)
 
-root.title("CAMA Tools")
+root.title("Land Valuation Tools")
 root.resizable(False, False)
 # No fixed geometry — root will wrap tightly around content
 
@@ -4906,12 +4915,8 @@ icon_img_ids = {}
 
 
 
-# === GROUP TITLE: Feature Management Tools ===
-feature_title = tk.Label(button_frame, text="Feature Management Tools", font=("Segoe UI", 9, "bold"), bg="#afd0f7", anchor="w")
-feature_title.pack(side="top", anchor="w", padx=8, pady=(4, 1))
-
 first_row = tk.Frame(button_frame, bg="#afd0f7")
-first_row.pack(side="top", anchor="w", padx=4, pady=(0, 2))
+first_row.pack(side="top", anchor="w", padx=4, pady=(6, 2))
 
 second_row = tk.Frame(button_frame, bg="#afd0f7")
 second_row.pack(side="top", anchor="w", padx=4, pady=(0, 6))
@@ -5021,30 +5026,89 @@ btn_frame.pack(pady=(6, 6))
 
 
 # === UPDATE MAP BUTTON ===
+UPDATE_MAP_BTN_NORMAL_BG = "#6a9f2f"
 update_map_btn = tk.Button(
     btn_frame, text="Update Map",
-    width=20,
-    bg="#6a9f2f",
+    width=14,
     fg="white",
-    activebackground="#4c7a20",
-    activeforeground="white",
     relief="flat",
-    command=update_map_and_select_recorded
+    # DB-gate ordering rule: _gm_export_guard's own finally block
+    # (see its docstring) unconditionally restores state="normal" on
+    # this button before this lambda's second element runs -- Python
+    # evaluates the tuple left-to-right, synchronously, so
+    # db_gate.refresh() always fires strictly AFTER that finally has
+    # already restored "normal", and re-applies whatever the CURRENT
+    # DB-gate state actually calls for. _gm_export_guard itself is not
+    # modified. db_gate is looked up as a global at CALL time (see
+    # _db_gate_refresh_if_ready()'s own comment above for why this
+    # matches the existing update_btn/update_map_btn lookup pattern).
+    command=lambda: (update_map_and_select_recorded(), _db_gate_refresh_if_ready())
 )
-update_map_btn.pack(side="left", padx=5)  # Add horizontal spacing
+# Starts disabled/gray -- the session starts with no verified DB
+# connection (VERIFIED is only reached via a successful Test
+# Connection), so this button's initial appearance must already
+# reflect that, not the enabled green it would otherwise default to.
+# db_gate.refresh() (called once db_gate exists, right after
+# create_hub_icon() below) re-asserts the correct state/color anyway,
+# but starting it already-gray avoids a one-frame flash of green
+# before that first refresh() runs.
+set_secondary_button_enabled(update_map_btn, False, UPDATE_MAP_BTN_NORMAL_BG)
+bind_secondary_button_hover(update_map_btn, UPDATE_MAP_BTN_NORMAL_BG)
+# NOTE: not packed yet -- create_hub_icon() below needs BOTH Button
+# objects to already exist (it wires their state/cursor into the
+# constructed DBGate), but Tk's pack() geometry manager lays widgets
+# out in the ORDER pack() is CALLED, not the order they're constructed.
+# So both buttons are constructed here first, the hub is built and
+# packed between them, and only then are update_map_btn/update_btn
+# themselves packed -- giving the visual order
+# [Update Map] [hub] [Update Database] while still letting
+# create_hub_icon() receive two fully-constructed Button widgets.
 
 # === UPDATE DB BUTTON ===
+UPDATE_DB_BTN_NORMAL_BG = "#007acc"
 update_btn = tk.Button(
     btn_frame, text="Update Database",
-    width=20,
-    bg="#007acc",
+    width=14,
     fg="white",
-    activebackground="#005f99",
-    activeforeground="white",
     relief="flat",
-    command=update_database_from_geopackage
+    # Same DB-gate ordering rule as update_map_btn above.
+    command=lambda: (update_database_from_geopackage(), _db_gate_refresh_if_ready())
 )
-update_btn.pack(side="left", padx=5)  # Add horizontal spacing
+# Same starts-disabled/gray reasoning as update_map_btn above.
+set_secondary_button_enabled(update_btn, False, UPDATE_DB_BTN_NORMAL_BG)
+bind_secondary_button_hover(update_btn, UPDATE_DB_BTN_NORMAL_BG)
+# Also not packed yet -- see the note above update_map_btn.
+
+
+# === DB STATUS HUB ICON ===
+# Placed BETWEEN the two Update buttons, on the same row inside
+# btn_frame. See core/startup_and_db_ui.py's create_hub_icon() for
+# what it builds and why it needs update_btn/update_map_btn to already
+# exist as real widgets -- both were constructed (not yet packed)
+# immediately above for exactly this reason.
+def _open_configure_db_dialog():
+    show_configure_db_dialog(root, apply_icon, get_credentials_path, db_gate)
+
+db_gate, _hub_canvas = create_hub_icon(
+    btn_frame, ICONS_DIR, update_btn, update_map_btn,
+    UPDATE_DB_BTN_NORMAL_BG, UPDATE_MAP_BTN_NORMAL_BG,
+    is_any_tool_active, lambda: _gm_automation_in_flight,
+    _open_configure_db_dialog,
+)
+
+# Now pack all three widgets, left to right, in the intended visual
+# order: Update Map, hub icon, Update Database.
+update_map_btn.pack(side="left", padx=5)
+_hub_canvas.pack(side="left", padx=5)
+update_btn.pack(side="left", padx=5)
+
+
+# Connector-line routing needs real winfo_* values, which only exist
+# once the widgets above have actually been laid out -- see
+# draw_hub_connectors()'s own docstring for why this is a one-time
+# post-layout call, not something done inside create_hub_icon() itself.
+root.update_idletasks()
+draw_hub_connectors(_hub_canvas, button_frame, update_map_btn, update_btn)
 
 
 
@@ -5118,7 +5182,7 @@ def launch_main_window():
 import pygetwindow as gw
 import time
 
-def launch_global_mapper():
+def launch_global_mapper(db_less=False):
     """
     Patches the selected .gmw workspace file's stored PostGIS
     connection details (host/port/database/schema/username/password)
@@ -5126,6 +5190,22 @@ def launch_global_mapper():
     copy to a temp file, leaving the original untouched), launches
     Global Mapper with that patched workspace, then calls
     wait_for_global_mapper() to poll until it's ready.
+
+    Args:
+        db_less: when True, the patching step is skipped entirely and
+            Global Mapper is launched with the ORIGINAL, unmodified
+            workspace file -- no temp copy, no regex substitution of
+            any POSTGIS_* field. Whatever PostGIS connection settings
+            already exist inside that .gmw file (if any) are left
+            exactly as they are; Global Mapper's own connection is not
+            CAMA Tools' concern in this mode. This is an explicit,
+            deterministic branch chosen by the caller (the combined
+            startup dialog's DB-less confirmation path) -- it is NOT
+            inferred from a patch failure. The pre-existing broad
+            except Exception below remains solely as protection
+            against an UNEXPECTED patch failure in the DB-ENABLED
+            (db_less=False) path; it is not reused to represent
+            intentional DB-less mode.
     """
     import re
     import shutil
@@ -5141,53 +5221,56 @@ def launch_global_mapper():
     gmw_path = selected_gmw_file
     patched_path = gmw_path  # default: use as-is
 
-    try:
-        with open(gmw_path, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read()
+    if db_less:
+        print("ℹ DB-less mode: launching original .gmw unmodified (patch step skipped).")
+    else:
+        try:
+            with open(gmw_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
 
-        # Patch DB_NAME
-        content = re.sub(
-            r'(POSTGIS_DATABASE\s*=\s*")[^"]*(")',
-            lambda m: m.group(1) + DB_NAME + m.group(2),
-            content
-        )
-        # Patch DB_HOST
-        content = re.sub(
-            r'(POSTGIS_HOST\s*=\s*")[^"]*(")',
-            lambda m: m.group(1) + DB_HOST + m.group(2),
-            content
-        )
-        # Patch DB_PORT
-        content = re.sub(
-            r'(POSTGIS_PORT\s*=\s*")[^"]*(")',
-            lambda m: m.group(1) + DB_PORT + m.group(2),
-            content
-        )
-        # Patch username
-        content = re.sub(
-            r'(POSTGIS_USER\s*=\s*")[^"]*(")',
-            lambda m: m.group(1) + stored_username + m.group(2),
-            content
-        )
-        # Patch password
-        content = re.sub(
-            r'(POSTGIS_PASSWORD\s*=\s*")[^"]*(")',
-            lambda m: m.group(1) + stored_password + m.group(2),
-            content
-        )
+            # Patch DB_NAME
+            content = re.sub(
+                r'(POSTGIS_DATABASE\s*=\s*")[^"]*(")',
+                lambda m: m.group(1) + DB_NAME + m.group(2),
+                content
+            )
+            # Patch DB_HOST
+            content = re.sub(
+                r'(POSTGIS_HOST\s*=\s*")[^"]*(")',
+                lambda m: m.group(1) + DB_HOST + m.group(2),
+                content
+            )
+            # Patch DB_PORT
+            content = re.sub(
+                r'(POSTGIS_PORT\s*=\s*")[^"]*(")',
+                lambda m: m.group(1) + DB_PORT + m.group(2),
+                content
+            )
+            # Patch username
+            content = re.sub(
+                r'(POSTGIS_USER\s*=\s*")[^"]*(")',
+                lambda m: m.group(1) + stored_username + m.group(2),
+                content
+            )
+            # Patch password
+            content = re.sub(
+                r'(POSTGIS_PASSWORD\s*=\s*")[^"]*(")',
+                lambda m: m.group(1) + stored_password + m.group(2),
+                content
+            )
 
-        # Write patched content to a temp file so we don't overwrite the original
-        tmp = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".gmw", delete=False,
-            encoding="utf-8", prefix="cama_patched_"
-        )
-        tmp.write(content)
-        tmp.close()
-        patched_path = tmp.name
-        print(f"✅ Patched .gmw written to: {patched_path}")
+            # Write patched content to a temp file so we don't overwrite the original
+            tmp = tempfile.NamedTemporaryFile(
+                mode="w", suffix=".gmw", delete=False,
+                encoding="utf-8", prefix="cama_patched_"
+            )
+            tmp.write(content)
+            tmp.close()
+            patched_path = tmp.name
+            print(f"✅ Patched .gmw written to: {patched_path}")
 
-    except Exception as e:
-        print(f"⚠ Could not patch .gmw file: {e} — launching with original")
+        except Exception as e:
+            print(f"⚠ Could not patch .gmw file: {e} — launching with original")
 
     # Task B fix: snapshot existing "Global Mapper Pro" windows BEFORE
     # launching, and capture the launched process's own PID -- both feed
@@ -5458,33 +5541,24 @@ def startup_sequence():
     """
     First thing that runs once the Tkinter event loop starts (scheduled
     via root.after(0, startup_sequence) at the very end of this file):
-    starts the resize_file_dialog() background thread, then prompts the
-    user to select a .gmw workspace file. On selection, proceeds to
-    show_login_and_connect() -- the next step in the launcher flow.
+    hands off entirely to core/startup_and_db_ui.show_startup_dialog(),
+    which now owns BOTH the .gmw workspace picker AND the credential/
+    Test-Connection UI that used to be the separate
+    show_login_and_connect() dialog (see that function's own docstring
+    -- it has been removed; its logic is superseded by the combined
+    dialog). resize_file_dialog is passed straight through as the
+    background-thread target the Browse button uses, unchanged. The
+    two small callbacks this module supplies
+    (_on_startup_verified/_on_startup_dbless, defined above) are what
+    the combined dialog calls once the user reaches VERIFIED or an
+    explicit DB-less confirmation -- both ultimately proceed through
+    the EXISTING, unchanged launch_global_mapper() ->
+    wait_for_global_mapper() -> launch_main_window() chain.
     """
-    global selected_gmw_file
-
-    threading.Thread(target=resize_file_dialog, daemon=True).start()
-
-    gmw_file = filedialog.askopenfilename(
-        title="Select Global Mapper Workspace File",
-        filetypes=[("Global Mapper Workspace", "*.gmw")]
+    show_startup_dialog(
+        root, apply_icon, get_credentials_path, resize_file_dialog,
+        _on_startup_verified, _on_startup_dbless,
     )
-
-    if not gmw_file:
-        try:
-            messagebox.showwarning("Cancelled", "No GMW file selected. Exiting.")
-        except Exception:
-            pass
-        try:
-            root.quit()
-            root.destroy()
-        except Exception:
-            pass
-        sys.exit(0)
-
-    selected_gmw_file = gmw_file
-    show_login_and_connect()
 
 root.after(0, startup_sequence)
 root.mainloop()

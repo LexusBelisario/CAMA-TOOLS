@@ -150,6 +150,7 @@ from utils.db_discovery import load_db_credentials, fetch_tables
 from utils.column_detection import detect_existing_output_columns
 from utils.window_icon import apply_icon
 from utils.gpkg_io import write_gpkg_atomic as _write_gpkg, GpkgWriteError
+from utils.db_gate_ui import disable_db_radio, attach_no_db_tooltip
 
 # ============================
 # FORCE WINDOWS APP ICON
@@ -161,7 +162,7 @@ import ctypes
 # module is loaded, before main() runs (see module docstring SIDE
 # EFFECTS). Not moved or deferred; see module docstring for why.
 def set_app_user_model_id():
-    appid = u"BLGF.CAMA.Tools.2025"
+    appid = u"BLGF.LandValuationTools"
     try:
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(appid)
     except Exception:
@@ -3249,7 +3250,7 @@ def run_processing(app_root, dist_col, extra_column_specs, overwrite_mode=None,
                 if lock_conn is None:
                     raise RuntimeError(
                         "Could not acquire the database run lock. Another "
-                        "CAMA Tools database write may already be in "
+                        "Land Valuation Tools database write may already be in "
                         "progress, or the database connection failed. "
                         "Aborting before any write -- no data was changed."
                     )
@@ -3558,7 +3559,7 @@ def _pick_db_tables(parent, tables, multi, on_select):
               width=20).pack(pady=(0, 10))
 
 
-def open_main_window(root):
+def open_main_window(root, db_verified=True):
     """
     Builds and shows the tool's single unified configuration window:
     Land Parcel and Influence Map Source pickers (each with a
@@ -3579,6 +3580,12 @@ def open_main_window(root):
 
     Args:
         root: the parent Tk root this window is opened under.
+        db_verified: bool, see main()'s own docstring for the full
+            explanation -- passed straight through here. Used once,
+            near the end of this function, to disable the three
+            "Database"-style radio buttons (parcel_radio_db,
+            fault_radio_db, out_radio_db) if False; see that block's
+            own comment for exactly why.
     """
     from tkinter import ttk
 
@@ -4707,9 +4714,14 @@ def open_main_window(root):
     tk.Radiobutton(out_radio_row, text="Save to Local Folder",
                    variable=output_dest_type, value="local",
                    command=lambda: _toggle_output()).pack(side="left")
-    tk.Radiobutton(out_radio_row, text="Save to Database",
-                   variable=output_dest_type, value="db",
-                   command=lambda: _toggle_output()).pack(side="left", padx=(12, 0))
+    # Named (unlike this section's Local Folder radio above) so the
+    # db_verified block near the end of this function can disable it
+    # when the session has no verified database connection.
+    out_radio_db = tk.Radiobutton(
+        out_radio_row, text="Save to Database",
+        variable=output_dest_type, value="db",
+        command=lambda: _toggle_output())
+    out_radio_db.pack(side="left", padx=(12, 0))
 
     output_dir_var = tk.StringVar(master=win, value="No folder selected")
     output_db_var = tk.StringVar(master=win,
@@ -4964,11 +4976,29 @@ def open_main_window(root):
     _update_fault_checklist_visibility()
     _update_run_button_state()
 
+    # If this session's database connection was not VERIFIED at the
+    # moment this tool was launched (see main()'s own db_verified
+    # docstring), disable the three "Database"-style radio buttons --
+    # parcel_radio_db, fault_radio_db, out_radio_db -- across all three
+    # sections, using the shared utils.db_gate_ui helpers (same
+    # disabled-cursor convention and hover tooltip every other tool
+    # file uses for this). Only the "db" radio in each pair is
+    # touched; the "local"/file-based radio next to it is never
+    # disabled. This does not replace or duplicate
+    # utils.db_discovery.load_db_credentials()/fetch_tables()'s own
+    # existing error handling for a connection that fails or is lost
+    # AFTER this window has already opened -- that remains fully in
+    # effect regardless of db_verified.
+    if not db_verified:
+        for _db_radio in (parcel_radio_db, fault_radio_db, out_radio_db):
+            disable_db_radio(_db_radio)
+            attach_no_db_tooltip(_db_radio)
+
 
 # ========================================
 # MAIN / ENTRYPOINT
 # ========================================
-def main(parent=None):
+def main(parent=None, db_verified=True):
     """
     Tool entry point. If parent is given (invoked from within another
     running Tk app), reuses it and just opens this tool's window.
@@ -4978,14 +5008,35 @@ def main(parent=None):
 
     Args:
         parent: an existing Tk root to reuse, or None to create one.
+        db_verified: bool, passed through from MAIN.py's own launcher
+            (see MAIN.py's run_tool_by_label()/dispatch_tool_if_requested()) --
+            True if the CAMA Tools session's database connection was
+            VERIFIED (a successful Test Connection) at the moment this
+            tool was launched, False otherwise. This is a ONE-TIME,
+            launch-time snapshot, not a live/continuously-updated
+            signal -- there is no mechanism here that re-checks it
+            while this tool's window stays open. Used only to disable
+            this tool's own "Database Table"-style radio buttons when
+            False (see open_main_window()'s own use of it below);
+            defaults to True so existing direct calls to main() (e.g.
+            manual/dev-mode testing without the --db-verified CLI flag
+            MAIN.py now passes) are unaffected and behave exactly as
+            before this parameter was added. This does NOT replace or
+            duplicate utils.db_discovery.load_db_credentials()/
+            fetch_tables()'s own existing error handling for a
+            connection that fails or is lost AFTER this tool has
+            already opened (that remains fully in effect regardless of
+            db_verified's value) -- db_verified only prevents starting
+            down that path at all when the session's DB was already
+            known-unverified at launch time.
     """
     if parent is not None:
-        open_main_window(parent)
+        open_main_window(parent, db_verified=db_verified)
     else:
         root = tk.Tk()
         apply_icon(root, "distancefactor.ico")
         root.withdraw()
-        open_main_window(root)
+        open_main_window(root, db_verified=db_verified)
         root.mainloop()
 
 

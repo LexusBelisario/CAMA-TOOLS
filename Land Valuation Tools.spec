@@ -67,7 +67,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='CAMA-Tools',
+    name='Land Valuation Tools',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
