@@ -191,6 +191,34 @@ def apply_icon(win):
     force_png_icon(win)
 
 
+_active_splash = None  # holds the splash window while GM/CAMA Tools loads, if any
+
+
+def show_splash():
+    # borderless always-on-top window shown while the app finishes loading
+    splash = tk.Toplevel()
+    splash.overrideredirect(True)
+    splash.attributes("-topmost", True)
+
+    img = Image.open(resource_path("resources/splash.png"))
+
+    # cap splash size so it never fills the screen, keep aspect ratio
+    max_w, max_h = 1000, 800
+    img.thumbnail((max_w, max_h), Image.LANCZOS)
+    photo = ImageTk.PhotoImage(img)
+
+    w, h = img.size
+    sw, sh = splash.winfo_screenwidth(), splash.winfo_screenheight()
+    splash.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+
+    label = tk.Label(splash, image=photo, borderwidth=0)
+    label.image = photo  # keep a reference so it doesn't get garbage collected
+    label.pack()
+
+    splash.update()
+    return splash
+
+
 import sys, importlib, argparse
 
 
@@ -4602,8 +4630,9 @@ def _on_start(workspace_path):
     set later, if and when the user commits a connection via the
     mid-session Configure Database dialog (see _on_credentials_changed()
     above)."""
-    global selected_gmw_file
+    global selected_gmw_file, _active_splash
     selected_gmw_file = workspace_path
+    _active_splash = show_splash()  # closed once GM window is confirmed open
     launch_global_mapper(db_less=True)
 
 
@@ -5748,6 +5777,14 @@ def wait_for_global_mapper():
         ready = got_rect and visible and not minimized and width > 100 and height > 100
 
     if ready:
+        # splash's only job is "did a real GM window appear" -- close it
+        # the instant that's true, without waiting for the stability lock below
+        global _active_splash
+        if _active_splash is not None:
+            _active_splash.destroy()
+            _active_splash = None
+            root.update()  # force the splash to actually disappear now, not later
+
         _gm_stable_count[0] += 1
         if _gm_stable_count[0] >= 2:      # stable for 2 consecutive checks (2s)
             # Lock onto the verified candidate HWND -- not gm_windows[0],

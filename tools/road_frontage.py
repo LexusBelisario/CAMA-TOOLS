@@ -1701,7 +1701,7 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
             # D-Cancel: explicit False only -- see this function's own
             # progress-contract docstring. None/True/no-return all mean
             # "continue," so an old-style caller keeps working unchanged.
-            if progress(f"{source_name}: {i}/{total}", i, total) is False:
+            if progress(f"Measuring Road Frontage: {i}/{total}", i, total) is False:
                 cancelled_pass1 = True
                 break
 
@@ -1990,7 +1990,7 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
             # depths/dwrs are treated as a completed result -- see the
             # discard check immediately after this loop, before those
             # lists are ever assigned onto brgy_gdf.
-            if progress(f"{source_name}: {i}/{total}", i, total) is False:
+            if progress(f"Measuring: {i}/{total}", i, total) is False:
                 cancelled_pass3 = True
                 break
 

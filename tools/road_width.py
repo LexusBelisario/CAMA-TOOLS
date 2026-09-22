@@ -4313,7 +4313,7 @@ class RoadWidthPresentationPolicy:
 class RoadWidthTkinterView:
     """
     Tkinter View (Progress Event Protocol v9) for road_width.py. The
-    only component that touches status_var/progress/count_var/win on a
+    only component that touches status_var/progress/win on a
     per-event basis. Construction/ownership of those widgets (including
     the initial indeterminate .start(12) animation and dialog
     centering) stays in ProgressWindow.__init__, unchanged. The
@@ -4330,7 +4330,7 @@ class RoadWidthTkinterView:
     state.cancelable if it's ever set (there's nothing to act on
     without a cancel_flag).
     """
-    def __init__(self, win, status_var, progressbar, count_var, cancel_flag=None):
+    def __init__(self, win, status_var, progressbar, cancel_flag=None):
         """
         Stores already-constructed widget references. Does not create
         any widgets itself -- see class docstring.
@@ -4350,7 +4350,6 @@ class RoadWidthTkinterView:
         self.win = win
         self.status_var = status_var
         self.progress = progressbar
-        self.count_var = count_var
         self._cancel_flag = cancel_flag
         self._on_cancel = None
 
@@ -4367,7 +4366,6 @@ class RoadWidthTkinterView:
         self.status_var.set(state.message)
         if state.value is not None and state.total is not None:
             self.progress["value"] = state.value
-            self.count_var.set(f"{state.value} / {state.total}")
         # D-Cancel: enables/disables the close button to match
         # state.cancelable, mirroring progress_framework.py's own
         # TkinterProgressView.render() -- only acts when this view was
@@ -4385,7 +4383,6 @@ class RoadWidthTkinterView:
     def render_switch(self, state: SwitchState):
         self.progress.stop()
         self.progress.config(mode="determinate", maximum=state.total, value=0)
-        self.count_var.set(f"0 / {state.total}")
 
     def destroy(self):
         try:
@@ -4467,10 +4464,6 @@ class ProgressWindow:
         self.progress.pack(pady=6)
         self.progress.start(12)
 
-        self.count_var = tk.StringVar(master=self.win)
-        self.count_var.set("")
-        tk.Label(self.win, textvariable=self.count_var).pack(pady=(0, 10))
-
         self.win.attributes("-topmost", True)
         self.win.update_idletasks()
         req_w = max(self.win.winfo_reqwidth(), 420)
@@ -4488,7 +4481,7 @@ class ProgressWindow:
         # wiring -- see RoadWidthTkinterView.__init__'s own docstring.
         self._policy = RoadWidthPresentationPolicy()
         self._view = RoadWidthTkinterView(
-            self.win, self.status_var, self.progress, self.count_var,
+            self.win, self.status_var, self.progress,
             cancel_flag=cancel_flag,
         )
 
@@ -5896,11 +5889,7 @@ def run_processing(app_root, overwrite_mode=None, resolved_table_name=None, reso
                 def progress_cb(_):
                     nonlocal current_step
                     current_step += 1
-                    msg = (
-                        f"Measuring road width...\n"
-                        f"Parcel {current_step} / {total_features}\n"
-                        f"Source: {current_source_label[0]}"
-                    )
+                    msg = f"Measuring Road Width: {current_step}/{total_features}"
                     q.put(("update", msg, current_step, total_features))
 
                 def status_cb(message, value=None, total=None, cancelable=None):
