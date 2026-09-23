@@ -1451,6 +1451,8 @@ def show_startup_dialog(root, apply_icon_fn, resize_file_dialog_fn, on_start):
     import threading
     from tkinter import filedialog
 
+    from utils.last_directory import get_last_directory, set_last_directory
+
     # Every session starts, and stays, UNVERIFIED until a successful
     # mid-session CHANGE CONNECTION commit -- see module docstring, DB
     # STATE MACHINE. Reset here (as the prior version of this dialog
@@ -1519,6 +1521,7 @@ def show_startup_dialog(root, apply_icon_fn, resize_file_dialog_fn, on_start):
     # function's own docstring). ---
     def _do_start():
         win.destroy()
+        set_last_directory("gm_workspace", workspace_path_var["path"])
         on_start(workspace_path_var["path"])
 
     start_btn = Button(outer, text="START", command=_do_start, state="disabled",
@@ -1526,6 +1529,24 @@ def show_startup_dialog(root, apply_icon_fn, resize_file_dialog_fn, on_start):
                         cursor="no", font=("Segoe UI", 10, "bold"))
     _bind_primary_button_hover(start_btn)
     start_btn.grid(row=2, column=0, columnspan=2, sticky="we", pady=(8, 0), ipady=4)
+
+    # Pre-fill from the last-used Global Mapper Workspace file, if one
+    # was saved on a prior run AND it still looks usable. get_last_directory()
+    # itself already confirms the saved path still exists on disk,
+    # returning None otherwise; this function is additionally
+    # responsible for its own category-specific check -- that the path
+    # still looks like a workspace file -- as a cheap defensive check
+    # against a corrupted/hand-edited last_directory.json pointing
+    # somewhere unrelated. Either check failing leaves the dialog
+    # exactly as it behaves today: empty path field, Start disabled,
+    # user must Browse. No error dialog for either case -- a missing
+    # or stale saved path is a normal, expected state, not a failure
+    # worth interrupting the user over.
+    last_workspace = get_last_directory("gm_workspace")
+    if last_workspace and last_workspace.lower().endswith(".gmw"):
+        workspace_path_var["path"] = last_workspace
+        _set_path_display(last_workspace)
+        _set_primary_button_enabled(start_btn, True)
 
     # Center the dialog on the screen. update_idletasks() forces Tk to
     # finish laying out every widget above so winfo_reqwidth/reqheight
