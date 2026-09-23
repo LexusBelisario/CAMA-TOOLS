@@ -1461,7 +1461,7 @@ def show_startup_dialog(root, apply_icon_fn, resize_file_dialog_fn, on_start):
     _verified_fields[0] = None
 
     win = Toplevel(root)
-    apply_icon_fn(win)
+    apply_icon_fn(win, "resources/igdi_icon.ico", "resources/igdi_icon.png")
     win.title("Land Valuation Tools - Startup")
     win.resizable(False, False)
     _remove_minmax_buttons(win)
@@ -1697,7 +1697,7 @@ def show_configure_db_dialog(root, apply_icon_fn, get_credentials_path_fn, db_ga
             own bug-fix notes.
     """
     win = Toplevel(root)
-    apply_icon_fn(win)
+    apply_icon_fn(win, "resources/igdi_icon.ico", "resources/igdi_icon.png")
     win.title("Configure Database Connection")
     win.resizable(False, False)
     _remove_minmax_buttons(win)
