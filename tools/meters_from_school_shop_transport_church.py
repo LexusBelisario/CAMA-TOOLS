@@ -1747,7 +1747,62 @@ def load_in_global_mapper(filepath):
 # ========================================
 # MAIN WINDOW
 # ========================================
-def open_main_window(app_root, db_verified=True):
+def is_batch_config_complete(config):
+    """
+    Batch-mode readiness check, per the contract documented in
+    tools/batchValuation/contract.py (PER-TOOL BATCH-MODE CONTRACT) --
+    the Batch Valuation orchestrator calls this against this tool's own
+    last-Saved config dict to decide whether to show its "Incomplete"
+    overlay.
+
+    This tool has TWO secondary sources -- POI Source and Road Network
+    Source -- both stay visible in batch mode (only Land Parcel Source
+    / Output Destination are hidden). A batch config is complete once
+    BOTH a POI source AND a Road Network source are selected -- mirrors
+    the non-live parts of this tool's own on_run()-gating readiness
+    cascade. NOTE: this deliberately does NOT also require
+    poi_types_reading to have finished (the live GUI's own "is the
+    background Other-Landmark-Types discovery read still in flight"
+    flag) -- that flag exists only to stop the LIVE Run button from
+    being pressed mid-read; it isn't a meaningful property of a saved
+    config snapshot, matching the same scoping decision already applied
+    to lot_location.py's own road_read_ok. "Include Other Landmark
+    Types" itself is OPTIONAL and never gates readiness either way,
+    exactly as in the tool's own existing logic.
+
+    Args:
+        config (dict): this tool's own last-Saved batch config, in the
+            shape _gather_batch_config() below produces:
+            {"poi_source_type": "local"|"db",
+             "poi_local_path"|"poi_db_table": "...",
+             "road_source_type": "local"|"db",
+             "road_local_path"|"road_db_table": "...",
+             "include_other_landmarks": bool,
+             "other_landmark_included_types": list[str]}.
+
+    Returns:
+        bool: True iff a POI source AND a Road Network source are both
+            present for whichever mode each one specifies.
+    """
+    if not config:
+        return False
+    if config.get("poi_source_type") == "local":
+        has_poi = bool(config.get("poi_local_path"))
+    elif config.get("poi_source_type") == "db":
+        has_poi = bool(config.get("poi_db_table"))
+    else:
+        return False
+    if config.get("road_source_type") == "local":
+        has_road = bool(config.get("road_local_path"))
+    elif config.get("road_source_type") == "db":
+        has_road = bool(config.get("road_db_table"))
+    else:
+        return False
+    return has_poi and has_road
+
+
+def open_main_window(app_root, db_verified=True, batch_mode=False,
+                      initial_config=None, on_save=None, on_cancel=None):
     """
     Builds and shows the tool's single unified configuration window:
     four source/destination pickers (Land Parcel, POI, Road Network,
@@ -1771,11 +1826,48 @@ def open_main_window(app_root, db_verified=True):
             near the end of this function, to disable the four
             "Database"-style radio buttons (parcel_radio_db,
             poi_radio_db, road_radio_db, out_radio_db) if False; see
-            that block's own comment for exactly why.
+            that block's own comment for exactly why. When
+            batch_mode=True, only poi_radio_db/road_radio_db are built
+            at all, so only those two are gated -- parcel_radio_db/
+            out_radio_db do not exist in that branch.
+        batch_mode: bool, default False -- NEW. When True, the Land
+            Parcel Source and Output Destination sections below are
+            not built at all (supplied globally by the Batch
+            Valuation orchestrator instead); POI Source and Road
+            Network Source -- including POI Source's own "Include
+            Other Landmark Types" checklist, entirely unmodified --
+            are the only sections still shown, since those are this
+            tool's only other settings; "Run Processing" is replaced
+            by a Cancel/Save row (see
+            utils.batch_mode_ui.build_save_cancel_row()). See
+            tools/batchValuation/contract.py for the full per-tool
+            batch-mode contract this implements. False (the default)
+            leaves every existing non-batch caller (the normal Feature
+            Management Tools icon-grid launch) completely unaffected --
+            same signature default, same behavior, same code path.
+        initial_config: dict | None, default None -- NEW. Pre-fills
+            POI Source and Road Network Source (this tool's only
+            batch-visible fields) when re-opening a previously-saved
+            batch entry, INCLUDING the "Include Other Landmark Types"
+            checklist's own previously-Saved checked/unchecked state --
+            restored once the background re-read this triggers (via
+            the SAME _toggle_poi() -> _refresh_poi_landmark_types()
+            path a normal Browse/Select already uses) actually
+            completes; see _pending_other_landmarks_restore's own
+            comment below and _poll_poi_landmark_queue()'s own
+            docstring for exactly where this is applied. See
+            is_batch_config_complete()'s own docstring for the config
+            dict's shape.
+        on_save: callable(config: dict) -> None, default None -- NEW.
+            Forwarded to build_save_cancel_row() -- see that helper's
+            own docstring for its full Save/Cancel lifecycle (Save
+            stays open; only Cancel/the titlebar X closes the window).
+        on_cancel: callable() -> None, default None -- NEW. Forwarded
+            to build_save_cancel_row(), same as on_save above.
     """
     win = tk.Toplevel(app_root)
     apply_icon(win, "distancefrom.ico")
-    win.title("Meters From (School, Shop, Transport, Church) Tool")
+    win.title("Meters From (School, Shop, Transport, Church) Tool" + (" — Batch Mode" if batch_mode else ""))
     win.resizable(False, False)
     win.update_idletasks()
     win.deiconify()
@@ -1819,81 +1911,129 @@ def open_main_window(app_root, db_verified=True):
         ttk.Separator(frm, orient="horizontal").pack(
             side="left", fill="x", expand=True, padx=(6, 0), pady=4)
 
-    # ── SECTION 1: LAND PARCEL ───────────────────────────────────
-    section_label(win, "Land Parcel Source")
-
-    parcel_frame = tk.Frame(win)
-    parcel_frame.pack(fill="x", padx=18, pady=2)
-
-    radio_row = tk.Frame(parcel_frame)
-    radio_row.pack(fill="x")
-    tk.Radiobutton(radio_row, text="Local File",
-                   variable=parcel_source_type, value="local",
-                   command=lambda: _toggle_parcel()).pack(side="left")
-    # Named (unlike this section's Local File radio above) so the
-    # db_verified block near the end of this function can disable it
-    # when the session has no verified database connection.
-    parcel_radio_db = tk.Radiobutton(
-        radio_row, text="Database Table",
-        variable=parcel_source_type, value="db",
-        command=lambda: _toggle_parcel())
-    parcel_radio_db.pack(side="left", padx=(12, 0))
-
-    parcel_files_var = tk.StringVar(master=win, value="No file selected")
-    parcel_db_label  = tk.StringVar(master=win, value="No table selected")
-
-    parcel_action_row = tk.Frame(parcel_frame)
-    parcel_action_row.pack(fill="x", pady=2)
-
-    parcel_lbl = tk.Label(parcel_action_row, textvariable=parcel_files_var,
-                          fg="gray", anchor="w", width=42)
-    parcel_lbl.pack(side="left")
-
-    parcel_btn = tk.Button(parcel_action_row, text="Browse…", width=10)
-    parcel_btn.pack(side="left", **PAD)
-
-    def browse_parcel_files():
-        file = filedialog.askopenfilename(filetypes=[
-            ("Shapefiles", "*.shp"), ("GeoPackage", "*.gpkg"), ("All", "*.*")])
-        if file:
-            nonlocal parcel_local_path
-            parcel_local_path = file
-            parcel_files_var.set(os.path.basename(file))
-        _update_run_button_state()
-
-    def _on_parcel_db_selected(sel):
-        nonlocal parcel_db_table
-        parcel_db_table = sel[0]
-        parcel_db_label.set(sel[0])
-        _update_run_button_state()
-
-    def browse_parcel_db():
-        creds = load_db_credentials()
-        if not creds:
-            messagebox.showerror("Error", "Could not load DB credentials.")
-            return
-        tables = fetch_tables(creds["schema"])
-        if not tables:
-            messagebox.showwarning("No Tables", "No tables found in the database schema.")
-            return
-        _pick_db_tables(win, tables, multi=False, on_select=_on_parcel_db_selected)
-
-    def _toggle_parcel():
-        if parcel_source_type.get() == "local":
-            parcel_lbl.config(textvariable=parcel_files_var)
-            parcel_btn.config(text="Browse…", command=browse_parcel_files)
-            parcel_files_var.set(
-                os.path.basename(parcel_local_path) if parcel_local_path
-                else "No file selected"
-            )
+    # NEW -- batch mode: pre-fill POI Source and Road Network Source
+    # from a previously-Saved config (see is_batch_config_complete()'s
+    # own docstring for the dict shape). Only sets the plain StringVars
+    # here -- the actual background re-read (and, once it completes,
+    # the "Include Other Landmark Types" restore queued into
+    # _pending_other_landmarks_restore below) is triggered naturally by
+    # the SAME _toggle_poi() call the batch-mode branch makes once,
+    # right after Section 3, for initial widget sync; nothing here
+    # calls _refresh_poi_landmark_types() directly. No-op when
+    # initial_config is None (first Edit this session) or when
+    # batch_mode is False.
+    _pending_other_landmarks_restore = [None]
+    if batch_mode and initial_config:
+        if initial_config.get("poi_source_type") == "db":
+            poi_source_type.set("db")
+            poi_db_table.set(initial_config.get("poi_db_table") or "")
         else:
-            parcel_lbl.config(textvariable=parcel_db_label)
-            parcel_btn.config(text="Select…", command=browse_parcel_db)
-            parcel_db_label.set(
-                parcel_db_table if parcel_db_table
-                else "No table selected"
-            )
-        _update_run_button_state()
+            poi_source_type.set("local")
+            poi_local_path.set(initial_config.get("poi_local_path") or "")
+        if initial_config.get("road_source_type") == "db":
+            road_source_type.set("db")
+            road_db_table.set(initial_config.get("road_db_table") or "")
+        else:
+            road_source_type.set("local")
+            road_local_path.set(initial_config.get("road_local_path") or "")
+        _pending_other_landmarks_restore[0] = (
+            bool(initial_config.get("include_other_landmarks")),
+            list(initial_config.get("other_landmark_included_types") or []),
+        )
+
+    # NEW -- placeholder assigned BEFORE Section 1 is built below.
+    # Section 1's, POI's (Section 2), and Road Network's (Section 3)
+    # own handlers call _update_run_button_state() unconditionally --
+    # the SAME code whether batch_mode is True or False, since POI
+    # Source and Road Network Source are the two sections this tool
+    # always builds. In batch mode there is no run_btn for the real
+    # implementation (defined much further below, near the Run button)
+    # to update, so this stays a no-op there; the REAL implementation
+    # is only defined -- shadowing this one -- inside the
+    # `if not batch_mode:` branch. Safe: Python resolves this name at
+    # CALL time (when the user actually interacts with a widget, after
+    # the whole window is built), not at each handler's own definition
+    # time.
+    if batch_mode:
+        def _update_run_button_state():
+            pass
+
+    if not batch_mode:
+        # ── SECTION 1: LAND PARCEL ───────────────────────────────────
+        section_label(win, "Land Parcel Source")
+
+        parcel_frame = tk.Frame(win)
+        parcel_frame.pack(fill="x", padx=18, pady=2)
+
+        radio_row = tk.Frame(parcel_frame)
+        radio_row.pack(fill="x")
+        tk.Radiobutton(radio_row, text="Local File",
+                       variable=parcel_source_type, value="local",
+                       command=lambda: _toggle_parcel()).pack(side="left")
+        # Named (unlike this section's Local File radio above) so the
+        # db_verified block near the end of this function can disable it
+        # when the session has no verified database connection.
+        parcel_radio_db = tk.Radiobutton(
+            radio_row, text="Database Table",
+            variable=parcel_source_type, value="db",
+            command=lambda: _toggle_parcel())
+        parcel_radio_db.pack(side="left", padx=(12, 0))
+
+        parcel_files_var = tk.StringVar(master=win, value="No file selected")
+        parcel_db_label  = tk.StringVar(master=win, value="No table selected")
+
+        parcel_action_row = tk.Frame(parcel_frame)
+        parcel_action_row.pack(fill="x", pady=2)
+
+        parcel_lbl = tk.Label(parcel_action_row, textvariable=parcel_files_var,
+                              fg="gray", anchor="w", width=42)
+        parcel_lbl.pack(side="left")
+
+        parcel_btn = tk.Button(parcel_action_row, text="Browse…", width=10)
+        parcel_btn.pack(side="left", **PAD)
+
+        def browse_parcel_files():
+            file = filedialog.askopenfilename(filetypes=[
+                ("Shapefiles", "*.shp"), ("GeoPackage", "*.gpkg"), ("All", "*.*")])
+            if file:
+                nonlocal parcel_local_path
+                parcel_local_path = file
+                parcel_files_var.set(os.path.basename(file))
+            _update_run_button_state()
+
+        def _on_parcel_db_selected(sel):
+            nonlocal parcel_db_table
+            parcel_db_table = sel[0]
+            parcel_db_label.set(sel[0])
+            _update_run_button_state()
+
+        def browse_parcel_db():
+            creds = load_db_credentials()
+            if not creds:
+                messagebox.showerror("Error", "Could not load DB credentials.")
+                return
+            tables = fetch_tables(creds["schema"])
+            if not tables:
+                messagebox.showwarning("No Tables", "No tables found in the database schema.")
+                return
+            _pick_db_tables(win, tables, multi=False, on_select=_on_parcel_db_selected)
+
+        def _toggle_parcel():
+            if parcel_source_type.get() == "local":
+                parcel_lbl.config(textvariable=parcel_files_var)
+                parcel_btn.config(text="Browse…", command=browse_parcel_files)
+                parcel_files_var.set(
+                    os.path.basename(parcel_local_path) if parcel_local_path
+                    else "No file selected"
+                )
+            else:
+                parcel_lbl.config(textvariable=parcel_db_label)
+                parcel_btn.config(text="Select…", command=browse_parcel_db)
+                parcel_db_label.set(
+                    parcel_db_table if parcel_db_table
+                    else "No table selected"
+                )
+            _update_run_button_state()
 
     # ── SECTION 2: POI SOURCE ────────────────────────────────────
     section_label(win, "POI Source")
@@ -2451,6 +2591,37 @@ def open_main_window(app_root, db_verified=True):
         else:
             _rebuild_other_landmarks_checklist(values)
 
+        # NEW -- batch mode only: if a previously-Saved batch config's
+        # "Include Other Landmark Types" state is pending restoration
+        # (set once, at window-open time, by the initial_config
+        # handling near the top of open_main_window -- see
+        # _pending_other_landmarks_restore's own comment there), apply
+        # it here -- this is the ONLY point in the entire read cycle
+        # where other_landmark_type_vars holds the FRESH, real
+        # BooleanVars a saved inclusion list can be matched against
+        # (keyed by display_text, unlike road_width.py's real_value-
+        # keyed equivalent -- this checklist has no separate
+        # display/real-value split). Consumed (reset to None)
+        # immediately, so an ORDINARY re-browse later in the same Edit
+        # session still leaves the checklist at its normal default
+        # (every type unchecked, "Include Other Landmark Types" off),
+        # exactly as it already does above. No-ops harmlessly if the
+        # read produced no eligible types at all (other_landmark_type_
+        # vars stays empty) -- nothing to restore in that case. Every
+        # existing non-batch caller never sets this cell at all, so
+        # this branch is always skipped for them -- zero behavior
+        # change there.
+        pending_restore = _pending_other_landmarks_restore[0]
+        if pending_restore is not None:
+            _pending_other_landmarks_restore[0] = None
+            restore_active, restore_included = pending_restore
+            if restore_active and other_landmark_type_vars:
+                included_set = set(restore_included)
+                for display_text, var in other_landmark_type_vars.items():
+                    if display_text in included_set:
+                        var.set(True)
+                include_other_landmarks_var.set(True)
+
         _update_other_landmarks_visibility()
         _update_run_button_state()
 
@@ -2563,390 +2734,452 @@ def open_main_window(app_root, db_verified=True):
             road_btn.config(text="Select…", command=browse_road_db)
         _update_run_button_state()
 
-    # ── SECTION 4: OUTPUT ────────────────────────────────────────
-    section_label(win, "Output Destination")
+    # NEW -- batch mode ONLY here: in the non-batch path, the initial
+    # _toggle_poi()/_toggle_road() sync stays in its ORIGINAL position,
+    # at the very end alongside _toggle_parcel()/_toggle_output() (see
+    # below) -- calling it this early would reach a point where run_btn
+    # does not exist yet in that path (Section 4/the Run button are
+    # only built further below, inside `if not batch_mode:`), raising
+    # NameError. In batch mode this is safe because
+    # _update_run_button_state was already shadowed to a no-op before
+    # Section 1, and there is no "later" position to defer to --
+    # Section 4/Run button are never built in that branch at all. Both
+    # calls are needed here (not just _toggle_road()) since POI Source
+    # and Road Network Source are BOTH batch-visible sections this
+    # tool always builds.
+    if batch_mode:
+        _toggle_poi()
+        _toggle_road()
+        if not db_verified:
+            for _db_radio in (poi_radio_db, road_radio_db):
+                disable_db_radio(_db_radio)
+                attach_no_db_tooltip(_db_radio)
 
-    output_frame = tk.Frame(win)
-    output_frame.pack(fill="x", padx=18, pady=2)
+    if not batch_mode:
+        # ── SECTION 4: OUTPUT ────────────────────────────────────────
+        section_label(win, "Output Destination")
 
-    out_radio_row = tk.Frame(output_frame)
-    out_radio_row.pack(fill="x")
-    tk.Radiobutton(out_radio_row, text="Save to Local Folder",
-                   variable=output_dest_type, value="local",
-                   command=lambda: _toggle_output()).pack(side="left")
-    # Named (unlike this section's Local Folder radio above) so the
-    # db_verified block near the end of this function can disable it
-    # when the session has no verified database connection.
-    out_radio_db = tk.Radiobutton(
-        out_radio_row, text="Save to Database",
-        variable=output_dest_type, value="db",
-        command=lambda: _toggle_output())
-    out_radio_db.pack(side="left", padx=(12, 0))
+        output_frame = tk.Frame(win)
+        output_frame.pack(fill="x", padx=18, pady=2)
 
-    output_dir_var = tk.StringVar(master=win, value="No folder selected")
-    output_db_var  = tk.StringVar(master=win,
-                                  value="Will write back to the connected PostGIS schema.")
+        out_radio_row = tk.Frame(output_frame)
+        out_radio_row.pack(fill="x")
+        tk.Radiobutton(out_radio_row, text="Save to Local Folder",
+                       variable=output_dest_type, value="local",
+                       command=lambda: _toggle_output()).pack(side="left")
+        # Named (unlike this section's Local Folder radio above) so the
+        # db_verified block near the end of this function can disable it
+        # when the session has no verified database connection.
+        out_radio_db = tk.Radiobutton(
+            out_radio_row, text="Save to Database",
+            variable=output_dest_type, value="db",
+            command=lambda: _toggle_output())
+        out_radio_db.pack(side="left", padx=(12, 0))
 
-    out_action_row = tk.Frame(output_frame)
-    out_action_row.pack(fill="x", pady=2)
+        output_dir_var = tk.StringVar(master=win, value="No folder selected")
+        output_db_var  = tk.StringVar(master=win,
+                                      value="Will write back to the connected PostGIS schema.")
 
-    out_lbl = tk.Label(out_action_row, textvariable=output_dir_var,
-                       fg="gray", anchor="w", width=42)
-    out_lbl.pack(side="left")
+        out_action_row = tk.Frame(output_frame)
+        out_action_row.pack(fill="x", pady=2)
 
-    out_btn = tk.Button(out_action_row, text="Browse…", width=10)
-    out_btn.pack(side="left", **PAD)
+        out_lbl = tk.Label(out_action_row, textvariable=output_dir_var,
+                           fg="gray", anchor="w", width=42)
+        out_lbl.pack(side="left")
 
-    def browse_output_dir():
-        d = filedialog.askdirectory()
-        if d:
-            output_local_dir.set(d)
-            output_dir_var.set(d)
+        out_btn = tk.Button(out_action_row, text="Browse…", width=10)
+        out_btn.pack(side="left", **PAD)
+
+        def browse_output_dir():
+            d = filedialog.askdirectory()
+            if d:
+                output_local_dir.set(d)
+                output_dir_var.set(d)
+                _update_run_button_state()
+
+        def _toggle_output():
+            if output_dest_type.get() == "local":
+                out_lbl.config(textvariable=output_dir_var,
+                               font=("Segoe UI", 9), fg="gray")
+                out_btn.config(text="Browse…", command=browse_output_dir)
+                out_btn.pack(side="left", **PAD)
+            else:
+                out_lbl.config(textvariable=output_db_var,
+                               font=("Segoe UI", 8, "italic"), fg="gray")
+                out_btn.pack_forget()
             _update_run_button_state()
 
-    def _toggle_output():
-        if output_dest_type.get() == "local":
-            out_lbl.config(textvariable=output_dir_var,
-                           font=("Segoe UI", 9), fg="gray")
-            out_btn.config(text="Browse…", command=browse_output_dir)
-            out_btn.pack(side="left", **PAD)
-        else:
-            out_lbl.config(textvariable=output_db_var,
-                           font=("Segoe UI", 8, "italic"), fg="gray")
-            out_btn.pack_forget()
+        # ── RUN BUTTON ───────────────────────────────────────────────
+        ttk.Separator(win, orient="horizontal").pack(
+            fill="x", padx=10, pady=(12, 4))
+
+        def on_run():
+            """
+            Run button handler: validates all four selections are present,
+            runs the existing-output-column conflict check (Priority 1),
+            the local output-file conflict check (Priority 2), and DB-output
+            table resolution (Priority 3) -- in that order, each able to
+            cancel the whole run -- then destroys this window and hands off
+            to run_with_progress(). Sets the module-level parcel_source,
+            poi_source, road_source, output_mode globals on success, plus
+            (PART 2) selected_other_poi_column_map.
+            """
+            global parcel_source, poi_source, road_source, output_mode
+            global selected_other_poi_column_map
+
+            # validate parcel
+            if parcel_source_type.get() == "local":
+                if not parcel_local_path:
+                    messagebox.showerror("Missing Input",
+                        "Please select a Land Parcel file.")
+                    return
+                parcel_source = ("local", (parcel_local_path,))
+            else:
+                if not parcel_db_table:
+                    messagebox.showerror("Missing Input",
+                        "Please select a Land Parcel table.")
+                    return
+                parcel_source = ("db", (parcel_db_table,))
+
+            # validate poi
+            if poi_source_type.get() == "local":
+                if not poi_local_path.get():
+                    messagebox.showerror("Missing Input",
+                        "Please select a POI file.")
+                    return
+                poi_source = ("local", [poi_local_path.get()])
+            else:
+                if not poi_db_table.get():
+                    messagebox.showerror("Missing Input",
+                        "Please select a POI table.")
+                    return
+                poi_source = ("db", [poi_db_table.get()])
+
+            # validate road
+            if road_source_type.get() == "local":
+                if not road_local_path.get():
+                    messagebox.showerror("Missing Input",
+                        "Please select a Road Network file.")
+                    return
+                road_source = ("local", [road_local_path.get()])
+            else:
+                if not road_db_table.get():
+                    messagebox.showerror("Missing Input",
+                        "Please select a Road Network table.")
+                    return
+                road_source = ("db", [road_db_table.get()])
+
+            # validate output
+            if output_dest_type.get() == "local":
+                if not output_local_dir.get():
+                    messagebox.showerror("Missing Input",
+                        "Please select an output folder.")
+                    return
+                output_mode = ("local", output_local_dir.get())
+            else:
+                output_mode = ("db", None)
+
+            # ------------------------------------------------------------------
+            # PART 2: capture which "Other Landmark Types" are checked, using
+            # the EXACT column-suffix assignment already shown in the
+            # checklist (other_landmark_column_suffixes, built by
+            # _rebuild_other_landmarks_checklist() from the full set of
+            # discovered non-ALLOWED_FCLASS types) -- never recomputed from
+            # just the checked subset, so the checklist and the columns
+            # task() actually writes always agree (see
+            # _assign_other_type_column_suffixes()'s own docstring for why
+            # recomputing from a filtered subset could silently change a
+            # collision-disambiguated suffix). Empty dict (not None) when
+            # the checkbox is unchecked or no sub-checkbox is checked --
+            # today's exact default behavior, fully unchanged.
+            # ------------------------------------------------------------------
+            if include_other_landmarks_var.get():
+                selected_other_poi_column_map = {
+                    t: other_landmark_column_suffixes[t]
+                    for t, var in other_landmark_type_vars.items()
+                    if var.get() and t in other_landmark_column_suffixes
+                }
+            else:
+                selected_other_poi_column_map = {}
+
+            # ------------------------------------------------------------------
+            # Existing OUTPUT-COLUMN conflict warning. This tool's output
+            # columns are dynamic (see _realizable_targets()) -- only POI
+            # types actually present in the selected POI source this run are
+            # checked. Extended (Fix 3) to cover both Local and Database
+            # Land Parcel sources -- previously LOCAL-only (see
+            # _check_parcel_poi_distance_conflicts()'s own docstring).
+            # Shown once, combined across every affected source, only here
+            # at Run time. Declining cancels the run entirely -- nothing is
+            # processed, including sources that had no conflict.
+            #
+            # Unlike every other tool's Task A, there is NO override map
+            # threaded through to processing here: this tool's output is a
+            # single merged dataframe (multiple parcel sources are
+            # concatenated together), so there is no per-source casing to
+            # preserve. This dialog is purely a confirmation gate -- the
+            # actual write-back always converges to the canonical CAMA_
+            # name, handled unconditionally and safely inside task() by
+            # _normalize_conflicting_columns() regardless of what happens
+            # here (and regardless of Local vs Database source, since that
+            # function already runs unconditionally on the merged
+            # dataframe).
+            # ------------------------------------------------------------------
+            poi_types_for_check = []
+            try:
+                creds_for_check = load_db_credentials()
+                engine_for_check = None
+                schema_for_check = None
+                if poi_source[0] == "db" and creds_for_check:
+                    schema_for_check = creds_for_check["schema"]
+                    engine_for_check = create_engine(
+                        f"postgresql://{creds_for_check['username']}:{creds_for_check['password']}@"
+                        f"{creds_for_check['host']}:{creds_for_check['port']}/{creds_for_check['database']}"
+                    )
+                poi_types_for_check = _get_poi_types_for_check(
+                    poi_source, engine_for_check, schema_for_check)
+            except Exception as e:
+                print(f"⚠️ Could not prepare POI-type check for column "
+                      f"conflicts: {e}")
+                poi_types_for_check = []
+
+            if poi_types_for_check:
+                targets_for_check = _realizable_targets(poi_types_for_check)
+                conflicts = _check_parcel_poi_distance_conflicts(
+                    list(parcel_source[1]), parcel_source[0], targets_for_check)
+                if conflicts:
+                    lines = "\n\n".join(
+                        f"'{os.path.basename(path)}' already has the following column(s):\n"
+                        + "\n".join(f"  • {existing_name}" for existing_name in existing_output_cols.values())
+                        for path, existing_output_cols in conflicts
+                    )
+                    proceed = messagebox.askyesno(
+                        "Existing output column(s) found",
+                        f"{lines}\n\n"
+                        "Processing will overwrite the existing column(s) with the "
+                        "newly computed values. The column name(s) will not change.\n\n"
+                        "Proceed?"
+                    )
+                    if not proceed:
+                        print("Run cancelled by user (existing output column(s) found).")
+                        return
+
+
+            # OUTPUT-FILE conflict check (local output only) -- PRIORITY 2
+            overwrite_mode = None
+            if output_mode[0] == "local":
+                desired_names = (
+                    [os.path.splitext(os.path.basename(p))[0] for p in parcel_source[1]]
+                    if parcel_source[0] == "local"
+                    else list(parcel_source[1])
+                )
+                conflicting_names = [
+                    f"{name}.gpkg" for name in desired_names
+                    if os.path.exists(os.path.join(output_mode[1], f"{name}.gpkg"))
+                ]
+                if conflicting_names:
+                    overwrite_mode = ask_overwrite_dialog(win, conflicting_names)
+                    if overwrite_mode == "cancel":
+                        print("Run cancelled by user (existing output file(s) found).")
+                        return
+
+            # ------------------------------------------------------------------
+            # PRIORITY 3: DB-output destination table resolution — mirrors
+            # PRIORITY 2 above. MOVED here from run_with_progress() (where it
+            # already existed from a prior fix, see that function's own
+            # "DB-output resolution -- newly added, previously missing"
+            # comment) rather than added from scratch. Resolved here on the
+            # main thread, before win.destroy(), so confirm_db_overwrite_
+            # dialog()/choose_db_overwrite_dialog() (invoked inside
+            # resolve_db_output_table()) still have a live parent window, and
+            # a Cancel here leaves the fully-configured win intact instead of
+            # forcing a from-scratch reopen. Previously this resolution
+            # happened inside run_with_progress(), which is only ever invoked
+            # AFTER win.destroy() -- see Fix 1 root cause. resolve_db_output_
+            # table()'s own matching/decision logic is untouched; only the
+            # call site moved here. resolved_table_name AND resolved_outcome
+            # are both passed into run_with_progress() as parameters -- same
+            # approach already used in every other migrated tool.
+            # resolved_outcome is NOT a throwaway (D-Cancel, this task): it is
+            # passed through to _write_db_output_safely() so FINAL_SWAP knows
+            # whether it needs a rename-existing-aside-to-backup step. The
+            # success message's own independent table_action re-derivation
+            # via fetch_tables() stays, for display purposes only -- it is
+            # NOT a substitute for the real value _write_db_output_safely()
+            # needs.
+            #
+            # The two app_root._poi_progress_open = False resets that used to
+            # sit alongside this block inside run_with_progress() are dropped
+            # here -- the guard is never set True until run_with_progress()
+            # itself begins (see its own unchanged top), so there is nothing
+            # to reset at this point in the flow.
+            # ------------------------------------------------------------------
+            resolved_table_name = None
+            resolved_outcome = None
+            if output_mode[0] == "db":
+                _resolve_creds = load_db_credentials()
+                if not _resolve_creds:
+                    return
+                _resolve_schema = _resolve_creds["schema"]
+                _resolve_engine = create_engine(
+                    f"postgresql://{_resolve_creds['username']}:{_resolve_creds['password']}@"
+                    f"{_resolve_creds['host']}:{_resolve_creds['port']}/{_resolve_creds['database']}"
+                )
+                resolved_table_name, resolved_outcome = resolve_db_output_table(
+                    win, _resolve_schema, parcel_source, _resolve_creds
+                )
+                if resolved_table_name is None:
+                    print("Run cancelled by user (database output table not confirmed).")
+                    return
+
+            win.destroy()
+            run_with_progress(app_root, overwrite_mode, resolved_table_name, resolved_outcome)
+
+        # Single source of truth for the Run button's enabled/disabled
+        # colors -- used both at button creation and inside
+        # _update_run_button_state() below, so there's only one place to
+        # change if the theme changes later.
+        RUN_BTN_BG_ENABLED  = "#2e7d32"
+        RUN_BTN_FG_ENABLED  = "white"
+        RUN_BTN_BG_DISABLED = "#e0e0e0"
+        RUN_BTN_FG_DISABLED = "#888888"
+
+        def _update_run_button_state():
+            """
+            Single source of truth for whether the Run button may be
+            pressed. Disabled (with an explanatory status message) until a
+            Land Parcel source, a POI source, a Road Network source, and an
+            Output destination are all present, AND no PART 2 background
+            POI landmark-type discovery read (poi_types_reading) is
+            currently in progress.
+
+            The cascade below intentionally mirrors on_run()'s own
+            validation order further down -- conscious duplication for a
+            minimal-risk, additive gating layer, not a refactor of on_run()
+            itself. Keep the two in sync if this tool's required inputs
+            ever change. (The additional single-parcel-table check inside
+            run_with_progress()'s task() for DB output is deeper than what
+            on_run() validates and is intentionally NOT mirrored here.)
+
+            PART 2 note: poi_types_reading is the ONLY landmark-related
+            condition that gates Run here. Whether "Include Other Landmark
+            Types" is checked, or which/how many of its sub-checkboxes are
+            checked, NEVER affects Run availability -- see
+            _on_include_other_toggled(), which never calls this function
+            in a way that could disable Run based on checkbox content.
+
+            Explicit bg/fg/cursor toggling (not just state=) is required:
+            Tkinter does NOT automatically gray out a classic tk.Button's
+            custom bg/fg when state="disabled", and does not suppress a
+            widget's assigned cursor either -- both must be set explicitly
+            for each state.
+            """
+            has_parcel = bool(parcel_local_path) if parcel_source_type.get() == "local" else bool(parcel_db_table)
+            has_poi = bool(poi_local_path.get()) if poi_source_type.get() == "local" else bool(poi_db_table.get())
+            has_road = bool(road_local_path.get()) if road_source_type.get() == "local" else bool(road_db_table.get())
+            has_output = bool(output_local_dir.get()) if output_dest_type.get() == "local" else True
+
+            if not has_parcel:
+                run_status_var.set("Please select a Land Parcel source.")
+                ready = False
+            elif not has_poi:
+                run_status_var.set("Please select a POI source.")
+                ready = False
+            elif poi_types_reading:
+                run_status_var.set("Reading POI landmark types...")
+                ready = False
+            elif not has_road:
+                run_status_var.set("Please select a Road Network source.")
+                ready = False
+            elif not has_output:
+                run_status_var.set("Please select an Output destination.")
+                ready = False
+            else:
+                run_status_var.set("Ready to run.")
+                ready = True
+
+            if ready:
+                run_btn.config(state="normal", cursor="hand2",
+                                bg=RUN_BTN_BG_ENABLED, fg=RUN_BTN_FG_ENABLED)
+            else:
+                run_btn.config(state="disabled", cursor="no",
+                                bg=RUN_BTN_BG_DISABLED, fg=RUN_BTN_FG_DISABLED,
+                                disabledforeground=RUN_BTN_FG_DISABLED)
+
+        run_btn = tk.Button(win, text="▶  Run Processing", command=on_run,
+                  bg=RUN_BTN_BG_ENABLED, fg=RUN_BTN_FG_ENABLED,
+                  font=("Segoe UI", 10, "bold"),
+                  relief="flat", padx=16, pady=6)
+        run_btn.pack(pady=(4, 4))
+
+        # Permanent status line UNDER the Run button -- always visible, no
+        # hover required.
+        run_status_lbl = tk.Label(win, textvariable=run_status_var,
+                                  font=("Segoe UI", 8), fg="gray")
+        run_status_lbl.pack(pady=(0, 12))
+
+        _toggle_parcel()
+        _toggle_poi()
+        _toggle_road()
+        _toggle_output()
         _update_run_button_state()
 
-    # ── RUN BUTTON ───────────────────────────────────────────────
-    ttk.Separator(win, orient="horizontal").pack(
-        fill="x", padx=10, pady=(12, 4))
+        # If this session's database connection was not VERIFIED at the
+        # moment this tool was launched (see main()'s own db_verified
+        # docstring), disable the four "Database"-style radio buttons --
+        # parcel_radio_db, poi_radio_db, road_radio_db, out_radio_db --
+        # using the shared utils.db_gate_ui helpers (same disabled-cursor
+        # convention and hover tooltip every other tool file uses for
+        # this). Only the "db" radio in each pair is touched; the "local"/
+        # file-based radio next to it is never disabled. This does not
+        # replace or duplicate utils.db_discovery.load_db_credentials()/
+        # fetch_tables()'s own existing error handling for a connection
+        # that fails or is lost AFTER this window has already opened --
+        # that remains fully in effect regardless of db_verified.
+        if not db_verified:
+            for _db_radio in (parcel_radio_db, poi_radio_db, road_radio_db, out_radio_db):
+                disable_db_radio(_db_radio)
+                attach_no_db_tooltip(_db_radio)
+    else:
+        # NEW -- batch mode: POI Source and Road Network Source (built
+        # above, unconditionally, including POI Source's own "Include
+        # Other Landmark Types" checklist) are this tool's only
+        # batch-visible sections. The Cancel/Save row (via the shared
+        # utils.batch_mode_ui.build_save_cancel_row(), Rule of Three --
+        # Instructions Section C/G.5) replaces "Run Processing" -- see
+        # that helper's own docstring for its full Save-stays-open /
+        # Cancel-or-X-closes-with-a-dirty-check lifecycle. Works even
+        # if incomplete, per the batch-mode contract (never blocks
+        # Save on completeness); the orchestrator's own "Incomplete"
+        # overlay (via is_batch_config_complete() above) is what
+        # actually reflects readiness, not this window.
+        def _gather_batch_config():
+            config = {}
+            if poi_source_type.get() == "local":
+                config["poi_source_type"] = "local"
+                config["poi_local_path"] = poi_local_path.get()
+            else:
+                config["poi_source_type"] = "db"
+                config["poi_db_table"] = poi_db_table.get()
+            if road_source_type.get() == "local":
+                config["road_source_type"] = "local"
+                config["road_local_path"] = road_local_path.get()
+            else:
+                config["road_source_type"] = "db"
+                config["road_db_table"] = road_db_table.get()
+            config["include_other_landmarks"] = include_other_landmarks_var.get()
+            if config["include_other_landmarks"]:
+                config["other_landmark_included_types"] = [
+                    display_text
+                    for display_text, var in other_landmark_type_vars.items()
+                    if var.get()
+                ]
+            else:
+                config["other_landmark_included_types"] = []
+            return config
 
-    def on_run():
-        """
-        Run button handler: validates all four selections are present,
-        runs the existing-output-column conflict check (Priority 1),
-        the local output-file conflict check (Priority 2), and DB-output
-        table resolution (Priority 3) -- in that order, each able to
-        cancel the whole run -- then destroys this window and hands off
-        to run_with_progress(). Sets the module-level parcel_source,
-        poi_source, road_source, output_mode globals on success, plus
-        (PART 2) selected_other_poi_column_map.
-        """
-        global parcel_source, poi_source, road_source, output_mode
-        global selected_other_poi_column_map
-
-        # validate parcel
-        if parcel_source_type.get() == "local":
-            if not parcel_local_path:
-                messagebox.showerror("Missing Input",
-                    "Please select a Land Parcel file.")
-                return
-            parcel_source = ("local", (parcel_local_path,))
-        else:
-            if not parcel_db_table:
-                messagebox.showerror("Missing Input",
-                    "Please select a Land Parcel table.")
-                return
-            parcel_source = ("db", (parcel_db_table,))
-
-        # validate poi
-        if poi_source_type.get() == "local":
-            if not poi_local_path.get():
-                messagebox.showerror("Missing Input",
-                    "Please select a POI file.")
-                return
-            poi_source = ("local", [poi_local_path.get()])
-        else:
-            if not poi_db_table.get():
-                messagebox.showerror("Missing Input",
-                    "Please select a POI table.")
-                return
-            poi_source = ("db", [poi_db_table.get()])
-
-        # validate road
-        if road_source_type.get() == "local":
-            if not road_local_path.get():
-                messagebox.showerror("Missing Input",
-                    "Please select a Road Network file.")
-                return
-            road_source = ("local", [road_local_path.get()])
-        else:
-            if not road_db_table.get():
-                messagebox.showerror("Missing Input",
-                    "Please select a Road Network table.")
-                return
-            road_source = ("db", [road_db_table.get()])
-
-        # validate output
-        if output_dest_type.get() == "local":
-            if not output_local_dir.get():
-                messagebox.showerror("Missing Input",
-                    "Please select an output folder.")
-                return
-            output_mode = ("local", output_local_dir.get())
-        else:
-            output_mode = ("db", None)
-
-        # ------------------------------------------------------------------
-        # PART 2: capture which "Other Landmark Types" are checked, using
-        # the EXACT column-suffix assignment already shown in the
-        # checklist (other_landmark_column_suffixes, built by
-        # _rebuild_other_landmarks_checklist() from the full set of
-        # discovered non-ALLOWED_FCLASS types) -- never recomputed from
-        # just the checked subset, so the checklist and the columns
-        # task() actually writes always agree (see
-        # _assign_other_type_column_suffixes()'s own docstring for why
-        # recomputing from a filtered subset could silently change a
-        # collision-disambiguated suffix). Empty dict (not None) when
-        # the checkbox is unchecked or no sub-checkbox is checked --
-        # today's exact default behavior, fully unchanged.
-        # ------------------------------------------------------------------
-        if include_other_landmarks_var.get():
-            selected_other_poi_column_map = {
-                t: other_landmark_column_suffixes[t]
-                for t, var in other_landmark_type_vars.items()
-                if var.get() and t in other_landmark_column_suffixes
-            }
-        else:
-            selected_other_poi_column_map = {}
-
-        # ------------------------------------------------------------------
-        # Existing OUTPUT-COLUMN conflict warning. This tool's output
-        # columns are dynamic (see _realizable_targets()) -- only POI
-        # types actually present in the selected POI source this run are
-        # checked. Extended (Fix 3) to cover both Local and Database
-        # Land Parcel sources -- previously LOCAL-only (see
-        # _check_parcel_poi_distance_conflicts()'s own docstring).
-        # Shown once, combined across every affected source, only here
-        # at Run time. Declining cancels the run entirely -- nothing is
-        # processed, including sources that had no conflict.
-        #
-        # Unlike every other tool's Task A, there is NO override map
-        # threaded through to processing here: this tool's output is a
-        # single merged dataframe (multiple parcel sources are
-        # concatenated together), so there is no per-source casing to
-        # preserve. This dialog is purely a confirmation gate -- the
-        # actual write-back always converges to the canonical CAMA_
-        # name, handled unconditionally and safely inside task() by
-        # _normalize_conflicting_columns() regardless of what happens
-        # here (and regardless of Local vs Database source, since that
-        # function already runs unconditionally on the merged
-        # dataframe).
-        # ------------------------------------------------------------------
-        poi_types_for_check = []
-        try:
-            creds_for_check = load_db_credentials()
-            engine_for_check = None
-            schema_for_check = None
-            if poi_source[0] == "db" and creds_for_check:
-                schema_for_check = creds_for_check["schema"]
-                engine_for_check = create_engine(
-                    f"postgresql://{creds_for_check['username']}:{creds_for_check['password']}@"
-                    f"{creds_for_check['host']}:{creds_for_check['port']}/{creds_for_check['database']}"
-                )
-            poi_types_for_check = _get_poi_types_for_check(
-                poi_source, engine_for_check, schema_for_check)
-        except Exception as e:
-            print(f"⚠️ Could not prepare POI-type check for column "
-                  f"conflicts: {e}")
-            poi_types_for_check = []
-
-        if poi_types_for_check:
-            targets_for_check = _realizable_targets(poi_types_for_check)
-            conflicts = _check_parcel_poi_distance_conflicts(
-                list(parcel_source[1]), parcel_source[0], targets_for_check)
-            if conflicts:
-                lines = "\n\n".join(
-                    f"'{os.path.basename(path)}' already has the following column(s):\n"
-                    + "\n".join(f"  • {existing_name}" for existing_name in existing_output_cols.values())
-                    for path, existing_output_cols in conflicts
-                )
-                proceed = messagebox.askyesno(
-                    "Existing output column(s) found",
-                    f"{lines}\n\n"
-                    "Processing will overwrite the existing column(s) with the "
-                    "newly computed values. The column name(s) will not change.\n\n"
-                    "Proceed?"
-                )
-                if not proceed:
-                    print("Run cancelled by user (existing output column(s) found).")
-                    return
-
-
-        # OUTPUT-FILE conflict check (local output only) -- PRIORITY 2
-        overwrite_mode = None
-        if output_mode[0] == "local":
-            desired_names = (
-                [os.path.splitext(os.path.basename(p))[0] for p in parcel_source[1]]
-                if parcel_source[0] == "local"
-                else list(parcel_source[1])
-            )
-            conflicting_names = [
-                f"{name}.gpkg" for name in desired_names
-                if os.path.exists(os.path.join(output_mode[1], f"{name}.gpkg"))
-            ]
-            if conflicting_names:
-                overwrite_mode = ask_overwrite_dialog(win, conflicting_names)
-                if overwrite_mode == "cancel":
-                    print("Run cancelled by user (existing output file(s) found).")
-                    return
-
-        # ------------------------------------------------------------------
-        # PRIORITY 3: DB-output destination table resolution — mirrors
-        # PRIORITY 2 above. MOVED here from run_with_progress() (where it
-        # already existed from a prior fix, see that function's own
-        # "DB-output resolution -- newly added, previously missing"
-        # comment) rather than added from scratch. Resolved here on the
-        # main thread, before win.destroy(), so confirm_db_overwrite_
-        # dialog()/choose_db_overwrite_dialog() (invoked inside
-        # resolve_db_output_table()) still have a live parent window, and
-        # a Cancel here leaves the fully-configured win intact instead of
-        # forcing a from-scratch reopen. Previously this resolution
-        # happened inside run_with_progress(), which is only ever invoked
-        # AFTER win.destroy() -- see Fix 1 root cause. resolve_db_output_
-        # table()'s own matching/decision logic is untouched; only the
-        # call site moved here. resolved_table_name AND resolved_outcome
-        # are both passed into run_with_progress() as parameters -- same
-        # approach already used in every other migrated tool.
-        # resolved_outcome is NOT a throwaway (D-Cancel, this task): it is
-        # passed through to _write_db_output_safely() so FINAL_SWAP knows
-        # whether it needs a rename-existing-aside-to-backup step. The
-        # success message's own independent table_action re-derivation
-        # via fetch_tables() stays, for display purposes only -- it is
-        # NOT a substitute for the real value _write_db_output_safely()
-        # needs.
-        #
-        # The two app_root._poi_progress_open = False resets that used to
-        # sit alongside this block inside run_with_progress() are dropped
-        # here -- the guard is never set True until run_with_progress()
-        # itself begins (see its own unchanged top), so there is nothing
-        # to reset at this point in the flow.
-        # ------------------------------------------------------------------
-        resolved_table_name = None
-        resolved_outcome = None
-        if output_mode[0] == "db":
-            _resolve_creds = load_db_credentials()
-            if not _resolve_creds:
-                return
-            _resolve_schema = _resolve_creds["schema"]
-            _resolve_engine = create_engine(
-                f"postgresql://{_resolve_creds['username']}:{_resolve_creds['password']}@"
-                f"{_resolve_creds['host']}:{_resolve_creds['port']}/{_resolve_creds['database']}"
-            )
-            resolved_table_name, resolved_outcome = resolve_db_output_table(
-                win, _resolve_schema, parcel_source, _resolve_creds
-            )
-            if resolved_table_name is None:
-                print("Run cancelled by user (database output table not confirmed).")
-                return
-
-        win.destroy()
-        run_with_progress(app_root, overwrite_mode, resolved_table_name, resolved_outcome)
-
-    # Single source of truth for the Run button's enabled/disabled
-    # colors -- used both at button creation and inside
-    # _update_run_button_state() below, so there's only one place to
-    # change if the theme changes later.
-    RUN_BTN_BG_ENABLED  = "#2e7d32"
-    RUN_BTN_FG_ENABLED  = "white"
-    RUN_BTN_BG_DISABLED = "#e0e0e0"
-    RUN_BTN_FG_DISABLED = "#888888"
-
-    def _update_run_button_state():
-        """
-        Single source of truth for whether the Run button may be
-        pressed. Disabled (with an explanatory status message) until a
-        Land Parcel source, a POI source, a Road Network source, and an
-        Output destination are all present, AND no PART 2 background
-        POI landmark-type discovery read (poi_types_reading) is
-        currently in progress.
-
-        The cascade below intentionally mirrors on_run()'s own
-        validation order further down -- conscious duplication for a
-        minimal-risk, additive gating layer, not a refactor of on_run()
-        itself. Keep the two in sync if this tool's required inputs
-        ever change. (The additional single-parcel-table check inside
-        run_with_progress()'s task() for DB output is deeper than what
-        on_run() validates and is intentionally NOT mirrored here.)
-
-        PART 2 note: poi_types_reading is the ONLY landmark-related
-        condition that gates Run here. Whether "Include Other Landmark
-        Types" is checked, or which/how many of its sub-checkboxes are
-        checked, NEVER affects Run availability -- see
-        _on_include_other_toggled(), which never calls this function
-        in a way that could disable Run based on checkbox content.
-
-        Explicit bg/fg/cursor toggling (not just state=) is required:
-        Tkinter does NOT automatically gray out a classic tk.Button's
-        custom bg/fg when state="disabled", and does not suppress a
-        widget's assigned cursor either -- both must be set explicitly
-        for each state.
-        """
-        has_parcel = bool(parcel_local_path) if parcel_source_type.get() == "local" else bool(parcel_db_table)
-        has_poi = bool(poi_local_path.get()) if poi_source_type.get() == "local" else bool(poi_db_table.get())
-        has_road = bool(road_local_path.get()) if road_source_type.get() == "local" else bool(road_db_table.get())
-        has_output = bool(output_local_dir.get()) if output_dest_type.get() == "local" else True
-
-        if not has_parcel:
-            run_status_var.set("Please select a Land Parcel source.")
-            ready = False
-        elif not has_poi:
-            run_status_var.set("Please select a POI source.")
-            ready = False
-        elif poi_types_reading:
-            run_status_var.set("Reading POI landmark types...")
-            ready = False
-        elif not has_road:
-            run_status_var.set("Please select a Road Network source.")
-            ready = False
-        elif not has_output:
-            run_status_var.set("Please select an Output destination.")
-            ready = False
-        else:
-            run_status_var.set("Ready to run.")
-            ready = True
-
-        if ready:
-            run_btn.config(state="normal", cursor="hand2",
-                            bg=RUN_BTN_BG_ENABLED, fg=RUN_BTN_FG_ENABLED)
-        else:
-            run_btn.config(state="disabled", cursor="no",
-                            bg=RUN_BTN_BG_DISABLED, fg=RUN_BTN_FG_DISABLED,
-                            disabledforeground=RUN_BTN_FG_DISABLED)
-
-    run_btn = tk.Button(win, text="▶  Run Processing", command=on_run,
-              bg=RUN_BTN_BG_ENABLED, fg=RUN_BTN_FG_ENABLED,
-              font=("Segoe UI", 10, "bold"),
-              relief="flat", padx=16, pady=6)
-    run_btn.pack(pady=(4, 4))
-
-    # Permanent status line UNDER the Run button -- always visible, no
-    # hover required.
-    run_status_lbl = tk.Label(win, textvariable=run_status_var,
-                              font=("Segoe UI", 8), fg="gray")
-    run_status_lbl.pack(pady=(0, 12))
-
-    _toggle_parcel()
-    _toggle_poi()
-    _toggle_road()
-    _toggle_output()
-    _update_run_button_state()
-
-    # If this session's database connection was not VERIFIED at the
-    # moment this tool was launched (see main()'s own db_verified
-    # docstring), disable the four "Database"-style radio buttons --
-    # parcel_radio_db, poi_radio_db, road_radio_db, out_radio_db --
-    # using the shared utils.db_gate_ui helpers (same disabled-cursor
-    # convention and hover tooltip every other tool file uses for
-    # this). Only the "db" radio in each pair is touched; the "local"/
-    # file-based radio next to it is never disabled. This does not
-    # replace or duplicate utils.db_discovery.load_db_credentials()/
-    # fetch_tables()'s own existing error handling for a connection
-    # that fails or is lost AFTER this window has already opened --
-    # that remains fully in effect regardless of db_verified.
-    if not db_verified:
-        for _db_radio in (parcel_radio_db, poi_radio_db, road_radio_db, out_radio_db):
-            disable_db_radio(_db_radio)
-            attach_no_db_tooltip(_db_radio)
+        build_save_cancel_row(win, gather_config=_gather_batch_config,
+                               on_save=on_save, on_cancel=on_cancel)
 
 
 # ========================================

@@ -192,34 +192,6 @@ def apply_icon(win, ico_filename="BLGF.ico", png_filename="BLGF.png"):
     force_png_icon(win, png_filename)
 
 
-_active_splash = None  # holds the splash window while GM/CAMA Tools loads, if any
-
-
-def show_splash():
-    # borderless always-on-top window shown while the app finishes loading
-    splash = tk.Toplevel()
-    splash.overrideredirect(True)
-    splash.attributes("-topmost", True)
-
-    img = Image.open(resource_path("resources/splash.png"))
-
-    # cap splash size so it never fills the screen, keep aspect ratio
-    max_w, max_h = 1000, 800
-    img.thumbnail((max_w, max_h), Image.LANCZOS)
-    photo = ImageTk.PhotoImage(img)
-
-    w, h = img.size
-    sw, sh = splash.winfo_screenwidth(), splash.winfo_screenheight()
-    splash.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
-
-    label = tk.Label(splash, image=photo, borderwidth=0)
-    label.image = photo  # keep a reference so it doesn't get garbage collected
-    label.pack()
-
-    splash.update()
-    return splash
-
-
 import sys, importlib, argparse
 
 
@@ -345,6 +317,7 @@ TOOL_MODULES = {
     "PARCEL TERRAIN LEVEL": "tools.terrain",
     "ROAD DENSITY": "tools.road_density",
     "ROAD SURFACE": "tools.road_surface",
+    "BATCH PROCESSING": "tools.batchProcessing",
 }
 
 def dispatch_tool_if_requested():
@@ -4631,9 +4604,8 @@ def _on_start(workspace_path):
     set later, if and when the user commits a connection via the
     mid-session Configure Database dialog (see _on_credentials_changed()
     above)."""
-    global selected_gmw_file, _active_splash
+    global selected_gmw_file
     selected_gmw_file = workspace_path
-    _active_splash = show_splash()  # closed once GM window is confirmed open
     launch_global_mapper(db_less=True)
 
 
@@ -5078,6 +5050,7 @@ _icon_files = {
     "PARCEL TERRAIN LEVEL": "terrain.png",
     "ROAD DENSITY": "roaddensity.png",
     "ROAD SURFACE": "roadsurface.png",
+    "BATCH PROCESSING": "batchvaluation.png",
     "LINEAR REGRESSION": "mlr.png",
     "RANDOM FOREST": "randomforest1.png",
     "XG BOOST": "xgboost.png",
@@ -5119,6 +5092,7 @@ tooltip_descriptions = {
     "PARCEL TERRAIN LEVEL": "Analyze slope and elevation difference",
     "ROAD DENSITY": "Calculate road concentration in area",
     "ROAD SURFACE": "Identify surface type of nearby roads",
+    "BATCH PROCESSING": "Run several tools in sequence as one batch",
     "LINEAR REGRESSION": "Run linear model on land data",
     "RANDOM FOREST": "Train a Random Forest model",
     "XG BOOST": "Train data using XG Boost",
@@ -5145,6 +5119,7 @@ buttons_2nd_row = [
     "PARCEL TERRAIN LEVEL",
     "ROAD DENSITY",
     "ROAD SURFACE",
+    "BATCH PROCESSING",
 ]
 
 popup_windows = {}
@@ -5770,14 +5745,6 @@ def wait_for_global_mapper():
         ready = got_rect and visible and not minimized and width > 100 and height > 100
 
     if ready:
-        # splash's only job is "did a real GM window appear" -- close it
-        # the instant that's true, without waiting for the stability lock below
-        global _active_splash
-        if _active_splash is not None:
-            _active_splash.destroy()
-            _active_splash = None
-            root.update()  # force the splash to actually disappear now, not later
-
         _gm_stable_count[0] += 1
         if _gm_stable_count[0] >= 2:      # stable for 2 consecutive checks (2s)
             # Lock onto the verified candidate HWND -- not gm_windows[0],

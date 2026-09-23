@@ -1759,7 +1759,7 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
             # D-Cancel: explicit False only -- see this function's own
             # progress-contract docstring. None/True/no-return all mean
             # "continue," so an old-style caller keeps working unchanged.
-            if progress(f"Measuring Road Frontage: {i}/{total}", i, total) is False:
+            if progress(f"{source_name}: {i}/{total}", i, total) is False:
                 cancelled_pass1 = True
                 break
 
@@ -2048,7 +2048,7 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
             # depths/dwrs are treated as a completed result -- see the
             # discard check immediately after this loop, before those
             # lists are ever assigned onto brgy_gdf.
-            if progress(f"Measuring: {i}/{total}", i, total) is False:
+            if progress(f"{source_name}: {i}/{total}", i, total) is False:
                 cancelled_pass3 = True
                 break
 
@@ -3680,7 +3680,43 @@ def choose_db_overwrite_dialog(parent, candidates):
 # ========================================
 # MAIN WINDOW
 # ========================================
-def open_main_window(root, db_verified=True):
+def is_batch_config_complete(config):
+    """
+    Batch-mode readiness check, per the contract documented in
+    tools/batchValuation/contract.py (PER-TOOL BATCH-MODE CONTRACT) --
+    the Batch Valuation orchestrator calls this against this tool's own
+    last-Saved config dict to decide whether to show its "Incomplete"
+    overlay.
+
+    This tool has ONE secondary source (Road Network Source), with an
+    OPTIONAL "Filter by Road Type" checklist beneath it -- mirrors
+    _update_run_button_state()'s own real readiness logic exactly: only
+    a selected Road Network source is required (has_road); the filter
+    checklist's own state never affects readiness.
+
+    Args:
+        config (dict): this tool's own last-Saved batch config, in the
+            shape _gather_batch_config() below produces:
+            {"road_source_type": "local"|"db",
+             "road_local_path"|"road_db_table": "...",
+             "filter_by_road_type_active": bool,
+             "road_type_excluded_values": list[str]}.
+
+    Returns:
+        bool: True iff a Road Network source is present for whichever
+            mode the config specifies.
+    """
+    if not config:
+        return False
+    if config.get("road_source_type") == "local":
+        return bool(config.get("road_local_path"))
+    elif config.get("road_source_type") == "db":
+        return bool(config.get("road_db_table"))
+    return False
+
+
+def open_main_window(root, db_verified=True, batch_mode=False,
+                      initial_config=None, on_save=None, on_cancel=None):
     """
     Builds and shows the tool's single unified configuration window:
     Land Parcel and Road Network source pickers (each with a
@@ -3705,11 +3741,46 @@ def open_main_window(root, db_verified=True):
             near the end of this function, to disable the three
             "Database"-style radio buttons (parcel_radio_db,
             road_radio_db, out_radio_db) if False; see that block's
-            own comment for exactly why.
+            own comment for exactly why. When batch_mode=True, only
+            road_radio_db is built at all, so only it is gated --
+            parcel_radio_db/out_radio_db do not exist in that branch.
+        batch_mode: bool, default False -- NEW. When True, the Land
+            Parcel Source and Output Destination sections below are
+            not built at all (supplied globally by the Batch
+            Valuation orchestrator instead); Road Network Source --
+            including its own Filter by Road Type checklist, entirely
+            unmodified -- is the only section still shown, since it is
+            this tool's only other setting; "Run Processing" is
+            replaced by a Cancel/Save row (see
+            utils.batch_mode_ui.build_save_cancel_row()). See
+            tools/batchValuation/contract.py for the full per-tool
+            batch-mode contract this implements. False (the default)
+            leaves every existing non-batch caller (the normal Feature
+            Management Tools icon-grid launch) completely unaffected --
+            same signature default, same behavior, same code path.
+        initial_config: dict | None, default None -- NEW. Pre-fills
+            Road Network Source (this tool's only batch-visible field)
+            when re-opening a previously-saved batch entry, INCLUDING
+            the Filter by Road Type checklist's own previously-Saved
+            checked/unchecked state -- restored once the background
+            re-read this triggers (via the SAME _toggle_road() ->
+            _refresh_road_classification() path a normal Browse/Select
+            already uses) actually completes; see
+            _pending_road_type_restore's own comment below and
+            _poll_road_classification_queue()'s own docstring for
+            exactly where this is applied. See
+            is_batch_config_complete()'s own docstring for the config
+            dict's shape.
+        on_save: callable(config: dict) -> None, default None -- NEW.
+            Forwarded to build_save_cancel_row() -- see that helper's
+            own docstring for its full Save/Cancel lifecycle (Save
+            stays open; only Cancel/the titlebar X closes the window).
+        on_cancel: callable() -> None, default None -- NEW. Forwarded
+            to build_save_cancel_row(), same as on_save above.
     """
     win = tk.Toplevel(root)
     apply_icon(win, "roadfrontage.ico")
-    win.title("Road Frontage & Depth-To-Width Ratio Tool")
+    win.title("Road Frontage & Depth-To-Width Ratio Tool" + (" — Batch Mode" if batch_mode else ""))
     win.resizable(False, False)
     win.update_idletasks()
     win.deiconify()
@@ -3779,6 +3850,19 @@ def open_main_window(root, db_verified=True):
     # (the canonical implementation this pattern is adapted from) does
     # not actually have them -- confirmed against the real file.
     road_type_value_vars = {}
+
+    # NEW -- batch mode only: holds a (filter_active, excluded_values)
+    # tuple, set once (below, near Section 1) from initial_config if a
+    # previously-Saved batch entry is being re-opened, and consumed
+    # exactly once -- inside _poll_road_classification_queue(), the
+    # ONLY point where road_type_value_vars holds the FRESH, real
+    # BooleanVars a saved exclusion list can actually be matched
+    # against (see that function's own docstring for why this can't be
+    # applied any earlier). Every existing non-batch caller never sets
+    # this cell at all, so it stays None there and that function's own
+    # ordinary "reset to everything included" behavior is completely
+    # unchanged for them.
+    _pending_road_type_restore = [None]
 
     # run_status_var: drives the always-visible "Ready to run." / "Reading
     # ...' / "Please select ..." label just above the Run button, and
@@ -4971,191 +5055,259 @@ def open_main_window(root, db_verified=True):
         # checklist swap means the OLD file's checked state stays fully
         # intact and visible for the entire duration of the read, only
         # changing at the exact moment the new checklist replaces it.
-        filter_road_type_var.set(False)
+        #
+        # NEW -- batch mode only: if a previously-Saved batch config's
+        # Filter by Road Type state is pending restoration (set once, at
+        # window-open time, by the initial_config handling near Section
+        # 1 below -- see _pending_road_type_restore's own comment at its
+        # declaration), apply it here instead of the plain reset below
+        # -- this is the ONLY point in the entire read cycle where
+        # road_type_value_vars holds the FRESH, real BooleanVars a saved
+        # exclusion list can be matched against. Consumed (reset to
+        # None) immediately, so an ORDINARY re-browse later in the same
+        # Edit session still resets to "everything included", exactly
+        # as it already does below. Every existing non-batch caller
+        # never sets this cell at all, so this branch is always skipped
+        # for them -- zero behavior change there.
+        pending_restore = _pending_road_type_restore[0]
+        if pending_restore is not None:
+            _pending_road_type_restore[0] = None
+            restore_active, restore_excluded = pending_restore
+            if restore_active:
+                excluded_set = set(restore_excluded)
+                for _display_text, (real_value, var) in road_type_value_vars.items():
+                    if real_value in excluded_set:
+                        var.set(False)
+                filter_road_type_var.set(True)
+            else:
+                filter_road_type_var.set(False)
+        else:
+            filter_road_type_var.set(False)
 
         _update_road_classification_visibility()
         _update_run_button_state()
 
-    # ── SECTION 1: LAND PARCEL ───────────────────────────────────
-    section_label(win, "Land Parcel Source")
-
-    parcel_frame = tk.Frame(win)
-    parcel_frame.pack(fill="x", padx=18, pady=2)
-
-    radio_row = tk.Frame(parcel_frame)
-    radio_row.pack(fill="x")
-    parcel_radio_local = tk.Radiobutton(radio_row, text="Local File",
-                   variable=parcel_source_type, value="local",
-                   command=lambda: _toggle_parcel())
-    parcel_radio_local.pack(side="left")
-    parcel_radio_db = tk.Radiobutton(radio_row, text="Database Table",
-                   variable=parcel_source_type, value="db",
-                   command=lambda: _toggle_parcel())
-    parcel_radio_db.pack(side="left", padx=(12, 0))
-
-    parcel_files_var = tk.StringVar(master=win, value="No file selected")
-    parcel_db_label  = tk.StringVar(master=win, value="No table selected")
-
-    parcel_action_row = tk.Frame(parcel_frame)
-    parcel_action_row.pack(fill="x", pady=2)
-
-    parcel_lbl = tk.Label(parcel_action_row, textvariable=parcel_files_var,
-                          fg="gray", anchor="w", width=42)
-    parcel_lbl.pack(side="left")
-
-    parcel_btn = tk.Button(parcel_action_row, text="Browse…", width=10, cursor="hand2")
-    parcel_btn.pack(side="left", **PAD)
-
-    # Per-source classification checklist -- one Checkbutton per selected
-    # Land Parcel source that has a usable LOT_LOCATION/LOT_LABEL column,
-    # built fresh by _rebuild_lot_classification_checklist() after each
-    # background read.
-    #
-    # Content-adaptive height, capped, scrollable when needed (Canvas +
-    # Scrollbar): the box sizes itself to fit however many checkboxes
-    # are actually present, up to LOT_CLASSIFICATION_MAX_HEIGHT -- past
-    # that cap, it stops growing and scrolls internally instead. Ported
-    # from road_width.py's validated pattern: an earlier version used a
-    # plain Frame with no height cap, which grew unbounded with content
-    # and resized the window twice per read cycle (once entering the
-    # "reading" state, once for the final content) -- confirmed to make
-    # a visual distortion bug worse. This version hides the box ENTIRELY
-    # when there's nothing to show (0 checkboxes) instead of an always-
-    # visible, pointlessly-scrollable empty box, and resizes it (once,
-    # cleanly -- see _resize_lot_classification_box()) only when its
-    # content actually changes.
-    LOT_CLASSIFICATION_MAX_HEIGHT = 90  # pixels -- cap; box grows to fit content up to this, then scrolls
-
-    lot_classification_outer = tk.Frame(parcel_frame)
-    lot_classification_canvas = tk.Canvas(
-        lot_classification_outer, highlightthickness=0, bd=0)
-    lot_classification_scrollbar = tk.Scrollbar(
-        lot_classification_outer, orient="vertical",
-        command=lot_classification_canvas.yview)
-    lot_classification_canvas.configure(yscrollcommand=lot_classification_scrollbar.set)
-    lot_classification_canvas.pack(side="left", fill="both", expand=True)
-    # lot_classification_scrollbar is packed/unpacked dynamically by
-    # _resize_lot_classification_box() below -- only shown when content
-    # actually exceeds the cap and scrolling is genuinely needed.
-
-    # lot_classification_list_container: the actual content frame drawn
-    # INSIDE the canvas -- this is what _rebuild_lot_classification_checklist()
-    # clears and repopulates.
-    lot_classification_list_container = tk.Frame(lot_classification_canvas)
-    _lot_classification_canvas_window = lot_classification_canvas.create_window(
-        (0, 0), window=lot_classification_list_container, anchor="nw")
-
-    def _on_lot_classification_content_configure(_event=None):
-        lot_classification_canvas.configure(
-            scrollregion=lot_classification_canvas.bbox("all"))
-    lot_classification_list_container.bind(
-        "<Configure>", _on_lot_classification_content_configure)
-
-    def _on_lot_classification_canvas_resize(event):
-        # Keep the inner frame's width matched to the canvas's own width
-        # so checkboxes wrap/align correctly and only VERTICAL scrolling
-        # is ever needed.
-        lot_classification_canvas.itemconfig(_lot_classification_canvas_window, width=event.width)
-    lot_classification_canvas.bind("<Configure>", _on_lot_classification_canvas_resize)
-
-    def _on_lot_classification_mousewheel(event):
-        lot_classification_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-    lot_classification_canvas.bind(
-        "<Enter>", lambda e: lot_classification_canvas.bind_all(
-            "<MouseWheel>", _on_lot_classification_mousewheel))
-    lot_classification_canvas.bind(
-        "<Leave>", lambda e: lot_classification_canvas.unbind_all("<MouseWheel>"))
-
-    def _resize_lot_classification_box():
-        """
-        Recomputes lot_classification_canvas's own height to fit
-        lot_classification_list_container's CURRENT content, capped at
-        LOT_CLASSIFICATION_MAX_HEIGHT. Shows the scrollbar only when the
-        content genuinely exceeds the cap (nothing to scroll -> no
-        scrollbar shown at all, avoiding a pointless, always-visible
-        scrollbar next to a box that never needs it). Called once per
-        content change (a state transition -- reading finished, checklist
-        rebuilt) -- never in a tight loop.
-        """
-        lot_classification_list_container.update_idletasks()
-        content_height = lot_classification_list_container.winfo_reqheight()
-        if content_height <= LOT_CLASSIFICATION_MAX_HEIGHT:
-            lot_classification_canvas.configure(height=content_height)
-            lot_classification_scrollbar.pack_forget()
+    # NEW -- batch mode: pre-fill Road Network Source from a previously
+    # -Saved config (see is_batch_config_complete()'s own docstring for
+    # the dict shape). Only sets the plain StringVars here -- the
+    # actual background re-read (and, once it completes, the Filter by
+    # Road Type restore queued into _pending_road_type_restore above)
+    # is triggered naturally by the SAME _toggle_road() call the batch-
+    # mode branch makes once, right after Section 2, for initial widget
+    # sync; nothing here calls _refresh_road_classification() directly.
+    # No-op when initial_config is None (first Edit this session) or
+    # when batch_mode is False.
+    if batch_mode and initial_config:
+        if initial_config.get("road_source_type") == "db":
+            road_source_type.set("db")
+            road_db_table.set(initial_config.get("road_db_table") or "")
         else:
-            lot_classification_canvas.configure(height=LOT_CLASSIFICATION_MAX_HEIGHT)
-            lot_classification_scrollbar.pack(side="right", fill="y")
-    # Starts unpacked; _update_parcel_classification_visibility() (via
-    # _refresh_parcel_classification()) decides what to show.
+            road_source_type.set("local")
+            road_local_path.set(initial_config.get("road_local_path") or "")
+        _pending_road_type_restore[0] = (
+            bool(initial_config.get("filter_by_road_type_active")),
+            list(initial_config.get("road_type_excluded_values") or []),
+        )
 
-    def browse_parcel_files():
-        file = filedialog.askopenfilename(filetypes=[
-            ("Shapefiles", "*.shp"), ("GeoPackage", "*.gpkg"), ("All", "*.*")])
-        # Cancel returns "" -- do not assign, preserving previous selection.
-        if file:
-            nonlocal parcel_local_path
-            parcel_local_path = file
-            parcel_files_var.set(os.path.basename(file))
-            # A new Land Parcel selection invalidates any prior
-            # LOT_LOCATION/LOT_LABEL detection -- re-inspect the (new)
-            # selected file. Canceling the dialog (the `if file:`
-            # Always checks fresh -- see _refresh_parcel_classification()
-            # docstring: no result is ever cached across calls.
-            #
-            # No manual reflow/freeze needed here: under the swap-based
-            # checklist lifecycle, the OLD checklist (if any) simply
-            # stays fully visible and untouched throughout the read that
-            # _refresh_parcel_classification() is about to start -- there
-            # is no intermediate "cleared" state to protect against. The
-            # window only ever resizes once, at the very end, when the
-            # new checklist actually replaces the old one.
-            _refresh_parcel_classification()
+    # NEW -- placeholder OVERRIDE assigned BEFORE Section 1 is built
+    # below, shadowing the REAL _update_run_button_state() already
+    # defined above (this file, like road_width.py, defines it for real
+    # early in this function's own preamble, not near the Run button at
+    # the end). Section 1's and Section 2's own handlers call
+    # _update_run_button_state() unconditionally -- the SAME code
+    # whether batch_mode is True or False. In batch mode there is no
+    # run_btn for the real implementation to update (it would raise
+    # NameError), so this shadows it with a no-op; the real one governs
+    # unchanged, exactly as before, whenever batch_mode is False (this
+    # override is simply never reached in that case). Safe: Python
+    # resolves this name at CALL time (when the user actually interacts
+    # with a widget, after the whole window is built), not at each
+    # handler's own definition time.
+    if batch_mode:
+        def _update_run_button_state():
+            pass
 
-    def browse_parcel_db():
-        creds = load_db_credentials()
-        if not creds:
-            messagebox.showerror("Error", "Could not load DB credentials.")
-            return
-        tables = fetch_tables(creds["schema"])
-        if not tables:
-            messagebox.showwarning("No Tables", "No tables found in the database schema.")
-            return
+    if not batch_mode:
+        # ── SECTION 1: LAND PARCEL ───────────────────────────────────
+        section_label(win, "Land Parcel Source")
 
-        def _on_parcel_tables_selected(sel):
-            # Only called on confirmed selection -- Cancel never calls
-            # on_select, so parcel_db_table retains its previous value.
-            if sel:
-                nonlocal parcel_db_table
-                parcel_db_table = sel[0]
-                parcel_db_label.set(sel[0])
-                # No _reflow_window() here -- same reasoning as
-                # browse_parcel_files() above. Always checks fresh.
+        parcel_frame = tk.Frame(win)
+        parcel_frame.pack(fill="x", padx=18, pady=2)
+
+        radio_row = tk.Frame(parcel_frame)
+        radio_row.pack(fill="x")
+        parcel_radio_local = tk.Radiobutton(radio_row, text="Local File",
+                       variable=parcel_source_type, value="local",
+                       command=lambda: _toggle_parcel())
+        parcel_radio_local.pack(side="left")
+        parcel_radio_db = tk.Radiobutton(radio_row, text="Database Table",
+                       variable=parcel_source_type, value="db",
+                       command=lambda: _toggle_parcel())
+        parcel_radio_db.pack(side="left", padx=(12, 0))
+
+        parcel_files_var = tk.StringVar(master=win, value="No file selected")
+        parcel_db_label  = tk.StringVar(master=win, value="No table selected")
+
+        parcel_action_row = tk.Frame(parcel_frame)
+        parcel_action_row.pack(fill="x", pady=2)
+
+        parcel_lbl = tk.Label(parcel_action_row, textvariable=parcel_files_var,
+                              fg="gray", anchor="w", width=42)
+        parcel_lbl.pack(side="left")
+
+        parcel_btn = tk.Button(parcel_action_row, text="Browse…", width=10, cursor="hand2")
+        parcel_btn.pack(side="left", **PAD)
+
+        # Per-source classification checklist -- one Checkbutton per selected
+        # Land Parcel source that has a usable LOT_LOCATION/LOT_LABEL column,
+        # built fresh by _rebuild_lot_classification_checklist() after each
+        # background read.
+        #
+        # Content-adaptive height, capped, scrollable when needed (Canvas +
+        # Scrollbar): the box sizes itself to fit however many checkboxes
+        # are actually present, up to LOT_CLASSIFICATION_MAX_HEIGHT -- past
+        # that cap, it stops growing and scrolls internally instead. Ported
+        # from road_width.py's validated pattern: an earlier version used a
+        # plain Frame with no height cap, which grew unbounded with content
+        # and resized the window twice per read cycle (once entering the
+        # "reading" state, once for the final content) -- confirmed to make
+        # a visual distortion bug worse. This version hides the box ENTIRELY
+        # when there's nothing to show (0 checkboxes) instead of an always-
+        # visible, pointlessly-scrollable empty box, and resizes it (once,
+        # cleanly -- see _resize_lot_classification_box()) only when its
+        # content actually changes.
+        LOT_CLASSIFICATION_MAX_HEIGHT = 90  # pixels -- cap; box grows to fit content up to this, then scrolls
+
+        lot_classification_outer = tk.Frame(parcel_frame)
+        lot_classification_canvas = tk.Canvas(
+            lot_classification_outer, highlightthickness=0, bd=0)
+        lot_classification_scrollbar = tk.Scrollbar(
+            lot_classification_outer, orient="vertical",
+            command=lot_classification_canvas.yview)
+        lot_classification_canvas.configure(yscrollcommand=lot_classification_scrollbar.set)
+        lot_classification_canvas.pack(side="left", fill="both", expand=True)
+        # lot_classification_scrollbar is packed/unpacked dynamically by
+        # _resize_lot_classification_box() below -- only shown when content
+        # actually exceeds the cap and scrolling is genuinely needed.
+
+        # lot_classification_list_container: the actual content frame drawn
+        # INSIDE the canvas -- this is what _rebuild_lot_classification_checklist()
+        # clears and repopulates.
+        lot_classification_list_container = tk.Frame(lot_classification_canvas)
+        _lot_classification_canvas_window = lot_classification_canvas.create_window(
+            (0, 0), window=lot_classification_list_container, anchor="nw")
+
+        def _on_lot_classification_content_configure(_event=None):
+            lot_classification_canvas.configure(
+                scrollregion=lot_classification_canvas.bbox("all"))
+        lot_classification_list_container.bind(
+            "<Configure>", _on_lot_classification_content_configure)
+
+        def _on_lot_classification_canvas_resize(event):
+            # Keep the inner frame's width matched to the canvas's own width
+            # so checkboxes wrap/align correctly and only VERTICAL scrolling
+            # is ever needed.
+            lot_classification_canvas.itemconfig(_lot_classification_canvas_window, width=event.width)
+        lot_classification_canvas.bind("<Configure>", _on_lot_classification_canvas_resize)
+
+        def _on_lot_classification_mousewheel(event):
+            lot_classification_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        lot_classification_canvas.bind(
+            "<Enter>", lambda e: lot_classification_canvas.bind_all(
+                "<MouseWheel>", _on_lot_classification_mousewheel))
+        lot_classification_canvas.bind(
+            "<Leave>", lambda e: lot_classification_canvas.unbind_all("<MouseWheel>"))
+
+        def _resize_lot_classification_box():
+            """
+            Recomputes lot_classification_canvas's own height to fit
+            lot_classification_list_container's CURRENT content, capped at
+            LOT_CLASSIFICATION_MAX_HEIGHT. Shows the scrollbar only when the
+            content genuinely exceeds the cap (nothing to scroll -> no
+            scrollbar shown at all, avoiding a pointless, always-visible
+            scrollbar next to a box that never needs it). Called once per
+            content change (a state transition -- reading finished, checklist
+            rebuilt) -- never in a tight loop.
+            """
+            lot_classification_list_container.update_idletasks()
+            content_height = lot_classification_list_container.winfo_reqheight()
+            if content_height <= LOT_CLASSIFICATION_MAX_HEIGHT:
+                lot_classification_canvas.configure(height=content_height)
+                lot_classification_scrollbar.pack_forget()
+            else:
+                lot_classification_canvas.configure(height=LOT_CLASSIFICATION_MAX_HEIGHT)
+                lot_classification_scrollbar.pack(side="right", fill="y")
+        # Starts unpacked; _update_parcel_classification_visibility() (via
+        # _refresh_parcel_classification()) decides what to show.
+
+        def browse_parcel_files():
+            file = filedialog.askopenfilename(filetypes=[
+                ("Shapefiles", "*.shp"), ("GeoPackage", "*.gpkg"), ("All", "*.*")])
+            # Cancel returns "" -- do not assign, preserving previous selection.
+            if file:
+                nonlocal parcel_local_path
+                parcel_local_path = file
+                parcel_files_var.set(os.path.basename(file))
+                # A new Land Parcel selection invalidates any prior
+                # LOT_LOCATION/LOT_LABEL detection -- re-inspect the (new)
+                # selected file. Canceling the dialog (the `if file:`
+                # Always checks fresh -- see _refresh_parcel_classification()
+                # docstring: no result is ever cached across calls.
+                #
+                # No manual reflow/freeze needed here: under the swap-based
+                # checklist lifecycle, the OLD checklist (if any) simply
+                # stays fully visible and untouched throughout the read that
+                # _refresh_parcel_classification() is about to start -- there
+                # is no intermediate "cleared" state to protect against. The
+                # window only ever resizes once, at the very end, when the
+                # new checklist actually replaces the old one.
                 _refresh_parcel_classification()
 
-        _pick_db_tables(win, tables, multi=False, on_select=_on_parcel_tables_selected)
+        def browse_parcel_db():
+            creds = load_db_credentials()
+            if not creds:
+                messagebox.showerror("Error", "Could not load DB credentials.")
+                return
+            tables = fetch_tables(creds["schema"])
+            if not tables:
+                messagebox.showwarning("No Tables", "No tables found in the database schema.")
+                return
 
-    def _toggle_parcel():
-        # Always render from authority variables -- never from StringVar state.
-        # Guarantees Local → DB → Local always restores the original selection.
-        if parcel_source_type.get() == "local":
-            parcel_lbl.config(textvariable=parcel_files_var)
-            parcel_btn.config(text="Browse…", command=browse_parcel_files)
-            parcel_files_var.set(
-                os.path.basename(parcel_local_path) if parcel_local_path
-                else "No file selected"
-            )
-        else:
-            parcel_lbl.config(textvariable=parcel_db_label)
-            parcel_btn.config(text="Select…", command=browse_parcel_db)
-            parcel_db_label.set(
-                parcel_db_table if parcel_db_table
-                else "No table selected"
-            )
-        # Switching Local <-> Database does NOT clear the other mode's
-        # remembered selection -- that's pre-existing behavior, left
-        # untouched. Always re-checks fresh for whichever mode is now
-        # active -- no cached result is ever restored.
-        _refresh_parcel_classification()
+            def _on_parcel_tables_selected(sel):
+                # Only called on confirmed selection -- Cancel never calls
+                # on_select, so parcel_db_table retains its previous value.
+                if sel:
+                    nonlocal parcel_db_table
+                    parcel_db_table = sel[0]
+                    parcel_db_label.set(sel[0])
+                    # No _reflow_window() here -- same reasoning as
+                    # browse_parcel_files() above. Always checks fresh.
+                    _refresh_parcel_classification()
+
+            _pick_db_tables(win, tables, multi=False, on_select=_on_parcel_tables_selected)
+
+        def _toggle_parcel():
+            # Always render from authority variables -- never from StringVar state.
+            # Guarantees Local → DB → Local always restores the original selection.
+            if parcel_source_type.get() == "local":
+                parcel_lbl.config(textvariable=parcel_files_var)
+                parcel_btn.config(text="Browse…", command=browse_parcel_files)
+                parcel_files_var.set(
+                    os.path.basename(parcel_local_path) if parcel_local_path
+                    else "No file selected"
+                )
+            else:
+                parcel_lbl.config(textvariable=parcel_db_label)
+                parcel_btn.config(text="Select…", command=browse_parcel_db)
+                parcel_db_label.set(
+                    parcel_db_table if parcel_db_table
+                    else "No table selected"
+                )
+            # Switching Local <-> Database does NOT clear the other mode's
+            # remembered selection -- that's pre-existing behavior, left
+            # untouched. Always re-checks fresh for whichever mode is now
+            # active -- no cached result is ever restored.
+            _refresh_parcel_classification()
 
     # ── SECTION 2: ROAD NETWORK ──────────────────────────────────
     section_label(win, "Road Network Source")
@@ -5369,306 +5521,360 @@ def open_main_window(root, db_verified=True):
         # active -- no cached checklist state is ever restored.
         _refresh_road_classification()
 
-    # ── SECTION 3: OUTPUT ────────────────────────────────────────
-    section_label(win, "Output Destination")
+    # NEW -- batch mode ONLY here: in the non-batch path, the initial
+    # _toggle_road()/_update_road_classification_visibility() sync stays
+    # in its ORIGINAL position, at the very end alongside
+    # _toggle_parcel()/_toggle_output() (see below) -- calling it this
+    # early would fire filter_road_type_var's own trace_add callback
+    # (-> _update_run_button_state()) at a point where run_btn does not
+    # exist yet in that path (Section 3/the Run button are only built
+    # further below, inside `if not batch_mode:`), raising NameError.
+    # In batch mode this is safe because _update_run_button_state was
+    # already shadowed to a no-op before Section 1, and there is no
+    # "later" position to defer to -- Section 3/Run button are never
+    # built in that branch at all.
+    if batch_mode:
+        _toggle_road()
+        _update_road_classification_visibility()
+        if not db_verified:
+            disable_db_radio(road_radio_db)
+            attach_no_db_tooltip(road_radio_db)
 
-    output_frame = tk.Frame(win)
-    output_frame.pack(fill="x", padx=18, pady=2)
+    if not batch_mode:
+        # ── SECTION 3: OUTPUT ────────────────────────────────────────
+        section_label(win, "Output Destination")
 
-    out_radio_row = tk.Frame(output_frame)
-    out_radio_row.pack(fill="x")
-    tk.Radiobutton(out_radio_row, text="Save to Local Folder",
-                   variable=output_dest_type, value="local",
-                   command=lambda: _toggle_output()).pack(side="left")
-    # Named (unlike this section's Local Folder radio above) so the
-    # db_verified block near the end of this function can disable it
-    # when the session has no verified database connection.
-    out_radio_db = tk.Radiobutton(
-        out_radio_row, text="Save to Database",
-        variable=output_dest_type, value="db",
-        command=lambda: _toggle_output())
-    out_radio_db.pack(side="left", padx=(12, 0))
+        output_frame = tk.Frame(win)
+        output_frame.pack(fill="x", padx=18, pady=2)
 
-    output_dir_var = tk.StringVar(master=win, value="No folder selected")
-    output_db_var  = tk.StringVar(master=win,
-                                  value="Will write back to the connected PostGIS schema.")
+        out_radio_row = tk.Frame(output_frame)
+        out_radio_row.pack(fill="x")
+        tk.Radiobutton(out_radio_row, text="Save to Local Folder",
+                       variable=output_dest_type, value="local",
+                       command=lambda: _toggle_output()).pack(side="left")
+        # Named (unlike this section's Local Folder radio above) so the
+        # db_verified block near the end of this function can disable it
+        # when the session has no verified database connection.
+        out_radio_db = tk.Radiobutton(
+            out_radio_row, text="Save to Database",
+            variable=output_dest_type, value="db",
+            command=lambda: _toggle_output())
+        out_radio_db.pack(side="left", padx=(12, 0))
 
-    out_action_row = tk.Frame(output_frame)
-    out_action_row.pack(fill="x", pady=2)
+        output_dir_var = tk.StringVar(master=win, value="No folder selected")
+        output_db_var  = tk.StringVar(master=win,
+                                      value="Will write back to the connected PostGIS schema.")
 
-    out_lbl = tk.Label(out_action_row, textvariable=output_dir_var,
-                       fg="gray", anchor="w", width=42)
-    out_lbl.pack(side="left")
+        out_action_row = tk.Frame(output_frame)
+        out_action_row.pack(fill="x", pady=2)
 
-    out_btn = tk.Button(out_action_row, text="Browse…", width=10, cursor="hand2")
-    out_btn.pack(side="left", **PAD)
+        out_lbl = tk.Label(out_action_row, textvariable=output_dir_var,
+                           fg="gray", anchor="w", width=42)
+        out_lbl.pack(side="left")
 
-    def browse_output_dir():
-        d = filedialog.askdirectory()
-        if d:
-            output_local_dir.set(d)
-            output_dir_var.set(d)
-            _reflow_window()
+        out_btn = tk.Button(out_action_row, text="Browse…", width=10, cursor="hand2")
+        out_btn.pack(side="left", **PAD)
+
+        def browse_output_dir():
+            d = filedialog.askdirectory()
+            if d:
+                output_local_dir.set(d)
+                output_dir_var.set(d)
+                _reflow_window()
+                _update_run_button_state()
+
+        def _toggle_output():
+            if output_dest_type.get() == "local":
+                out_lbl.config(textvariable=output_dir_var,
+                               font=("Segoe UI", 9), fg="gray")
+                out_btn.config(text="Browse…", command=browse_output_dir)
+                out_btn.pack(side="left", **PAD)
+            else:
+                out_lbl.config(textvariable=output_db_var,
+                               font=("Segoe UI", 8, "italic"), fg="gray")
+                out_btn.pack_forget()
             _update_run_button_state()
 
-    def _toggle_output():
-        if output_dest_type.get() == "local":
-            out_lbl.config(textvariable=output_dir_var,
-                           font=("Segoe UI", 9), fg="gray")
-            out_btn.config(text="Browse…", command=browse_output_dir)
-            out_btn.pack(side="left", **PAD)
-        else:
-            out_lbl.config(textvariable=output_db_var,
-                           font=("Segoe UI", 8, "italic"), fg="gray")
-            out_btn.pack_forget()
-        _update_run_button_state()
+        out_btn.config(command=browse_output_dir)
 
-    out_btn.config(command=browse_output_dir)
+        # ── RUN BUTTON ───────────────────────────────────────────────
+        ttk.Separator(win, orient="horizontal").pack(
+            fill="x", padx=10, pady=(12, 4))
 
-    # ── RUN BUTTON ───────────────────────────────────────────────
-    ttk.Separator(win, orient="horizontal").pack(
-        fill="x", padx=10, pady=(12, 4))
+        def on_run():
+            global barangay_source, road_source, output_mode, parcel_classification_selection, filter_by_road_type_active, road_type_excluded_values, overwrite_mode, parcel_output_column_overrides
 
-    def on_run():
-        global barangay_source, road_source, output_mode, parcel_classification_selection, filter_by_road_type_active, road_type_excluded_values, overwrite_mode, parcel_output_column_overrides
+            if parcel_source_type.get() == "local":
+                if not parcel_local_path:
+                    messagebox.showerror("Missing Input",
+                        "Please select a Land Parcel file.")
+                    return
+                # Validation guarantees parcel_local_path is not None here --
+                # barangay_source never contains None (Phase 1 invariant 3).
+                barangay_source = ("local", (parcel_local_path,))
+            else:
+                if not parcel_db_table:
+                    messagebox.showerror("Missing Input",
+                        "Please select a Land Parcel table.")
+                    return
+                barangay_source = ("db", (parcel_db_table,))
 
-        if parcel_source_type.get() == "local":
-            if not parcel_local_path:
-                messagebox.showerror("Missing Input",
-                    "Please select a Land Parcel file.")
+            if road_source_type.get() == "local":
+                if not road_local_path.get():
+                    messagebox.showerror("Missing Input",
+                        "Please select a Road Network file.")
+                    return
+                road_source = ("local", [road_local_path.get()])
+            else:
+                if not road_db_table.get():
+                    messagebox.showerror("Missing Input",
+                        "Please select a Road Network table.")
+                    return
+                road_source = ("db", [road_db_table.get()])
+
+            if output_dest_type.get() == "local":
+                if not output_local_dir.get():
+                    messagebox.showerror("Missing Input",
+                        "Please select an output folder.")
+                    return
+                output_mode = ("local", output_local_dir.get())
+            else:
+                output_mode = ("db", None)
+
+            # Road Classification: resolved mode + excluded values are read
+            # here and stored as module globals, same pattern as
+            # barangay_source / road_source / output_mode above --
+            # run_processing() (and, per source, resolve_classification())
+            # consumes them from there. excluded_road_types is only ever
+            # populated when the user is explicitly in "Filter by Road Type"
+            # mode; Automatic mode always stores [] regardless of any stale
+            # checklist state, since Automatic mode never consults it (see
+            # resolve_classification()).
+            #
+            # Belt-and-suspenders: the Run button is disabled while either
+            # background read is in progress (_update_run_button_state()), so
+            # this branch should be unreachable in normal use -- kept as a
+            # hard stop in case on_run() is ever invoked some other way (e.g.
+            # a future keyboard shortcut) while a read is still running.
+            if parcel_is_reading or road_is_reading:
+                messagebox.showwarning(
+                    "Please Wait",
+                    "Still reading the selected source(s) for Road Classification. "
+                    "Please wait for the status line to finish updating before running."
+                )
                 return
-            # Validation guarantees parcel_local_path is not None here --
-            # barangay_source never contains None (Phase 1 invariant 3).
-            barangay_source = ("local", (parcel_local_path,))
-        else:
-            if not parcel_db_table:
-                messagebox.showerror("Missing Input",
-                    "Please select a Land Parcel table.")
-                return
-            barangay_source = ("db", (parcel_db_table,))
 
-        if road_source_type.get() == "local":
-            if not road_local_path.get():
-                messagebox.showerror("Missing Input",
-                    "Please select a Road Network file.")
-                return
-            road_source = ("local", [road_local_path.get()])
-        else:
-            if not road_db_table.get():
-                messagebox.showerror("Missing Input",
-                    "Please select a Road Network table.")
-                return
-            road_source = ("db", [road_db_table.get()])
+            parcel_classification_selection = {
+                path_or_table: var.get() for path_or_table, var in parcel_classification_vars.items()
+            }
+            filter_by_road_type_active = filter_road_type_var.get()
+            if filter_by_road_type_active:
+                road_type_excluded_values = [
+                    real_value for display_text, (real_value, var) in road_type_value_vars.items()
+                    if not var.get()
+                ]
+            else:
+                road_type_excluded_values = []
 
-        if output_dest_type.get() == "local":
-            if not output_local_dir.get():
-                messagebox.showerror("Missing Input",
-                    "Please select an output folder.")
-                return
-            output_mode = ("local", output_local_dir.get())
-        else:
-            output_mode = ("db", None)
+            # ------------------------------------------------------------------
+            # PRIORITY 1: existing OUTPUT-COLUMN conflict warning. Checks all
+            # three output columns (ROAD_FRONTAGE, DEPTH, DEPTH_WIDTH_RATIO) --
+            # not just ROAD_FRONTAGE -- per project-lead decision: they are one
+            # feature set computed together, so a conflict on ANY of them
+            # warrants one combined warning covering all affected sources and
+            # columns, shown once here (never per-file mid-processing, never
+            # only at Browse time). Declining cancels the run entirely rather
+            # than skipping just the affected source(s). Column names are
+            # shown with their EXACT existing casing (e.g. "dePTH"), and that
+            # exact casing/name is what process_frontage_single() will write
+            # into later -- never renamed to the standard casing.
+            # ------------------------------------------------------------------
+            if parcel_output_column_conflicts:
+                lines = "\n\n".join(
+                    f"'{os.path.basename(path_or_table)}' already has the following column(s):\n"
+                    + "\n".join(f"  • {existing_name}" for existing_name in existing_output_cols.values())
+                    for path_or_table, existing_output_cols in parcel_output_column_conflicts
+                )
+                proceed = messagebox.askyesno(
+                    "Existing output column(s) found",
+                    f"{lines}\n\n"
+                    "Processing will overwrite the existing column(s) with the "
+                    "newly computed values. The column name(s) will not change.\n\n"
+                    "Proceed?"
+                )
+                if not proceed:
+                    print("Run cancelled by user (existing output column(s) found).")
+                    return
+                # Preserve each source's existing column name(s)/casing exactly
+                # -- e.g. a detected "dePTH" is written back to "dePTH", not a
+                # hardcoded "DEPTH" -- so no duplicate column is ever created
+                # regardless of the existing casing. A source with no entry
+                # here (no conflict was found) simply uses the default names
+                # in process_frontage_single() below.
+                parcel_output_column_overrides = dict(parcel_output_column_conflicts)
+            else:
+                parcel_output_column_overrides = {}
 
-        # Road Classification: resolved mode + excluded values are read
-        # here and stored as module globals, same pattern as
-        # barangay_source / road_source / output_mode above --
-        # run_processing() (and, per source, resolve_classification())
-        # consumes them from there. excluded_road_types is only ever
-        # populated when the user is explicitly in "Filter by Road Type"
-        # mode; Automatic mode always stores [] regardless of any stale
-        # checklist state, since Automatic mode never consults it (see
-        # resolve_classification()).
-        #
-        # Belt-and-suspenders: the Run button is disabled while either
-        # background read is in progress (_update_run_button_state()), so
-        # this branch should be unreachable in normal use -- kept as a
-        # hard stop in case on_run() is ever invoked some other way (e.g.
-        # a future keyboard shortcut) while a read is still running.
-        if parcel_is_reading or road_is_reading:
-            messagebox.showwarning(
-                "Please Wait",
-                "Still reading the selected source(s) for Road Classification. "
-                "Please wait for the status line to finish updating before running."
-            )
-            return
+            # ------------------------------------------------------------------
+            # PRIORITY 2: output FILENAME conflict pre-scan. Resolved ONCE, up
+            # front, here on the main thread -- BEFORE the window is destroyed
+            # and BEFORE run_processing()'s background worker starts (Tkinter
+            # dialogs must never be shown from a worker thread). Desired names
+            # only need each source's own filename/table name (no need to
+            # actually read/measure anything yet), so this check is cheap.
+            # Ported from road_width.py's validated pattern -- see
+            # ask_overwrite_dialog()'s docstring for the full behavior.
+            # Matches road_width.py's own convention exactly: the main output
+            # reuses the parcel source's own name directly, no tool-name
+            # suffix appended (confirmed/changed by the project lead -- the
+            # "_road_frontage" suffix that used to be appended here is gone).
+            # This tool now writes exactly one output file per source -- the
+            # previously-paired QA layers (and the with_output_suffix()
+            # helper that derived their filenames) have been removed
+            # entirely -- see the module docstring and process_frontage_
+            # single()'s own docstring.
+            # ------------------------------------------------------------------
+            overwrite_mode = None
+            if output_mode[0] == "local":
+                desired_names = (
+                    [os.path.splitext(os.path.basename(p))[0] for p in barangay_source[1]]
+                    if barangay_source[0] == "local"
+                    else list(barangay_source[1])
+                )
+                conflicting_names = [
+                    f"{name}.gpkg" for name in desired_names
+                    if os.path.exists(os.path.join(output_mode[1], f"{name}.gpkg"))
+                ]
+                if conflicting_names:
+                    overwrite_mode = ask_overwrite_dialog(win, conflicting_names)
+                    if overwrite_mode == "cancel":
+                        print("Run cancelled by user (existing output file(s) found).")
+                        return
 
-        parcel_classification_selection = {
-            path_or_table: var.get() for path_or_table, var in parcel_classification_vars.items()
-        }
-        filter_by_road_type_active = filter_road_type_var.get()
-        if filter_by_road_type_active:
-            road_type_excluded_values = [
-                real_value for display_text, (real_value, var) in road_type_value_vars.items()
-                if not var.get()
-            ]
-        else:
-            road_type_excluded_values = []
-
-        # ------------------------------------------------------------------
-        # PRIORITY 1: existing OUTPUT-COLUMN conflict warning. Checks all
-        # three output columns (ROAD_FRONTAGE, DEPTH, DEPTH_WIDTH_RATIO) --
-        # not just ROAD_FRONTAGE -- per project-lead decision: they are one
-        # feature set computed together, so a conflict on ANY of them
-        # warrants one combined warning covering all affected sources and
-        # columns, shown once here (never per-file mid-processing, never
-        # only at Browse time). Declining cancels the run entirely rather
-        # than skipping just the affected source(s). Column names are
-        # shown with their EXACT existing casing (e.g. "dePTH"), and that
-        # exact casing/name is what process_frontage_single() will write
-        # into later -- never renamed to the standard casing.
-        # ------------------------------------------------------------------
-        if parcel_output_column_conflicts:
-            lines = "\n\n".join(
-                f"'{os.path.basename(path_or_table)}' already has the following column(s):\n"
-                + "\n".join(f"  • {existing_name}" for existing_name in existing_output_cols.values())
-                for path_or_table, existing_output_cols in parcel_output_column_conflicts
-            )
-            proceed = messagebox.askyesno(
-                "Existing output column(s) found",
-                f"{lines}\n\n"
-                "Processing will overwrite the existing column(s) with the "
-                "newly computed values. The column name(s) will not change.\n\n"
-                "Proceed?"
-            )
-            if not proceed:
-                print("Run cancelled by user (existing output column(s) found).")
-                return
-            # Preserve each source's existing column name(s)/casing exactly
-            # -- e.g. a detected "dePTH" is written back to "dePTH", not a
-            # hardcoded "DEPTH" -- so no duplicate column is ever created
-            # regardless of the existing casing. A source with no entry
-            # here (no conflict was found) simply uses the default names
-            # in process_frontage_single() below.
-            parcel_output_column_overrides = dict(parcel_output_column_conflicts)
-        else:
-            parcel_output_column_overrides = {}
-
-        # ------------------------------------------------------------------
-        # PRIORITY 2: output FILENAME conflict pre-scan. Resolved ONCE, up
-        # front, here on the main thread -- BEFORE the window is destroyed
-        # and BEFORE run_processing()'s background worker starts (Tkinter
-        # dialogs must never be shown from a worker thread). Desired names
-        # only need each source's own filename/table name (no need to
-        # actually read/measure anything yet), so this check is cheap.
-        # Ported from road_width.py's validated pattern -- see
-        # ask_overwrite_dialog()'s docstring for the full behavior.
-        # Matches road_width.py's own convention exactly: the main output
-        # reuses the parcel source's own name directly, no tool-name
-        # suffix appended (confirmed/changed by the project lead -- the
-        # "_road_frontage" suffix that used to be appended here is gone).
-        # This tool now writes exactly one output file per source -- the
-        # previously-paired QA layers (and the with_output_suffix()
-        # helper that derived their filenames) have been removed
-        # entirely -- see the module docstring and process_frontage_
-        # single()'s own docstring.
-        # ------------------------------------------------------------------
-        overwrite_mode = None
-        if output_mode[0] == "local":
-            desired_names = (
-                [os.path.splitext(os.path.basename(p))[0] for p in barangay_source[1]]
-                if barangay_source[0] == "local"
-                else list(barangay_source[1])
-            )
-            conflicting_names = [
-                f"{name}.gpkg" for name in desired_names
-                if os.path.exists(os.path.join(output_mode[1], f"{name}.gpkg"))
-            ]
-            if conflicting_names:
-                overwrite_mode = ask_overwrite_dialog(win, conflicting_names)
-                if overwrite_mode == "cancel":
-                    print("Run cancelled by user (existing output file(s) found).")
+            # ------------------------------------------------------------------
+            # PRIORITY 3: DB-output destination table resolution — mirrors
+            # PRIORITY 2 above. Resolved here on the main thread, before
+            # win.destroy(), so confirm_db_overwrite_dialog() /
+            # choose_db_overwrite_dialog() (invoked inside
+            # resolve_db_output_table()) still have a live parent window, and
+            # a Cancel here leaves the fully-configured win intact instead of
+            # forcing a from-scratch reopen. Previously this resolution
+            # happened inside run_processing(), which is only ever invoked
+            # AFTER win.destroy() -- see Fix 1 root cause. resolve_db_output_
+            # table()'s own matching/decision logic is untouched; only the
+            # call site moved here.
+            #
+            # resolved_table_name is passed into run_processing() as a
+            # parameter -- same approach already used in lot_location.py,
+            # road_surface.py, road_density.py, and land_shape_compactness.py.
+            # overwrite_mode above is left exactly as-is (module-level global,
+            # unique to this file) -- not refactored to match. resolved_outcome
+            # IS threaded through as of this task (D-Cancel): unlike road_
+            # surface.py/road_density.py/land_shape_compactness.py, this file
+            # now has a _write_db_output_safely()-style write (see the "DB
+            # ATOMIC WRITE / CANCEL-SAFE STAGING" section above), which needs
+            # to know whether FINAL_SWAP requires a rename-existing-aside-to-
+            # backup step -- so both halves of resolve_db_output_table()'s
+            # return value are kept and passed into run_processing() below.
+            # resolve_db_output_table()'s own matching logic also now runs
+            # the crash-orphan-recovery scan first (see that function's own
+            # docstring) -- creds is loaded here regardless (already was, to
+            # determine _resolve_schema) and passed straight through.
+            # ------------------------------------------------------------------
+            resolved_table_name = None
+            resolved_outcome = None
+            if output_mode[0] == "db":
+                _resolve_creds = load_db_credentials()
+                if not _resolve_creds:
+                    messagebox.showerror("Error", "Missing pg_credentials.json")
+                    return
+                _resolve_schema = _resolve_creds["schema"]
+                resolved_table_name, resolved_outcome = resolve_db_output_table(
+                    win, _resolve_schema, barangay_source, _resolve_creds
+                )
+                if resolved_table_name is None:
+                    print("Run cancelled by user (database output table not confirmed).")
                     return
 
-        # ------------------------------------------------------------------
-        # PRIORITY 3: DB-output destination table resolution — mirrors
-        # PRIORITY 2 above. Resolved here on the main thread, before
-        # win.destroy(), so confirm_db_overwrite_dialog() /
-        # choose_db_overwrite_dialog() (invoked inside
-        # resolve_db_output_table()) still have a live parent window, and
-        # a Cancel here leaves the fully-configured win intact instead of
-        # forcing a from-scratch reopen. Previously this resolution
-        # happened inside run_processing(), which is only ever invoked
-        # AFTER win.destroy() -- see Fix 1 root cause. resolve_db_output_
-        # table()'s own matching/decision logic is untouched; only the
-        # call site moved here.
-        #
-        # resolved_table_name is passed into run_processing() as a
-        # parameter -- same approach already used in lot_location.py,
-        # road_surface.py, road_density.py, and land_shape_compactness.py.
-        # overwrite_mode above is left exactly as-is (module-level global,
-        # unique to this file) -- not refactored to match. resolved_outcome
-        # IS threaded through as of this task (D-Cancel): unlike road_
-        # surface.py/road_density.py/land_shape_compactness.py, this file
-        # now has a _write_db_output_safely()-style write (see the "DB
-        # ATOMIC WRITE / CANCEL-SAFE STAGING" section above), which needs
-        # to know whether FINAL_SWAP requires a rename-existing-aside-to-
-        # backup step -- so both halves of resolve_db_output_table()'s
-        # return value are kept and passed into run_processing() below.
-        # resolve_db_output_table()'s own matching logic also now runs
-        # the crash-orphan-recovery scan first (see that function's own
-        # docstring) -- creds is loaded here regardless (already was, to
-        # determine _resolve_schema) and passed straight through.
-        # ------------------------------------------------------------------
-        resolved_table_name = None
-        resolved_outcome = None
-        if output_mode[0] == "db":
-            _resolve_creds = load_db_credentials()
-            if not _resolve_creds:
-                messagebox.showerror("Error", "Missing pg_credentials.json")
+            win.destroy()
+            if _app_root is None:
+                messagebox.showerror("Error", "No root window available. Please restart the tool.")
                 return
-            _resolve_schema = _resolve_creds["schema"]
-            resolved_table_name, resolved_outcome = resolve_db_output_table(
-                win, _resolve_schema, barangay_source, _resolve_creds
-            )
-            if resolved_table_name is None:
-                print("Run cancelled by user (database output table not confirmed).")
-                return
+            run_processing(_app_root, resolved_table_name, resolved_outcome)
 
-        win.destroy()
-        if _app_root is None:
-            messagebox.showerror("Error", "No root window available. Please restart the tool.")
-            return
-        run_processing(_app_root, resolved_table_name, resolved_outcome)
+        run_btn = tk.Button(win, text="▶  Run Processing", command=on_run,
+                  bg="#2e7d32", fg="white",
+                  font=("Segoe UI", 10, "bold"),
+                  relief="flat", padx=16, pady=6)
+        run_btn.pack(pady=(4, 4))
 
-    run_btn = tk.Button(win, text="▶  Run Processing", command=on_run,
-              bg="#2e7d32", fg="white",
-              font=("Segoe UI", 10, "bold"),
-              relief="flat", padx=16, pady=6)
-    run_btn.pack(pady=(4, 4))
+        # Permanent status line UNDER the Run button -- always visible, no
+        # hover required. Matches lot_location.py exactly (position below the
+        # button, not italic) -- confirmed against the real file rather than
+        # assumed; road_frontage.py originally had this above the button and
+        # italic, an inconsistency with no deliberate reason behind it.
+        run_status_lbl = tk.Label(win, textvariable=run_status_var,
+                                  font=("Segoe UI", 8), fg="gray")
+        run_status_lbl.pack(pady=(0, 12))
 
-    # Permanent status line UNDER the Run button -- always visible, no
-    # hover required. Matches lot_location.py exactly (position below the
-    # button, not italic) -- confirmed against the real file rather than
-    # assumed; road_frontage.py originally had this above the button and
-    # italic, an inconsistency with no deliberate reason behind it.
-    run_status_lbl = tk.Label(win, textvariable=run_status_var,
-                              font=("Segoe UI", 8), fg="gray")
-    run_status_lbl.pack(pady=(0, 12))
+        # set initial button commands to match default radio state
+        _toggle_parcel()
+        _toggle_road()
+        _toggle_output()
+        _update_parcel_classification_visibility()
+        _update_road_classification_visibility()
+        _update_run_button_state()
 
-    # set initial button commands to match default radio state
-    _toggle_parcel()
-    _toggle_road()
-    _toggle_output()
-    _update_parcel_classification_visibility()
-    _update_road_classification_visibility()
-    _update_run_button_state()
+        # If this session's database connection was not VERIFIED at the
+        # moment this tool was launched (see main()'s own db_verified
+        # docstring), disable the three "Database"-style radio buttons --
+        # parcel_radio_db, road_radio_db, out_radio_db -- using the shared
+        # utils.db_gate_ui helpers (same disabled-cursor convention and
+        # hover tooltip every other tool file uses for this). Only the
+        # "db" radio in each pair is touched; the "local"/file-based radio
+        # next to it is never disabled. This does not replace or duplicate
+        # utils.db_discovery.load_db_credentials()/fetch_tables()'s own
+        # existing error handling for a connection that fails or is lost
+        # AFTER this window has already opened -- that remains fully in
+        # effect regardless of db_verified.
+        if not db_verified:
+            for _db_radio in (parcel_radio_db, road_radio_db, out_radio_db):
+                disable_db_radio(_db_radio)
+                attach_no_db_tooltip(_db_radio)
+    else:
+        # NEW -- batch mode: Road Network Source (built above,
+        # unconditionally, including its own Filter by Road Type
+        # checklist) is this tool's only batch-visible section. The
+        # Cancel/Save row (via the shared
+        # utils.batch_mode_ui.build_save_cancel_row(), Rule of Three --
+        # Instructions Section C/G.5) replaces "Run Processing" -- see
+        # that helper's own docstring for its full Save-stays-open /
+        # Cancel-or-X-closes-with-a-dirty-check lifecycle. Works even
+        # if incomplete, per the batch-mode contract (never blocks
+        # Save on completeness); the orchestrator's own "Incomplete"
+        # overlay (via is_batch_config_complete() above) is what
+        # actually reflects readiness, not this window.
+        def _gather_batch_config():
+            config = {}
+            if road_source_type.get() == "local":
+                config["road_source_type"] = "local"
+                config["road_local_path"] = road_local_path.get()
+            else:
+                config["road_source_type"] = "db"
+                config["road_db_table"] = road_db_table.get()
+            config["filter_by_road_type_active"] = filter_road_type_var.get()
+            if config["filter_by_road_type_active"]:
+                config["road_type_excluded_values"] = [
+                    real_value
+                    for _display_text, (real_value, var) in road_type_value_vars.items()
+                    if not var.get()
+                ]
+            else:
+                config["road_type_excluded_values"] = []
+            return config
 
-    # If this session's database connection was not VERIFIED at the
-    # moment this tool was launched (see main()'s own db_verified
-    # docstring), disable the three "Database"-style radio buttons --
-    # parcel_radio_db, road_radio_db, out_radio_db -- using the shared
-    # utils.db_gate_ui helpers (same disabled-cursor convention and
-    # hover tooltip every other tool file uses for this). Only the
-    # "db" radio in each pair is touched; the "local"/file-based radio
-    # next to it is never disabled. This does not replace or duplicate
-    # utils.db_discovery.load_db_credentials()/fetch_tables()'s own
-    # existing error handling for a connection that fails or is lost
-    # AFTER this window has already opened -- that remains fully in
-    # effect regardless of db_verified.
-    if not db_verified:
-        for _db_radio in (parcel_radio_db, road_radio_db, out_radio_db):
-            disable_db_radio(_db_radio)
-            attach_no_db_tooltip(_db_radio)
+        build_save_cancel_row(win, gather_config=_gather_batch_config,
+                               on_save=on_save, on_cancel=on_cancel)
 
 
 

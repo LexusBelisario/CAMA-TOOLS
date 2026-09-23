@@ -1685,9 +1685,42 @@ def load_in_global_mapper(filepath):
 
 
 # ========================================
+# BATCH VALUATION -- batch-mode readiness check
+# ========================================
+def is_batch_config_complete(config):
+    """
+    Batch-mode readiness check, per the contract documented in
+    tools/batchValuation/contract.py (PER-TOOL BATCH-MODE CONTRACT) --
+    the Batch Valuation orchestrator calls this against this tool's own
+    last-Saved config dict to decide whether to show its "Incomplete"
+    overlay.
+
+    This tool has NO secondary source section -- Land Parcel Source and
+    Output Destination are its only two sections, and both are hidden
+    in batch mode (supplied globally by the orchestrator instead --
+    see open_main_window()'s own batch_mode branch below). There is
+    therefore nothing a batch config could be incomplete ABOUT: this
+    always returns True. (The orchestrator's own state.BatchState.is_
+    complete() already treats a tool that was never Saved at all as
+    Incomplete on its own -- this function is only ever called with an
+    actual saved config dict, never with None.)
+
+    Args:
+        config (dict): this tool's own last-Saved batch config (always
+            {} for this tool -- see open_main_window()'s batch_mode
+            branch).
+
+    Returns:
+        bool: always True.
+    """
+    return True
+
+
+# ========================================
 # MAIN WINDOW
 # ========================================
-def open_main_window(root, db_verified=True):
+def open_main_window(root, db_verified=True, batch_mode=False,
+                      initial_config=None, on_save=None, on_cancel=None):
     """
     Builds and shows the tool's single unified configuration window: a
     Land Parcel source picker (Local-file/Database-table radio toggle),
@@ -1710,8 +1743,48 @@ def open_main_window(root, db_verified=True):
             near the end of this function, to disable the two
             "Database"-style radio buttons (parcel_radio_db,
             out_radio_db) if False; see that block's own comment for
-            exactly why.
+            exactly why. Ignored when batch_mode=True (see below) --
+            neither Database radio is ever built in that branch.
+        batch_mode: bool, default False -- NEW. When True, this tool's
+            normal Land Parcel Source / Output Destination / Run
+            Processing UI (everything below this docstring) is never
+            built at all; a minimal Save/Cancel branch runs instead
+            and returns early. See tools/batchValuation/contract.py
+            for the full per-tool batch-mode contract this implements.
+            False (the default) leaves every existing non-batch caller
+            (the normal Feature Management Tools icon-grid launch)
+            completely unaffected -- same signature default, same
+            behavior, same code path.
+        initial_config: dict | None, default None -- NEW. Accepted for
+            contract-uniformity with the other 10 tool files' own
+            batch-mode adaptation, but genuinely unused here: this
+            tool has no secondary source and no batch-visible fields
+            to pre-fill (see is_batch_config_complete()'s own
+            docstring for why).
+        on_save: callable(config: dict) -> None, default None -- NEW.
+            Called immediately, synchronously, with {} whenever
+            batch_mode=True -- this tool has nothing to capture, and
+            per explicit request, Edit is no longer a visible workflow
+            for this specific tool at all (unlike every other adapted
+            tool file): no window is ever built, no Label, no Cancel/
+            Save row -- clicking "Edit" for Land Shape in the Batch
+            Valuation orchestrator has no visible effect; it simply
+            confirms this tool as configured (is_batch_config_complete()
+            above already always returns True regardless).
+        on_cancel: callable() -> None, default None -- NEW. Accepted
+            for contract-uniformity, but never called -- there is no
+            window to Cancel out of.
     """
+    if batch_mode:
+        # Nothing to configure, no window, no Cancel/Save row -- see
+        # on_save's own docstring above for the full rationale. Safe
+        # to call synchronously here even before this function returns
+        # -- the caller (tools/batchValuation/grid.py's own
+        # _on_edit()) is a plain, non-blocking Python function call.
+        if on_save:
+            on_save({})
+        return
+
     from tkinter import ttk
     win = tk.Toplevel(root)
     apply_icon(win, "landshape.ico")

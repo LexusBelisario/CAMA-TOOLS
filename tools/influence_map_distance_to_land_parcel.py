@@ -3622,7 +3622,49 @@ def _pick_db_tables(parent, tables, multi, on_select):
               width=20).pack(pady=(0, 10))
 
 
-def open_main_window(root, db_verified=True):
+def is_batch_config_complete(config):
+    """
+    Batch-mode readiness check, per the contract documented in
+    tools/batchValuation/contract.py (PER-TOOL BATCH-MODE CONTRACT) --
+    the Batch Valuation orchestrator calls this against this tool's own
+    last-Saved config dict to decide whether to show its "Incomplete"
+    overlay.
+
+    This tool has ONE secondary source (Influence Map Source, SINGLE-
+    select here -- unlike influence_map_to_land_parcel.py's own multi-
+    select Influence Map Source, confirmed by re-reading this file's own
+    state block rather than assumed), with an OPTIONAL "Add Other
+    Column(s)" checklist beneath it (confirmed OPTIONAL by this file's
+    own open_main_window() docstring and _update_run_button_state()'s
+    own readiness cascade -- neither the checkbox nor any checked
+    column ever gates Run). A batch config is complete once an
+    Influence Map source is selected -- mirrors _update_run_button_
+    state()'s own has_fault check exactly.
+
+    Args:
+        config (dict): this tool's own last-Saved batch config, in the
+            shape _gather_batch_config() below produces:
+            {"fault_source_type": "local"|"db",
+             "fault_local_path": "...", "fault_local_layer": str|None,
+             "fault_db_table": "...",
+             "add_other_columns": bool,
+             "other_columns_checked": list[str]}.
+
+    Returns:
+        bool: True iff an Influence Map source is present for whichever
+            mode the config specifies.
+    """
+    if not config:
+        return False
+    if config.get("fault_source_type") == "local":
+        return bool(config.get("fault_local_path"))
+    elif config.get("fault_source_type") == "db":
+        return bool(config.get("fault_db_table"))
+    return False
+
+
+def open_main_window(root, db_verified=True, batch_mode=False,
+                      initial_config=None, on_save=None, on_cancel=None):
     """
     Builds and shows the tool's single unified configuration window:
     Land Parcel and Influence Map Source pickers (each with a
@@ -3648,13 +3690,47 @@ def open_main_window(root, db_verified=True):
             near the end of this function, to disable the three
             "Database"-style radio buttons (parcel_radio_db,
             fault_radio_db, out_radio_db) if False; see that block's
-            own comment for exactly why.
+            own comment for exactly why. When batch_mode=True, only
+            fault_radio_db is built at all, so only it is gated --
+            parcel_radio_db/out_radio_db do not exist in that branch.
+        batch_mode: bool, default False -- NEW. When True, the Land
+            Parcel Source and Output Destination sections below are
+            not built at all (supplied globally by the Batch
+            Valuation orchestrator instead); Influence Map Source --
+            including its own optional "Add Other Column(s)" checklist,
+            entirely unmodified -- is the only section still shown,
+            since it is this tool's only other setting; "Run
+            Processing" is replaced by a Cancel/Save row (see
+            utils.batch_mode_ui.build_save_cancel_row()). See
+            tools/batchValuation/contract.py for the full per-tool
+            batch-mode contract this implements. False (the default)
+            leaves every existing non-batch caller (the normal Feature
+            Management Tools icon-grid launch) completely unaffected --
+            same signature default, same behavior, same code path.
+        initial_config: dict | None, default None -- NEW. Pre-fills
+            Influence Map Source (this tool's only batch-visible field)
+            when re-opening a previously-saved batch entry, INCLUDING
+            the "Add Other Column(s)" checklist's own previously-Saved
+            checked/unchecked state -- restored once the background
+            re-read this triggers (via the SAME _on_fault_toggle() ->
+            _refresh_fault_columns() path a normal Browse/Select
+            already uses) actually completes; see
+            _pending_fault_column_restore's own comment below and
+            _poll_fault_columns_queue()'s own docstring for exactly
+            where this is applied. See is_batch_config_complete()'s own
+            docstring for the config dict's shape.
+        on_save: callable(config: dict) -> None, default None -- NEW.
+            Forwarded to build_save_cancel_row() -- see that helper's
+            own docstring for its full Save/Cancel lifecycle (Save
+            stays open; only Cancel/the titlebar X closes the window).
+        on_cancel: callable() -> None, default None -- NEW. Forwarded
+            to build_save_cancel_row(), same as on_save above.
     """
     from tkinter import ttk
 
     win = tk.Toplevel(root)
     apply_icon(win, "distancefactor.ico")
-    win.title("Influence Map Distance to Land Parcel Tool")
+    win.title("Influence Map Distance to Land Parcel Tool" + (" — Batch Mode" if batch_mode else ""))
     win.resizable(False, False)
     win.update_idletasks()
     win.deiconify()
@@ -3785,82 +3861,131 @@ def open_main_window(root, db_verified=True):
         _reflow_window.last_applied_size = (req_w, req_h)
     _reflow_window.last_applied_size = (None, None)
 
-    # ── SECTION 1: LAND PARCEL ───────────────────────────────────
-    section_label(win, "Land Parcel Source")
-
-    parcel_frame = tk.Frame(win)
-    parcel_frame.pack(fill="x", padx=18, pady=2)
-
-    parcel_radio_row = tk.Frame(parcel_frame)
-    parcel_radio_row.pack(fill="x")
-    parcel_radio_local = tk.Radiobutton(parcel_radio_row, text="Local File",
-                   variable=parcel_source_type, value="local",
-                   command=lambda: _toggle_parcel())
-    parcel_radio_local.pack(side="left")
-    parcel_radio_db = tk.Radiobutton(parcel_radio_row, text="Database Table",
-                   variable=parcel_source_type, value="db",
-                   command=lambda: _toggle_parcel())
-    parcel_radio_db.pack(side="left", padx=(12, 0))
-
-    parcel_files_var = tk.StringVar(master=win, value="No file selected")
-    parcel_db_label = tk.StringVar(master=win, value="No table selected")
-
-    parcel_action_row = tk.Frame(parcel_frame)
-    parcel_action_row.pack(fill="x", pady=2)
-
-    parcel_lbl = tk.Label(parcel_action_row, textvariable=parcel_files_var,
-                          fg="gray", anchor="w", width=42)
-    parcel_lbl.pack(side="left")
-
-    parcel_btn = tk.Button(parcel_action_row, text="Browse…", width=10)
-    parcel_btn.pack(side="left", **PAD)
-
-    def browse_parcel_files():
-        nonlocal parcel_local_path
-        file = filedialog.askopenfilename(
-            title="Select Land Parcel file",
-            filetypes=VECTOR_FILETYPES)
-        # Cancel returns "" -- do not assign, preserving previous selection.
-        if file:
-            parcel_local_path = file
-            parcel_files_var.set(os.path.basename(file))
-        _update_run_button_state()
-
-    def _on_parcel_db_selected(sel):
-        nonlocal parcel_db_table
-        parcel_db_table = sel[0]
-        parcel_db_label.set(sel[0])
-        _update_run_button_state()
-
-    def browse_parcel_db():
-        creds = load_db_credentials()
-        if not creds:
-            return
-        tables = fetch_tables(creds["schema"])
-        if not tables:
-            messagebox.showwarning("No Tables", "No tables found in the database schema.")
-            return
-        _pick_db_tables(win, tables, multi=False, on_select=_on_parcel_db_selected)
-
-    def _toggle_parcel():
-        # Always render from authority variables -- never from StringVar state.
-        if parcel_source_type.get() == "local":
-            parcel_lbl.config(textvariable=parcel_files_var)
-            parcel_btn.config(text="Browse…", command=browse_parcel_files)
-            parcel_files_var.set(
-                os.path.basename(parcel_local_path) if parcel_local_path
-                else "No file selected"
-            )
+    # NEW -- batch mode: pre-fill Influence Map Source from a
+    # previously-Saved config (see is_batch_config_complete()'s own
+    # docstring for the dict shape). fault_local_path/fault_local_layer/
+    # fault_db_table are plain scalar "authority" variables (not
+    # StringVars, not lists) -- reassigning them here, in this same top
+    # -level scope where they were first declared just above, is a
+    # plain Python rebind (no `nonlocal` needed at this scope level);
+    # every nested function that later does `nonlocal fault_local_path`
+    # etc. sees this new value, since Python closures share the
+    # variable's cell by reference. Only sets these plain values here --
+    # the actual background re-read (and, once it completes, the
+    # per-column restore queued into _pending_fault_column_restore
+    # below) is triggered naturally by calling _on_fault_toggle() (not
+    # the "pure setup only" _toggle_fault() -- see that function's own
+    # docstring for why the two are kept separate) once, right after
+    # Section 2, for initial widget sync in the batch-mode branch below.
+    # No-op when initial_config is None (first Edit this session) or
+    # when batch_mode is False.
+    _pending_fault_column_restore = [None]
+    if batch_mode and initial_config:
+        if initial_config.get("fault_source_type") == "db":
+            fault_source_type.set("db")
+            fault_db_table = initial_config.get("fault_db_table")
         else:
-            parcel_lbl.config(textvariable=parcel_db_label)
-            parcel_btn.config(text="Select…", command=browse_parcel_db)
-            parcel_db_label.set(
-                parcel_db_table if parcel_db_table
-                else "No table selected"
-            )
-        # Switching Local <-> Database does NOT clear the other mode's
-        # remembered selection -- pre-existing behavior, left untouched.
-        _update_run_button_state()
+            fault_source_type.set("local")
+            fault_local_path = initial_config.get("fault_local_path")
+            fault_local_layer = initial_config.get("fault_local_layer")
+        _pending_fault_column_restore[0] = (
+            bool(initial_config.get("add_other_columns")),
+            list(initial_config.get("other_columns_checked") or []),
+        )
+
+    # NEW -- placeholder assigned BEFORE Section 1 is built below.
+    # Section 1's and Section 2's own handlers call
+    # _update_run_button_state() unconditionally -- the SAME code
+    # whether batch_mode is True or False, since Influence Map Source
+    # is the one section this tool always builds. In batch mode there
+    # is no run_btn for the real implementation (defined much further
+    # below, near the Run button) to update, so this stays a no-op
+    # there; the REAL implementation is only defined -- shadowing this
+    # one -- inside the `if not batch_mode:` branch. Safe: Python
+    # resolves this name at CALL time (when the user actually interacts
+    # with a widget, after the whole window is built), not at each
+    # handler's own definition time.
+    if batch_mode:
+        def _update_run_button_state():
+            pass
+
+    if not batch_mode:
+        # ── SECTION 1: LAND PARCEL ───────────────────────────────────
+        section_label(win, "Land Parcel Source")
+
+        parcel_frame = tk.Frame(win)
+        parcel_frame.pack(fill="x", padx=18, pady=2)
+
+        parcel_radio_row = tk.Frame(parcel_frame)
+        parcel_radio_row.pack(fill="x")
+        parcel_radio_local = tk.Radiobutton(parcel_radio_row, text="Local File",
+                       variable=parcel_source_type, value="local",
+                       command=lambda: _toggle_parcel())
+        parcel_radio_local.pack(side="left")
+        parcel_radio_db = tk.Radiobutton(parcel_radio_row, text="Database Table",
+                       variable=parcel_source_type, value="db",
+                       command=lambda: _toggle_parcel())
+        parcel_radio_db.pack(side="left", padx=(12, 0))
+
+        parcel_files_var = tk.StringVar(master=win, value="No file selected")
+        parcel_db_label = tk.StringVar(master=win, value="No table selected")
+
+        parcel_action_row = tk.Frame(parcel_frame)
+        parcel_action_row.pack(fill="x", pady=2)
+
+        parcel_lbl = tk.Label(parcel_action_row, textvariable=parcel_files_var,
+                              fg="gray", anchor="w", width=42)
+        parcel_lbl.pack(side="left")
+
+        parcel_btn = tk.Button(parcel_action_row, text="Browse…", width=10)
+        parcel_btn.pack(side="left", **PAD)
+
+        def browse_parcel_files():
+            nonlocal parcel_local_path
+            file = filedialog.askopenfilename(
+                title="Select Land Parcel file",
+                filetypes=VECTOR_FILETYPES)
+            # Cancel returns "" -- do not assign, preserving previous selection.
+            if file:
+                parcel_local_path = file
+                parcel_files_var.set(os.path.basename(file))
+            _update_run_button_state()
+
+        def _on_parcel_db_selected(sel):
+            nonlocal parcel_db_table
+            parcel_db_table = sel[0]
+            parcel_db_label.set(sel[0])
+            _update_run_button_state()
+
+        def browse_parcel_db():
+            creds = load_db_credentials()
+            if not creds:
+                return
+            tables = fetch_tables(creds["schema"])
+            if not tables:
+                messagebox.showwarning("No Tables", "No tables found in the database schema.")
+                return
+            _pick_db_tables(win, tables, multi=False, on_select=_on_parcel_db_selected)
+
+        def _toggle_parcel():
+            # Always render from authority variables -- never from StringVar state.
+            if parcel_source_type.get() == "local":
+                parcel_lbl.config(textvariable=parcel_files_var)
+                parcel_btn.config(text="Browse…", command=browse_parcel_files)
+                parcel_files_var.set(
+                    os.path.basename(parcel_local_path) if parcel_local_path
+                    else "No file selected"
+                )
+            else:
+                parcel_lbl.config(textvariable=parcel_db_label)
+                parcel_btn.config(text="Select…", command=browse_parcel_db)
+                parcel_db_label.set(
+                    parcel_db_table if parcel_db_table
+                    else "No table selected"
+                )
+            # Switching Local <-> Database does NOT clear the other mode's
+            # remembered selection -- pre-existing behavior, left untouched.
+            _update_run_button_state()
 
     # ── SECTION 2: INFLUENCE MAP SOURCE ──────────────────────────
     section_label(win, "Influence Map Source")
@@ -4578,6 +4703,33 @@ def open_main_window(root, db_verified=True):
         _set_fault_reading_state(False)
         copy_other_columns_var.set(False)
         _rebuild_fault_column_checklist()
+
+        # NEW -- batch mode only: if a previously-Saved batch config's
+        # "Add Other Column(s)" state is pending restoration (set once,
+        # at window-open time, by the initial_config handling near
+        # Section 1 above -- see _pending_fault_column_restore's own
+        # comment there), apply it here instead of the plain reset
+        # above (copy_other_columns_var.set(False)) -- this is the ONLY
+        # point in the entire read cycle where fault_column_check_vars
+        # holds the FRESH, real BooleanVars a saved selection can be
+        # matched against. Consumed (reset to None) immediately, so an
+        # ORDINARY re-browse later in the same Edit session still
+        # leaves the checklist at its normal default (every column
+        # unchecked, checkbox off), exactly as it already does above.
+        # Every existing non-batch caller never sets this cell at all,
+        # so this branch is always skipped for them -- zero behavior
+        # change there.
+        pending_restore = _pending_fault_column_restore[0]
+        if pending_restore is not None:
+            _pending_fault_column_restore[0] = None
+            restore_active, restore_checked = pending_restore
+            if restore_active and fault_column_check_vars:
+                checked_set = set(restore_checked)
+                for col, var in fault_column_check_vars.items():
+                    if col in checked_set:
+                        var.set(True)
+                copy_other_columns_var.set(True)
+
         _update_fault_checklist_visibility()
 
     def _refresh_fault_columns():
@@ -4766,296 +4918,379 @@ def open_main_window(root, db_verified=True):
         _toggle_fault()
         _refresh_fault_columns()
 
-    # ── SECTION 3: OUTPUT ────────────────────────────────────────
-    section_label(win, "Output Destination")
+    # NEW -- batch mode ONLY here: in the non-batch path, the initial
+    # sync stays in its ORIGINAL position, at the very end, and calls
+    # the "pure setup" _toggle_fault() alone -- NOT _on_fault_toggle()
+    # -- deliberately, so a fresh (nothing pre-selected) window-open
+    # never kicks off an unnecessary read (see _on_fault_toggle()'s own
+    # docstring). In batch mode, the opposite is needed: initial_config
+    # may have pre-filled a source (see the prefill block near Section
+    # 1), and re-triggering its own discovery read is exactly how that
+    # source's "Add Other Column(s)" checklist gets repopulated and the
+    # pending restore gets applied -- so _on_fault_toggle() (setup AND
+    # read) is called here instead. Calling this at all this early is
+    # only safe in batch mode, since _update_run_button_state was
+    # already shadowed to a no-op before Section 1 -- in the non-batch
+    # path, calling it this early would reach a point where run_btn
+    # does not exist yet (Section 3/the Run button are only built
+    # further below, inside `if not batch_mode:`), raising NameError.
+    if batch_mode:
+        # _build_fault_checklist_widgets() must run before ANYTHING
+        # that could fire copy_other_columns_var's own trace_add
+        # callback (a successful read, a failed read, or "nothing
+        # selected" all do) -- it is what actually creates
+        # fault_checklist_outer for the first time; that widget is NOT
+        # built as part of Section 2's own static construction, only
+        # here (matching the non-batch tail's own identical call, at
+        # the exact same point in its own initialization order) or
+        # lazily inside _rebuild_fault_column_checklist(). Skipping
+        # this call is exactly what raised AttributeError on
+        # fault_checklist_outer being None during this task's own
+        # testing -- confirmed as a real, pre-existing structural
+        # requirement of this file's own initialization order, not
+        # something specific to batch mode.
+        _build_fault_checklist_widgets()
+        # Only trigger a read if initial_config actually pre-filled a
+        # source -- calling _on_fault_toggle() with NOTHING selected
+        # would reach _clear_fault_checklist_state(), matching the
+        # non-batch tail's own _toggle_fault()-not-_on_fault_toggle()
+        # choice for a fresh window (see _on_fault_toggle()'s own
+        # docstring) -- avoided here for the same reason, even though
+        # _build_fault_checklist_widgets() above now makes either call
+        # safe either way.
+        if fault_local_path or fault_db_table:
+            _on_fault_toggle()
+        else:
+            _toggle_fault()
+        if not db_verified:
+            disable_db_radio(fault_radio_db)
+            attach_no_db_tooltip(fault_radio_db)
 
-    output_frame = tk.Frame(win)
-    output_frame.pack(fill="x", padx=18, pady=2)
+    if not batch_mode:
+        # ── SECTION 3: OUTPUT ────────────────────────────────────────
+        section_label(win, "Output Destination")
 
-    out_radio_row = tk.Frame(output_frame)
-    out_radio_row.pack(fill="x")
-    tk.Radiobutton(out_radio_row, text="Save to Local Folder",
-                   variable=output_dest_type, value="local",
-                   command=lambda: _toggle_output()).pack(side="left")
-    # Named (unlike this section's Local Folder radio above) so the
-    # db_verified block near the end of this function can disable it
-    # when the session has no verified database connection.
-    out_radio_db = tk.Radiobutton(
-        out_radio_row, text="Save to Database",
-        variable=output_dest_type, value="db",
-        command=lambda: _toggle_output())
-    out_radio_db.pack(side="left", padx=(12, 0))
+        output_frame = tk.Frame(win)
+        output_frame.pack(fill="x", padx=18, pady=2)
 
-    output_dir_var = tk.StringVar(master=win, value="No folder selected")
-    output_db_var = tk.StringVar(master=win,
-                                  value="Output will be written to the connected database.")
+        out_radio_row = tk.Frame(output_frame)
+        out_radio_row.pack(fill="x")
+        tk.Radiobutton(out_radio_row, text="Save to Local Folder",
+                       variable=output_dest_type, value="local",
+                       command=lambda: _toggle_output()).pack(side="left")
+        # Named (unlike this section's Local Folder radio above) so the
+        # db_verified block near the end of this function can disable it
+        # when the session has no verified database connection.
+        out_radio_db = tk.Radiobutton(
+            out_radio_row, text="Save to Database",
+            variable=output_dest_type, value="db",
+            command=lambda: _toggle_output())
+        out_radio_db.pack(side="left", padx=(12, 0))
 
-    out_action_row = tk.Frame(output_frame)
-    out_action_row.pack(fill="x", pady=2)
+        output_dir_var = tk.StringVar(master=win, value="No folder selected")
+        output_db_var = tk.StringVar(master=win,
+                                      value="Output will be written to the connected database.")
 
-    out_lbl = tk.Label(out_action_row, textvariable=output_dir_var,
-                       fg="gray", anchor="w", width=42)
-    out_lbl.pack(side="left")
+        out_action_row = tk.Frame(output_frame)
+        out_action_row.pack(fill="x", pady=2)
 
-    out_btn = tk.Button(out_action_row, text="Browse…", width=10)
-    out_btn.pack(side="left", **PAD)
+        out_lbl = tk.Label(out_action_row, textvariable=output_dir_var,
+                           fg="gray", anchor="w", width=42)
+        out_lbl.pack(side="left")
 
-    def browse_output_dir():
-        d = filedialog.askdirectory(title="Select Output Folder")
-        if d:
-            output_local_dir.set(d)
-            output_dir_var.set(d)
+        out_btn = tk.Button(out_action_row, text="Browse…", width=10)
+        out_btn.pack(side="left", **PAD)
+
+        def browse_output_dir():
+            d = filedialog.askdirectory(title="Select Output Folder")
+            if d:
+                output_local_dir.set(d)
+                output_dir_var.set(d)
+                _update_run_button_state()
+
+        def _toggle_output():
+            if output_dest_type.get() == "local":
+                out_lbl.config(textvariable=output_dir_var, fg="gray")
+                out_btn.config(text="Browse…", command=browse_output_dir)
+                out_btn.pack(side="left", **PAD)
+            else:
+                out_lbl.config(textvariable=output_db_var, fg="gray")
+                out_btn.pack_forget()
             _update_run_button_state()
 
-    def _toggle_output():
-        if output_dest_type.get() == "local":
-            out_lbl.config(textvariable=output_dir_var, fg="gray")
-            out_btn.config(text="Browse…", command=browse_output_dir)
-            out_btn.pack(side="left", **PAD)
-        else:
-            out_lbl.config(textvariable=output_db_var, fg="gray")
-            out_btn.pack_forget()
+        # ---------------- Run ----------------
+        def on_run():
+            """
+            Run button handler: validates Land Parcel + Influence Map
+            Source + Output selections are present, computes this run's
+            dynamic output column set from the selected Influence Map
+            source's display name plus whatever "Add Other Column(s)"
+            checklist items are checked, runs the Land Parcel existing-
+            output-column conflict check SYNCHRONOUSLY against that dynamic
+            set (PRIORITY 1 -- confirmed Run-time-only design; this is no
+            longer a detect-on-select background check), runs the local
+            output-file conflict check (PRIORITY 2), and per-source
+            DB-output table resolution (PRIORITY 3) -- each able to cancel
+            the whole run -- then destroys this window and hands off to
+            run_processing(). Sets the module-level parcel_source,
+            fault_source, output_mode, and parcel_output_column_overrides
+            globals on success.
+            """
+            nonlocal parcel_local_path, parcel_db_table, fault_local_path, fault_local_layer, fault_db_table
+            global parcel_source, fault_source, output_mode, parcel_output_column_overrides
+
+            if parcel_source_type.get() == "local":
+                if not parcel_local_path:
+                    messagebox.showerror("Error", "Please select a Land Parcel file.", parent=win)
+                    return
+                parcel_source = ("local", [parcel_local_path])
+            else:
+                if not parcel_db_table:
+                    messagebox.showerror("Error", "Please select a Land Parcel table.", parent=win)
+                    return
+                parcel_source = ("db", [parcel_db_table])
+
+            if fault_source_type.get() == "local":
+                if not fault_local_path:
+                    messagebox.showerror("Error", "Please select an Influence Map file.", parent=win)
+                    return
+                fault_source = ("local", fault_local_path, fault_local_layer)
+            else:
+                if not fault_db_table:
+                    messagebox.showerror("Error", "Please select an Influence Map table.", parent=win)
+                    return
+                fault_source = ("db", fault_db_table)
+
+            output_mode = (
+                ("local", output_local_dir.get()) if output_dest_type.get() == "local"
+                else ("db", None)
+            )
+
+            if output_mode[0] == "local" and not output_mode[1]:
+                messagebox.showerror("Error", "Please select an output folder.", parent=win)
+                return
+
+            # ---- Compute this run's dynamic output column set ----
+            # checked_raw_columns: ordered per the checklist's own UI
+            # order (dict insertion order == the order columns were
+            # populated in _rebuild_fault_column_checklist(), itself the
+            # order the source's own columns were returned in) -- this
+            # exact order becomes the output column order (Task Prompt
+            # Section E hard requirement).
+            checked_raw_columns = (
+                [col for col, var in fault_column_check_vars.items() if var.get()]
+                if copy_other_columns_var.get() else []
+            )
+            fault_display_name = _influence_source_display_name(
+                fault_source[0],
+                fault_source[1],
+                fault_source[2] if fault_source[0] == "local" else None,
+            )
+            targets = _compute_output_column_targets(fault_display_name, checked_raw_columns)
+            dist_col, *extra_final_cols = targets
+            extra_column_specs = list(zip(checked_raw_columns, extra_final_cols))
+
+            # PRIORITY 1: column conflict check -- warn if the selected Land
+            # Parcel source already has any of this run's dynamic target
+            # column names. Shown before the file-conflict dialog so the
+            # user can decide whether to proceed at all before being asked
+            # about filename conflicts. Declining cancels the run entirely;
+            # main window stays open.
+            #
+            # Confirmed Run-time-only design: this check can only run now,
+            # here, since the target column set (dist_col/extra_column_specs
+            # above) isn't known until the Influence Map Source checklist
+            # has been resolved -- reading the Land Parcel source any
+            # earlier (e.g. at selection time, as this tool used to) would
+            # be checking against a column set that might still change,
+            # which would be actively inaccurate.
+            conflicts = _check_parcel_output_conflicts(
+                parcel_source[1], parcel_source[0], targets)
+            if conflicts is None:
+                messagebox.showerror(
+                    "Error",
+                    "Could not read the selected Land Parcel source to check for "
+                    "existing output column(s). Please try again.",
+                    parent=win,
+                )
+                return
+            if conflicts:
+                lines = "\n\n".join(
+                    f"'{os.path.basename(path)}' already has the following column(s):\n"
+                    + "\n".join(f"  • {existing_name}" for existing_name in existing_output_cols.values())
+                    for path, existing_output_cols in conflicts
+                )
+                proceed = messagebox.askyesno(
+                    "Existing output column(s) found",
+                    f"{lines}\n\n"
+                    "Processing will overwrite the existing column(s) with the "
+                    "newly computed values. The column name(s) will not change.\n\n"
+                    "Proceed?",
+                    parent=win,
+                )
+                if not proceed:
+                    print("Run cancelled by user (existing output column(s) found).")
+                    return
+                parcel_output_column_overrides = dict(conflicts)
+            else:
+                parcel_output_column_overrides = {}
+
+            # ---------------- PRIORITY 2: local output-file overwrite ----------------
+            overwrite_mode = None
+            if output_mode[0] == "local":
+                desired_names = (
+                    [os.path.splitext(os.path.basename(p))[0] for p in parcel_source[1]]
+                    if parcel_source[0] == "local" else list(parcel_source[1])
+                )
+                conflicting_names = [
+                    f"{name}.gpkg" for name in desired_names
+                    if os.path.exists(os.path.join(output_mode[1], f"{name}.gpkg"))
+                ]
+                if conflicting_names:
+                    overwrite_mode = ask_overwrite_dialog(win, conflicting_names)
+                    if overwrite_mode == "cancel":
+                        print("Run cancelled by user (existing output file(s) found).")
+                        return
+
+            # ---------------- PRIORITY 3: DB output-table resolution ----------------
+            per_source_resolution = {}
+            if output_mode[0] == "db":
+                _resolve_creds = load_db_credentials()
+                if not _resolve_creds:
+                    return
+                _resolve_schema = _resolve_creds["schema"]
+                for source_id in parcel_source[1]:
+                    desired_name = (
+                        os.path.splitext(os.path.basename(source_id))[0]
+                        if parcel_source[0] == "local" else source_id
+                    )
+                    table_name, outcome = resolve_db_output_table(win, _resolve_schema, parcel_source, desired_name, _resolve_creds)
+                    if table_name is None:
+                        print("Run cancelled by user (database output table not confirmed).")
+                        return
+                    per_source_resolution[source_id] = (table_name, outcome)
+
+            win.destroy()
+            run_processing(root, dist_col, extra_column_specs, overwrite_mode,
+                           per_source_resolution,
+                           influence_source_display_name=fault_display_name)
+
+        # Single source of truth for the Run button's enabled/disabled
+        # colors -- same convention as influence_to_barangay.py.
+        RUN_BTN_BG_ENABLED = "#2e7d32"
+        RUN_BTN_FG_ENABLED = "white"
+        RUN_BTN_BG_DISABLED = "#e0e0e0"
+        RUN_BTN_FG_DISABLED = "#888888"
+
+        def _update_run_button_state():
+            has_parcel = bool(parcel_local_path) if parcel_source_type.get() == "local" else bool(parcel_db_table)
+            has_fault = bool(fault_local_path) if fault_source_type.get() == "local" else bool(fault_db_table)
+            has_output = bool(output_local_dir.get()) if output_dest_type.get() == "local" else True
+
+            if not has_parcel:
+                run_status_var.set("Please select a Land Parcel source.")
+                ready = False
+            elif not has_fault:
+                run_status_var.set("Please select an Influence Map source.")
+                ready = False
+            elif not has_output:
+                run_status_var.set("Please select an Output destination.")
+                ready = False
+            elif fault_is_reading:
+                # Influence Map Source column-discovery read is still in
+                # flight -- the checklist state used to build this run's
+                # dynamic output column set is not yet current. Zero-checked
+                # columns is still a perfectly valid Run state once reading
+                # finishes (DISTANCE-only output) -- this branch only blocks
+                # Run WHILE the read itself is actively in progress.
+                checking_name = (
+                    os.path.basename(fault_local_path) if fault_source_type.get() == "local"
+                    else fault_db_table
+                ) or "source"
+                run_status_var.set(f'⏳ Reading "{checking_name}" columns…')
+                ready = False
+            else:
+                run_status_var.set("Ready to run.")
+                ready = True
+
+            if ready:
+                run_btn.config(state="normal", cursor="hand2",
+                                bg=RUN_BTN_BG_ENABLED, fg=RUN_BTN_FG_ENABLED)
+            else:
+                run_btn.config(state="disabled", cursor="no",
+                                bg=RUN_BTN_BG_DISABLED, fg=RUN_BTN_FG_DISABLED,
+                                disabledforeground=RUN_BTN_FG_DISABLED)
+
+        run_btn = tk.Button(win, text="▶  Run Processing", command=on_run,
+                  bg=RUN_BTN_BG_ENABLED, fg=RUN_BTN_FG_ENABLED,
+                  font=("Segoe UI", 10, "bold"),
+                  relief="flat", padx=16, pady=6)
+        run_btn.pack(pady=(4, 4))
+
+        # Permanent status line UNDER the Run button -- always visible, no
+        # hover required.
+        run_status_lbl = tk.Label(win, textvariable=run_status_var,
+                                  font=("Segoe UI", 8), fg="gray")
+        run_status_lbl.pack(pady=(0, 12))
+
+        _toggle_parcel()
+        _toggle_fault()
+        _toggle_output()
+        _build_fault_checklist_widgets()
+        _update_fault_checklist_visibility()
         _update_run_button_state()
 
-    # ---------------- Run ----------------
-    def on_run():
-        """
-        Run button handler: validates Land Parcel + Influence Map
-        Source + Output selections are present, computes this run's
-        dynamic output column set from the selected Influence Map
-        source's display name plus whatever "Add Other Column(s)"
-        checklist items are checked, runs the Land Parcel existing-
-        output-column conflict check SYNCHRONOUSLY against that dynamic
-        set (PRIORITY 1 -- confirmed Run-time-only design; this is no
-        longer a detect-on-select background check), runs the local
-        output-file conflict check (PRIORITY 2), and per-source
-        DB-output table resolution (PRIORITY 3) -- each able to cancel
-        the whole run -- then destroys this window and hands off to
-        run_processing(). Sets the module-level parcel_source,
-        fault_source, output_mode, and parcel_output_column_overrides
-        globals on success.
-        """
-        nonlocal parcel_local_path, parcel_db_table, fault_local_path, fault_local_layer, fault_db_table
-        global parcel_source, fault_source, output_mode, parcel_output_column_overrides
+        # If this session's database connection was not VERIFIED at the
+        # moment this tool was launched (see main()'s own db_verified
+        # docstring), disable the three "Database"-style radio buttons --
+        # parcel_radio_db, fault_radio_db, out_radio_db -- across all three
+        # sections, using the shared utils.db_gate_ui helpers (same
+        # disabled-cursor convention and hover tooltip every other tool
+        # file uses for this). Only the "db" radio in each pair is
+        # touched; the "local"/file-based radio next to it is never
+        # disabled. This does not replace or duplicate
+        # utils.db_discovery.load_db_credentials()/fetch_tables()'s own
+        # existing error handling for a connection that fails or is lost
+        # AFTER this window has already opened -- that remains fully in
+        # effect regardless of db_verified.
+        if not db_verified:
+            for _db_radio in (parcel_radio_db, fault_radio_db, out_radio_db):
+                disable_db_radio(_db_radio)
+                attach_no_db_tooltip(_db_radio)
+    else:
+        # NEW -- batch mode: Influence Map Source (built above,
+        # unconditionally, including its own optional "Add Other
+        # Column(s)" checklist) is this tool's only batch-visible
+        # section. The Cancel/Save row (via the shared
+        # utils.batch_mode_ui.build_save_cancel_row(), Rule of Three --
+        # Instructions Section C/G.5) replaces "Run Processing" -- see
+        # that helper's own docstring for its full Save-stays-open /
+        # Cancel-or-X-closes-with-a-dirty-check lifecycle. Works even
+        # if incomplete, per the batch-mode contract (never blocks
+        # Save on completeness); the orchestrator's own "Incomplete"
+        # overlay (via is_batch_config_complete() above) is what
+        # actually reflects readiness, not this window.
+        def _gather_batch_config():
+            config = {}
+            if fault_source_type.get() == "local":
+                config["fault_source_type"] = "local"
+                config["fault_local_path"] = fault_local_path
+                config["fault_local_layer"] = fault_local_layer
+            else:
+                config["fault_source_type"] = "db"
+                config["fault_db_table"] = fault_db_table
+            config["add_other_columns"] = copy_other_columns_var.get()
+            if config["add_other_columns"]:
+                config["other_columns_checked"] = [
+                    col for col, var in fault_column_check_vars.items()
+                    if var.get()
+                ]
+            else:
+                config["other_columns_checked"] = []
+            return config
 
-        if parcel_source_type.get() == "local":
-            if not parcel_local_path:
-                messagebox.showerror("Error", "Please select a Land Parcel file.", parent=win)
-                return
-            parcel_source = ("local", [parcel_local_path])
-        else:
-            if not parcel_db_table:
-                messagebox.showerror("Error", "Please select a Land Parcel table.", parent=win)
-                return
-            parcel_source = ("db", [parcel_db_table])
-
-        if fault_source_type.get() == "local":
-            if not fault_local_path:
-                messagebox.showerror("Error", "Please select an Influence Map file.", parent=win)
-                return
-            fault_source = ("local", fault_local_path, fault_local_layer)
-        else:
-            if not fault_db_table:
-                messagebox.showerror("Error", "Please select an Influence Map table.", parent=win)
-                return
-            fault_source = ("db", fault_db_table)
-
-        output_mode = (
-            ("local", output_local_dir.get()) if output_dest_type.get() == "local"
-            else ("db", None)
-        )
-
-        if output_mode[0] == "local" and not output_mode[1]:
-            messagebox.showerror("Error", "Please select an output folder.", parent=win)
-            return
-
-        # ---- Compute this run's dynamic output column set ----
-        # checked_raw_columns: ordered per the checklist's own UI
-        # order (dict insertion order == the order columns were
-        # populated in _rebuild_fault_column_checklist(), itself the
-        # order the source's own columns were returned in) -- this
-        # exact order becomes the output column order (Task Prompt
-        # Section E hard requirement).
-        checked_raw_columns = (
-            [col for col, var in fault_column_check_vars.items() if var.get()]
-            if copy_other_columns_var.get() else []
-        )
-        fault_display_name = _influence_source_display_name(
-            fault_source[0],
-            fault_source[1],
-            fault_source[2] if fault_source[0] == "local" else None,
-        )
-        targets = _compute_output_column_targets(fault_display_name, checked_raw_columns)
-        dist_col, *extra_final_cols = targets
-        extra_column_specs = list(zip(checked_raw_columns, extra_final_cols))
-
-        # PRIORITY 1: column conflict check -- warn if the selected Land
-        # Parcel source already has any of this run's dynamic target
-        # column names. Shown before the file-conflict dialog so the
-        # user can decide whether to proceed at all before being asked
-        # about filename conflicts. Declining cancels the run entirely;
-        # main window stays open.
-        #
-        # Confirmed Run-time-only design: this check can only run now,
-        # here, since the target column set (dist_col/extra_column_specs
-        # above) isn't known until the Influence Map Source checklist
-        # has been resolved -- reading the Land Parcel source any
-        # earlier (e.g. at selection time, as this tool used to) would
-        # be checking against a column set that might still change,
-        # which would be actively inaccurate.
-        conflicts = _check_parcel_output_conflicts(
-            parcel_source[1], parcel_source[0], targets)
-        if conflicts is None:
-            messagebox.showerror(
-                "Error",
-                "Could not read the selected Land Parcel source to check for "
-                "existing output column(s). Please try again.",
-                parent=win,
-            )
-            return
-        if conflicts:
-            lines = "\n\n".join(
-                f"'{os.path.basename(path)}' already has the following column(s):\n"
-                + "\n".join(f"  • {existing_name}" for existing_name in existing_output_cols.values())
-                for path, existing_output_cols in conflicts
-            )
-            proceed = messagebox.askyesno(
-                "Existing output column(s) found",
-                f"{lines}\n\n"
-                "Processing will overwrite the existing column(s) with the "
-                "newly computed values. The column name(s) will not change.\n\n"
-                "Proceed?",
-                parent=win,
-            )
-            if not proceed:
-                print("Run cancelled by user (existing output column(s) found).")
-                return
-            parcel_output_column_overrides = dict(conflicts)
-        else:
-            parcel_output_column_overrides = {}
-
-        # ---------------- PRIORITY 2: local output-file overwrite ----------------
-        overwrite_mode = None
-        if output_mode[0] == "local":
-            desired_names = (
-                [os.path.splitext(os.path.basename(p))[0] for p in parcel_source[1]]
-                if parcel_source[0] == "local" else list(parcel_source[1])
-            )
-            conflicting_names = [
-                f"{name}.gpkg" for name in desired_names
-                if os.path.exists(os.path.join(output_mode[1], f"{name}.gpkg"))
-            ]
-            if conflicting_names:
-                overwrite_mode = ask_overwrite_dialog(win, conflicting_names)
-                if overwrite_mode == "cancel":
-                    print("Run cancelled by user (existing output file(s) found).")
-                    return
-
-        # ---------------- PRIORITY 3: DB output-table resolution ----------------
-        per_source_resolution = {}
-        if output_mode[0] == "db":
-            _resolve_creds = load_db_credentials()
-            if not _resolve_creds:
-                return
-            _resolve_schema = _resolve_creds["schema"]
-            for source_id in parcel_source[1]:
-                desired_name = (
-                    os.path.splitext(os.path.basename(source_id))[0]
-                    if parcel_source[0] == "local" else source_id
-                )
-                table_name, outcome = resolve_db_output_table(win, _resolve_schema, parcel_source, desired_name, _resolve_creds)
-                if table_name is None:
-                    print("Run cancelled by user (database output table not confirmed).")
-                    return
-                per_source_resolution[source_id] = (table_name, outcome)
-
-        win.destroy()
-        run_processing(root, dist_col, extra_column_specs, overwrite_mode,
-                       per_source_resolution,
-                       influence_source_display_name=fault_display_name)
-
-    # Single source of truth for the Run button's enabled/disabled
-    # colors -- same convention as influence_to_barangay.py.
-    RUN_BTN_BG_ENABLED = "#2e7d32"
-    RUN_BTN_FG_ENABLED = "white"
-    RUN_BTN_BG_DISABLED = "#e0e0e0"
-    RUN_BTN_FG_DISABLED = "#888888"
-
-    def _update_run_button_state():
-        has_parcel = bool(parcel_local_path) if parcel_source_type.get() == "local" else bool(parcel_db_table)
-        has_fault = bool(fault_local_path) if fault_source_type.get() == "local" else bool(fault_db_table)
-        has_output = bool(output_local_dir.get()) if output_dest_type.get() == "local" else True
-
-        if not has_parcel:
-            run_status_var.set("Please select a Land Parcel source.")
-            ready = False
-        elif not has_fault:
-            run_status_var.set("Please select an Influence Map source.")
-            ready = False
-        elif not has_output:
-            run_status_var.set("Please select an Output destination.")
-            ready = False
-        elif fault_is_reading:
-            # Influence Map Source column-discovery read is still in
-            # flight -- the checklist state used to build this run's
-            # dynamic output column set is not yet current. Zero-checked
-            # columns is still a perfectly valid Run state once reading
-            # finishes (DISTANCE-only output) -- this branch only blocks
-            # Run WHILE the read itself is actively in progress.
-            checking_name = (
-                os.path.basename(fault_local_path) if fault_source_type.get() == "local"
-                else fault_db_table
-            ) or "source"
-            run_status_var.set(f'⏳ Reading "{checking_name}" columns…')
-            ready = False
-        else:
-            run_status_var.set("Ready to run.")
-            ready = True
-
-        if ready:
-            run_btn.config(state="normal", cursor="hand2",
-                            bg=RUN_BTN_BG_ENABLED, fg=RUN_BTN_FG_ENABLED)
-        else:
-            run_btn.config(state="disabled", cursor="no",
-                            bg=RUN_BTN_BG_DISABLED, fg=RUN_BTN_FG_DISABLED,
-                            disabledforeground=RUN_BTN_FG_DISABLED)
-
-    run_btn = tk.Button(win, text="▶  Run Processing", command=on_run,
-              bg=RUN_BTN_BG_ENABLED, fg=RUN_BTN_FG_ENABLED,
-              font=("Segoe UI", 10, "bold"),
-              relief="flat", padx=16, pady=6)
-    run_btn.pack(pady=(4, 4))
-
-    # Permanent status line UNDER the Run button -- always visible, no
-    # hover required.
-    run_status_lbl = tk.Label(win, textvariable=run_status_var,
-                              font=("Segoe UI", 8), fg="gray")
-    run_status_lbl.pack(pady=(0, 12))
-
-    _toggle_parcel()
-    _toggle_fault()
-    _toggle_output()
-    _build_fault_checklist_widgets()
-    _update_fault_checklist_visibility()
-    _update_run_button_state()
-
-    # If this session's database connection was not VERIFIED at the
-    # moment this tool was launched (see main()'s own db_verified
-    # docstring), disable the three "Database"-style radio buttons --
-    # parcel_radio_db, fault_radio_db, out_radio_db -- across all three
-    # sections, using the shared utils.db_gate_ui helpers (same
-    # disabled-cursor convention and hover tooltip every other tool
-    # file uses for this). Only the "db" radio in each pair is
-    # touched; the "local"/file-based radio next to it is never
-    # disabled. This does not replace or duplicate
-    # utils.db_discovery.load_db_credentials()/fetch_tables()'s own
-    # existing error handling for a connection that fails or is lost
-    # AFTER this window has already opened -- that remains fully in
-    # effect regardless of db_verified.
-    if not db_verified:
-        for _db_radio in (parcel_radio_db, fault_radio_db, out_radio_db):
-            disable_db_radio(_db_radio)
-            attach_no_db_tooltip(_db_radio)
+        build_save_cancel_row(win, gather_config=_gather_batch_config,
+                               on_save=on_save, on_cancel=on_cancel)
 
 
 # ========================================
