@@ -170,25 +170,26 @@ from core.startup_and_db_ui import (
 # ========================================
 # ICON HELPERS
 # ========================================
-def force_png_icon(win):
-    """Sets win's taskbar/titlebar icon from BLGF.png via iconphoto(),
-    holding a reference on the window to prevent garbage collection."""
-    png = resource_path("BLGF.png")
+def force_png_icon(win, png_filename="BLGF.png"):
+    """Sets win's taskbar/titlebar icon from the given .png via
+    iconphoto(), holding a reference on the window to prevent garbage
+    collection."""
+    png = resource_path(png_filename)
     if os.path.exists(png):
         img = tk.PhotoImage(file=png)
         win.iconphoto(True, img)
         win._icon_ref = img  # prevent garbage collection
 
-def apply_icon(win):
-    """Sets win's icon from BLGF.ico (iconbitmap), falling back to
-    force_png_icon() for the taskbar/titlebar icon."""
-    ico = resource_path("BLGF.ico")
+def apply_icon(win, ico_filename="BLGF.ico", png_filename="BLGF.png"):
+    """Sets win's icon from the given .ico file (iconbitmap), falling
+    back to force_png_icon() for the taskbar/titlebar icon."""
+    ico = resource_path(ico_filename)
     if os.path.exists(ico):
         try:
             win.iconbitmap(ico)
         except Exception:
             pass
-    force_png_icon(win)
+    force_png_icon(win, png_filename)
 
 
 _active_splash = None  # holds the splash window while GM/CAMA Tools loads, if any
@@ -534,7 +535,7 @@ if not IS_TOOL_RUN:
     root.attributes("-alpha", 0)
     root.geometry("1x1+-9999+-9999")
     root.update_idletasks()               # flush any pending window creation events
-    apply_icon(root)                      # safe to call now — window is invisible
+    apply_icon(root, "resources/igdi_icon.ico", "resources/igdi_icon.png")  # main window: IGDI icon, not BLGF
     # Height lowered from 200 to 150: empirically measured (headless Tk
     # run against this exact panel layout -- icon grid + Update Map /
     # hub / Update Database row) that the packed content's own natural
@@ -4652,15 +4653,19 @@ SWP_NOSIZE     = 0x0001
 SWP_NOMOVE     = 0x0002
 SWP_NOACTIVATE = 0x0010
 
-def hide_from_taskbar():
-    """Clears WS_EX_APPWINDOW / sets WS_EX_TOOLWINDOW on root's Win32
-    window style, so the CAMA Tools window has no taskbar entry."""
+def show_in_taskbar():
+    """Sets WS_EX_APPWINDOW / clears WS_EX_TOOLWINDOW on root's Win32
+    window style, so CAMA Tools gets a normal taskbar entry -- needed
+    since minimizing (or Alt+Tab) has nothing to restore from without
+    one. Renamed from the old hide_from_taskbar(), which did the
+    opposite; see monitor_gm_state()'s own docstring for why CAMA no
+    longer hides itself based on GM's focus state."""
     hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
     style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-    style = (style | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW
+    style = (style | WS_EX_APPWINDOW) & ~WS_EX_TOOLWINDOW
     ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
 
-root.after(100, hide_from_taskbar)
+root.after(100, show_in_taskbar)
 
 # Disable the close button functionality
 def do_nothing():
@@ -5396,8 +5401,8 @@ def launch_main_window():
     """
     Positions and shows the CAMA Tools panel relative to the just-
     confirmed Global Mapper window (sized/positioned via
-    get_cama_size()/_locked_gm_snapshot()), then installs the taskbar-
-    hiding and window-drag-clamping hooks (hide_from_taskbar(),
+    get_cama_size()/_locked_gm_snapshot()), then installs the
+    taskbar-entry and window-drag-clamping hooks (show_in_taskbar(),
     install_wm_moving_hook()) and binds dragging to the whole panel.
     """
     snap = _locked_gm_snapshot()
@@ -5442,7 +5447,7 @@ def launch_main_window():
     root.deiconify()
     root.lift()
     # Pin as topmost at Win32 level — more reliable than tkinter's -topmost.
-    # Uses GetParent(root.winfo_id()) — the same pattern hide_from_taskbar()
+    # Uses GetParent(root.winfo_id()) — the same pattern show_in_taskbar()
     # already uses — rather than a title-based lookup, to get CAMA's real
     # top-level HWND directly.
     cama_hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
@@ -5609,97 +5614,85 @@ def monitor_gm_state():
         if snap and snap[4]:  # snap[4] = visible - preserves old .visible filter
             gm_left, gm_top, gm_w, gm_h, _visible, gm_minimized = snap
 
-            if gm_minimized or not is_relevant_window_focused():
-                if root.state() != 'withdrawn':
-                    root.withdraw()
-                    # CAMA itself is going invisible — any tooltip that
-                    # happened to be showing has no business staying on
-                    # screen (it would float over whatever other window
-                    # the user switched to). It intentionally does NOT
-                    # come back when CAMA is shown again below — it only
-                    # reappears through the normal hover (enter) path.
-                    if _active_tooltips:
-                        for _tip in list(_active_tooltips):
-                            _tip.withdraw()
-                        _active_tooltips.clear()
-            else:
-                just_shown = (root.state() == 'withdrawn')
+            # CAMA Tools now stays visible regardless of GM's minimize/focus
+            # state -- it used to withdraw whenever GM was minimized or lost
+            # focus, which made CAMA disappear on dual-monitor setups just
+            # from clicking another window. Only monitor_gm_closure() (GM
+            # actually closing) should ever take CAMA Tools down now.
+            just_shown = (root.state() == 'withdrawn')
+            if just_shown:
+                root.attributes("-alpha", 1)
+                root.deiconify()
+
+            # See note above launch_main_window()'s cama_hwnd assignment.
+            cama_hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
+
+            # --- Z-order: only re-pin topmost when just shown, or occasionally ---
+            # Calling SetWindowPos every 200ms causes visible title-bar flicker.
+            if cama_hwnd:
                 if just_shown:
-                    root.attributes("-alpha", 1)
-                    root.deiconify()
+                    ctypes.windll.user32.SetWindowPos(
+                        cama_hwnd, HWND_TOPMOST,
+                        0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+                    )
+                    # Z-order fix: see _repin_active_tooltips().
+                    _repin_active_tooltips()
+                else:
+                    _topmost_recheck_counter[0] += 1
+                    if _topmost_recheck_counter[0] >= 10:  # ~every 2s instead of every 200ms
+                        _topmost_recheck_counter[0] = 0
+                        # Task C fix: only re-pin topmost when Global
+                        # Mapper itself currently has the foreground.
+                        # The throttle counter still resets every cycle
+                        # either way, preserving the existing ~2s cadence
+                        # -- only the SetWindowPos call itself becomes
+                        # conditional. See should_repin_topmost() in
+                        # core/window_management.py.
+                        if should_repin_topmost(get_foreground_pid(), _locked_gm_pid[0]):
+                            ctypes.windll.user32.SetWindowPos(
+                                cama_hwnd, HWND_TOPMOST,
+                                0, 0, 0, 0,
+                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+                            )
+                            # Z-order fix: see _repin_active_tooltips().
+                            _repin_active_tooltips()
 
-                # See note above launch_main_window()'s cama_hwnd assignment.
-                cama_hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
+            # --- Follow GM when it moves ---
+            gm_moved = (
+                prev_gm_rect[0] != gm_left or
+                prev_gm_rect[1] != gm_top  or
+                prev_gm_rect[2] != gm_w    or
+                prev_gm_rect[3] != gm_h
+            )
 
-                # --- Z-order: only re-pin topmost when just shown, or occasionally ---
-                # Calling SetWindowPos every 200ms causes visible title-bar flicker.
-                if cama_hwnd:
-                    if just_shown:
-                        ctypes.windll.user32.SetWindowPos(
-                            cama_hwnd, HWND_TOPMOST,
-                            0, 0, 0, 0,
-                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
-                        )
-                        # Z-order fix: see _repin_active_tooltips().
-                        _repin_active_tooltips()
-                    else:
-                        _topmost_recheck_counter[0] += 1
-                        if _topmost_recheck_counter[0] >= 10:  # ~every 2s instead of every 200ms
-                            _topmost_recheck_counter[0] = 0
-                            # Task C fix: only re-pin topmost when Global
-                            # Mapper itself currently has the foreground --
-                            # narrower than is_relevant_window_focused()
-                            # (which still gates the withdraw/show decision
-                            # above, unchanged). The throttle counter still
-                            # resets every cycle either way, preserving the
-                            # existing ~2s cadence -- only the SetWindowPos
-                            # call itself becomes conditional. See
-                            # should_repin_topmost() in
-                            # core/window_management.py.
-                            if should_repin_topmost(get_foreground_pid(), _locked_gm_pid[0]):
-                                ctypes.windll.user32.SetWindowPos(
-                                    cama_hwnd, HWND_TOPMOST,
-                                    0, 0, 0, 0,
-                                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
-                                )
-                                # Z-order fix: see _repin_active_tooltips().
-                                _repin_active_tooltips()
+            if gm_moved:
+                if cama_offset[0] is None:
+                    # First time — set offset from current CAMA position
+                    cama_offset[0] = root.winfo_x() - gm_left
+                    cama_offset[1] = root.winfo_y() - gm_top
+                else:
+                    # GM moved — reposition CAMA using saved offset
+                    new_x = gm_left + cama_offset[0]
+                    new_y = gm_top  + cama_offset[1]
 
-                # --- Follow GM when it moves ---
-                gm_moved = (
-                    prev_gm_rect[0] != gm_left or
-                    prev_gm_rect[1] != gm_top  or
-                    prev_gm_rect[2] != gm_w    or
-                    prev_gm_rect[3] != gm_h
-                )
+                    # Clamp inside GM bounds
+                    cama_w = root.winfo_width()
+                    cama_h = root.winfo_height()
+                    new_x = max(gm_left + GM_LEFT_PANEL_W,
+                                min(new_x, gm_left + gm_w - cama_w))
+                    new_y = max(gm_top  + GM_TITLEBAR_H,
+                                min(new_y, gm_top  + gm_h - cama_h))
 
-                if gm_moved:
-                    if cama_offset[0] is None:
-                        # First time — set offset from current CAMA position
-                        cama_offset[0] = root.winfo_x() - gm_left
-                        cama_offset[1] = root.winfo_y() - gm_top
-                    else:
-                        # GM moved — reposition CAMA using saved offset
-                        new_x = gm_left + cama_offset[0]
-                        new_y = gm_top  + cama_offset[1]
+                    root.geometry(f"+{new_x}+{new_y}")
 
-                        # Clamp inside GM bounds
-                        cama_w = root.winfo_width()
-                        cama_h = root.winfo_height()
-                        new_x = max(gm_left + GM_LEFT_PANEL_W,
-                                    min(new_x, gm_left + gm_w - cama_w))
-                        new_y = max(gm_top  + GM_TITLEBAR_H,
-                                    min(new_y, gm_top  + gm_h - cama_h))
-
-                        root.geometry(f"+{new_x}+{new_y}")
-
-                    prev_gm_rect[0] = gm_left
-                    prev_gm_rect[1] = gm_top
-                    prev_gm_rect[2] = gm_w
-                    prev_gm_rect[3] = gm_h
+                prev_gm_rect[0] = gm_left
+                prev_gm_rect[1] = gm_top
+                prev_gm_rect[2] = gm_w
+                prev_gm_rect[3] = gm_h
 
         else:
-            print("❌ Global Mapper closed. Closing Tkinter.")
+            print("Global Mapper closed. Closing Tkinter.")
             root.destroy()
 
     except Exception as e:

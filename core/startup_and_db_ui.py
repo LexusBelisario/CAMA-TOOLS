@@ -1369,6 +1369,39 @@ def try_restore_saved_connection(get_credentials_path_fn):
     return values
 
 
+def _remove_minmax_buttons(win):
+    """
+    Strips the titlebar's minimize and maximize buttons via the Win32
+    API directly, same GetWindowLongW/SetWindowLongW approach as
+    road_width.py's _remove_close_button(). Neither button does
+    anything useful on a fixed-size, non-resizable dialog like this
+    one -- they stay visible and clickable by default even with
+    resizable(False, False) set, which reads as broken rather than
+    intentionally absent. This actually removes them from the
+    titlebar, leaving just the close (X) button and icon.
+
+    GetParent(win.winfo_id()) rather than win.winfo_id() directly:
+    same long-standing Tkinter-on-Windows HWND quirk noted in
+    road_width.py's own version of this pattern.
+
+    Windows-only, fully defensive: any failure here is caught and
+    logged, leaving the buttons visible but otherwise not affecting
+    the dialog -- a cosmetic miss, not a crash.
+    """
+    try:
+        import ctypes
+        GWL_STYLE = -16
+        WS_MINIMIZEBOX = 0x00020000
+        WS_MAXIMIZEBOX = 0x00010000
+        hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+        style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_STYLE)
+        style &= ~WS_MINIMIZEBOX
+        style &= ~WS_MAXIMIZEBOX
+        ctypes.windll.user32.SetWindowLongW(hwnd, GWL_STYLE, style)
+    except Exception as e:
+        print(f"Could not remove the titlebar minimize/maximize buttons: {e}")
+
+
 def show_startup_dialog(root, apply_icon_fn, resize_file_dialog_fn, on_start):
     """
     Shows the startup dialog: Global Mapper Workspace file picker +
@@ -1431,6 +1464,7 @@ def show_startup_dialog(root, apply_icon_fn, resize_file_dialog_fn, on_start):
     apply_icon_fn(win)
     win.title("Land Valuation Tools - Startup")
     win.resizable(False, False)
+    _remove_minmax_buttons(win)
     win.grab_set()
 
     def _on_close():
@@ -1666,6 +1700,7 @@ def show_configure_db_dialog(root, apply_icon_fn, get_credentials_path_fn, db_ga
     apply_icon_fn(win)
     win.title("Configure Database Connection")
     win.resizable(False, False)
+    _remove_minmax_buttons(win)
     win.grab_set()
 
     dirty = {"flag": False}
