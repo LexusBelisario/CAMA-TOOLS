@@ -158,6 +158,7 @@ from utils.column_detection import detect_existing_output_columns
 from utils.window_icon import apply_icon
 from utils.gpkg_io import write_gpkg_atomic as _write_gpkg
 from utils.db_gate_ui import disable_db_radio, attach_no_db_tooltip
+from utils.batch_mode_ui import build_save_cancel_row
 from PIL import Image, ImageTk, ImageDraw
 
 
@@ -2243,7 +2244,91 @@ def process_poi_counts_dynamic(gdf, poi_gdf, checked_categories, aerial_radius_m
 # ========================================
 # MAIN WINDOW
 # ========================================
-def open_main_window(root, db_verified=True):
+def is_batch_config_complete(config):
+    """
+    Batch-mode readiness check, per the contract documented in
+    tools/batchValuation/contract.py (PER-TOOL BATCH-MODE CONTRACT) --
+    the Batch Valuation orchestrator calls this against this tool's own
+    last-Saved config dict to decide whether to show its "Incomplete"
+    overlay.
+
+    This is the most complex readiness check among the 11 tools: THREE
+    secondary sources (Road Network Source, POI Source, Search
+    Distance) plus a REQUIRED per-category checklist where each
+    checked row also carries its own Aerial/Road Method choice.
+    Mirrors _update_run_button_state()'s own real readiness cascade
+    exactly (its Land Parcel/Output portions excluded, since batch mode
+    never captures those):
+      - a POI source must be selected;
+      - at least one category must be checked;
+      - if any checked category uses "aerial", aerial_radius must be a
+        valid positive number;
+      - if any checked category uses "road", road_radius must be a
+        valid positive number AND a Road Network source must be
+        selected (Road Network Source is only conditionally required,
+        exactly matching _update_run_button_state()'s own
+        has_road_source logic -- see that function's own docstring:
+        "a Road Network source (if any checked category uses Road)").
+
+    Args:
+        config (dict): this tool's own last-Saved batch config, in the
+            shape _gather_batch_config() below produces:
+            {"road_source_type": "local"|"db",
+             "road_local_path"|"road_db_table": "...",
+             "poi_source_type": "local"|"db",
+             "poi_local_path"|"poi_db_table": "...",
+             "aerial_radius": "200", "road_radius": "200",
+             "category_selections": [
+                 {"key": sanitized_key, "method": "aerial"|"road"},
+                 ...
+             ]}.
+            category_selections includes only CHECKED categories.
+
+    Returns:
+        bool: True iff every condition above is satisfied.
+    """
+    def _valid_radius(value):
+        try:
+            return float(value) > 0
+        except (TypeError, ValueError):
+            return False
+
+    if not config:
+        return False
+    if config.get("poi_source_type") == "local":
+        has_poi = bool(config.get("poi_local_path"))
+    elif config.get("poi_source_type") == "db":
+        has_poi = bool(config.get("poi_db_table"))
+    else:
+        return False
+    if not has_poi:
+        return False
+
+    selections = config.get("category_selections") or []
+    if not selections:
+        return False
+
+    any_aerial = any(rec.get("method") == "aerial" for rec in selections)
+    any_road = any(rec.get("method") == "road" for rec in selections)
+
+    if any_aerial and not _valid_radius(config.get("aerial_radius")):
+        return False
+    if any_road:
+        if not _valid_radius(config.get("road_radius")):
+            return False
+        if config.get("road_source_type") == "local":
+            if not config.get("road_local_path"):
+                return False
+        elif config.get("road_source_type") == "db":
+            if not config.get("road_db_table"):
+                return False
+        else:
+            return False
+    return True
+
+
+def open_main_window(root, db_verified=True, batch_mode=False,
+                      initial_config=None, on_save=None, on_cancel=None):
     """
     Builds and shows the tool's single unified configuration window:
     Land Parcel and POI source pickers (each with a Local-file/
@@ -2267,11 +2352,49 @@ def open_main_window(root, db_verified=True):
             radio_aerial) -- those select a DISTANCE-CALCULATION
             METHOD, unrelated to whether the data source is a local
             file or a database table, so they are never part of this
-            db_verified gating.
+            db_verified gating. When batch_mode=True, only
+            road_radio_db/poi_radio_db are built at all, so only those
+            two are gated -- parcel_radio_db/out_radio_db do not exist
+            in that branch.
+        batch_mode: bool, default False -- NEW. When True, the Land
+            Parcel Source and Output Destination sections below are
+            not built at all (supplied globally by the Batch
+            Valuation orchestrator instead); Road Network Source, POI
+            Source (including its own REQUIRED per-category checklist
+            with per-row Aerial/Road Method, entirely unmodified), and
+            the independent Aerial/Road distance entries are the only
+            sections still shown, since those are this tool's only
+            other settings; "Run Processing" is replaced by a
+            Cancel/Save row (see
+            utils.batch_mode_ui.build_save_cancel_row()). See
+            tools/batchValuation/contract.py for the full per-tool
+            batch-mode contract this implements. False (the default)
+            leaves every existing non-batch caller (the normal Feature
+            Management Tools icon-grid launch) completely unaffected --
+            same signature default, same behavior, same code path.
+        initial_config: dict | None, default None -- NEW. Pre-fills
+            Road Network Source, POI Source, both distance entries, and
+            the per-category checklist's own previously-Saved checked/
+            method state (this tool's only batch-visible fields) when
+            re-opening a previously-saved batch entry -- the checklist
+            restoration is applied once the background re-read POI
+            Source pre-filling triggers (via the SAME _toggle_poi() ->
+            _refresh_poi_categories() path a normal Browse/Select
+            already uses) actually completes; see
+            _pending_category_restore's own comment below and
+            _poll_poi_category_queue()'s own docstring for exactly
+            where this is applied. See is_batch_config_complete()'s own
+            docstring for the config dict's shape.
+        on_save: callable(config: dict) -> None, default None -- NEW.
+            Forwarded to build_save_cancel_row() -- see that helper's
+            own docstring for its full Save/Cancel lifecycle (Save
+            stays open; only Cancel/the titlebar X closes the window).
+        on_cancel: callable() -> None, default None -- NEW. Forwarded
+            to build_save_cancel_row(), same as on_save above.
     """
     win = tk.Toplevel(root)
     apply_icon(win, "landmarks200.ico")
-    win.title("Landmarks Within Meters Tool")
+    win.title("Landmarks Within Meters Tool" + (" — Batch Mode" if batch_mode else ""))
     win.resizable(False, False)
     win.update_idletasks()
     win.deiconify()
@@ -2527,86 +2650,146 @@ def open_main_window(root, db_verified=True):
             side="left", fill="x", expand=True, padx=(6, 0), pady=4)
         return frm
 
-    # ── SECTION 1: LAND PARCEL ───────────────────────────────────
-    section_label(win, "Land Parcel Source")
-
-    parcel_frame = tk.Frame(win)
-    parcel_frame.pack(fill="x", padx=18, pady=2)
-
-    radio_row = tk.Frame(parcel_frame)
-    radio_row.pack(fill="x")
-    parcel_radio_local = tk.Radiobutton(radio_row, text="Local File",
-                   variable=parcel_source_type, value="local",
-                   command=lambda: _toggle_parcel())
-    parcel_radio_local.pack(side="left")
-    parcel_radio_db = tk.Radiobutton(radio_row, text="Database Table",
-                   variable=parcel_source_type, value="db",
-                   command=lambda: _toggle_parcel())
-    parcel_radio_db.pack(side="left", padx=(12, 0))
-
-    parcel_files_var = tk.StringVar(master=win, value="No file selected")
-    parcel_db_label  = tk.StringVar(master=win, value="No table selected")
-
-    parcel_action_row = tk.Frame(parcel_frame)
-    parcel_action_row.pack(fill="x", pady=2)
-
-    parcel_lbl = tk.Label(parcel_action_row, textvariable=parcel_files_var,
-                          fg="gray", anchor="w", width=42)
-    parcel_lbl.pack(side="left")
-
-    parcel_btn = tk.Button(parcel_action_row, text="Browse…", width=10)
-    parcel_btn.pack(side="left", **PAD)
-
-    def browse_parcel_files():
-        file = filedialog.askopenfilename(filetypes=[
-            ("Shapefiles", "*.shp"), ("GeoPackage", "*.gpkg"), ("All", "*.*")])
-        # Cancel returns "" -- do not assign, preserving previous selection.
-        if file:
-            nonlocal parcel_local_path
-            parcel_local_path = file
-            parcel_files_var.set(os.path.basename(file))
-        _update_run_button_state()
-
-    def _on_parcel_db_selected(sel):
-        # Only called on confirmed selection -- Cancel never calls on_select,
-        # so parcel_db_table retains its previous value automatically.
-        nonlocal parcel_db_table
-        parcel_db_table = sel[0]
-        parcel_db_label.set(sel[0])
-        _update_run_button_state()
-
-    def browse_parcel_db():
-        creds = load_db_credentials()
-        if not creds:
-            messagebox.showerror("Error", "Could not load DB credentials.")
-            return
-        tables = fetch_tables(creds["schema"])
-        if not tables:
-            messagebox.showwarning("No Tables", "No tables found in the database schema.")
-            return
-        _pick_db_tables(win, tables, multi=False, on_select=_on_parcel_db_selected)
-
-    def _toggle_parcel():
-        # Always render from authority variables -- never from StringVar state.
-        # Guarantees Local → DB → Local always restores the original selection.
-        if parcel_source_type.get() == "local":
-            parcel_lbl.config(textvariable=parcel_files_var)
-            parcel_btn.config(text="Browse…", command=browse_parcel_files)
-            parcel_files_var.set(
-                os.path.basename(parcel_local_path) if parcel_local_path
-                else "No file selected"
-            )
+    # NEW -- batch mode: pre-fill Road Network Source, POI Source, and
+    # both distance entries from a previously-Saved config (see
+    # is_batch_config_complete()'s own docstring for the dict shape).
+    # road_local_path/road_db_table are plain scalar "authority"
+    # variables (not StringVars) -- reassigning them here, in this same
+    # top-level scope where they were first declared just above, is a
+    # plain Python rebind (no `nonlocal` needed at this scope level);
+    # every nested function that later does `nonlocal road_local_path`
+    # etc. sees this new value, since Python closures share the
+    # variable's cell by reference (same technique already used in
+    # influence_map_distance_to_land_parcel.py's own batch-mode
+    # adaptation for its structurally identical fault_local_path).
+    # poi_local_path/poi_db_table/aerial_radius_var/road_radius_var ARE
+    # StringVars, so .set() is used for those instead. Only sets these
+    # plain values here -- the actual background re-read (and, once it
+    # completes, the per-category checklist restore queued into
+    # _pending_category_restore below) is triggered naturally by
+    # calling _toggle_poi() once, right after Section 3, for initial
+    # widget sync in the batch-mode branch below. No-op when
+    # initial_config is None (first Edit this session) or when
+    # batch_mode is False.
+    _pending_category_restore = [[]]
+    if batch_mode and initial_config:
+        if initial_config.get("road_source_type") == "db":
+            road_source_type.set("db")
+            road_db_table = initial_config.get("road_db_table")
         else:
-            parcel_lbl.config(textvariable=parcel_db_label)
-            parcel_btn.config(text="Select…", command=browse_parcel_db)
-            parcel_db_label.set(
-                parcel_db_table if parcel_db_table
-                else "No table selected"
-            )
-        # Switching Local <-> Database does NOT clear the other mode's
-        # remembered selection -- that's pre-existing behavior, left
-        # untouched.
-        _update_run_button_state()
+            road_source_type.set("local")
+            road_local_path = initial_config.get("road_local_path")
+        if initial_config.get("poi_source_type") == "db":
+            poi_source_type.set("db")
+            poi_db_table.set(initial_config.get("poi_db_table") or "")
+        else:
+            poi_source_type.set("local")
+            poi_local_path.set(initial_config.get("poi_local_path") or "")
+        if initial_config.get("aerial_radius"):
+            aerial_radius_var.set(initial_config["aerial_radius"])
+        if initial_config.get("road_radius"):
+            road_radius_var.set(initial_config["road_radius"])
+        _pending_category_restore[0] = list(
+            initial_config.get("category_selections") or [])
+
+    # NEW -- placeholder assigned BEFORE Section 1 is built below.
+    # Section 1's, Road Network's, and POI's own handlers call
+    # _update_run_button_state() unconditionally -- the SAME code
+    # whether batch_mode is True or False, since Road Network Source,
+    # POI Source, and the distance entries are the sections this tool
+    # always builds. In batch mode there is no run_btn for the real
+    # implementation (defined much further below, near the Run button)
+    # to update, so this stays a no-op there; the REAL implementation
+    # is only defined -- shadowing this one -- inside the
+    # `if not batch_mode:` branch. Safe: Python resolves this name at
+    # CALL time (when the user actually interacts with a widget, after
+    # the whole window is built), not at each handler's own definition
+    # time.
+    if batch_mode:
+        def _update_run_button_state():
+            pass
+
+    if not batch_mode:
+        # ── SECTION 1: LAND PARCEL ───────────────────────────────────
+        section_label(win, "Land Parcel Source")
+
+        parcel_frame = tk.Frame(win)
+        parcel_frame.pack(fill="x", padx=18, pady=2)
+
+        radio_row = tk.Frame(parcel_frame)
+        radio_row.pack(fill="x")
+        parcel_radio_local = tk.Radiobutton(radio_row, text="Local File",
+                       variable=parcel_source_type, value="local",
+                       command=lambda: _toggle_parcel())
+        parcel_radio_local.pack(side="left")
+        parcel_radio_db = tk.Radiobutton(radio_row, text="Database Table",
+                       variable=parcel_source_type, value="db",
+                       command=lambda: _toggle_parcel())
+        parcel_radio_db.pack(side="left", padx=(12, 0))
+
+        parcel_files_var = tk.StringVar(master=win, value="No file selected")
+        parcel_db_label  = tk.StringVar(master=win, value="No table selected")
+
+        parcel_action_row = tk.Frame(parcel_frame)
+        parcel_action_row.pack(fill="x", pady=2)
+
+        parcel_lbl = tk.Label(parcel_action_row, textvariable=parcel_files_var,
+                              fg="gray", anchor="w", width=42)
+        parcel_lbl.pack(side="left")
+
+        parcel_btn = tk.Button(parcel_action_row, text="Browse…", width=10)
+        parcel_btn.pack(side="left", **PAD)
+
+        def browse_parcel_files():
+            file = filedialog.askopenfilename(filetypes=[
+                ("Shapefiles", "*.shp"), ("GeoPackage", "*.gpkg"), ("All", "*.*")])
+            # Cancel returns "" -- do not assign, preserving previous selection.
+            if file:
+                nonlocal parcel_local_path
+                parcel_local_path = file
+                parcel_files_var.set(os.path.basename(file))
+            _update_run_button_state()
+
+        def _on_parcel_db_selected(sel):
+            # Only called on confirmed selection -- Cancel never calls on_select,
+            # so parcel_db_table retains its previous value automatically.
+            nonlocal parcel_db_table
+            parcel_db_table = sel[0]
+            parcel_db_label.set(sel[0])
+            _update_run_button_state()
+
+        def browse_parcel_db():
+            creds = load_db_credentials()
+            if not creds:
+                messagebox.showerror("Error", "Could not load DB credentials.")
+                return
+            tables = fetch_tables(creds["schema"])
+            if not tables:
+                messagebox.showwarning("No Tables", "No tables found in the database schema.")
+                return
+            _pick_db_tables(win, tables, multi=False, on_select=_on_parcel_db_selected)
+
+        def _toggle_parcel():
+            # Always render from authority variables -- never from StringVar state.
+            # Guarantees Local → DB → Local always restores the original selection.
+            if parcel_source_type.get() == "local":
+                parcel_lbl.config(textvariable=parcel_files_var)
+                parcel_btn.config(text="Browse…", command=browse_parcel_files)
+                parcel_files_var.set(
+                    os.path.basename(parcel_local_path) if parcel_local_path
+                    else "No file selected"
+                )
+            else:
+                parcel_lbl.config(textvariable=parcel_db_label)
+                parcel_btn.config(text="Select…", command=browse_parcel_db)
+                parcel_db_label.set(
+                    parcel_db_table if parcel_db_table
+                    else "No table selected"
+                )
+            # Switching Local <-> Database does NOT clear the other mode's
+            # remembered selection -- that's pre-existing behavior, left
+            # untouched.
+            _update_run_button_state()
 
     # ── SECTION 1B: ROAD NETWORK SOURCE ──────────────────────────
     # Task 5: new secondary source, positioned below Land Parcel
@@ -3755,6 +3938,43 @@ def open_main_window(root, db_verified=True):
         # fresh section, and nothing has grown any canvas between then
         # and here, so it is still guaranteed unpoisoned at this point.
         _rebuild_category_checklist()
+
+        # NEW -- batch mode only: if a previously-Saved batch config's
+        # per-category checked/method selections are pending
+        # restoration (set once, at window-open time, by the
+        # initial_config handling near Section 1 above -- see
+        # _pending_category_restore's own comment there), apply them
+        # here -- this is the ONLY point in the entire discovery cycle
+        # where poi_category_vars/poi_category_method_vars hold the
+        # FRESH, real Tkinter variables a saved selection can be
+        # matched against. For each saved (key, method) pair whose key
+        # still exists in this fresh discovery, the saved method is
+        # seeded into poi_category_remembered_method[key] BEFORE
+        # calling _on_category_checked_toggle(key) -- that function's
+        # own "checking" branch restores method_var FROM
+        # poi_category_remembered_method[key] (defaulting to "road"
+        # only when no entry exists), so seeding it first is what makes
+        # the restored method (not the default) actually apply; reused
+        # exactly as-is, never a second, divergent enable/disable
+        # implementation of its own. A saved key that no longer exists
+        # in this fresh discovery (e.g. the POI source's own available
+        # categories changed) is simply skipped, never an error.
+        # Consumed (reset to []) immediately, so an ORDINARY re-browse
+        # later in the same Edit session still leaves the checklist at
+        # its normal default (every category unchecked), exactly as it
+        # already does. Every existing non-batch caller never sets this
+        # cell at all, so this loop is always a no-op for them -- zero
+        # behavior change there.
+        for _rec in _pending_category_restore[0]:
+            _key = _rec.get("key")
+            _method = _rec.get("method")
+            if _key in poi_category_vars:
+                if _method:
+                    poi_category_remembered_method[_key] = _method
+                poi_category_vars[_key].set(True)
+                _on_category_checked_toggle(_key)
+        _pending_category_restore[0] = []
+
         _set_poi_category_reading_state(False)
         count = len(poi_categories)
         _set_category_status_emphasis(True)
@@ -4034,487 +4254,554 @@ def open_main_window(root, db_verified=True):
             radio.config(state=state)
         _recompute_radius_enablement()
 
-    # ── SECTION 4: OUTPUT ────────────────────────────────────────
-    section_label(win, "Output Destination")
+    # NEW -- batch mode ONLY here: in the non-batch path, the initial
+    # _toggle_road()/_toggle_poi() sync stays in its ORIGINAL position,
+    # at the very end alongside _toggle_parcel()/_toggle_output() (see
+    # below) -- calling it this early would reach a point where run_btn
+    # does not exist yet in that path (Section 4/the Run button are
+    # only built further below, inside `if not batch_mode:`), raising
+    # NameError. In batch mode this is safe because
+    # _update_run_button_state was already shadowed to a no-op before
+    # Section 1, and there is no "later" position to defer to --
+    # Section 4/Run button are never built in that branch at all. Both
+    # calls are needed here (not just _toggle_poi()) since Road Network
+    # Source and POI Source are BOTH batch-visible sections this tool
+    # always builds. Unlike influence_map_distance_to_land_parcel.py's
+    # own equivalent fix, no extra "_build_widgets()" call is needed
+    # here first -- _create_category_section() (which builds
+    # category_frame/category_checklist_outer etc.) already runs
+    # unconditionally as part of Section 3 (POI Source)'s own
+    # construction above, confirmed by re-reading that section fresh
+    # rather than assumed to match the previous file's own structure.
+    if batch_mode:
+        _toggle_road()
+        _toggle_poi()
+        if not db_verified:
+            for _db_radio in (road_radio_db, poi_radio_db):
+                disable_db_radio(_db_radio)
+                attach_no_db_tooltip(_db_radio)
 
-    output_frame = tk.Frame(win)
-    output_frame.pack(fill="x", padx=18, pady=2)
+    if not batch_mode:
+        # ── SECTION 4: OUTPUT ────────────────────────────────────────
+        section_label(win, "Output Destination")
 
-    out_radio_row = tk.Frame(output_frame)
-    out_radio_row.pack(fill="x")
-    tk.Radiobutton(out_radio_row, text="Save to Local Folder",
-                   variable=output_dest_type, value="local",
-                   command=lambda: _toggle_output()).pack(side="left")
-    # Named (unlike this section's Local Folder radio above) so the
-    # db_verified block near the end of this function can disable it
-    # when the session has no verified database connection.
-    out_radio_db = tk.Radiobutton(
-        out_radio_row, text="Save to Database",
-        variable=output_dest_type, value="db",
-        command=lambda: _toggle_output())
-    out_radio_db.pack(side="left", padx=(12, 0))
+        output_frame = tk.Frame(win)
+        output_frame.pack(fill="x", padx=18, pady=2)
 
-    output_dir_var = tk.StringVar(master=win, value="No folder selected")
-    output_db_var  = tk.StringVar(master=win,
-                                  value="Will write back to the connected PostGIS schema.")
+        out_radio_row = tk.Frame(output_frame)
+        out_radio_row.pack(fill="x")
+        tk.Radiobutton(out_radio_row, text="Save to Local Folder",
+                       variable=output_dest_type, value="local",
+                       command=lambda: _toggle_output()).pack(side="left")
+        # Named (unlike this section's Local Folder radio above) so the
+        # db_verified block near the end of this function can disable it
+        # when the session has no verified database connection.
+        out_radio_db = tk.Radiobutton(
+            out_radio_row, text="Save to Database",
+            variable=output_dest_type, value="db",
+            command=lambda: _toggle_output())
+        out_radio_db.pack(side="left", padx=(12, 0))
 
-    out_action_row = tk.Frame(output_frame)
-    out_action_row.pack(fill="x", pady=2)
+        output_dir_var = tk.StringVar(master=win, value="No folder selected")
+        output_db_var  = tk.StringVar(master=win,
+                                      value="Will write back to the connected PostGIS schema.")
 
-    out_lbl = tk.Label(out_action_row, textvariable=output_dir_var,
-                       fg="gray", anchor="w", width=42)
-    out_lbl.pack(side="left")
+        out_action_row = tk.Frame(output_frame)
+        out_action_row.pack(fill="x", pady=2)
 
-    out_btn = tk.Button(out_action_row, text="Browse…", width=10)
-    out_btn.pack(side="left", **PAD)
+        out_lbl = tk.Label(out_action_row, textvariable=output_dir_var,
+                           fg="gray", anchor="w", width=42)
+        out_lbl.pack(side="left")
 
-    def browse_output_dir():
-        d = filedialog.askdirectory()
-        if d:
-            output_local_dir.set(d)
-            output_dir_var.set(d)
+        out_btn = tk.Button(out_action_row, text="Browse…", width=10)
+        out_btn.pack(side="left", **PAD)
+
+        def browse_output_dir():
+            d = filedialog.askdirectory()
+            if d:
+                output_local_dir.set(d)
+                output_dir_var.set(d)
+                _update_run_button_state()
+
+        def _toggle_output():
+            if output_dest_type.get() == "local":
+                out_lbl.config(textvariable=output_dir_var,
+                               font=("Segoe UI", 9), fg="gray")
+                out_btn.config(text="Browse…", command=browse_output_dir)
+                out_btn.pack(side="left", **PAD)
+            else:
+                out_lbl.config(textvariable=output_db_var,
+                               font=("Segoe UI", 8, "italic"), fg="gray")
+                out_btn.pack_forget()
             _update_run_button_state()
 
-    def _toggle_output():
-        if output_dest_type.get() == "local":
-            out_lbl.config(textvariable=output_dir_var,
-                           font=("Segoe UI", 9), fg="gray")
-            out_btn.config(text="Browse…", command=browse_output_dir)
-            out_btn.pack(side="left", **PAD)
-        else:
-            out_lbl.config(textvariable=output_db_var,
-                           font=("Segoe UI", 8, "italic"), fg="gray")
-            out_btn.pack_forget()
+        # ── RUN BUTTON ───────────────────────────────────────────────
+        ttk.Separator(win, orient="horizontal").pack(
+            fill="x", padx=10, pady=(12, 4))
+
+        def on_run():
+            """
+            Run button handler: validates Land Parcel + POI + the dynamic
+            checklist (checked categories, per-method radii, Road Network
+            source if needed) + Output selections are present, checks for
+            existing output-column conflicts (PRIORITY 1), runs the local
+            output-file conflict check (PRIORITY 2), and DB-output table
+            resolution (PRIORITY 3) -- each able to cancel the whole run --
+            then destroys this window and hands off to run_processing().
+            Sets the module-level barangay_source, poi_source, output_mode,
+            checked_categories, target_column_map, aerial_radius_meters,
+            road_radius_meters, road_source, and
+            parcel_output_column_overrides globals on success.
+
+            D3c note: radius_var/radius_meters (the single old fixed-radius
+            field) have been fully retired -- see this function's own
+            dedicated validation block, right after POI validation below,
+            for the precedence now actually used (checked categories, then
+            Aerial radius if needed, then Road radius if needed, then Road
+            Network source if needed).
+            """
+            global barangay_source, poi_source, output_mode
+
+            # validate parcel
+            if parcel_source_type.get() == "local":
+                if not parcel_local_path:
+                    messagebox.showerror("Missing Input",
+                        "Please select a Land Parcel file.")
+                    return
+                # Validation guarantees parcel_local_path is not None here --
+                # barangay_source never contains None (Phase 1 invariant 3).
+                barangay_source = ("local", (parcel_local_path,))
+            else:
+                if not parcel_db_table:
+                    messagebox.showerror("Missing Input",
+                        "Please select a Land Parcel table.")
+                    return
+                barangay_source = ("db", (parcel_db_table,))
+
+            # validate poi
+            if poi_source_type.get() == "local":
+                if not poi_local_path.get():
+                    messagebox.showerror("Missing Input",
+                        "Please select a POI file.")
+                    return
+                poi_source = ("local", [poi_local_path.get()])
+            else:
+                if not poi_db_table.get():
+                    messagebox.showerror("Missing Input",
+                        "Please select a POI table.")
+                    return
+                poi_source = ("db", [poi_db_table.get()])
+
+            # ------------------------------------------------------------------
+            # D3a/D3c -- dynamic-checklist validation (approved precedence,
+            # steps 3-6). Builds checked_categories/target_column_map/
+            # aerial_radius_meters/road_radius_meters/road_source (module-
+            # level globals declared above) -- consumed by run_processing()
+            # (D3c wired this in; the old fixed-radius pipeline these
+            # globals originally coexisted alongside has since been
+            # retired entirely).
+            # ------------------------------------------------------------------
+            global checked_categories, target_column_map
+            global aerial_radius_meters, road_radius_meters, road_source
+
+            # Step 3: no checked categories. This is a validation rule on
+            # user input (the checklist), not a re-statement of the
+            # separately-deferred "zero eligible categories" question
+            # (POI discovery producing no valid fclass buckets at all) --
+            # that remains an explicitly NOT-yet-approved proposal and is
+            # NOT implemented here. This step only blocks the case where
+            # eligible categories DO exist but the user checked none of
+            # them, which would otherwise let a run reach run_processing()
+            # with an empty target list -- a silent no-op.
+            checked_categories = {
+                key: poi_category_method_vars[key].get()
+                for key, var in poi_category_vars.items()
+                if var.get()
+            }
+            if not checked_categories:
+                messagebox.showerror("Missing Input",
+                    "Please check at least one landmark type to count.")
+                return
+            target_column_map = dict(zip(
+                checked_categories.keys(),
+                derive_target_columns(checked_categories.keys())))
+
+            any_aerial = any(m == "aerial" for m in checked_categories.values())
+            any_road = any(m == "road" for m in checked_categories.values())
+
+            # Step 4: Aerial radius -- only validated if at least one
+            # checked category actually uses the Aerial method. Left None
+            # (its module-level default) if not currently relevant, rather
+            # than validated-but-unused, so a stale/invalid value sitting
+            # in a currently-disabled field can never block a run that
+            # doesn't need it.
+            if any_aerial:
+                try:
+                    aerial_radius_meters = float(aerial_radius_var.get())
+                    if aerial_radius_meters <= 0:
+                        raise ValueError
+                except ValueError:
+                    messagebox.showerror("Invalid Input",
+                        "Please enter a valid positive number for the Aerial radius.")
+                    return
+            else:
+                aerial_radius_meters = None
+
+            # Step 5: Road distance -- same reasoning as Step 4, mirrored
+            # for the Road method.
+            if any_road:
+                try:
+                    road_radius_meters = float(road_radius_var.get())
+                    if road_radius_meters <= 0:
+                        raise ValueError
+                except ValueError:
+                    messagebox.showerror("Invalid Input",
+                        "Please enter a valid positive number for the Road distance.")
+                    return
+            else:
+                road_radius_meters = None
+
+            # Step 6: Road Network source -- required ONLY if at least one
+            # checked category uses Road (Task 5's explicit requirement).
+            # Generic message, deliberately not naming which category
+            # triggered it -- matches Document 1's exact wording ("Please
+            # select a road network source"), independent of however many
+            # categories are actually Road-method.
+            if any_road:
+                if road_source_type.get() == "local":
+                    if not road_local_path:
+                        messagebox.showerror("Missing Input",
+                            "Please select a road network source.")
+                        return
+                    road_source = ("local", (road_local_path, road_local_layer))
+                else:
+                    if not road_db_table:
+                        messagebox.showerror("Missing Input",
+                            "Please select a road network source.")
+                        return
+                    road_source = ("db", (road_db_table,))
+            else:
+                road_source = None
+
+            # validate output
+            if output_dest_type.get() == "local":
+                if not output_local_dir.get():
+                    messagebox.showerror("Missing Input",
+                        "Please select an output folder.")
+                    return
+                output_mode = ("local", output_local_dir.get())
+            else:
+                output_mode = ("db", None)
+
+            # ------------------------------------------------------------------
+            # PRIORITY 1: existing-output-column conflict check -- warn if the
+            # selected Land Parcel source already has any of the currently
+            # checked categories' dynamic output columns. Resolved here on the
+            # main thread, BEFORE win.destroy(), so the dialog has a live
+            # parent AND declining leaves the fully-configured win intact
+            # instead of forcing a from-scratch reopen -- same "resolve before
+            # destroy" pattern PRIORITY 2/3 below already follow.
+            #
+            # Explicit correction: this check briefly lived inside run_
+            # processing() instead (D3b/D3c), which only ever runs AFTER win.
+            # destroy() -- meaning a "No" response there could never actually
+            # return the user to their configuration (the window was already
+            # gone), and worse, since PRIORITY 2/3 still ran here in on_run()
+            # (before destroy), this check ended up visibly running AFTER them
+            # instead of before -- reversing the intended 1->2->3 order.
+            # Task 8's real intent (no more background pre-fetch machinery --
+            # always a fresh, synchronous read, never a cached result) is still
+            # fully honored here: this is a synchronous read happening right
+            # now, at Run-click time, not a background-prefetched result read
+            # back later -- only the LOCATION relative to win.destroy() has
+            # been corrected.
+            #
+            # Skips the check ENTIRELY if there's nothing to check for
+            # (targets_for_check empty) -- mirrors influence_map_to_land_
+            # parcel.py's own established pattern for this exact situation.
+            # If the check itself cannot verify (conflicts is None -- a read
+            # failure), this falls through as "no known conflict/no overrides"
+            # rather than aborting here -- the SAME source is about to be read
+            # again inside run_processing() for actual processing, so a
+            # genuine read failure surfaces naturally via that function's own
+            # try/except instead of needing a second, separate failure path
+            # here.
+            # ------------------------------------------------------------------
+            global parcel_output_column_overrides
+            targets_for_check = sorted(set(target_column_map.values())) if target_column_map else []
+            if targets_for_check:
+                conflicts = _check_parcel_poi_conflicts(
+                    list(barangay_source[1]), barangay_source[0], targets_for_check)
+            else:
+                conflicts = []
+            if conflicts:
+                lines = "\n\n".join(
+                    f"'{os.path.basename(path)}' already has the following column(s):\n"
+                    + "\n".join(f"  • {existing_name}" for existing_name in existing_output_cols.values())
+                    for path, existing_output_cols in conflicts
+                )
+                proceed = messagebox.askyesno(
+                    "Existing output column(s) found",
+                    f"{lines}\n\n"
+                    "Processing will overwrite the existing column(s) with the "
+                    "newly computed values. The column name(s) will not change.\n\n"
+                    "Proceed?",
+                    parent=win
+                )
+                if not proceed:
+                    print("Run cancelled by user (existing output column(s) found).")
+                    return
+                # Preserve each source's existing column name(s)/casing exactly
+                # -- e.g. a detected "caMA_NUM_SCHOOL" is written back to
+                # "caMA_NUM_SCHOOL", not the default "CAMA_NUM_SCHOOL" -- so no
+                # duplicate column is ever created regardless of the existing
+                # casing. A source with no entry here (no conflict was found,
+                # or the check could not verify) simply uses target_column_map's
+                # own default names, via the resolved_target_column_map
+                # computation in each per-source loop inside run_processing().
+                parcel_output_column_overrides = dict(conflicts)
+            else:
+                parcel_output_column_overrides = {}
+
+            # PRIORITY 2: file conflict check -- warn if an output file with
+            # the same name already exists in the chosen output folder.
+            # Resolved here on the main thread, before win.destroy(), so the
+            # dialog has a live parent. Cancel aborts the run; main window
+            # stays open.
+            overwrite_mode = None
+            if output_mode[0] == "local":
+                desired_names = (
+                    [os.path.splitext(os.path.basename(p))[0] for p in barangay_source[1]]
+                    if barangay_source[0] == "local"
+                    else list(barangay_source[1])
+                )
+                conflicting_names = [
+                    f"{name}.gpkg" for name in desired_names
+                    if os.path.exists(os.path.join(output_mode[1], f"{name}.gpkg"))
+                ]
+                if conflicting_names:
+                    overwrite_mode = ask_overwrite_dialog(win, conflicting_names)
+                    if overwrite_mode == "cancel":
+                        print("Run cancelled by user (existing output file(s) found).")
+                        return
+
+            # ------------------------------------------------------------------
+            # PRIORITY 3: DB-output destination table resolution — mirrors
+            # PRIORITY 2 above. Resolved here on the main thread, before
+            # win.destroy(), so confirm_db_overwrite_dialog() /
+            # choose_db_overwrite_dialog() (invoked inside
+            # resolve_db_output_table()) still have a live parent window, and
+            # a Cancel here leaves the fully-configured win intact instead of
+            # forcing a from-scratch reopen. Previously this resolution
+            # happened inside run_processing(), which is only ever invoked
+            # AFTER win.destroy() -- see Fix 1 root cause. resolve_db_output_
+            # table()'s own matching/decision logic is untouched; only the
+            # call site moved here. resolved_table_name is passed into
+            # run_processing() as a parameter -- same approach already used
+            # in lot_location.py, road_surface.py, road_density.py,
+            # land_shape_compactness.py, road_frontage.py, and terrain.py.
+            # resolved_outcome is not threaded through (same as those files)
+            # because nothing downstream in this file's processing loop
+            # consumes it -- only resolved_table_name is read (see the
+            # output_table fallback near "Falls back to the old...").
+            # This block sits entirely before run_processing()'s own
+            # try/except/finally error-handling wrapper (added in a prior
+            # fix) -- removing it from run_processing() does not touch,
+            # shrink, or reorder that wrapper in any way.
+            # ------------------------------------------------------------------
+            resolved_table_name = None
+            resolved_outcome = None
+            if output_mode[0] == "db":
+                _resolve_creds = load_db_credentials()
+                if not _resolve_creds:
+                    return
+                _resolve_schema = _resolve_creds["schema"]
+                resolved_table_name, resolved_outcome = resolve_db_output_table(
+                    win, _resolve_schema, barangay_source, _resolve_creds
+                )
+                if resolved_table_name is None:
+                    print("Run cancelled by user (database output table not confirmed).")
+                    return
+
+            win.destroy()
+            run_processing(root, overwrite_mode, resolved_table_name, resolved_outcome)
+
+        # Single source of truth for the Run button's enabled/disabled
+        # colors -- used both at button creation and inside
+        # _update_run_button_state() below, so there's only one place to
+        # change if the theme changes later.
+        RUN_BTN_BG_ENABLED  = "#2e7d32"
+        RUN_BTN_FG_ENABLED  = "white"
+        RUN_BTN_BG_DISABLED = "#e0e0e0"
+        RUN_BTN_FG_DISABLED = "#888888"
+
+        def _is_valid_radius(value):
+            """Same acceptance rule on_run() applies (float, > 0)."""
+            try:
+                r = float(value)
+            except (TypeError, ValueError):
+                return False
+            return r > 0
+
+        def _update_run_button_state():
+            """
+            Single source of truth for whether the Run button may be
+            pressed. Disabled (with an explanatory status message) until a
+            Land Parcel source, a POI source, at least one checked
+            category, a valid radius for every method actually in use, a
+            Road Network source (if any checked category uses Road), and
+            an Output destination are all present -- mirrors on_run()'s own
+            D3a/D3c validation precedence exactly, so the Run button's live
+            state never disagrees with what clicking it would actually do.
+            Does not set any module-level global itself -- purely a live
+            readiness check as the user configures.
+
+            Explicit bg/fg/cursor toggling (not just state=) is required:
+            Tkinter does NOT automatically gray out a classic tk.Button's
+            custom bg/fg when state="disabled", and does not suppress a
+            widget's assigned cursor either -- both must be set explicitly
+            for each state.
+            """
+            has_parcel = bool(parcel_local_path) if parcel_source_type.get() == "local" else bool(parcel_db_table)
+            has_poi = bool(poi_local_path.get()) if poi_source_type.get() == "local" else bool(poi_db_table.get())
+            has_output = bool(output_local_dir.get()) if output_dest_type.get() == "local" else True
+
+            live_checked = {
+                key: poi_category_method_vars[key].get()
+                for key, var in poi_category_vars.items()
+                if var.get()
+            }
+            any_aerial = any(m == "aerial" for m in live_checked.values())
+            any_road = any(m == "road" for m in live_checked.values())
+            aerial_ok = _is_valid_radius(aerial_radius_var.get()) if any_aerial else True
+            road_radius_ok = _is_valid_radius(road_radius_var.get()) if any_road else True
+            has_road_source = (
+                bool(road_local_path) if road_source_type.get() == "local" else bool(road_db_table)
+            ) if any_road else True
+
+            # D3b (Task 8): no more "existing-output-column check in
+            # progress" gate here -- that check used to run in the
+            # background the moment a Land Parcel source was selected, and
+            # this gate existed to block Run while its result was still
+            # unknown. It has been relocated to run inside on_run()'s own
+            # PRIORITY 1 block, synchronously, at the moment Run is
+            # actually clicked, before win.destroy() -- there is no more
+            # in-between "reading" state for the Run button to ever need
+            # to gate against.
+            if not has_parcel:
+                run_status_var.set("Please select a Land Parcel source.")
+                ready = False
+            elif not has_poi:
+                run_status_var.set("Please select a POI source.")
+                ready = False
+            elif not live_checked:
+                run_status_var.set("Please check at least one landmark type to count.")
+                ready = False
+            elif not aerial_ok:
+                run_status_var.set("Please enter a valid Aerial radius.")
+                ready = False
+            elif not road_radius_ok:
+                run_status_var.set("Please enter a valid Road distance.")
+                ready = False
+            elif not has_road_source:
+                run_status_var.set("Please select a road network source.")
+                ready = False
+            elif not has_output:
+                run_status_var.set("Please select an Output destination.")
+                ready = False
+            else:
+                run_status_var.set("Ready to run.")
+                ready = True
+
+            if ready:
+                run_btn.config(state="normal", cursor="hand2",
+                                bg=RUN_BTN_BG_ENABLED, fg=RUN_BTN_FG_ENABLED)
+            else:
+                run_btn.config(state="disabled", cursor="no",
+                                bg=RUN_BTN_BG_DISABLED, fg=RUN_BTN_FG_DISABLED,
+                                disabledforeground=RUN_BTN_FG_DISABLED)
+
+        run_btn = tk.Button(win, text="▶  Run Processing", command=on_run,
+                  bg=RUN_BTN_BG_ENABLED, fg=RUN_BTN_FG_ENABLED,
+                  font=("Segoe UI", 10, "bold"),
+                  relief="flat", padx=16, pady=6)
+        run_btn.pack(pady=(4, 4))
+
+        # Permanent status line UNDER the Run button -- always visible, no
+        # hover required.
+        run_status_lbl = tk.Label(win, textvariable=run_status_var,
+                                  font=("Segoe UI", 8), fg="gray")
+        run_status_lbl.pack(pady=(0, 12))
+
+        # Live-updates the Run button as the user types in either radius
+        # field, without requiring focus-out or Enter.
+        aerial_radius_var.trace_add("write", lambda *_: _update_run_button_state())
+        road_radius_var.trace_add("write", lambda *_: _update_run_button_state())
+
+        _toggle_parcel()
+        _toggle_road()
+        _toggle_poi()
+        _toggle_output()
         _update_run_button_state()
 
-    # ── RUN BUTTON ───────────────────────────────────────────────
-    ttk.Separator(win, orient="horizontal").pack(
-        fill="x", padx=10, pady=(12, 4))
-
-    def on_run():
-        """
-        Run button handler: validates Land Parcel + POI + the dynamic
-        checklist (checked categories, per-method radii, Road Network
-        source if needed) + Output selections are present, checks for
-        existing output-column conflicts (PRIORITY 1), runs the local
-        output-file conflict check (PRIORITY 2), and DB-output table
-        resolution (PRIORITY 3) -- each able to cancel the whole run --
-        then destroys this window and hands off to run_processing().
-        Sets the module-level barangay_source, poi_source, output_mode,
-        checked_categories, target_column_map, aerial_radius_meters,
-        road_radius_meters, road_source, and
-        parcel_output_column_overrides globals on success.
-
-        D3c note: radius_var/radius_meters (the single old fixed-radius
-        field) have been fully retired -- see this function's own
-        dedicated validation block, right after POI validation below,
-        for the precedence now actually used (checked categories, then
-        Aerial radius if needed, then Road radius if needed, then Road
-        Network source if needed).
-        """
-        global barangay_source, poi_source, output_mode
-
-        # validate parcel
-        if parcel_source_type.get() == "local":
-            if not parcel_local_path:
-                messagebox.showerror("Missing Input",
-                    "Please select a Land Parcel file.")
-                return
-            # Validation guarantees parcel_local_path is not None here --
-            # barangay_source never contains None (Phase 1 invariant 3).
-            barangay_source = ("local", (parcel_local_path,))
-        else:
-            if not parcel_db_table:
-                messagebox.showerror("Missing Input",
-                    "Please select a Land Parcel table.")
-                return
-            barangay_source = ("db", (parcel_db_table,))
-
-        # validate poi
-        if poi_source_type.get() == "local":
-            if not poi_local_path.get():
-                messagebox.showerror("Missing Input",
-                    "Please select a POI file.")
-                return
-            poi_source = ("local", [poi_local_path.get()])
-        else:
-            if not poi_db_table.get():
-                messagebox.showerror("Missing Input",
-                    "Please select a POI table.")
-                return
-            poi_source = ("db", [poi_db_table.get()])
-
-        # ------------------------------------------------------------------
-        # D3a/D3c -- dynamic-checklist validation (approved precedence,
-        # steps 3-6). Builds checked_categories/target_column_map/
-        # aerial_radius_meters/road_radius_meters/road_source (module-
-        # level globals declared above) -- consumed by run_processing()
-        # (D3c wired this in; the old fixed-radius pipeline these
-        # globals originally coexisted alongside has since been
-        # retired entirely).
-        # ------------------------------------------------------------------
-        global checked_categories, target_column_map
-        global aerial_radius_meters, road_radius_meters, road_source
-
-        # Step 3: no checked categories. This is a validation rule on
-        # user input (the checklist), not a re-statement of the
-        # separately-deferred "zero eligible categories" question
-        # (POI discovery producing no valid fclass buckets at all) --
-        # that remains an explicitly NOT-yet-approved proposal and is
-        # NOT implemented here. This step only blocks the case where
-        # eligible categories DO exist but the user checked none of
-        # them, which would otherwise let a run reach run_processing()
-        # with an empty target list -- a silent no-op.
-        checked_categories = {
-            key: poi_category_method_vars[key].get()
-            for key, var in poi_category_vars.items()
-            if var.get()
-        }
-        if not checked_categories:
-            messagebox.showerror("Missing Input",
-                "Please check at least one landmark type to count.")
-            return
-        target_column_map = dict(zip(
-            checked_categories.keys(),
-            derive_target_columns(checked_categories.keys())))
-
-        any_aerial = any(m == "aerial" for m in checked_categories.values())
-        any_road = any(m == "road" for m in checked_categories.values())
-
-        # Step 4: Aerial radius -- only validated if at least one
-        # checked category actually uses the Aerial method. Left None
-        # (its module-level default) if not currently relevant, rather
-        # than validated-but-unused, so a stale/invalid value sitting
-        # in a currently-disabled field can never block a run that
-        # doesn't need it.
-        if any_aerial:
-            try:
-                aerial_radius_meters = float(aerial_radius_var.get())
-                if aerial_radius_meters <= 0:
-                    raise ValueError
-            except ValueError:
-                messagebox.showerror("Invalid Input",
-                    "Please enter a valid positive number for the Aerial radius.")
-                return
-        else:
-            aerial_radius_meters = None
-
-        # Step 5: Road distance -- same reasoning as Step 4, mirrored
-        # for the Road method.
-        if any_road:
-            try:
-                road_radius_meters = float(road_radius_var.get())
-                if road_radius_meters <= 0:
-                    raise ValueError
-            except ValueError:
-                messagebox.showerror("Invalid Input",
-                    "Please enter a valid positive number for the Road distance.")
-                return
-        else:
-            road_radius_meters = None
-
-        # Step 6: Road Network source -- required ONLY if at least one
-        # checked category uses Road (Task 5's explicit requirement).
-        # Generic message, deliberately not naming which category
-        # triggered it -- matches Document 1's exact wording ("Please
-        # select a road network source"), independent of however many
-        # categories are actually Road-method.
-        if any_road:
+        # If this session's database connection was not VERIFIED at the
+        # moment this tool was launched (see main()'s own db_verified
+        # docstring), disable the four "Database"-style radio buttons --
+        # parcel_radio_db, road_radio_db, poi_radio_db, out_radio_db --
+        # using the shared utils.db_gate_ui helpers (same disabled-cursor
+        # convention and hover tooltip every other tool file uses for
+        # this). Only the "db" radio in each pair is touched; the "local"/
+        # file-based radio next to it is never disabled. Does NOT touch
+        # the per-category Aerial/Road method radios (radio_road/
+        # radio_aerial) -- see open_main_window()'s own docstring for why
+        # those are unrelated to this gating. This does not replace or
+        # duplicate utils.db_discovery.load_db_credentials()/fetch_tables()'s
+        # own existing error handling for a connection that fails or is
+        # lost AFTER this window has already opened -- that remains fully
+        # in effect regardless of db_verified.
+        if not db_verified:
+            for _db_radio in (parcel_radio_db, road_radio_db, poi_radio_db, out_radio_db):
+                disable_db_radio(_db_radio)
+                attach_no_db_tooltip(_db_radio)
+    else:
+        # NEW -- batch mode: Road Network Source, POI Source (with its
+        # own REQUIRED per-category checklist + per-row Method), and
+        # the independent Aerial/Road distance entries (all built
+        # above, unconditionally) are this tool's only batch-visible
+        # sections. The Cancel/Save row (via the shared
+        # utils.batch_mode_ui.build_save_cancel_row(), Rule of Three --
+        # Instructions Section C/G.5) replaces "Run Processing" -- see
+        # that helper's own docstring for its full Save-stays-open /
+        # Cancel-or-X-closes-with-a-dirty-check lifecycle. Works even
+        # if incomplete, per the batch-mode contract (never blocks
+        # Save on completeness); the orchestrator's own "Incomplete"
+        # overlay (via is_batch_config_complete() above) is what
+        # actually reflects readiness, not this window.
+        def _gather_batch_config():
+            config = {}
             if road_source_type.get() == "local":
-                if not road_local_path:
-                    messagebox.showerror("Missing Input",
-                        "Please select a road network source.")
-                    return
-                road_source = ("local", (road_local_path, road_local_layer))
+                config["road_source_type"] = "local"
+                config["road_local_path"] = road_local_path
             else:
-                if not road_db_table:
-                    messagebox.showerror("Missing Input",
-                        "Please select a road network source.")
-                    return
-                road_source = ("db", (road_db_table,))
-        else:
-            road_source = None
-
-        # validate output
-        if output_dest_type.get() == "local":
-            if not output_local_dir.get():
-                messagebox.showerror("Missing Input",
-                    "Please select an output folder.")
-                return
-            output_mode = ("local", output_local_dir.get())
-        else:
-            output_mode = ("db", None)
-
-        # ------------------------------------------------------------------
-        # PRIORITY 1: existing-output-column conflict check -- warn if the
-        # selected Land Parcel source already has any of the currently
-        # checked categories' dynamic output columns. Resolved here on the
-        # main thread, BEFORE win.destroy(), so the dialog has a live
-        # parent AND declining leaves the fully-configured win intact
-        # instead of forcing a from-scratch reopen -- same "resolve before
-        # destroy" pattern PRIORITY 2/3 below already follow.
-        #
-        # Explicit correction: this check briefly lived inside run_
-        # processing() instead (D3b/D3c), which only ever runs AFTER win.
-        # destroy() -- meaning a "No" response there could never actually
-        # return the user to their configuration (the window was already
-        # gone), and worse, since PRIORITY 2/3 still ran here in on_run()
-        # (before destroy), this check ended up visibly running AFTER them
-        # instead of before -- reversing the intended 1->2->3 order.
-        # Task 8's real intent (no more background pre-fetch machinery --
-        # always a fresh, synchronous read, never a cached result) is still
-        # fully honored here: this is a synchronous read happening right
-        # now, at Run-click time, not a background-prefetched result read
-        # back later -- only the LOCATION relative to win.destroy() has
-        # been corrected.
-        #
-        # Skips the check ENTIRELY if there's nothing to check for
-        # (targets_for_check empty) -- mirrors influence_map_to_land_
-        # parcel.py's own established pattern for this exact situation.
-        # If the check itself cannot verify (conflicts is None -- a read
-        # failure), this falls through as "no known conflict/no overrides"
-        # rather than aborting here -- the SAME source is about to be read
-        # again inside run_processing() for actual processing, so a
-        # genuine read failure surfaces naturally via that function's own
-        # try/except instead of needing a second, separate failure path
-        # here.
-        # ------------------------------------------------------------------
-        global parcel_output_column_overrides
-        targets_for_check = sorted(set(target_column_map.values())) if target_column_map else []
-        if targets_for_check:
-            conflicts = _check_parcel_poi_conflicts(
-                list(barangay_source[1]), barangay_source[0], targets_for_check)
-        else:
-            conflicts = []
-        if conflicts:
-            lines = "\n\n".join(
-                f"'{os.path.basename(path)}' already has the following column(s):\n"
-                + "\n".join(f"  • {existing_name}" for existing_name in existing_output_cols.values())
-                for path, existing_output_cols in conflicts
-            )
-            proceed = messagebox.askyesno(
-                "Existing output column(s) found",
-                f"{lines}\n\n"
-                "Processing will overwrite the existing column(s) with the "
-                "newly computed values. The column name(s) will not change.\n\n"
-                "Proceed?",
-                parent=win
-            )
-            if not proceed:
-                print("Run cancelled by user (existing output column(s) found).")
-                return
-            # Preserve each source's existing column name(s)/casing exactly
-            # -- e.g. a detected "caMA_NUM_SCHOOL" is written back to
-            # "caMA_NUM_SCHOOL", not the default "CAMA_NUM_SCHOOL" -- so no
-            # duplicate column is ever created regardless of the existing
-            # casing. A source with no entry here (no conflict was found,
-            # or the check could not verify) simply uses target_column_map's
-            # own default names, via the resolved_target_column_map
-            # computation in each per-source loop inside run_processing().
-            parcel_output_column_overrides = dict(conflicts)
-        else:
-            parcel_output_column_overrides = {}
-
-        # PRIORITY 2: file conflict check -- warn if an output file with
-        # the same name already exists in the chosen output folder.
-        # Resolved here on the main thread, before win.destroy(), so the
-        # dialog has a live parent. Cancel aborts the run; main window
-        # stays open.
-        overwrite_mode = None
-        if output_mode[0] == "local":
-            desired_names = (
-                [os.path.splitext(os.path.basename(p))[0] for p in barangay_source[1]]
-                if barangay_source[0] == "local"
-                else list(barangay_source[1])
-            )
-            conflicting_names = [
-                f"{name}.gpkg" for name in desired_names
-                if os.path.exists(os.path.join(output_mode[1], f"{name}.gpkg"))
+                config["road_source_type"] = "db"
+                config["road_db_table"] = road_db_table
+            if poi_source_type.get() == "local":
+                config["poi_source_type"] = "local"
+                config["poi_local_path"] = poi_local_path.get()
+            else:
+                config["poi_source_type"] = "db"
+                config["poi_db_table"] = poi_db_table.get()
+            config["aerial_radius"] = aerial_radius_var.get()
+            config["road_radius"] = road_radius_var.get()
+            config["category_selections"] = [
+                {"key": key, "method": poi_category_method_vars[key].get()}
+                for key, var in poi_category_vars.items()
+                if var.get()
             ]
-            if conflicting_names:
-                overwrite_mode = ask_overwrite_dialog(win, conflicting_names)
-                if overwrite_mode == "cancel":
-                    print("Run cancelled by user (existing output file(s) found).")
-                    return
+            return config
 
-        # ------------------------------------------------------------------
-        # PRIORITY 3: DB-output destination table resolution — mirrors
-        # PRIORITY 2 above. Resolved here on the main thread, before
-        # win.destroy(), so confirm_db_overwrite_dialog() /
-        # choose_db_overwrite_dialog() (invoked inside
-        # resolve_db_output_table()) still have a live parent window, and
-        # a Cancel here leaves the fully-configured win intact instead of
-        # forcing a from-scratch reopen. Previously this resolution
-        # happened inside run_processing(), which is only ever invoked
-        # AFTER win.destroy() -- see Fix 1 root cause. resolve_db_output_
-        # table()'s own matching/decision logic is untouched; only the
-        # call site moved here. resolved_table_name is passed into
-        # run_processing() as a parameter -- same approach already used
-        # in lot_location.py, road_surface.py, road_density.py,
-        # land_shape_compactness.py, road_frontage.py, and terrain.py.
-        # resolved_outcome is not threaded through (same as those files)
-        # because nothing downstream in this file's processing loop
-        # consumes it -- only resolved_table_name is read (see the
-        # output_table fallback near "Falls back to the old...").
-        # This block sits entirely before run_processing()'s own
-        # try/except/finally error-handling wrapper (added in a prior
-        # fix) -- removing it from run_processing() does not touch,
-        # shrink, or reorder that wrapper in any way.
-        # ------------------------------------------------------------------
-        resolved_table_name = None
-        resolved_outcome = None
-        if output_mode[0] == "db":
-            _resolve_creds = load_db_credentials()
-            if not _resolve_creds:
-                return
-            _resolve_schema = _resolve_creds["schema"]
-            resolved_table_name, resolved_outcome = resolve_db_output_table(
-                win, _resolve_schema, barangay_source, _resolve_creds
-            )
-            if resolved_table_name is None:
-                print("Run cancelled by user (database output table not confirmed).")
-                return
-
-        win.destroy()
-        run_processing(root, overwrite_mode, resolved_table_name, resolved_outcome)
-
-    # Single source of truth for the Run button's enabled/disabled
-    # colors -- used both at button creation and inside
-    # _update_run_button_state() below, so there's only one place to
-    # change if the theme changes later.
-    RUN_BTN_BG_ENABLED  = "#2e7d32"
-    RUN_BTN_FG_ENABLED  = "white"
-    RUN_BTN_BG_DISABLED = "#e0e0e0"
-    RUN_BTN_FG_DISABLED = "#888888"
-
-    def _is_valid_radius(value):
-        """Same acceptance rule on_run() applies (float, > 0)."""
-        try:
-            r = float(value)
-        except (TypeError, ValueError):
-            return False
-        return r > 0
-
-    def _update_run_button_state():
-        """
-        Single source of truth for whether the Run button may be
-        pressed. Disabled (with an explanatory status message) until a
-        Land Parcel source, a POI source, at least one checked
-        category, a valid radius for every method actually in use, a
-        Road Network source (if any checked category uses Road), and
-        an Output destination are all present -- mirrors on_run()'s own
-        D3a/D3c validation precedence exactly, so the Run button's live
-        state never disagrees with what clicking it would actually do.
-        Does not set any module-level global itself -- purely a live
-        readiness check as the user configures.
-
-        Explicit bg/fg/cursor toggling (not just state=) is required:
-        Tkinter does NOT automatically gray out a classic tk.Button's
-        custom bg/fg when state="disabled", and does not suppress a
-        widget's assigned cursor either -- both must be set explicitly
-        for each state.
-        """
-        has_parcel = bool(parcel_local_path) if parcel_source_type.get() == "local" else bool(parcel_db_table)
-        has_poi = bool(poi_local_path.get()) if poi_source_type.get() == "local" else bool(poi_db_table.get())
-        has_output = bool(output_local_dir.get()) if output_dest_type.get() == "local" else True
-
-        live_checked = {
-            key: poi_category_method_vars[key].get()
-            for key, var in poi_category_vars.items()
-            if var.get()
-        }
-        any_aerial = any(m == "aerial" for m in live_checked.values())
-        any_road = any(m == "road" for m in live_checked.values())
-        aerial_ok = _is_valid_radius(aerial_radius_var.get()) if any_aerial else True
-        road_radius_ok = _is_valid_radius(road_radius_var.get()) if any_road else True
-        has_road_source = (
-            bool(road_local_path) if road_source_type.get() == "local" else bool(road_db_table)
-        ) if any_road else True
-
-        # D3b (Task 8): no more "existing-output-column check in
-        # progress" gate here -- that check used to run in the
-        # background the moment a Land Parcel source was selected, and
-        # this gate existed to block Run while its result was still
-        # unknown. It has been relocated to run inside on_run()'s own
-        # PRIORITY 1 block, synchronously, at the moment Run is
-        # actually clicked, before win.destroy() -- there is no more
-        # in-between "reading" state for the Run button to ever need
-        # to gate against.
-        if not has_parcel:
-            run_status_var.set("Please select a Land Parcel source.")
-            ready = False
-        elif not has_poi:
-            run_status_var.set("Please select a POI source.")
-            ready = False
-        elif not live_checked:
-            run_status_var.set("Please check at least one landmark type to count.")
-            ready = False
-        elif not aerial_ok:
-            run_status_var.set("Please enter a valid Aerial radius.")
-            ready = False
-        elif not road_radius_ok:
-            run_status_var.set("Please enter a valid Road distance.")
-            ready = False
-        elif not has_road_source:
-            run_status_var.set("Please select a road network source.")
-            ready = False
-        elif not has_output:
-            run_status_var.set("Please select an Output destination.")
-            ready = False
-        else:
-            run_status_var.set("Ready to run.")
-            ready = True
-
-        if ready:
-            run_btn.config(state="normal", cursor="hand2",
-                            bg=RUN_BTN_BG_ENABLED, fg=RUN_BTN_FG_ENABLED)
-        else:
-            run_btn.config(state="disabled", cursor="no",
-                            bg=RUN_BTN_BG_DISABLED, fg=RUN_BTN_FG_DISABLED,
-                            disabledforeground=RUN_BTN_FG_DISABLED)
-
-    run_btn = tk.Button(win, text="▶  Run Processing", command=on_run,
-              bg=RUN_BTN_BG_ENABLED, fg=RUN_BTN_FG_ENABLED,
-              font=("Segoe UI", 10, "bold"),
-              relief="flat", padx=16, pady=6)
-    run_btn.pack(pady=(4, 4))
-
-    # Permanent status line UNDER the Run button -- always visible, no
-    # hover required.
-    run_status_lbl = tk.Label(win, textvariable=run_status_var,
-                              font=("Segoe UI", 8), fg="gray")
-    run_status_lbl.pack(pady=(0, 12))
-
-    # Live-updates the Run button as the user types in either radius
-    # field, without requiring focus-out or Enter.
-    aerial_radius_var.trace_add("write", lambda *_: _update_run_button_state())
-    road_radius_var.trace_add("write", lambda *_: _update_run_button_state())
-
-    _toggle_parcel()
-    _toggle_road()
-    _toggle_poi()
-    _toggle_output()
-    _update_run_button_state()
-
-    # If this session's database connection was not VERIFIED at the
-    # moment this tool was launched (see main()'s own db_verified
-    # docstring), disable the four "Database"-style radio buttons --
-    # parcel_radio_db, road_radio_db, poi_radio_db, out_radio_db --
-    # using the shared utils.db_gate_ui helpers (same disabled-cursor
-    # convention and hover tooltip every other tool file uses for
-    # this). Only the "db" radio in each pair is touched; the "local"/
-    # file-based radio next to it is never disabled. Does NOT touch
-    # the per-category Aerial/Road method radios (radio_road/
-    # radio_aerial) -- see open_main_window()'s own docstring for why
-    # those are unrelated to this gating. This does not replace or
-    # duplicate utils.db_discovery.load_db_credentials()/fetch_tables()'s
-    # own existing error handling for a connection that fails or is
-    # lost AFTER this window has already opened -- that remains fully
-    # in effect regardless of db_verified.
-    if not db_verified:
-        for _db_radio in (parcel_radio_db, road_radio_db, poi_radio_db, out_radio_db):
-            disable_db_radio(_db_radio)
-            attach_no_db_tooltip(_db_radio)
+        build_save_cancel_row(win, gather_config=_gather_batch_config,
+                               on_save=on_save, on_cancel=on_cancel)
 
 
 # ========================================
