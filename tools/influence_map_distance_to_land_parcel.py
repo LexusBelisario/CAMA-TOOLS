@@ -151,6 +151,69 @@ from utils.column_detection import detect_existing_output_columns
 from utils.window_icon import apply_icon
 from utils.gpkg_io import write_gpkg_atomic as _write_gpkg, GpkgWriteError
 from utils.db_gate_ui import disable_db_radio, attach_no_db_tooltip
+from PIL import Image, ImageTk, ImageDraw
+
+
+def _draw_dialog_icon(kind, size=48):
+    # draws the dialog's body icon in code so no separate image asset is needed
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    pad = 2
+
+    if kind == "success":
+        draw.ellipse([pad, pad, size - pad, size - pad], fill=(46, 160, 67, 255))
+        s = size / 64
+        draw.line(
+            [(18 * s, 33 * s), (28 * s, 43 * s), (46 * s, 20 * s)],
+            fill=(255, 255, 255, 255), width=max(3, int(5 * s)), joint="curve",
+        )
+    elif kind == "error":
+        draw.ellipse([pad, pad, size - pad, size - pad], fill=(196, 43, 43, 255))
+        s = size / 64
+        draw.line([(20 * s, 20 * s), (44 * s, 44 * s)], fill=(255, 255, 255, 255), width=max(3, int(5 * s)))
+        draw.line([(44 * s, 20 * s), (20 * s, 44 * s)], fill=(255, 255, 255, 255), width=max(3, int(5 * s)))
+    elif kind == "warning":
+        draw.ellipse([pad, pad, size - pad, size - pad], fill=(214, 149, 24, 255))
+        s = size / 64
+        draw.line([(32 * s, 18 * s), (32 * s, 36 * s)], fill=(255, 255, 255, 255), width=max(3, int(5 * s)))
+        draw.ellipse([29 * s, 42 * s, 35 * s, 48 * s], fill=(255, 255, 255, 255))
+    else:  # cancelled / neutral
+        draw.ellipse([pad, pad, size - pad, size - pad], fill=(150, 150, 150, 255))
+        s = size / 64
+        draw.line([(32 * s, 16 * s), (32 * s, 38 * s)], fill=(255, 255, 255, 255), width=max(3, int(5 * s)))
+        draw.ellipse([30 * s, 44 * s, 34 * s, 48 * s], fill=(255, 255, 255, 255))
+
+    return img
+
+
+def show_tool_dialog(parent, title, message, body_icon="success"):
+    # messagebox look-alike, but with a clear checkmark/X/warning/neutral icon instead of the generic info bubble
+    win = tk.Toplevel(parent)
+    win.title(title)
+    win.resizable(False, False)
+    win.transient(parent)
+    apply_icon(win, "distancefactor.ico")
+
+    body = tk.Frame(win, padx=20, pady=15)
+    body.pack(fill="both", expand=True)
+
+    icon_img = _draw_dialog_icon(body_icon)
+    icon_photo = ImageTk.PhotoImage(icon_img)
+    icon_label = tk.Label(body, image=icon_photo)
+    icon_label.image = icon_photo  # keep a reference so it doesn't get garbage collected
+    icon_label.pack(side="left", padx=(0, 15))
+
+    tk.Label(body, text=message, justify="left", wraplength=300).pack(side="left")
+
+    tk.Button(win, text="OK", width=10, command=win.destroy).pack(pady=(0, 15))
+
+    win.update_idletasks()
+    x = parent.winfo_rootx() + (parent.winfo_width() - win.winfo_width()) // 2
+    y = parent.winfo_rooty() + (parent.winfo_height() - win.winfo_height()) // 2
+    win.geometry(f"+{x}+{y}")
+
+    win.grab_set()      # modal, same as messagebox
+    win.wait_window()
 
 # ============================
 # FORCE WINDOWS APP ICON
@@ -2604,9 +2667,8 @@ def show_success_dialog(root, total, failed_sources, single_success_detail):
     was processed, or a generic "all N processed" message otherwise).
 
     Args:
-        root: unused directly (messagebox calls use no explicit parent
-        here); kept for signature consistency with this file's other
-        dialog functions.
+        root: the live top-level window, used as the parent for the
+        dialog shown here.
         total (int): total number of sources attempted.
         failed_sources (list[tuple[str, str]]): (source_label, reason)
         pairs for any source that raised during processing.
@@ -2616,15 +2678,16 @@ def show_success_dialog(root, total, failed_sources, single_success_detail):
     """
     if failed_sources:
         lines = "\n".join(f"  • {name}: {reason}" for name, reason in failed_sources)
-        messagebox.showwarning(
-            "Completed With Errors",
+        show_tool_dialog(
+            root, "Completed With Errors",
             f"Processed {total} source(s).\n\n"
             f"{len(failed_sources)} source(s) failed:\n{lines}",
+            body_icon="warning",
         )
     elif single_success_detail:
-        messagebox.showinfo("Success", single_success_detail)
+        show_tool_dialog(root, "Success", single_success_detail, body_icon="success")
     else:
-        messagebox.showinfo("Success", f"All {total} source(s) processed successfully.")
+        show_tool_dialog(root, "Success", f"All {total} source(s) processed successfully.", body_icon="success")
 
 
 # ========================================
@@ -3502,11 +3565,11 @@ def run_processing(app_root, dist_col, extra_column_specs, overwrite_mode=None,
                     # the module docstring's parcel_source note), so
                     # this statement is accurate as shipped.
                     progress.close()
-                    messagebox.showinfo("Cancelled", "The run was cancelled. No data was changed.")
+                    show_tool_dialog(app_root, "Cancelled", "The run was cancelled. No data was changed.", body_icon="cancelled")
                     return
                 elif kind == "fatal_error":
                     progress.close()
-                    messagebox.showerror("Error", f"Could not complete processing: {msg[1]}")
+                    show_tool_dialog(app_root, "Error", f"Could not complete processing: {msg[1]}", body_icon="error")
                     return
         except queue.Empty:
             # q is empty for now -- render whatever the latest pending
