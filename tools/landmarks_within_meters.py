@@ -7,11 +7,12 @@ PURPOSE:
     range of the parcel centroid, per user-checked landmark category
     (dynamically discovered from the POI source's own 'fclass' values
     -- see the "Landmark Categories" checklist in open_main_window()).
-    Each checked category independently uses either the Aerial method
-    (straight-line geodesic distance, within a user-entered Aerial
-    radius) or the Road method (network-routed distance along a
-    user-supplied Road Network source, within a separate user-entered
-    Road distance) -- see process_poi_counts_dynamic(). Writes one
+    Each checked category independently uses either the Straight
+    method (straight-line geodesic distance, within a user-entered
+    Straight-Line Distance) or the Road method (network-routed
+    distance along a user-supplied Road Network source, within a
+    separate user-entered Road Distance) -- see
+    process_poi_counts_dynamic(). Writes one
     CAMA_NUM_{KEY}-prefixed count column per checked category
     (derive_target_columns()), e.g. CAMA_NUM_POLICE_STATION.
 
@@ -115,8 +116,8 @@ SIDE EFFECTS:
     REDESIGN COMPLETE (Clusters A through D3c -- see project task
     documents for the full plan): the "Landmark Categories" checklist
     (dynamic, discovered from the POI source's distinct 'fclass'
-    values), the per-category Aerial/Road method selection, the
-    independent Aerial/Road radii, the Road Network Source section, and
+    values), the per-category Straight/Road method selection, the
+    independent Straight/Road radii, the Road Network Source section, and
     the road-network distance engine (process_poi_counts_dynamic(),
     replacing osmnx entirely) are now the tool's ONLY processing path.
     The old fixed police/park/mall/others category model and
@@ -320,9 +321,9 @@ output_mode = None
 # thread as of Part 3's threading change -- see run_processing()'s
 # docstring for why this is safe (on_run() never reassigns them while
 # a run is in flight).
-checked_categories = None      # {sanitized_key: "aerial" | "road"} -- CHECKED categories only
+checked_categories = None      # {sanitized_key: "straight" | "road"} -- CHECKED categories only
 target_column_map = None       # {sanitized_key: "CAMA_NUM_..."} -- derive_target_columns()'s mapping
-aerial_radius_meters = None    # only meaningful if any checked_categories value == "aerial"
+straight_line_radius_meters = None    # only meaningful if any checked_categories value == "straight"
 road_radius_meters = None      # only meaningful if any checked_categories value == "road"
 road_source = None             # ("local", (path, layer_or_None)) | ("db", (table,)) | None if unused
 APP_ROOT = None
@@ -1522,7 +1523,7 @@ def _detect_road_working_crs(labeled_gdfs):
 
     Per approved decision 0.2(c): this working CRS is used ONLY by the
     Road-method distance pipeline (this section, plus D2's Dijkstra
-    routing) -- it NEVER touches the Aerial method's existing
+    routing) -- it NEVER touches the Straight method's existing
     EPSG:4326 + geopy.geodesic() mechanism, which stays completely
     untouched by this whole cluster. Adapted from meters_from_school_
     shop_transport_church.py's own detect_prs92_zone() -- same
@@ -1834,8 +1835,8 @@ def snap_point_to_road(G_local, edge_tree, edge_geoms, edges_list, point_xy, edg
 # DYNAMIC POI COUNTING (Task 6/7, Cluster D2)
 # ========================================
 # process_poi_counts_dynamic() below is the counting engine: dynamic
-# checked categories (Task 1/2), per-category Aerial/Road method
-# (Task 3), independent Aerial/Road radii (Task 4), and Road-method
+# checked categories (Task 1/2), per-category Straight/Road method
+# (Task 3), independent Straight/Road radii (Task 4), and Road-method
 # reachability with NO straight-line fallback (Task 7) -- built on
 # D1's road-graph primitives above.
 #
@@ -1872,7 +1873,7 @@ class RoadContext(NamedTuple):
         being passed to snap_point_to_road() below -- see process_poi_
         counts_dynamic()'s own CRS-handling section for exactly where
         that reprojection happens (a scratch copy, never the main gdf/
-        poi_gdf that Aerial distance and the final output use).
+        poi_gdf that Straight-method distance and the final output use).
     """
     edges_list: list
     edge_geoms: list
@@ -1884,8 +1885,8 @@ def _geodesic_bbox_envelope(centroid_lat, centroid_lon, margin_m):
     """
     Conservative geographic bounding envelope for the POI candidate
     prefilter, computed via geopy.distance.geodesic().destination() --
-    the SAME ellipsoidal geodesic function already used for the Aerial
-    distance check elsewhere in this file (ox... no relation to osmnx;
+    the SAME ellipsoidal geodesic function already used for the Straight-
+    method distance check elsewhere in this file (ox... no relation to osmnx;
     this is the `from geopy.distance import geodesic` already imported
     at module top), not a second, independent distance approximation.
 
@@ -1912,7 +1913,7 @@ def _geodesic_bbox_envelope(centroid_lat, centroid_lon, margin_m):
       - This is a PREFILTER ONLY. The returned bbox is used solely to
         narrow the candidate POI set via a fast bounding-box query
         (gdf.cx[...]) -- it is NEVER used as the actual counted
-        distance. Aerial-method counting still uses exact geodesic()
+        distance. Straight-method counting still uses exact geodesic()
         distance; Road-method counting still uses the projected snap +
         network routing distance from D1. This function's only job is
         "don't exclude anyone who might matter," not "decide who's in
@@ -1925,12 +1926,12 @@ def _geodesic_bbox_envelope(centroid_lat, centroid_lon, margin_m):
     return west.longitude, south.latitude, east.longitude, north.latitude
 
 
-def process_poi_counts_dynamic(gdf, poi_gdf, checked_categories, aerial_radius_m,
+def process_poi_counts_dynamic(gdf, poi_gdf, checked_categories, straight_line_radius_m,
                                 road_radius_m, road_context, target_column_map,
                                 progress_cb=None):
     """
     Counts landmarks per parcel using the dynamic, per-category
-    Aerial/Road pipeline (Tasks 1/2/3/4/6/7) -- this tool's only
+    Straight/Road pipeline (Tasks 1/2/3/4/6/7) -- this tool's only
     counting engine as of D3c, having replaced the original fixed
     police/park/mall/others counting function (retired entirely in
     D3c; this function was written to match its contract/conventions
@@ -1942,12 +1943,12 @@ def process_poi_counts_dynamic(gdf, poi_gdf, checked_categories, aerial_radius_m
             restored at the end -- see the "CRS handling" section
             below for the precise sequence.
         poi_gdf: POI GeoDataFrame. Must have an 'fclass' column.
-        checked_categories: {sanitized_key: "aerial" | "road"} --
+        checked_categories: {sanitized_key: "straight" | "road"} --
             ONLY the categories the user actually checked. A POI whose
             sanitized fclass key is not a key in this dict is excluded
             entirely (Task 2 -- no catch-all "others" bucket).
-        aerial_radius_m, road_radius_m: independent radii (Task 4),
-            applied respectively to every "aerial"-method and "road"-
+        straight_line_radius_m, road_radius_m: independent radii (Task 4),
+            applied respectively to every "straight"-method and "road"-
             method checked category. Either may be None -- on_run()
             leaves whichever method has no checked category at None
             (Step 4/5) -- but not both, since checked_categories is
@@ -1976,7 +1977,7 @@ def process_poi_counts_dynamic(gdf, poi_gdf, checked_categories, aerial_radius_m
     CRS handling (per approved decision 0.2(c) -- see this section's
     header comment): TWO independent CRS treatments happen here, never
     mixed:
-        MAIN gdf/poi_gdf -- reprojected to EPSG:4326. Aerial-method
+        MAIN gdf/poi_gdf -- reprojected to EPSG:4326. Straight-method
             distance uses geopy.geodesic() on these 4326 coordinates.
             The dynamic count columns are written onto THIS gdf, which
             is what gets reprojected back to original_crs at the end
@@ -2012,7 +2013,7 @@ def process_poi_counts_dynamic(gdf, poi_gdf, checked_categories, aerial_radius_m
                                                       count"
     """
     print(f"🚀 Starting dynamic POI count processing "
-          f"(aerial radius = {aerial_radius_m}m, road radius = {road_radius_m}m)...")
+          f"(straight-line radius = {straight_line_radius_m}m, road radius = {road_radius_m}m)...")
 
     original_crs = gdf.crs
 
@@ -2105,7 +2106,7 @@ def process_poi_counts_dynamic(gdf, poi_gdf, checked_categories, aerial_radius_m
 
     # SCRATCH projected copies -- ONLY built if actually needed (Task
     # 5's requirement mirrored here: no road_context work at all when
-    # every checked category is Aerial). Never touches the main
+    # every checked category is Straight). Never touches the main
     # gdf/poi_gdf above -- see this function's own CRS-handling
     # docstring section.
     if have_road_context:
@@ -2118,15 +2119,15 @@ def process_poi_counts_dynamic(gdf, poi_gdf, checked_categories, aerial_radius_m
     # bbox_margin_m: the shared candidate-prefilter margin (see
     # _geodesic_bbox_envelope()'s own docstring for why max() of the two
     # radii is a valid shared bound when both are in use). Either
-    # aerial_radius_m or road_radius_m may be None -- on_run() leaves
+    # straight_line_radius_m or road_radius_m may be None -- on_run() leaves
     # whichever method has no checked category at None (Step 4/5) -- so
     # this filters None out before taking max(), rather than assuming
     # both are always floats. At least one of the two is always a real
     # float, since checked_categories is never empty by the time this
     # function is called (on_run() requires at least one checked
-    # category, and every checked category is either "aerial" or
+    # category, and every checked category is either "straight" or
     # "road").
-    bbox_margin_m = max(v for v in (aerial_radius_m, road_radius_m) if v is not None)
+    bbox_margin_m = max(v for v in (straight_line_radius_m, road_radius_m) if v is not None)
 
     total = len(gdf)
     for pos, (idx, row) in enumerate(gdf.iterrows()):
@@ -2168,9 +2169,9 @@ def process_poi_counts_dynamic(gdf, poi_gdf, checked_categories, aerial_radius_m
             method = checked_categories[key]
             poi_lat, poi_lon = cand.geometry.y, cand.geometry.x
 
-            if method == "aerial":
+            if method == "straight":
                 dist = geodesic((lat, lon), (poi_lat, poi_lon)).meters
-                if dist <= aerial_radius_m:
+                if dist <= straight_line_radius_m:
                     counters[key] += 1
 
             elif method == "road":
@@ -2203,7 +2204,7 @@ def process_poi_counts_dynamic(gdf, poi_gdf, checked_categories, aerial_radius_m
                     counters[key] += 1
                 # else: exceeds road_radius_m -> not counted (Task 7,
                 # no fallback -- this is the same "distance computed
-                # but too far" case as Aerial's own `if dist <=` check
+                # but too far" case as Straight's own `if dist <=` check
                 # just above, not a failure case at all)
 
         # Iterates checked_categories (not target_column_map.items())
@@ -2255,13 +2256,13 @@ def is_batch_config_complete(config):
     This is the most complex readiness check among the 11 tools: THREE
     secondary sources (Road Network Source, POI Source, Search
     Distance) plus a REQUIRED per-category checklist where each
-    checked row also carries its own Aerial/Road Method choice.
+    checked row also carries its own Straight/Road Method choice.
     Mirrors _update_run_button_state()'s own real readiness cascade
     exactly (its Land Parcel/Output portions excluded, since batch mode
     never captures those):
       - a POI source must be selected;
       - at least one category must be checked;
-      - if any checked category uses "aerial", aerial_radius must be a
+      - if any checked category uses "straight", straight_line_radius must be a
         valid positive number;
       - if any checked category uses "road", road_radius must be a
         valid positive number AND a Road Network source must be
@@ -2277,9 +2278,9 @@ def is_batch_config_complete(config):
              "road_local_path"|"road_db_table": "...",
              "poi_source_type": "local"|"db",
              "poi_local_path"|"poi_db_table": "...",
-             "aerial_radius": "200", "road_radius": "200",
+             "straight_line_radius": "200", "road_radius": "200",
              "category_selections": [
-                 {"key": sanitized_key, "method": "aerial"|"road"},
+                 {"key": sanitized_key, "method": "straight"|"road"},
                  ...
              ]}.
             category_selections includes only CHECKED categories.
@@ -2308,10 +2309,10 @@ def is_batch_config_complete(config):
     if not selections:
         return False
 
-    any_aerial = any(rec.get("method") == "aerial" for rec in selections)
+    any_straight = any(rec.get("method") == "straight" for rec in selections)
     any_road = any(rec.get("method") == "road" for rec in selections)
 
-    if any_aerial and not _valid_radius(config.get("aerial_radius")):
+    if any_straight and not _valid_radius(config.get("straight_line_radius")):
         return False
     if any_road:
         if not _valid_radius(config.get("road_radius")):
@@ -2333,9 +2334,9 @@ def open_main_window(root, db_verified=True, batch_mode=False,
     Builds and shows the tool's single unified configuration window:
     Land Parcel and POI source pickers (each with a Local-file/
     Database-table radio toggle), a dynamic Landmark Categories
-    checklist with per-category Aerial/Road method selection
+    checklist with per-category Straight/Road method selection
     (discovered from the POI source, see _refresh_poi_categories()),
-    independent Aerial/Road distance entries, a Road Network Source
+    independent Straight/Road distance entries, a Road Network Source
     picker (Local-file/Database-table, used only if any checked
     category selects Road), an Output destination picker, and a Run
     button gated by _update_run_button_state().
@@ -2348,8 +2349,8 @@ def open_main_window(root, db_verified=True, batch_mode=False,
             "Database"-style radio buttons (parcel_radio_db,
             road_radio_db, poi_radio_db, out_radio_db) if False; see
             that block's own comment for exactly why. Does NOT touch
-            the per-category Aerial/Road method radios (radio_road/
-            radio_aerial) -- those select a DISTANCE-CALCULATION
+            the per-category Straight/Road method radios (radio_road/
+            radio_straight) -- those select a DISTANCE-CALCULATION
             METHOD, unrelated to whether the data source is a local
             file or a database table, so they are never part of this
             db_verified gating. When batch_mode=True, only
@@ -2361,8 +2362,8 @@ def open_main_window(root, db_verified=True, batch_mode=False,
             not built at all (supplied globally by the Batch
             Valuation orchestrator instead); Road Network Source, POI
             Source (including its own REQUIRED per-category checklist
-            with per-row Aerial/Road Method, entirely unmodified), and
-            the independent Aerial/Road distance entries are the only
+            with per-row Straight/Road Method, entirely unmodified), and
+            the independent Straight/Road distance entries are the only
             sections still shown, since those are this tool's only
             other settings; "Run Processing" is replaced by a
             Cancel/Save row (see
@@ -2463,7 +2464,7 @@ def open_main_window(root, db_verified=True, batch_mode=False,
         win.geometry(f"{req_w}x{req_h}")
 
     # theme_use("clam") was previously called here to suppress a
-    # dotted focus-ring rendering glitch on the Aerial/Road method
+    # dotted focus-ring rendering glitch on the Straight/Road method
     # radios (Cluster B) -- REMOVED. Because ttk.Style's theme is
     # process-wide (not scoped to any one window), that change also
     # silently changed every OTHER ttk widget created afterward in
@@ -2487,7 +2488,7 @@ def open_main_window(root, db_verified=True, batch_mode=False,
     # under the native theme.
     #
     # Known, accepted tradeoff: the dotted focus-ring glitch on the
-    # Aerial/Road method radios returns -- confirmed acceptable, this
+    # Straight/Road method radios returns -- confirmed acceptable, this
     # tool does not actually need that suppression.
 
     # ── state ────────────────────────────────────────────────────
@@ -2609,13 +2610,13 @@ def open_main_window(root, db_verified=True, batch_mode=False,
     # nothing has been packed after it yet at that point.
     distance_radius_anchor = None
 
-    # Task 3 (Cluster B): per-category Aerial/Road method state and the
+    # Task 3 (Cluster B): per-category Straight/Road method state and the
     # widget references needed to enable/disable each row's own radio
     # pair from that row's checkbox command. Rebuilt in lockstep with
     # poi_category_vars by _rebuild_category_checklist() -- same
     # discard-on-source-change convention, never reused across a POI
     # source change.
-    poi_category_method_vars = {}      # {sanitized_key: tk.StringVar}  -- "aerial" | "road" | "" (unchecked)
+    poi_category_method_vars = {}      # {sanitized_key: tk.StringVar}  -- "straight" | "road" | "" (unchecked)
     poi_category_radio_widgets = {}    # {sanitized_key: (Radiobutton, Radiobutton)}
     # poi_category_remembered_method: the last method the user EXPLICITLY
     # chose for each category, kept even while that category is
@@ -2624,13 +2625,13 @@ def open_main_window(root, db_verified=True, batch_mode=False,
     # row is re-checked -- see _on_category_checked_toggle() below.
     # Starts at "road" for every row (Task 3's default), updated only
     # when the user actually clicks a radio while the row is checked.
-    poi_category_remembered_method = {}  # {sanitized_key: "aerial" | "road"}
+    poi_category_remembered_method = {}  # {sanitized_key: "straight" | "road"}
 
     # Task 4 (Cluster B): two independent radius inputs, one per
     # distance method. D3c: these are now the ONLY radii actually
     # consumed by run_processing() -- the old single radius_var field
     # they used to sit inert alongside has been fully retired.
-    aerial_radius_var = tk.StringVar(master=win, value="200")
+    straight_line_radius_var = tk.StringVar(master=win, value="200")
     road_radius_var   = tk.StringVar(master=win, value="200")
 
     # run_status_var: drives the always-visible status label under the
@@ -2662,7 +2663,7 @@ def open_main_window(root, db_verified=True, batch_mode=False,
     # variable's cell by reference (same technique already used in
     # influence_map_distance_to_land_parcel.py's own batch-mode
     # adaptation for its structurally identical fault_local_path).
-    # poi_local_path/poi_db_table/aerial_radius_var/road_radius_var ARE
+    # poi_local_path/poi_db_table/straight_line_radius_var/road_radius_var ARE
     # StringVars, so .set() is used for those instead. Only sets these
     # plain values here -- the actual background re-read (and, once it
     # completes, the per-category checklist restore queued into
@@ -2685,8 +2686,8 @@ def open_main_window(root, db_verified=True, batch_mode=False,
         else:
             poi_source_type.set("local")
             poi_local_path.set(initial_config.get("poi_local_path") or "")
-        if initial_config.get("aerial_radius"):
-            aerial_radius_var.set(initial_config["aerial_radius"])
+        if initial_config.get("straight_line_radius"):
+            straight_line_radius_var.set(initial_config["straight_line_radius"])
         if initial_config.get("road_radius"):
             road_radius_var.set(initial_config["road_radius"])
         _pending_category_restore[0] = list(
@@ -2989,7 +2990,7 @@ def open_main_window(root, db_verified=True, batch_mode=False,
     # Vertical scrollbar appears ONLY once more than 7 categories are
     # detected (explicit requirement); horizontal scrollbar appears ONLY
     # when a label is wider than the box, and applies ONLY to the POI/
-    # checkbox column -- the Aerial/Road radio column is a "frozen" column
+    # checkbox column -- the Straight/Road radio column is a "frozen" column
     # (spreadsheet-style: like Excel's freeze panes) that never scrolls
     # horizontally, so a long fclass label can never cover or push the
     # radios out of view. This requires TWO separate Canvas widgets
@@ -3111,7 +3112,7 @@ def open_main_window(root, db_verified=True, batch_mode=False,
         def _check_all_categories():
             """Sets every discovered category's checkbox to True, going
             through _on_category_checked_toggle() per key so each row's
-            Aerial/Road radios and remembered method are updated exactly
+            Straight/Road radios and remembered method are updated exactly
             as if the user had clicked each checkbox individually. Never
             touches method state directly."""
             for key in poi_category_vars:
@@ -3128,7 +3129,7 @@ def open_main_window(root, db_verified=True, batch_mode=False,
         # Vertical scrollbar appears ONLY once more than 7 categories are
         # detected (explicit requirement); horizontal scrollbar appears
         # ONLY when a label is wider than the box, and applies ONLY to the
-        # POI/checkbox column -- the Aerial/Road radio column is a
+        # POI/checkbox column -- the Straight/Road radio column is a
         # "frozen" column (spreadsheet-style: like Excel's freeze panes)
         # that never scrolls horizontally, so a long fclass label can
         # never cover or push the radios out of view. This requires TWO
@@ -3161,7 +3162,7 @@ def open_main_window(root, db_verified=True, batch_mode=False,
 
         # Header row: "POI" (+ Check All/Uncheck All, scoped to this
         # column) above the checkbox/fclass column, "Method" above the
-        # Aerial/Road column. Both header Frames get a SESSION-LOCKED width
+        # Straight/Road column. Both header Frames get a SESSION-LOCKED width
         # (and height) below -- measured ONCE from their actual real
         # content right after construction, then frozen via
         # pack_propagate(False) + an explicit width=/height= that
@@ -3186,7 +3187,7 @@ def open_main_window(root, db_verified=True, batch_mode=False,
         poi_header_lbl.pack(side="left")
 
         # Check All / Uncheck All -- affects ONLY the POI/checkbox column
-        # (poi_category_vars), never the Aerial/Road method radios; lives
+        # (poi_category_vars), never the Straight/Road method radios; lives
         # INSIDE poi_header_frame (explicit request: "katabi ng POI
         # column... nasa loob siya ng POI column"), not in a separate
         # full-width row. Each click reuses _on_category_checked_toggle()
@@ -3223,23 +3224,23 @@ def open_main_window(root, db_verified=True, batch_mode=False,
                                       font=("Segoe UI", 8, "bold"), anchor="w", fg="#444444")
         method_header_lbl.pack(side="left")
 
-        # One-time probe: a throwaway Aerial/Road ttk.Radiobutton pair,
+        # One-time probe: a throwaway Straight/Road ttk.Radiobutton pair,
         # built with the exact same widget type/styling/padding a real
         # checklist row's method radios use, ONLY to measure their true
         # rendered width in this session's actual font/theme -- "Method"
-        # (the header word alone) is narrower than "Aerial  Road" (the
+        # (the header word alone) is narrower than "Straight  Road" (the
         # actual content that sits under it row after row), so locking the
         # Method column to the header text's width alone would clip the
         # real radios. Built, measured, and destroyed immediately -- never
         # part of the visible tree.
         _method_probe_frame = tk.Frame(win)
         _probe_road = ttk.Radiobutton(_method_probe_frame, text="Road")
-        _probe_aerial = ttk.Radiobutton(_method_probe_frame, text="Aerial")
+        _probe_straight = ttk.Radiobutton(_method_probe_frame, text="Straight")
         _probe_road.pack(side="left", padx=(2, 0))
-        _probe_aerial.pack(side="left", padx=(3, 0))
+        _probe_straight.pack(side="left", padx=(3, 0))
         _method_probe_frame.update_idletasks()
         _probe_content_width = (
-            _probe_aerial.winfo_reqwidth() + _probe_road.winfo_reqwidth() + 5)
+            _probe_straight.winfo_reqwidth() + _probe_road.winfo_reqwidth() + 5)
         _method_probe_frame.destroy()
 
         # POI_COLUMN_EXTRA_PADDING: added on top of the bare-minimum
@@ -3295,7 +3296,7 @@ def open_main_window(root, db_verified=True, batch_mode=False,
         # window's width (set by whichever section is widest overall), not
         # from poi_action_row's width specifically. That leftover space
         # being silently consumed is exactly what pushed method_canvas (the
-        # Aerial/Road column) too far to the right of where it should sit --
+        # Straight/Road column) too far to the right of where it should sit --
         # confirmed via isolated live testing: an explicit .configure(
         # width=200) on poi_canvas was silently overridden to 500px by
         # pack()'s own fill+expand behavior, and removing expand=True
@@ -3314,7 +3315,7 @@ def open_main_window(root, db_verified=True, batch_mode=False,
         # _resize_category_checklist_box() below -- only shown when the
         # POI column's own content actually exceeds its own box width.
 
-        # method_canvas: the frozen Aerial/Road column -- a genuine Canvas
+        # method_canvas: the frozen Straight/Road column -- a genuine Canvas
         # (not a plain Frame) because with up to ~136 rows and only 7
         # visible at a time, this column still needs the SAME vertical
         # clipping/scrolling as the POI column, even though it never needs
@@ -3324,7 +3325,7 @@ def open_main_window(root, db_verified=True, batch_mode=False,
 
         # category_vscroll: ONE shared vertical scrollbar, driving BOTH
         # canvases' yview together via _on_category_vscroll_command() below
-        # -- this is what keeps every row's checkbox and its Aerial/Road
+        # -- this is what keeps every row's checkbox and its Straight/Road
         # radios vertically aligned while scrolling.
         category_vscroll = tk.Scrollbar(category_body_row, orient="vertical")
 
@@ -3492,18 +3493,18 @@ def open_main_window(root, db_verified=True, batch_mode=False,
 
         # method_canvas's embedded window always matches the locked
         # METHOD_COLUMN_WIDTH -- this column never scrolls horizontally
-        # (explicit requirement: the Aerial/Road radios must never be
+        # (explicit requirement: the Straight/Road radios must never be
         # covered by, or shift because of, a long fclass label).
         method_canvas.itemconfig(_method_canvas_window, width=METHOD_COLUMN_WIDTH)
 
     def _rebuild_category_checklist():
         """
         Clears and repopulates poi_checklist_container (checkbox
-        column) and method_checklist_container (frozen Aerial/Road
+        column) and method_checklist_container (frozen Straight/Road
         column) from the
         current poi_categories dict -- one row per sanitized key, each
         row a Checkbutton (label = the lowercase sanitized key itself,
-        Task 1 step 6) plus an Aerial/Road Radiobutton pair (Task 3).
+        Task 1 step 6) plus a Straight/Road Radiobutton pair (Task 3).
         Each row's BooleanVar defaults to False (unchecked): Document 1
         does not specify a default-checked state, and defaulting
         unchecked is the safer choice -- an unchecked category is
@@ -3513,13 +3514,13 @@ def open_main_window(root, db_verified=True, batch_mode=False,
         Uses grid() (row=row_idx, column=0[/1]), NOT pack(), within
         EACH container separately, so the Checkbutton column lines up
         vertically across every row in poi_checklist_container, and the
-        Aerial/Road columns line up vertically across every row in
+        Straight/Road columns line up vertically across every row in
         method_checklist_container, regardless of label length
         ("archaeological" vs "alpine_hut") -- grid auto-sizes each
         column to its widest cell, shared across all rows in the same
         container. Splitting the row across two containers (rather
         than one container with three grid columns) is what keeps the
-        Aerial/Road column from ever being affected by the checkbox
+        Straight/Road column from ever being affected by the checkbox
         column's own horizontal scrolling -- see the Canvas/column-
         split docstring on category_checklist_outer's construction
         above.
@@ -3583,7 +3584,7 @@ def open_main_window(root, db_verified=True, batch_mode=False,
             # default padding/metrics); even a small per-row
             # discrepancy compounds across many rows into a real,
             # growing vertical misalignment between the checkbox column
-            # and the Aerial/Road column the further down the (possibly
+            # and the Straight/Road column the further down the (possibly
             # 100+ row) list you scroll -- confirmed via live headless
             # testing, not a theoretical concern.
             row_wrapper_pairs = []
@@ -3621,8 +3622,8 @@ def open_main_window(root, db_verified=True, batch_mode=False,
                 # see the Canvas/column-split docstring above.
                 method_row_wrapper = tk.Frame(method_checklist_container)
                 method_row_wrapper.grid(row=row_idx, column=0, sticky="w")
-                # Road first (left), Aerial second (right) -- explicit
-                # request to swap the original Aerial-first order.
+                # Road first (left), Straight second (right) -- explicit
+                # request to swap the original Straight-first order.
                 #
                 # takefocus=0 on both: excludes these radios from
                 # Tab-key focus traversal entirely, which is what
@@ -3641,9 +3642,9 @@ def open_main_window(root, db_verified=True, batch_mode=False,
                     method_row_wrapper, text="Road", variable=method_var,
                     value="road", state="disabled", takefocus=0,
                     command=_recompute_radius_enablement)
-                radio_aerial = ttk.Radiobutton(
-                    method_row_wrapper, text="Aerial", variable=method_var,
-                    value="aerial", state="disabled", takefocus=0,
+                radio_straight = ttk.Radiobutton(
+                    method_row_wrapper, text="Straight", variable=method_var,
+                    value="straight", state="disabled", takefocus=0,
                     command=_recompute_radius_enablement)
                 # Small, roughly one-space gaps on both sides -- the
                 # Road radio sits close to the column's left edge so
@@ -3653,11 +3654,11 @@ def open_main_window(root, db_verified=True, batch_mode=False,
                 # previous 16px offset which visibly misaligned the
                 # radios from their own column header (explicit
                 # feedback: "hindi siya align sa title name na
-                # Method"). Aerial's own gap from Road is kept equally
+                # Method"). Straight's own gap from Road is kept equally
                 # tight, per explicit request ("one space lang").
                 radio_road.pack(side="left", padx=(2, 0))
-                radio_aerial.pack(side="left", padx=(3, 0))
-                poi_category_radio_widgets[key] = (radio_road, radio_aerial)
+                radio_straight.pack(side="left", padx=(3, 0))
+                poi_category_radio_widgets[key] = (radio_road, radio_straight)
                 row_wrapper_pairs.append((poi_row_wrapper, method_row_wrapper))
 
             # Force every row's two wrappers to the SAME pixel height --
@@ -4094,7 +4095,7 @@ def open_main_window(root, db_verified=True, batch_mode=False,
         win.after(100, lambda: _poll_poi_category_queue(
             result_queue, deadline, source_type))
 
-    # ── SECTION 2C: SEARCH DISTANCE (Aerial / Road) ──────────────
+    # ── SECTION 2C: SEARCH DISTANCE (Straight / Road) ──────────────
     # Task 4 (Cluster B): two independent radius inputs, one per
     # distance method. D3c: these are now the only radius fields in
     # this tool -- the old single "Search Radius" section (SECTION 3)
@@ -4112,44 +4113,55 @@ def open_main_window(root, db_verified=True, batch_mode=False,
     dual_radius_frame = tk.Frame(win)
     dual_radius_frame.pack(fill="x", padx=18, pady=2)
 
-    # Road distance row packed FIRST (appears on top), Aerial radius row
-    # packed SECOND (appears below) -- per explicit request, swapped
-    # from this section's original top-to-bottom order. Label reads
-    # "Road distance", not "Road radius" -- a road-network path length
-    # is a linear distance along the network, not a circular/
-    # omnidirectional radius (which "Aerial radius" correctly is, being
-    # straight-line). Deliberately deviates from Document 1 Task 4's
-    # literal field-label wording for this reason (confirmed decision).
-    # The underlying variable/widget names (road_radius_var,
-    # road_radius_row, road_radius_entry) are left as-is -- internal
-    # identifiers, not user-facing text, and unaffected by either the
-    # label wording or this row-order swap.
+    # Road Distance row packed FIRST (appears on top), Straight-Line
+    # Distance row packed SECOND (appears below) -- per explicit
+    # request, swapped from this section's original top-to-bottom
+    # order. Label reads "Road Distance", not "Road radius" -- a
+    # road-network path length is a linear distance along the network,
+    # not a circular/omnidirectional radius (which "Straight-Line
+    # Distance" correctly is, being straight-line). Deliberately
+    # deviates from Document 1 Task 4's literal field-label wording for
+    # this reason (confirmed decision). The underlying variable/widget
+    # names (road_radius_var, road_radius_row, road_radius_entry) are
+    # left as-is -- internal identifiers, not user-facing text, and
+    # unaffected by either the label wording or this row-order swap.
+    #
+    # No shared/fixed width= on either Label -- each one auto-sizes to
+    # its own text length (Tk's own default Label behavior), so the two
+    # rows are NOT forced to visually align with each other -- per
+    # explicit request, the Entry box should instead sit close to its
+    # own row's ":" with a small, fixed gap (ENTRY_GAP_PADX below),
+    # regardless of whether that leaves the two "200" boxes at
+    # different x-positions across the two rows.
+    ENTRY_GAP_PADX = 6
+
     road_radius_row = tk.Frame(dual_radius_frame)
     road_radius_row.pack(fill="x", pady=2)
-    tk.Label(road_radius_row, text="Road distance (meters):",
-             anchor="w", width=18).pack(side="left")
+    tk.Label(road_radius_row, text="Road Distance (meters):",
+             anchor="w").pack(side="left")
     road_radius_entry = tk.Entry(road_radius_row, textvariable=road_radius_var,
-                                  width=10, state="disabled")
-    road_radius_entry.pack(side="left", padx=(4, 0))
+                                  width=6, state="disabled")
+    road_radius_entry.pack(side="left", padx=(ENTRY_GAP_PADX, 0))
 
-    aerial_radius_row = tk.Frame(dual_radius_frame)
-    aerial_radius_row.pack(fill="x", pady=2)
-    tk.Label(aerial_radius_row, text="Aerial radius (meters):",
-             anchor="w", width=18).pack(side="left")
+    straight_line_radius_row = tk.Frame(dual_radius_frame)
+    straight_line_radius_row.pack(fill="x", pady=2)
+    tk.Label(straight_line_radius_row, text="Straight-Line Distance (meters):",
+             anchor="w").pack(side="left")
     # Starts disabled -- nothing is checked yet at construction time,
-    # so no checked category can be using the Aerial method yet (Task
-    # 4). _recompute_radius_enablement() below is the single source of
-    # truth for this state from here on.
-    aerial_radius_entry = tk.Entry(aerial_radius_row, textvariable=aerial_radius_var,
-                                    width=10, state="disabled")
-    aerial_radius_entry.pack(side="left", padx=(4, 0))
+    # so no checked category can be using the Straight method yet
+    # (Task 4). _recompute_radius_enablement() below is the single
+    # source of truth for this state from here on.
+    straight_line_radius_entry = tk.Entry(
+        straight_line_radius_row, textvariable=straight_line_radius_var,
+        width=6, state="disabled")
+    straight_line_radius_entry.pack(side="left", padx=(ENTRY_GAP_PADX, 0))
 
     def _recompute_radius_enablement():
         """
         Task 4: each radius Entry is enabled iff at least one CHECKED
         category currently has that field's corresponding method
-        selected -- e.g. if every checked category is set to Aerial,
-        the Road distance input stays disabled.
+        selected -- e.g. if every checked category is set to Straight,
+        the Road Distance input stays disabled.
 
         Only ever toggles Entry(state=...) -- textvariable is never
         touched here, so a value entered before a field became
@@ -4169,22 +4181,22 @@ def open_main_window(root, db_verified=True, batch_mode=False,
         category count, which radii are actually relevant, whether a
         Road Network source is required) needs to be re-evaluated.
         """
-        any_aerial = any(
-            poi_category_vars[key].get() and poi_category_method_vars[key].get() == "aerial"
+        any_straight = any(
+            poi_category_vars[key].get() and poi_category_method_vars[key].get() == "straight"
             for key in poi_category_vars
         )
         any_road = any(
             poi_category_vars[key].get() and poi_category_method_vars[key].get() == "road"
             for key in poi_category_vars
         )
-        aerial_radius_entry.config(state="normal" if any_aerial else "disabled")
+        straight_line_radius_entry.config(state="normal" if any_straight else "disabled")
         road_radius_entry.config(state="normal" if any_road else "disabled")
         _update_run_button_state()
 
     def _on_category_checked_toggle(key):
         """
         Per-row Checkbutton command= (Task 3, refined per explicit
-        request): enables/disables ONLY that row's own Aerial/Road
+        request): enables/disables ONLY that row's own Straight/Road
         radio pair, based on whether the row is now checked -- an
         unchecked category's method selection is irrelevant since it
         won't be counted at all. Touches no other row.
@@ -4203,7 +4215,7 @@ def open_main_window(root, db_verified=True, batch_mode=False,
                explicitly picked, or the Task 3 default if never
                touched) into poi_category_remembered_method[key].
             2. Clear method_var to "" -- neither radio's `value=`
-               ("aerial"/"road") matches "", so neither shows selected.
+               ("straight"/"road") matches "", so neither shows selected.
             3. Disable both radios.
 
           Checking (was unchecked -> now checked):
@@ -4215,9 +4227,9 @@ def open_main_window(root, db_verified=True, batch_mode=False,
             2. Enable both radios.
 
           This means a category's chosen method survives any number of
-          uncheck/recheck cycles -- e.g. check -> switch to Aerial ->
-          uncheck (Aerial remembered, nothing visibly selected) ->
-          recheck (Aerial reappears selected, not reset to the Road
+          uncheck/recheck cycles -- e.g. check -> switch to Straight ->
+          uncheck (Straight remembered, nothing visibly selected) ->
+          recheck (Straight reappears selected, not reset to the Road
           default) -> switch back to Road -> uncheck -> recheck (Road
           reappears selected). Each explicit radio click updates
           method_var immediately via Tkinter's own shared-variable
@@ -4349,7 +4361,7 @@ def open_main_window(root, db_verified=True, batch_mode=False,
             resolution (PRIORITY 3) -- each able to cancel the whole run --
             then destroys this window and hands off to run_processing().
             Sets the module-level barangay_source, poi_source, output_mode,
-            checked_categories, target_column_map, aerial_radius_meters,
+            checked_categories, target_column_map, straight_line_radius_meters,
             road_radius_meters, road_source, and
             parcel_output_column_overrides globals on success.
 
@@ -4357,7 +4369,7 @@ def open_main_window(root, db_verified=True, batch_mode=False,
             field) have been fully retired -- see this function's own
             dedicated validation block, right after POI validation below,
             for the precedence now actually used (checked categories, then
-            Aerial radius if needed, then Road radius if needed, then Road
+            Straight-Line radius if needed, then Road radius if needed, then Road
             Network source if needed).
             """
             global barangay_source, poi_source, output_mode
@@ -4395,14 +4407,14 @@ def open_main_window(root, db_verified=True, batch_mode=False,
             # ------------------------------------------------------------------
             # D3a/D3c -- dynamic-checklist validation (approved precedence,
             # steps 3-6). Builds checked_categories/target_column_map/
-            # aerial_radius_meters/road_radius_meters/road_source (module-
+            # straight_line_radius_meters/road_radius_meters/road_source (module-
             # level globals declared above) -- consumed by run_processing()
             # (D3c wired this in; the old fixed-radius pipeline these
             # globals originally coexisted alongside has since been
             # retired entirely).
             # ------------------------------------------------------------------
             global checked_categories, target_column_map
-            global aerial_radius_meters, road_radius_meters, road_source
+            global straight_line_radius_meters, road_radius_meters, road_source
 
             # Step 3: no checked categories. This is a validation rule on
             # user input (the checklist), not a re-statement of the
@@ -4426,26 +4438,26 @@ def open_main_window(root, db_verified=True, batch_mode=False,
                 checked_categories.keys(),
                 derive_target_columns(checked_categories.keys())))
 
-            any_aerial = any(m == "aerial" for m in checked_categories.values())
+            any_straight = any(m == "straight" for m in checked_categories.values())
             any_road = any(m == "road" for m in checked_categories.values())
 
-            # Step 4: Aerial radius -- only validated if at least one
-            # checked category actually uses the Aerial method. Left None
+            # Step 4: Straight-Line radius -- only validated if at least one
+            # checked category actually uses the Straight method. Left None
             # (its module-level default) if not currently relevant, rather
             # than validated-but-unused, so a stale/invalid value sitting
             # in a currently-disabled field can never block a run that
             # doesn't need it.
-            if any_aerial:
+            if any_straight:
                 try:
-                    aerial_radius_meters = float(aerial_radius_var.get())
-                    if aerial_radius_meters <= 0:
+                    straight_line_radius_meters = float(straight_line_radius_var.get())
+                    if straight_line_radius_meters <= 0:
                         raise ValueError
                 except ValueError:
                     messagebox.showerror("Invalid Input",
-                        "Please enter a valid positive number for the Aerial radius.")
+                        "Please enter a valid positive number for the Straight-Line Distance.")
                     return
             else:
-                aerial_radius_meters = None
+                straight_line_radius_meters = None
 
             # Step 5: Road distance -- same reasoning as Step 4, mirrored
             # for the Road method.
@@ -4671,9 +4683,9 @@ def open_main_window(root, db_verified=True, batch_mode=False,
                 for key, var in poi_category_vars.items()
                 if var.get()
             }
-            any_aerial = any(m == "aerial" for m in live_checked.values())
+            any_straight = any(m == "straight" for m in live_checked.values())
             any_road = any(m == "road" for m in live_checked.values())
-            aerial_ok = _is_valid_radius(aerial_radius_var.get()) if any_aerial else True
+            straight_ok = _is_valid_radius(straight_line_radius_var.get()) if any_straight else True
             road_radius_ok = _is_valid_radius(road_radius_var.get()) if any_road else True
             has_road_source = (
                 bool(road_local_path) if road_source_type.get() == "local" else bool(road_db_table)
@@ -4697,8 +4709,8 @@ def open_main_window(root, db_verified=True, batch_mode=False,
             elif not live_checked:
                 run_status_var.set("Please check at least one landmark type to count.")
                 ready = False
-            elif not aerial_ok:
-                run_status_var.set("Please enter a valid Aerial radius.")
+            elif not straight_ok:
+                run_status_var.set("Please enter a valid Straight-Line Distance.")
                 ready = False
             elif not road_radius_ok:
                 run_status_var.set("Please enter a valid Road distance.")
@@ -4735,7 +4747,7 @@ def open_main_window(root, db_verified=True, batch_mode=False,
 
         # Live-updates the Run button as the user types in either radius
         # field, without requiring focus-out or Enter.
-        aerial_radius_var.trace_add("write", lambda *_: _update_run_button_state())
+        straight_line_radius_var.trace_add("write", lambda *_: _update_run_button_state())
         road_radius_var.trace_add("write", lambda *_: _update_run_button_state())
 
         _toggle_parcel()
@@ -4752,8 +4764,8 @@ def open_main_window(root, db_verified=True, batch_mode=False,
         # convention and hover tooltip every other tool file uses for
         # this). Only the "db" radio in each pair is touched; the "local"/
         # file-based radio next to it is never disabled. Does NOT touch
-        # the per-category Aerial/Road method radios (radio_road/
-        # radio_aerial) -- see open_main_window()'s own docstring for why
+        # the per-category Straight/Road method radios (radio_road/
+        # radio_straight) -- see open_main_window()'s own docstring for why
         # those are unrelated to this gating. This does not replace or
         # duplicate utils.db_discovery.load_db_credentials()/fetch_tables()'s
         # own existing error handling for a connection that fails or is
@@ -4766,7 +4778,7 @@ def open_main_window(root, db_verified=True, batch_mode=False,
     else:
         # NEW -- batch mode: Road Network Source, POI Source (with its
         # own REQUIRED per-category checklist + per-row Method), and
-        # the independent Aerial/Road distance entries (all built
+        # the independent Straight/Road distance entries (all built
         # above, unconditionally) are this tool's only batch-visible
         # sections. The Cancel/Save row (via the shared
         # utils.batch_mode_ui.build_save_cancel_row(), Rule of Three --
@@ -4791,7 +4803,7 @@ def open_main_window(root, db_verified=True, batch_mode=False,
             else:
                 config["poi_source_type"] = "db"
                 config["poi_db_table"] = poi_db_table.get()
-            config["aerial_radius"] = aerial_radius_var.get()
+            config["straight_line_radius"] = straight_line_radius_var.get()
             config["road_radius"] = road_radius_var.get()
             config["category_selections"] = [
                 {"key": key, "method": poi_category_method_vars[key].get()}
@@ -5464,7 +5476,7 @@ def run_processing(app_root, overwrite_mode=None, resolved_table_name=None,
     any checked category uses the Road method (D3c), then for each
     Land Parcel file/table, opens a fresh progress window, runs
     process_poi_counts_dynamic() (the dynamic, per-category
-    Aerial/Road counting engine -- D2), and saves the result either
+    Straight/Road counting engine -- D2), and saves the result either
     locally (.gpkg, optionally opened in Global Mapper) or to PostGIS
     (matched to an existing table by name for local sources, or
     replaced in place for DB sources).
@@ -5579,7 +5591,7 @@ def run_processing(app_root, overwrite_mode=None, resolved_table_name=None,
     """
     global barangay_source, poi_source, output_mode
     global checked_categories, target_column_map
-    global aerial_radius_meters, road_radius_meters, road_source
+    global straight_line_radius_meters, road_radius_meters, road_source
 
     if not barangay_source or not poi_source or not output_mode:
         messagebox.showerror("Error", "Selections incomplete.")
@@ -5698,7 +5710,7 @@ def run_processing(app_root, overwrite_mode=None, resolved_table_name=None,
             # -- conditionally, only if at least one checked category
             # currently uses the Road method (Task 5's explicit
             # requirement: no Road Network source work at all when every
-            # checked category is Aerial). Passed into every parcel's
+            # checked category is Straight). Passed into every parcel's
             # process_poi_counts_dynamic() call below unchanged -- never
             # rebuilt per parcel (see RoadContext's own docstring for the
             # full performance rationale this whole redesign exists to
@@ -5782,7 +5794,7 @@ def run_processing(app_root, overwrite_mode=None, resolved_table_name=None,
 
                     result_queue.put(("new_source", len(gdf)))
                     result = process_poi_counts_dynamic(
-                        gdf, poi_gdf, checked_categories, aerial_radius_meters,
+                        gdf, poi_gdf, checked_categories, straight_line_radius_meters,
                         road_radius_meters, road_context, resolved_target_column_map,
                         progress_cb=worker_progress_cb)
 
@@ -5853,7 +5865,7 @@ def run_processing(app_root, overwrite_mode=None, resolved_table_name=None,
 
                     result_queue.put(("new_source", len(gdf)))
                     result = process_poi_counts_dynamic(
-                        gdf, poi_gdf, checked_categories, aerial_radius_meters,
+                        gdf, poi_gdf, checked_categories, straight_line_radius_meters,
                         road_radius_meters, road_context, resolved_target_column_map,
                         progress_cb=worker_progress_cb)
 

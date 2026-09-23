@@ -1589,7 +1589,7 @@ _CHANGE_CONN_UNSAVED_MSG = (
     "application can write to its configuration folder."
 )
 _TOOLTIP_TEXT_EMPTY = (
-    "Fill in all six database connection fields to enable Change Connection."
+    "Fill in all six database connection fields to enable Test & Save Connection."
 )
 _TOOLTIP_TEXT_SAME = (
     "No changes to save \u2014 this matches your current database connection."
@@ -1794,7 +1794,7 @@ def show_configure_db_dialog(root, apply_icon_fn, get_credentials_path_fn, db_ga
         text first: this is what guarantees the button never stays
         showing a leftover spinner glyph once whatever triggered this
         call has finished."""
-        change_conn_btn.config(text="CHANGE CONNECTION")
+        change_conn_btn.config(text="TEST & SAVE CONNECTION")
         reason = _change_conn_disabled_reason()
         disabled_reason["value"] = reason
         _set_primary_button_enabled(change_conn_btn, reason is None)
@@ -1989,14 +1989,14 @@ def show_configure_db_dialog(root, apply_icon_fn, get_credentials_path_fn, db_ga
 
     # width= is set explicitly (character units) so the button's own
     # requested size is fixed at construction time from its longest
-    # label ("CHANGE CONNECTION") -- combined with sticky="we" below
+    # label ("TEST & SAVE CONNECTION") -- combined with sticky="we" below
     # (which stretches it to the grid cell's own width, itself set by
     # the six Entry fields above), this guarantees swapping its text
     # for a single spinner glyph and back (see _start_test()/
     # _refresh_change_conn_enabled()) can never visibly resize or
     # reflow the button, in either direction.
-    change_conn_btn = Button(outer, text="CHANGE CONNECTION", command=_start_test,
-                              width=20, state="disabled", bg=_PRIMARY_BTN_DISABLED_BG,
+    change_conn_btn = Button(outer, text="TEST & SAVE CONNECTION", command=_start_test,
+                              width=26, state="disabled", bg=_PRIMARY_BTN_DISABLED_BG,
                               fg=_PRIMARY_BTN_DISABLED_FG, cursor="no",
                               font=("Segoe UI", 10, "bold"))
     _bind_primary_button_hover(change_conn_btn)
