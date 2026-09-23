@@ -151,6 +151,7 @@ from utils.column_detection import detect_existing_output_columns
 from utils.window_icon import apply_icon
 from utils.gpkg_io import write_gpkg_atomic as _write_gpkg, GpkgWriteError
 from utils.db_gate_ui import disable_db_radio, attach_no_db_tooltip
+from utils.batch_mode_ui import build_save_cancel_row
 from PIL import Image, ImageTk, ImageDraw
 
 

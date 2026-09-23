@@ -123,6 +123,7 @@ from utils.db_discovery import load_db_credentials, fetch_tables
 from utils.window_icon import apply_icon
 from utils.gpkg_io import write_gpkg_atomic as _write_gpkg
 from utils.db_gate_ui import disable_db_radio, attach_no_db_tooltip
+from utils.batch_mode_ui import build_save_cancel_row
 from PIL import Image, ImageTk, ImageDraw
 
 
