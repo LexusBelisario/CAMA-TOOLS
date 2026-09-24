@@ -1330,15 +1330,14 @@ def compute_ppr_and_lot_shape_gdf(gdf,
 
     classify_lot_shape() itself is UNCHANGED -- it still returns the
     bare internal labels "TRIANGLE"/"RECTANGLE"/"L_SHAPED"/"OTHERS".
-    Those bare labels are used here only as an internal lookup key
+    Those bare labels are used here as an internal lookup key
     (shape_col_map below) to pick which of the four one-hot *_col
-    columns gets set to 1 -- they are never written to any column
-    as-is. The lot_shape_col VALUE (not just the column NAME) is
-    deliberately prefixed too, per explicit project decision: it is
-    written as "CAMA_TRIANGLE"/"CAMA_RECTANGLE"/"CAMA_L_SHAPED"/
-    "CAMA_OTHERS", not the bare label -- confirmed: no other tool in
-    this project reads/depends on this tool's LOT_SHAPE values, so this
-    is a safe, isolated change.
+    columns gets set to 1, AND as the lot_shape_col VALUE itself --
+    only the COLUMN NAME carries the CAMA_ prefix (e.g. CAMA_LOT_SHAPE),
+    never the value written into it. lot_shape_col is written as the
+    bare label "TRIANGLE"/"RECTANGLE"/"L_SHAPED"/"OTHERS", matching
+    exactly what classify_lot_shape() itself returns, with no extra
+    prefixing applied here.
     """
     # Internal label (from classify_lot_shape()/the invalid-geometry
     # fallback) -> which one-hot *_col column to set to 1. Keys are the
@@ -1482,7 +1481,7 @@ def compute_ppr_and_lot_shape_gdf(gdf,
             # Temporary behavior: parcels whose geometry cannot be
             # repaired are retained in the output (never dropped --
             # every input row must appear exactly once in the output)
-            # with LOT_SHAPE="CAMA_OTHERS" and PP_RATIO=NaN (area/perimeter
+            # with LOT_SHAPE="OTHERS" and PP_RATIO=NaN (area/perimeter
             # above are NaN for a None entry in fixed_geoms, so
             # PP_RATIO is already NaN for this row without extra code
             # here) until the business rule for a dedicated
@@ -1494,7 +1493,7 @@ def compute_ppr_and_lot_shape_gdf(gdf,
             gdf.at[idx, rectangle_col] = 0
             gdf.at[idx, l_shaped_col] = 0
             gdf.at[idx, others_col] = 1
-            gdf.at[idx, lot_shape_col] = "CAMA_OTHERS"
+            gdf.at[idx, lot_shape_col] = "OTHERS"
             continue
 
         angles = vertex_angles(poly)
@@ -1505,7 +1504,7 @@ def compute_ppr_and_lot_shape_gdf(gdf,
         gdf.at[idx, l_shaped_col] = 0
         gdf.at[idx, others_col] = 0
         gdf.at[idx, shape_col_map[shape_type]] = 1
-        gdf.at[idx, lot_shape_col] = f"CAMA_{shape_type}"
+        gdf.at[idx, lot_shape_col] = shape_type
         gdf.at[idx, vtx_count_col] = len(angles)
         gdf.at[idx, angs_txt_col] = ",".join(map(str, angles))
 
@@ -2758,7 +2757,7 @@ def run_processing(root, overwrite_mode=None, resolved_table_name=None,
                     # parcel whose geometry can't be repaired is no longer
                     # dropped -- compute_ppr_and_lot_shape_gdf() below keeps it
                     # in the output with its ORIGINAL geometry, PP_RATIO=NaN,
-                    # and LOT_SHAPE="CAMA_OTHERS" as a temporary placeholder
+                    # and LOT_SHAPE="OTHERS" as a temporary placeholder
                     # pending a dedicated "INVALID_GEOMETRY" classification once
                     # that business rule is finalized with the team lead.
                     #
