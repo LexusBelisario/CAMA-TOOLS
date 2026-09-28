@@ -27,27 +27,28 @@ INPUTS:
     utils/db_discovery.py) for any DB source or DB output.
 
 OUTPUTS:
-    Local output mode: writes exactly one atomically-written .gpkg per
-    processed Land Parcel source, then attempts to open it in Global
-    Mapper (via load_in_global_mapper()-equivalent logic in this
-    file's GPKG overwrite safety / Global Mapper handling). The
-    previously-disabled buffer-diagnostic/Visual Measurement (VM) QA
-    layers have been removed entirely (not just disabled) -- a
-    successful run now always produces exactly one output artifact per
-    source, local or DB.
-    DB output mode: writes/replaces one PostGIS table per source, via a
-    cancel-safe staging/verify/atomic-rename-swap sequence
-    (_write_db_output_safely() -- see the "DB ATOMIC WRITE / CANCEL-SAFE
-    STAGING" section below), never touching the real destination table
-    until the swap itself. The destination table is resolved via
-    resolve_db_output_table() -- an exact-match replace for a DB Land
-    Parcel source, or a fuzzy-match-with-confirmation flow
-    (confirm_db_overwrite_dialog() / choose_db_overwrite_dialog()) for a
-    local-file Land Parcel source. That resolution step also scans for,
-    and offers to clean up, any leftover staging/backup table left
-    behind by a previous run that was interrupted before it could clean
-    up after itself (_scan_orphaned_cama_tables() /
-    _prompt_orphaned_cama_tables()).
+    There is no separate Output Destination picker -- the Land Parcel
+    source is always overwritten in place, atomically
+    (_write_gpkg()/_write_db_output_safely()). Local source: if it is
+    already a .gpkg, that exact file is overwritten; otherwise a new
+    .gpkg with the same base name is written into the source's own
+    folder (silently overwritten on any later run that produces the
+    same name), then an attempt is made to open it in Global Mapper.
+    DB source: the exact same table it was read from is overwritten,
+    via a cancel-safe staging/verify/atomic-rename-swap sequence
+    (_write_db_output_safely() -- see the "DB ATOMIC WRITE /
+    CANCEL-SAFE STAGING" section below) -- no fuzzy-matching, no
+    separate output table resolution. Either way, resolve_db_output_
+    table() is gone; the leftover-staging-table scan it used to run
+    (_scan_orphaned_cama_tables() / _prompt_orphaned_cama_tables())
+    now runs directly from on_run() before a DB-output write.
+
+    CANCELLATION: the Run Processing progress window's title-bar close
+    button acts as a cooperative Cancel control (see ProgressWindow and
+    the "DB ATOMIC WRITE / CANCEL-SAFE STAGING" section below).
+    Cancellation is checked at explicit checkpoints between and within
+    the per-parcel processing passes in process_frontage_single() --
+    it is NOT instantaneous everywhere: a single blocking geometry
 
     CANCELLATION: the Run Processing progress window's title-bar close
     button acts as a cooperative Cancel control (see ProgressWindow and
@@ -280,14 +281,6 @@ filter_by_road_type_active = False
 # value left over from a previous session can never leak into that
 # source's run.
 road_type_excluded_values = []
-
-# overwrite_mode: "overwrite" | "new" | None (no conflicts found, or
-# output destination isn't local). Resolved ONCE, up front, in on_run(),
-# via ask_overwrite_dialog() -- see that function's docstring for why
-# this is a single combined decision for the whole batch rather than a
-# per-file prompt. Read by run_processing() when writing each source's
-# output files. Ported from road_width.py's validated pattern.
-overwrite_mode = None
 
 # parcel_output_column_overrides: {path_or_table: {"CAMA_ROAD_FRONTAGE": name,
 # "CAMA_DEPTH": name, "CAMA_DEPTH_WIDTH_RATIO": name}} -- for any Land Parcel
@@ -948,68 +941,6 @@ def _longest_linestring(geom):
                 best_len = ls.length
         return best
     return None
-
-
-# ========================================
-# OUTPUT FILENAME CONFLICT HANDLING
-# ========================================
-# Ported directly from road_width.py's canonical pattern (see that file's
-# resolve_output_base_name() for the original, validated implementation
-# this is copied from). This tool now writes exactly ONE output file per
-# source -- the previously-paired QA outputs (frontage_lines/VM,
-# segment_buffers) and the with_output_suffix() helper that derived their
-# filenames from this resolved name have been removed entirely (see the
-# module docstring's OUTPUTS section, and process_frontage_single()'s
-# docstring, for the full removal rationale). resolve_output_base_name()
-# itself is unchanged -- it still resolves the MAIN output's own
-# "Create New File" numbering exactly as before.
-def _split_trailing_number(base_name: str):
-    """
-    Splits a base name into (root, existing_number) if it ends with
-    "_<digits>" (e.g. "landparcel_1" -> ("landparcel", 1)), else returns
-    (base_name, None) unchanged.
-    """
-    m = re.match(r'^(.*)_(\d+)$', base_name)
-    if m:
-        return m.group(1), int(m.group(2))
-    return base_name, None
-
-
-def resolve_output_base_name(folder: str, desired_base_name: str, ext: str = "gpkg") -> str:
-    """
-    Determines the actual output base name (no extension) to use for a
-    NEW file in `folder`, given the DESIRED name -- normally the Land
-    Parcel source's own filename, unchanged, with no tool-name suffix
-    appended.
-
-    Rule: reuse the desired name exactly if nothing of that name exists
-    yet in `folder`. If it already exists, NEVER overwrite -- instead,
-    strip any existing trailing "_<N>" from the desired name to get a
-    root (e.g. "landparcel_1" -> root "landparcel"), scan `folder` for
-    every file matching "<root>_<N>.<ext>", and use "<root>_<max(N)+1>"
-    -- the highest N found ANYWHERE in the folder, not just "the source
-    file's own N + 1".
-
-    This function decides the number ONCE, for the MAIN (and, as of
-    this tool's current output shape, only) output.
-    """
-    candidate_path = os.path.join(folder, f"{desired_base_name}.{ext}")
-    if not os.path.exists(candidate_path):
-        return desired_base_name
-
-    root, _existing_number = _split_trailing_number(desired_base_name)
-
-    pattern = re.compile(rf'^{re.escape(root)}_(\d+)\.{re.escape(ext)}$', re.IGNORECASE)
-    max_n = 0
-    try:
-        for fname in os.listdir(folder):
-            m = pattern.match(fname)
-            if m:
-                max_n = max(max_n, int(m.group(1)))
-    except OSError:
-        pass  # folder unreadable for some reason -- fall through with max_n=0, worst case reuses N=1
-
-    return f"{root}_{max_n + 1}"
 
 
 def open_in_global_mapper(output_path):
@@ -2543,10 +2474,12 @@ def _write_db_output_safely(engine, schema, gdf, resolved_table_name,
         engine: SQLAlchemy engine.
         schema (str): destination schema.
         gdf (GeoDataFrame): the processed result to write.
-        resolved_table_name (str): destination table name, from
-            resolve_db_output_table() (via on_run()/run_processing()).
-        resolved_outcome (str | None): "overwritten" or "created", from
-            the same source. If it's anything else (the documented
+        resolved_table_name (str): destination table name -- always
+            `out_base` for a DB-source Land Parcel source (worker()'s
+            per-source write site; its only caller now that Output
+            Destination has been removed).
+        resolved_outcome (str | None): always "overwritten" from that
+            same caller. If it's anything else (the documented
             defensive-fallback case in worker(), where resolved_table_name
             itself was somehow None), the real outcome is determined here
             directly via _table_exists() rather than guessed.
@@ -2688,8 +2621,9 @@ def _scan_orphaned_cama_tables(schema, creds):
     (releasing each one immediately after testing -- it must never itself
     end up holding one) and reads catalog metadata. It never drops
     anything -- see _prompt_orphaned_cama_tables() for the user-driven
-    removal step, called from resolve_db_output_table() before its
-    existing fuzzy-match logic runs.
+    removal step, called from on_run() before the DB-output write
+    starts (previously called from resolve_db_output_table(), now
+    removed -- see the Output Destination removal).
     """
     engine = create_engine(
         f"postgresql://{creds['username']}:{creds['password']}@"
@@ -2729,8 +2663,10 @@ def _scan_orphaned_cama_tables(schema, creds):
 
 def _prompt_orphaned_cama_tables(root, orphans, schema, creds):
     """
-    Shown once, from resolve_db_output_table(), before its own normal
-    fuzzy-match flow. Presents each orphan (its destination table, role,
+    Shown once, from on_run(), before the DB-output write starts
+    (previously shown from resolve_db_output_table(), before its own
+    fuzzy-match flow -- both removed; see the Output Destination
+    removal). Presents each orphan (its destination table, role,
     and run start time when available) and offers a per-item checkbox
     choice: remove now, or leave for later manual review. Never deletes
     anything the user hasn't explicitly checked -- declining to check
@@ -2802,90 +2738,20 @@ def _prompt_orphaned_cama_tables(root, orphans, schema, creds):
 
 
 # ========================================
-# DB OUTPUT RESOLUTION
-# ========================================
-def resolve_db_output_table(root, schema, barangay_source, creds):
-    """
-    Determines the DB-output destination table for the Land Parcel
-    source, BEFORE the worker thread starts -- same "resolve everything
-    up front, main thread only" philosophy as ask_overwrite_dialog()
-    (see run_processing()). This is what lets the fuzzy-match +
-    confirmation flow avoid ever needing a thread-safe dialog
-    mechanism: the Land Parcel source is singular (see parcel_local_path
-    / parcel_db_table -- single-select architecture), so everything
-    needed to resolve the destination table is already known before any
-    background processing begins.
-
-    Two cases:
-      - DB-source Land Parcel (barangay_source[0] == "db"): always
-        writes back to the exact same table it was read from -- no
-        matching, no dialog, matches worker()'s own pre-existing
-        src_type handling (out_base = name).
-      - Local-file Land Parcel: fuzzy-matches the filename against
-        existing tables via find_matching_tables() (which already
-        excludes CAMA_Table, CAMA_Transaction_Log, and any "_VM"
-        table -- that exclusion is shared, out-of-scope utils code for
-        this task and is left untouched), then requires user
-        confirmation before treating a match as an overwrite target --
-        zero candidates skips the dialog entirely and creates a new
-        table under the filename.
-
-    D-Cancel: also runs the crash-orphan recovery scan first, before any
-    of its own existing logic -- _scan_orphaned_cama_tables() plus, if
-    it finds anything, _prompt_orphaned_cama_tables(). This is the
-    natural point for it: it's the one place in this file that already
-    runs on the main thread, synchronously, with a live `root` to open a
-    dialog on, before any new staging table for THIS run could possibly
-    exist to confuse the scan. creds is a new required parameter for
-    this reason -- the caller (on_run()) already loads it to determine
-    schema before calling this function, so this is a zero-cost addition
-    at the call site.
-
-    Returns (resolved_table_name, resolved_outcome), or (None, None) if
-    the user cancelled -- caller must abort the entire run in that
-    case, matching ask_overwrite_dialog()'s existing
-    cancel-aborts-everything semantics (there is no "create new" choice
-    for DB output).
-    """
-    orphans = _scan_orphaned_cama_tables(schema, creds)
-    if orphans:
-        _prompt_orphaned_cama_tables(root, orphans, schema, creds)
-
-    if barangay_source[0] == "db":
-        return barangay_source[1][0], "overwritten"
-
-    desired_name = os.path.splitext(os.path.basename(barangay_source[1][0]))[0]
-    all_tables = fetch_tables(schema)
-    candidates = find_matching_tables(desired_name, all_tables)
-
-    if len(candidates) == 0:
-        return desired_name, "created"
-    elif len(candidates) == 1:
-        if not confirm_db_overwrite_dialog(root, candidates[0]):
-            return None, None
-        return candidates[0], "overwritten"
-    else:
-        chosen = choose_db_overwrite_dialog(root, candidates)
-        if chosen is None:
-            return None, None
-        return chosen, "overwritten"
-
-
-# ========================================
 # MAIN PROCESS
 # ========================================
-def run_processing(app_root, resolved_table_name=None, resolved_outcome=None):
+def run_processing(app_root):
     """
     Orchestrates the full run on a background thread with progress
     reported via a queue.Queue: loads the Road Network layer once,
     then for each selected Land Parcel source runs
-    process_frontage_single() (with the module-level overwrite_mode
-    and parcel_output_column_overrides settings already resolved by
-    on_run() before this was called) and saves the result either
-    locally (.gpkg, optionally opened in Global Mapper) or to PostGIS.
-    The previously-optional QA layers (frontage_lines/VM,
-    segment_buffers) have been removed entirely -- a successful run now
-    always produces exactly one output artifact per source.
+    process_frontage_single() (with parcel_output_column_overrides
+    settings already resolved by on_run() before this was called) and
+    saves the result either locally (.gpkg, optionally opened in
+    Global Mapper) or to PostGIS. The previously-optional QA layers
+    (frontage_lines/VM, segment_buffers) have been removed entirely --
+    a successful run now always produces exactly one output artifact
+    per source.
 
     D-Cancel (this task): one new_cancel_flag() is created per run and
     passed to ProgressWindow, wiring the title-bar X as Cancel for the
@@ -2912,19 +2778,12 @@ def run_processing(app_root, resolved_table_name=None, resolved_outcome=None):
 
     Args:
         app_root: the live top-level window, used as the parent for
-        the ProgressWindow and any dialogs.
-        resolved_table_name (str | None): the already-confirmed DB
-        output table name from resolve_db_output_table() in on_run() --
-        only relevant for DB output mode.
-        resolved_outcome (str | None): "overwritten" or "created", the
-        other half of resolve_db_output_table()'s return value (via
-        on_run()) -- only relevant for DB output mode. Passed straight
-        through to _write_db_output_safely() so it knows whether
-        FINAL_SWAP needs a rename-existing-aside-to-backup step.
-        Previously discarded by on_run() (the call site kept only
-        resolved_table_name); now actually used -- see on_run().
+        the ProgressWindow and any dialogs. Output destination
+        resolution already happened in on_run() before this was
+        called, and always overwrites in place, so there is nothing
+        left here to confirm.
     """
-    global barangay_source, road_source, output_mode, overwrite_mode, parcel_output_column_overrides
+    global barangay_source, road_source, output_mode, parcel_output_column_overrides
     if not barangay_source or not road_source or not output_mode:
         messagebox.showerror("Error", "Selections incomplete (Barangay, Road, Output required).")
         return
@@ -2939,15 +2798,12 @@ def run_processing(app_root, resolved_table_name=None, resolved_outcome=None):
         f"postgresql://{creds['username']}:{creds['password']}@{creds['host']}:{creds['port']}/{creds['database']}"
     )
 
-    # resolved_table_name: the DB-output destination table. Resolution
-    # responsibility now belongs to on_run() (PRIORITY 3), on the main
-    # thread, BEFORE win.destroy() -- see Fix 1. Passed in as a parameter
-    # -- same approach already used in lot_location.py, road_surface.py,
-    # road_density.py, and land_shape_compactness.py. By the time it
-    # reaches this function it is treated as an already-validated value:
-    # either None (local output, or output_mode[0] != "db") or a
-    # confirmed table name (DB output, user already had the chance to
-    # cancel in on_run()). No re-resolution or re-validation happens here.
+    # output_mode (module global, set in on_run() before
+    # win.destroy()) is the only output-destination state this
+    # function consumes -- there is no separate table-name/outcome
+    # resolution step anymore; worker()'s per-source write site
+    # derives both the local path and the DB table directly from
+    # output_mode + out_base (see that block's local/db branches).
 
     cancel_flag = new_cancel_flag()
     progress = ProgressWindow(app_root, "Road Frontage Progress", cancel_flag=cancel_flag)
@@ -3119,54 +2975,34 @@ def run_processing(app_root, resolved_table_name=None, resolved_outcome=None):
 
                     brgy_gdf = result["parcels"]
 
-                    if output_mode[0] == "local":
-                        # Priority 1: filename resolution happens ONCE
-                        # here, for the main output only -- overwrite_mode
-                        # was already decided ONCE, up front, for the
-                        # whole batch (see the pre-scan + ask_overwrite_dialog()
-                        # in on_run()) -- no per-file prompt here.
-                        #
+                    # output_mode always matches barangay_source's own
+                    # type now (no more cross-mode -- see the Output
+                    # Destination removal), so src_type alone decides
+                    # the write path here; the former resolved_table_name
+                    # fallback for a local-source -> DB-output write is
+                    # gone, since that path (Local source -> Save to
+                    # Database) no longer exists.
+                    if src_type == "local":
                         # Naming convention: the main output reuses the
-                        # parcel source's own name directly, no tool-name
-                        # suffix (matches road_width.py's convention
-                        # exactly). This tool writes exactly this ONE
-                        # output file per source -- the previously-paired
-                        # QA layers have been removed entirely (see the
-                        # module docstring and process_frontage_single()'s
-                        # own docstring).
-                        desired_base_name = out_base
-                        candidate_path = os.path.join(output_mode[1], f"{desired_base_name}.gpkg")
-                        had_conflict = os.path.exists(candidate_path)
-                        if had_conflict and overwrite_mode == "new":
-                            base_name = resolve_output_base_name(output_mode[1], desired_base_name)
-                        else:
-                            # Either no conflict, or the user chose
-                            # "Overwrite" -- both cases use the plain
-                            # desired name (overwriting in place).
-                            base_name = desired_base_name
-
-                        out = os.path.join(output_mode[1], f"{base_name}.gpkg")
+                        # parcel source's own name directly, no
+                        # tool-name suffix (matches road_width.py's
+                        # convention exactly). Always overwrites in
+                        # place -- no "create new" numbering, no
+                        # conflict dialog.
+                        out = os.path.join(output_mode[1], f"{out_base}.gpkg")
                         _write_gpkg(brgy_gdf, out)
                         q.put(("open_gm", out, None, None))
                     else:
-                        # The actual destination table was already
-                        # decided by resolve_db_output_table(), BEFORE
-                        # this function (and the worker thread) even
-                        # started -- fuzzy matching + user confirmation
-                        # already happened there (see that function's
-                        # docstring). This just uses the result. Falls
-                        # back to out_base only if resolved_table_name
-                        # is somehow None here (output_mode[0] != "db"
-                        # can't reach this branch, so this is just a
-                        # defensive fallback).
-                        db_table = resolved_table_name if resolved_table_name is not None else out_base
+                        # DB-source -> DB-output: writes back to the
+                        # exact SAME table it read from -- no matching,
+                        # no dialog.
                         # D-Cancel: staging-write / verify / atomic
                         # rename-swap, replacing the previous direct
                         # to_postgis(..., if_exists="replace") call --
                         # see "DB ATOMIC WRITE / CANCEL-SAFE STAGING"
                         # above.
                         _write_db_output_safely(engine, schema, brgy_gdf,
-                                                 db_table, resolved_outcome,
+                                                 out_base, "overwritten",
                                                  run_id, run_started_at)
 
                 except Exception as source_err:
@@ -3324,361 +3160,6 @@ def _pick_db_tables(parent, tables, multi, on_select):
 
 
 # ========================================
-# OVERWRITE DIALOGS
-# ========================================
-def ask_overwrite_dialog(parent, conflicting_names):
-    """
-    Combined dialog shown ONCE, before any processing starts, when one or
-    more Land Parcel sources' desired local output filename already
-    exists in the chosen output folder. Not a per-file prompt -- every
-    conflicting name in the batch is listed together, and the chosen
-    action applies to ALL of them:
-
-      - "Overwrite": every conflicting file is replaced in place, using
-        its plain desired name (no numbering).
-      - "Create New File": every conflicting file is instead saved under
-        a new, non-colliding name via resolve_output_base_name()'s
-        auto-numbering -- the existing files are left untouched.
-      - "Cancel": aborts the ENTIRE run. Nothing is written, including
-        sources that had no conflict at all.
-
-    If the user wants a MIXED outcome (overwrite some, rename others),
-    the expected workflow is to run the tool twice -- once selecting
-    only the sources to overwrite, once for the rest -- rather than
-    choosing per-file in a single dialog.
-
-    Returns "overwrite", "new", or "cancel" (also returned if the
-    dialog's own titlebar close button is used, treated the same as an
-    explicit Cancel -- never silently defaults to a destructive choice).
-
-    Ported directly from road_width.py's validated implementation.
-    Deliberately does NOT call dialog.transient(parent): this app's root
-    is permanently withdrawn (see main()), and transient() on a withdrawn
-    parent is a known source of window-manager-dependent "dialog never
-    becomes viewable" behavior -- confirmed in road_width.py's own
-    testing. grab_set()+deiconify()+lift()+focus_force()+topmost is used
-    instead, matching this file's own existing dialog pattern elsewhere
-    (see _pick_db_tables()).
-    """
-    result = {"choice": "cancel"}
-
-    dialog = tk.Toplevel(parent)
-    apply_icon(dialog, "roadfrontage.ico")
-    dialog.title("File(s) Already Exist")
-    dialog.resizable(False, False)
-    dialog.grab_set()
-
-    def choose(value):
-        result["choice"] = value
-        dialog.destroy()
-
-    dialog.protocol("WM_DELETE_WINDOW", lambda: choose("cancel"))
-
-    # Buttons packed first, at the bottom -- guaranteed visible/reachable
-    # regardless of how long the scrollable list above them ends up being.
-    btn_frame = tk.Frame(dialog)
-    btn_frame.pack(side="bottom", fill="x", pady=(4, 12))
-    tk.Button(btn_frame, text="Overwrite", width=14, cursor="hand2",
-              command=lambda: choose("overwrite")).pack(side="left", padx=(16, 4))
-    tk.Button(btn_frame, text="Create New File", width=16, cursor="hand2",
-              command=lambda: choose("new")).pack(side="left", padx=4)
-    tk.Button(btn_frame, text="Cancel", width=10, cursor="hand2",
-              command=lambda: choose("cancel")).pack(side="left", padx=(4, 16))
-
-    tk.Label(dialog, text="The following output file(s) already exist:",
-             font=("Segoe UI", 10, "bold"), anchor="w"
-             ).pack(fill="x", padx=16, pady=(16, 4))
-
-    # Scrollable BOTH ways -- vertical for many conflicting names,
-    # horizontal for long filenames -- wrap="none" so long names stay on
-    # one line and scroll into view rather than wrapping awkwardly.
-    # Scrollbars are only shown when actually needed.
-    MAX_LIST_LINES = 10
-    TEXT_WIDTH_CHARS = 55
-
-    list_frame = tk.Frame(dialog)
-    list_frame.pack(fill="both", expand=True, padx=16, pady=(0, 4))
-    vscroll = tk.Scrollbar(list_frame, orient="vertical")
-    hscroll = tk.Scrollbar(list_frame, orient="horizontal")
-    text = tk.Text(
-        list_frame, wrap="none", height=min(len(conflicting_names), MAX_LIST_LINES),
-        width=TEXT_WIDTH_CHARS, yscrollcommand=vscroll.set, xscrollcommand=hscroll.set,
-        relief="flat", bg=dialog.cget("bg"), font=("Segoe UI", 9))
-    vscroll.config(command=text.yview)
-    hscroll.config(command=text.xview)
-    if len(conflicting_names) > MAX_LIST_LINES:
-        vscroll.pack(side="right", fill="y")
-    needs_hscroll = any(len(f"• {name}") > TEXT_WIDTH_CHARS for name in conflicting_names)
-    if needs_hscroll:
-        hscroll.pack(side="bottom", fill="x")
-    text.pack(side="left", fill="both", expand=True)
-    for name in conflicting_names:
-        text.insert("end", f"• {name}\n")
-    text.config(state="disabled")
-
-    tk.Label(dialog, text=(
-        "Overwrite will replace these files. Create New File will save "
-        "them under a new name instead, leaving the existing files "
-        "untouched. This choice applies to all files listed above."
-    ), anchor="w", justify="left", wraplength=420
-             ).pack(fill="x", padx=16, pady=(4, 16))
-
-    dialog.update_idletasks()
-    req_w = max(dialog.winfo_reqwidth(), 460)
-    req_h = dialog.winfo_reqheight()
-    # Centered on the SCREEN, not on `parent` -- `parent` here is
-    # MAIN.py's _tool_root, a deliberately invisible 1x1 anchor window
-    # placed off-screen at (-9999, -9999) purely for Tk plumbing (icon
-    # binding, mainloop hosting). Centering against it produced a wildly
-    # negative x/y that the old max(x,0)/max(y,0) clamp collapsed to
-    # exactly (0, 0) every time -- pinning the dialog to the screen's
-    # top-left corner regardless of where any real window (the CAMA
-    # Tools panel, Global Mapper, etc.) actually was. Screen dimensions
-    # are a stable, always-meaningful reference this dialog can center
-    # against instead. Button layout (packed side="bottom" above) is
-    # unaffected -- this only changes where the whole window is placed,
-    # not how its own contents are arranged inside it.
-    screen_w = dialog.winfo_screenwidth()
-    screen_h = dialog.winfo_screenheight()
-    x = (screen_w - req_w) // 2
-    y = (screen_h - req_h) // 2
-    dialog.geometry(f"{req_w}x{req_h}+{max(x,0)}+{max(y,0)}")
-
-    # deiconify/lift/focus_force/topmost are called LAST -- after content
-    # and geometry() -- see confirm_db_overwrite_dialog()'s matching
-    # comment for the full rationale (repositioning a window can perturb
-    # its stacking order against another always-on-top window from a
-    # separate process on some Windows builds). Topmost is deliberately
-    # never reset back to False afterward -- this dialog can stay open
-    # indefinitely waiting on the user's answer, and grab_set() alone
-    # cannot protect it from being covered by a separate process's window.
-    dialog.deiconify()
-    dialog.lift()
-    dialog.focus_force()
-    dialog.attributes("-topmost", True)
-
-    # A single lift()/topmost assertion at creation time was confirmed
-    # (in testing) to still be insufficient: the CAMA Tools floating
-    # panel is ITSELF persistently topmost (a separate process, always
-    # floating above the map), so whenever it regains z-order priority
-    # over this dialog -- e.g. after the user interacts with the map --
-    # a one-time lift() at dialog-creation time doesn't help, since that
-    # moment has already passed. This keeps re-asserting lift()+topmost
-    # every 250ms for as long as the dialog exists, so it keeps winning
-    # that z-order fight for its entire (indefinite, user-controlled)
-    # lifetime rather than only at the instant it first appeared.
-    # Self-cancels via the winfo_exists() guard once dialog.destroy()
-    # runs in choose() above -- no dangling after() callbacks survive
-    # the dialog closing.
-    def _keep_dialog_on_top():
-        if dialog.winfo_exists():
-            dialog.lift()
-            dialog.attributes("-topmost", True)
-            dialog.after(250, _keep_dialog_on_top)
-    dialog.after(250, _keep_dialog_on_top)
-
-    dialog.wait_window()
-    return result["choice"]
-
-
-def confirm_db_overwrite_dialog(parent, table_name):
-    """
-    Shown when find_matching_tables() returns EXACTLY ONE candidate for
-    the DB-output destination table. Asks the user to confirm before
-    overwriting that specific table -- fuzzy matching only PROPOSES a
-    candidate (see find_matching_tables()'s own docstring); this dialog
-    is the actual safety check before anything is overwritten.
-
-    Returns True (Yes -- proceed with overwriting table_name) or False
-    (No, or the dialog was closed -- caller must treat this as a full
-    cancel, not "create new" -- there is no "create new" for DB output).
-    """
-    result = {"confirmed": False}
-
-    dialog = tk.Toplevel(parent)
-    apply_icon(dialog, "roadfrontage.ico")
-    dialog.title("ROAD FRONTAGE TOOL")
-    dialog.resizable(False, False)
-    dialog.grab_set()
-
-    def choose(confirmed):
-        result["confirmed"] = confirmed
-        dialog.destroy()
-
-    dialog.protocol("WM_DELETE_WINDOW", lambda: choose(False))
-
-    # Buttons packed first, at the bottom -- same reasoning as
-    # ask_overwrite_dialog() above.
-    btn_frame = tk.Frame(dialog)
-    btn_frame.pack(side="bottom", fill="x", pady=(4, 12))
-    tk.Button(btn_frame, text="Yes", width=14, cursor="hand2",
-              command=lambda: choose(True)).pack(side="left", padx=(16, 4))
-    tk.Button(btn_frame, text="No", width=14, cursor="hand2",
-              command=lambda: choose(False)).pack(side="left", padx=(4, 16))
-
-    tk.Label(
-        dialog, text="Found existing table:",
-        font=("Segoe UI", 10, "bold"), anchor="w"
-    ).pack(fill="x", padx=16, pady=(16, 4))
-
-    tk.Label(
-        dialog, text=table_name, anchor="w", font=("Segoe UI", 9)
-    ).pack(fill="x", padx=16, pady=(0, 12))
-
-    tk.Label(dialog, text="Overwrite this table?", anchor="w"
-             ).pack(fill="x", padx=16, pady=(0, 16))
-
-    dialog.update_idletasks()
-    req_w = max(dialog.winfo_reqwidth(), 360)
-    req_h = dialog.winfo_reqheight()
-    # Centered on the SCREEN, not on `parent` -- `parent` here is
-    # MAIN.py's _tool_root, a deliberately invisible 1x1 anchor window
-    # placed off-screen at (-9999, -9999) purely for Tk plumbing (icon
-    # binding, mainloop hosting). Centering against it produced a wildly
-    # negative x/y that the old max(x,0)/max(y,0) clamp collapsed to
-    # exactly (0, 0) every time -- pinning the dialog to the screen's
-    # top-left corner regardless of where any real window (the CAMA
-    # Tools panel, Global Mapper, etc.) actually was. Screen dimensions
-    # are a stable, always-meaningful reference this dialog can center
-    # against instead. Button layout (packed side="bottom" above) is
-    # unaffected -- this only changes where the whole window is placed,
-    # not how its own contents are arranged inside it.
-    screen_w = dialog.winfo_screenwidth()
-    screen_h = dialog.winfo_screenheight()
-    x = (screen_w - req_w) // 2
-    y = (screen_h - req_h) // 2
-    dialog.geometry(f"{req_w}x{req_h}+{max(x,0)}+{max(y,0)}")
-
-    # deiconify/lift/focus_force/topmost are called LAST -- after all
-    # content is built and geometry() has already repositioned the
-    # window -- not before. Calling them before geometry() risked losing
-    # the z-order fight against another always-on-top window from a
-    # separate process (the CAMA Tools floating panel, which sets its
-    # own -topmost persistently): repositioning a window can perturb its
-    # stacking order on some Windows compositor/window-manager builds,
-    # so asserting "come to front" only after the window has reached its
-    # final size/position is the safer order. See also the comment above
-    # -- topmost is deliberately never reset back to False afterward,
-    # since this dialog can stay open indefinitely waiting on the user.
-    dialog.deiconify()
-    dialog.lift()
-    dialog.focus_force()
-    dialog.attributes("-topmost", True)
-
-    # See ask_overwrite_dialog()'s matching comment -- a one-time lift()
-    # at creation isn't enough against a persistently-topmost window from
-    # a separate process (the CAMA Tools floating panel). Keeps
-    # re-asserting for the dialog's whole (indefinite) lifetime;
-    # self-cancels once dialog.destroy() runs in choose() above.
-    def _keep_dialog_on_top():
-        if dialog.winfo_exists():
-            dialog.lift()
-            dialog.attributes("-topmost", True)
-            dialog.after(250, _keep_dialog_on_top)
-    dialog.after(250, _keep_dialog_on_top)
-
-    dialog.wait_window()
-    return result["confirmed"]
-
-
-def choose_db_overwrite_dialog(parent, candidates):
-    """
-    Shown when find_matching_tables() returns MORE THAN ONE candidate
-    for the DB-output destination table -- e.g. both "landparcel_draft"
-    and "landparcel_final" exist and both fuzzy-match the incoming
-    filename. Lets the user pick exactly which one to overwrite via
-    radio buttons; the FIRST candidate in the list is pre-selected by
-    default.
-
-    Returns the chosen table name, or None if the user cancelled (must
-    be treated as a full cancel by the caller -- there is no "create
-    new" for DB output).
-    """
-    result = {"chosen": None}
-    selected = tk.StringVar(value=candidates[0])
-
-    dialog = tk.Toplevel(parent)
-    apply_icon(dialog, "roadfrontage.ico")
-    dialog.title("ROAD FRONTAGE TOOL")
-    dialog.resizable(False, False)
-    dialog.grab_set()
-
-    def choose(confirm):
-        result["chosen"] = selected.get() if confirm else None
-        dialog.destroy()
-
-    dialog.protocol("WM_DELETE_WINDOW", lambda: choose(False))
-
-    # Buttons packed first, at the bottom -- same reasoning as
-    # ask_overwrite_dialog() above.
-    btn_frame = tk.Frame(dialog)
-    btn_frame.pack(side="bottom", fill="x", pady=(4, 12))
-    tk.Button(btn_frame, text="Confirm", width=14, cursor="hand2",
-              command=lambda: choose(True)).pack(side="left", padx=(16, 4))
-    tk.Button(btn_frame, text="Cancel", width=14, cursor="hand2",
-              command=lambda: choose(False)).pack(side="left", padx=(4, 16))
-
-    tk.Label(
-        dialog, text="Multiple possible matches found.",
-        font=("Segoe UI", 10, "bold"), anchor="w"
-    ).pack(fill="x", padx=16, pady=(16, 4))
-
-    tk.Label(
-        dialog, text="Select the table to overwrite:", anchor="w"
-    ).pack(fill="x", padx=16, pady=(0, 8))
-
-    radio_frame = tk.Frame(dialog)
-    radio_frame.pack(fill="x", padx=16, pady=(0, 16))
-    for name in candidates:
-        tk.Radiobutton(
-            radio_frame, text=name, variable=selected, value=name,
-            anchor="w"
-        ).pack(fill="x", anchor="w")
-
-    dialog.update_idletasks()
-    req_w = max(dialog.winfo_reqwidth(), 360)
-    req_h = dialog.winfo_reqheight()
-    # Centered on the SCREEN, not on `parent` -- `parent` here is
-    # MAIN.py's _tool_root, a deliberately invisible 1x1 anchor window
-    # placed off-screen at (-9999, -9999) purely for Tk plumbing (icon
-    # binding, mainloop hosting). Centering against it produced a wildly
-    # negative x/y that the old max(x,0)/max(y,0) clamp collapsed to
-    # exactly (0, 0) every time -- pinning the dialog to the screen's
-    # top-left corner regardless of where any real window (the CAMA
-    # Tools panel, Global Mapper, etc.) actually was. Screen dimensions
-    # are a stable, always-meaningful reference this dialog can center
-    # against instead. Button layout (packed side="bottom" above) is
-    # unaffected -- this only changes where the whole window is placed,
-    # not how its own contents are arranged inside it.
-    screen_w = dialog.winfo_screenwidth()
-    screen_h = dialog.winfo_screenheight()
-    x = (screen_w - req_w) // 2
-    y = (screen_h - req_h) // 2
-    dialog.geometry(f"{req_w}x{req_h}+{max(x,0)}+{max(y,0)}")
-
-    # deiconify/lift/focus_force/topmost are called LAST -- see
-    # confirm_db_overwrite_dialog()'s matching comment for the full
-    # rationale.
-    dialog.deiconify()
-    dialog.lift()
-    dialog.focus_force()
-    dialog.attributes("-topmost", True)
-
-    # See ask_overwrite_dialog()'s matching comment -- periodic
-    # re-assertion for the dialog's whole lifetime; self-cancels once
-    # dialog.destroy() runs in choose() above.
-    def _keep_dialog_on_top():
-        if dialog.winfo_exists():
-            dialog.lift()
-            dialog.attributes("-topmost", True)
-            dialog.after(250, _keep_dialog_on_top)
-    dialog.after(250, _keep_dialog_on_top)
-
-    dialog.wait_window()
-    return result["chosen"]
-
-
-# ========================================
 # MAIN WINDOW
 # ========================================
 def is_batch_config_complete(config):
@@ -3724,8 +3205,11 @@ def open_main_window(root, db_verified=True, batch_mode=False,
     Local-file/Database-table radio toggle), a Road Classification
     section (per-source Lot Location/Lot Label checkboxes, mutually
     exclusive with the Road Type exclusion filter -- see the module
-    docstring and the RUNTIME STATE section), an Output destination
-    picker, and a Run button gated by _update_run_button_state().
+    docstring and the RUNTIME STATE section), and a Run button gated by
+    _update_run_button_state(). There is no separate Output Destination
+    section -- the Land Parcel source is always overwritten in place
+    (see run_processing()'s own docstring, and module docstring
+    OUTPUTS above, for exactly how, per source type).
 
     Runs TWO independent background detect-on-select systems (each its
     own daemon thread + win.after()-polled queue.Queue): one for Land
@@ -3739,16 +3223,16 @@ def open_main_window(root, db_verified=True, batch_mode=False,
         root: the parent Tk root this window is opened under.
         db_verified: bool, see main()'s own docstring for the full
             explanation -- passed straight through here. Used once,
-            near the end of this function, to disable the three
+            near the end of this function, to disable the two
             "Database"-style radio buttons (parcel_radio_db,
-            road_radio_db, out_radio_db) if False; see that block's
-            own comment for exactly why. When batch_mode=True, only
-            road_radio_db is built at all, so only it is gated --
-            parcel_radio_db/out_radio_db do not exist in that branch.
+            road_radio_db) if False; see that block's own comment for
+            exactly why. When batch_mode=True, only road_radio_db is
+            built at all, so only it is gated -- parcel_radio_db does
+            not exist in that branch.
         batch_mode: bool, default False -- NEW. When True, the Land
-            Parcel Source and Output Destination sections below are
-            not built at all (supplied globally by the Batch
-            Valuation orchestrator instead); Road Network Source --
+            Parcel Source section below is not built at all (supplied
+            globally by the Batch Valuation orchestrator instead);
+            Road Network Source --
             including its own Filter by Road Type checklist, entirely
             unmodified -- is the only section still shown, since it is
             this tool's only other setting; "Run Processing" is
@@ -3801,7 +3285,6 @@ def open_main_window(root, db_verified=True, batch_mode=False,
     # the root cause of the blank-GUI symptom reported in testing.
     parcel_source_type = tk.StringVar(master=win, value="local")
     road_source_type   = tk.StringVar(master=win, value="local")
-    output_dest_type   = tk.StringVar(master=win, value="local")
 
     # Single-selection architecture: one local file and one DB table
     # may exist in memory at any time. Authority variables -- all GUI
@@ -3810,7 +3293,6 @@ def open_main_window(root, db_verified=True, batch_mode=False,
     parcel_db_table   = None   # authority: single DB table name
     road_local_path    = tk.StringVar(master=win)
     road_db_table      = tk.StringVar(master=win)
-    output_local_dir   = tk.StringVar(master=win)
 
     PAD = dict(padx=8, pady=4)
 
@@ -4564,16 +4046,12 @@ def open_main_window(root, db_verified=True, batch_mode=False,
         """
         has_parcel = bool(parcel_local_path) if parcel_source_type.get() == "local" else bool(parcel_db_table)
         has_road = bool(road_local_path.get()) if road_source_type.get() == "local" else bool(road_db_table.get())
-        has_output = bool(output_local_dir.get()) if output_dest_type.get() == "local" else True
 
         if not has_parcel:
             run_status_var.set("Please select a Land Parcel source.")
             ready = False
         elif not has_road:
             run_status_var.set("Please select a Road Network source.")
-            ready = False
-        elif not has_output:
-            run_status_var.set("Please select an Output destination.")
             ready = False
         elif parcel_is_reading:
             checking_name = (
@@ -5525,15 +5003,15 @@ def open_main_window(root, db_verified=True, batch_mode=False,
     # NEW -- batch mode ONLY here: in the non-batch path, the initial
     # _toggle_road()/_update_road_classification_visibility() sync stays
     # in its ORIGINAL position, at the very end alongside
-    # _toggle_parcel()/_toggle_output() (see below) -- calling it this
-    # early would fire filter_road_type_var's own trace_add callback
+    # _toggle_parcel() (see below) -- calling it this early would fire
+    # filter_road_type_var's own trace_add callback
     # (-> _update_run_button_state()) at a point where run_btn does not
-    # exist yet in that path (Section 3/the Run button are only built
-    # further below, inside `if not batch_mode:`), raising NameError.
-    # In batch mode this is safe because _update_run_button_state was
-    # already shadowed to a no-op before Section 1, and there is no
-    # "later" position to defer to -- Section 3/Run button are never
-    # built in that branch at all.
+    # exist yet in that path (the Run button is only built further
+    # below, inside `if not batch_mode:`), raising NameError. In batch
+    # mode this is safe because _update_run_button_state was already
+    # shadowed to a no-op before Section 1, and there is no "later"
+    # position to defer to -- the Run button is never built in that
+    # branch at all.
     if batch_mode:
         _toggle_road()
         _update_road_classification_visibility()
@@ -5542,68 +5020,14 @@ def open_main_window(root, db_verified=True, batch_mode=False,
             attach_no_db_tooltip(road_radio_db)
 
     if not batch_mode:
-        # ── SECTION 3: OUTPUT ────────────────────────────────────────
-        section_label(win, "Output Destination")
 
-        output_frame = tk.Frame(win)
-        output_frame.pack(fill="x", padx=18, pady=2)
-
-        out_radio_row = tk.Frame(output_frame)
-        out_radio_row.pack(fill="x")
-        tk.Radiobutton(out_radio_row, text="Save to Local Folder",
-                       variable=output_dest_type, value="local",
-                       command=lambda: _toggle_output()).pack(side="left")
-        # Named (unlike this section's Local Folder radio above) so the
-        # db_verified block near the end of this function can disable it
-        # when the session has no verified database connection.
-        out_radio_db = tk.Radiobutton(
-            out_radio_row, text="Save to Database",
-            variable=output_dest_type, value="db",
-            command=lambda: _toggle_output())
-        out_radio_db.pack(side="left", padx=(12, 0))
-
-        output_dir_var = tk.StringVar(master=win, value="No folder selected")
-        output_db_var  = tk.StringVar(master=win,
-                                      value="Will write back to the connected PostGIS schema.")
-
-        out_action_row = tk.Frame(output_frame)
-        out_action_row.pack(fill="x", pady=2)
-
-        out_lbl = tk.Label(out_action_row, textvariable=output_dir_var,
-                           fg="gray", anchor="w", width=42)
-        out_lbl.pack(side="left")
-
-        out_btn = tk.Button(out_action_row, text="Browse…", width=10, cursor="hand2")
-        out_btn.pack(side="left", **PAD)
-
-        def browse_output_dir():
-            d = filedialog.askdirectory()
-            if d:
-                output_local_dir.set(d)
-                output_dir_var.set(d)
-                _reflow_window()
-                _update_run_button_state()
-
-        def _toggle_output():
-            if output_dest_type.get() == "local":
-                out_lbl.config(textvariable=output_dir_var,
-                               font=("Segoe UI", 9), fg="gray")
-                out_btn.config(text="Browse…", command=browse_output_dir)
-                out_btn.pack(side="left", **PAD)
-            else:
-                out_lbl.config(textvariable=output_db_var,
-                               font=("Segoe UI", 8, "italic"), fg="gray")
-                out_btn.pack_forget()
-            _update_run_button_state()
-
-        out_btn.config(command=browse_output_dir)
 
         # ── RUN BUTTON ───────────────────────────────────────────────
         ttk.Separator(win, orient="horizontal").pack(
             fill="x", padx=10, pady=(12, 4))
 
         def on_run():
-            global barangay_source, road_source, output_mode, parcel_classification_selection, filter_by_road_type_active, road_type_excluded_values, overwrite_mode, parcel_output_column_overrides
+            global barangay_source, road_source, output_mode, parcel_classification_selection, filter_by_road_type_active, road_type_excluded_values, parcel_output_column_overrides
 
             if parcel_source_type.get() == "local":
                 if not parcel_local_path:
@@ -5632,15 +5056,6 @@ def open_main_window(root, db_verified=True, batch_mode=False,
                         "Please select a Road Network table.")
                     return
                 road_source = ("db", [road_db_table.get()])
-
-            if output_dest_type.get() == "local":
-                if not output_local_dir.get():
-                    messagebox.showerror("Missing Input",
-                        "Please select an output folder.")
-                    return
-                output_mode = ("local", output_local_dir.get())
-            else:
-                output_mode = ("db", None)
 
             # Road Classification: resolved mode + excluded values are read
             # here and stored as module globals, same pattern as
@@ -5716,92 +5131,45 @@ def open_main_window(root, db_verified=True, batch_mode=False,
             else:
                 parcel_output_column_overrides = {}
 
-            # ------------------------------------------------------------------
-            # PRIORITY 2: output FILENAME conflict pre-scan. Resolved ONCE, up
-            # front, here on the main thread -- BEFORE the window is destroyed
-            # and BEFORE run_processing()'s background worker starts (Tkinter
-            # dialogs must never be shown from a worker thread). Desired names
-            # only need each source's own filename/table name (no need to
-            # actually read/measure anything yet), so this check is cheap.
-            # Ported from road_width.py's validated pattern -- see
-            # ask_overwrite_dialog()'s docstring for the full behavior.
-            # Matches road_width.py's own convention exactly: the main output
-            # reuses the parcel source's own name directly, no tool-name
-            # suffix appended (confirmed/changed by the project lead -- the
-            # "_road_frontage" suffix that used to be appended here is gone).
-            # This tool now writes exactly one output file per source -- the
-            # previously-paired QA layers (and the with_output_suffix()
-            # helper that derived their filenames) have been removed
-            # entirely -- see the module docstring and process_frontage_
-            # single()'s own docstring.
-            # ------------------------------------------------------------------
-            overwrite_mode = None
-            if output_mode[0] == "local":
-                desired_names = (
-                    [os.path.splitext(os.path.basename(p))[0] for p in barangay_source[1]]
-                    if barangay_source[0] == "local"
-                    else list(barangay_source[1])
-                )
-                conflicting_names = [
-                    f"{name}.gpkg" for name in desired_names
-                    if os.path.exists(os.path.join(output_mode[1], f"{name}.gpkg"))
-                ]
-                if conflicting_names:
-                    overwrite_mode = ask_overwrite_dialog(win, conflicting_names)
-                    if overwrite_mode == "cancel":
-                        print("Run cancelled by user (existing output file(s) found).")
-                        return
-
-            # ------------------------------------------------------------------
-            # PRIORITY 3: DB-output destination table resolution — mirrors
-            # PRIORITY 2 above. Resolved here on the main thread, before
-            # win.destroy(), so confirm_db_overwrite_dialog() /
-            # choose_db_overwrite_dialog() (invoked inside
-            # resolve_db_output_table()) still have a live parent window, and
-            # a Cancel here leaves the fully-configured win intact instead of
-            # forcing a from-scratch reopen. Previously this resolution
-            # happened inside run_processing(), which is only ever invoked
-            # AFTER win.destroy() -- see Fix 1 root cause. resolve_db_output_
-            # table()'s own matching/decision logic is untouched; only the
-            # call site moved here.
-            #
-            # resolved_table_name is passed into run_processing() as a
-            # parameter -- same approach already used in lot_location.py,
-            # road_surface.py, road_density.py, and land_shape_compactness.py.
-            # overwrite_mode above is left exactly as-is (module-level global,
-            # unique to this file) -- not refactored to match. resolved_outcome
-            # IS threaded through as of this task (D-Cancel): unlike road_
-            # surface.py/road_density.py/land_shape_compactness.py, this file
-            # now has a _write_db_output_safely()-style write (see the "DB
-            # ATOMIC WRITE / CANCEL-SAFE STAGING" section above), which needs
-            # to know whether FINAL_SWAP requires a rename-existing-aside-to-
-            # backup step -- so both halves of resolve_db_output_table()'s
-            # return value are kept and passed into run_processing() below.
-            # resolve_db_output_table()'s own matching logic also now runs
-            # the crash-orphan-recovery scan first (see that function's own
-            # docstring) -- creds is loaded here regardless (already was, to
-            # determine _resolve_schema) and passed straight through.
-            # ------------------------------------------------------------------
-            resolved_table_name = None
-            resolved_outcome = None
-            if output_mode[0] == "db":
-                _resolve_creds = load_db_credentials()
-                if not _resolve_creds:
+            # Output destination is now fully determined by the Land
+            # Parcel source itself -- no user choice, no "create new"
+            # numbering, and no file/table conflict dialog. Local
+            # source: overwritten in place (or a same-named sibling
+            # .gpkg created for a non-.gpkg source) in the source's
+            # own folder. DB source: overwrites the exact same table.
+            # See worker()'s per-source write site for exactly how
+            # each candidate path/table is derived from this.
+            if barangay_source[0] == "local":
+                output_mode = ("local", os.path.dirname(barangay_source[1][0]))
+            else:
+                output_mode = ("db", None)
+                # Orphan-recovery: surfaces any leftover _camastg_*/
+                # _camabak_* table from a previous interrupted DB run,
+                # before this run's own write. Relocated here from
+                # the now-removed resolve_db_output_table() (which
+                # used to also do local-filename fuzzy-matching
+                # against existing tables -- no longer needed now that
+                # DB output always targets the exact same table the
+                # Land Parcel source was read from). Error-handling
+                # kept exactly as it was in resolve_db_output_table():
+                # no guard, no try/except -- a scan failure here CAN
+                # abort the Run, same as before this task (this file
+                # never wrapped the scan defensively, unlike
+                # road_width.py -- do not unify, E.5/BITAG 4).
+                _output_creds = load_db_credentials()
+                if not _output_creds:
                     messagebox.showerror("Error", "Missing pg_credentials.json")
                     return
-                _resolve_schema = _resolve_creds["schema"]
-                resolved_table_name, resolved_outcome = resolve_db_output_table(
-                    win, _resolve_schema, barangay_source, _resolve_creds
-                )
-                if resolved_table_name is None:
-                    print("Run cancelled by user (database output table not confirmed).")
-                    return
+                _output_schema = _output_creds["schema"]
+                orphans = _scan_orphaned_cama_tables(_output_schema, _output_creds)
+                if orphans:
+                    _prompt_orphaned_cama_tables(win, orphans, _output_schema, _output_creds)
 
             win.destroy()
             if _app_root is None:
                 messagebox.showerror("Error", "No root window available. Please restart the tool.")
                 return
-            run_processing(_app_root, resolved_table_name, resolved_outcome)
+            run_processing(_app_root)
 
         run_btn = tk.Button(win, text="▶  Run Processing", command=on_run,
                   bg="#2e7d32", fg="white",
@@ -5821,15 +5189,14 @@ def open_main_window(root, db_verified=True, batch_mode=False,
         # set initial button commands to match default radio state
         _toggle_parcel()
         _toggle_road()
-        _toggle_output()
         _update_parcel_classification_visibility()
         _update_road_classification_visibility()
         _update_run_button_state()
 
         # If this session's database connection was not VERIFIED at the
         # moment this tool was launched (see main()'s own db_verified
-        # docstring), disable the three "Database"-style radio buttons --
-        # parcel_radio_db, road_radio_db, out_radio_db -- using the shared
+        # docstring), disable the "Database"-style radio buttons --
+        # parcel_radio_db, road_radio_db -- using the shared
         # utils.db_gate_ui helpers (same disabled-cursor convention and
         # hover tooltip every other tool file uses for this). Only the
         # "db" radio in each pair is touched; the "local"/file-based radio
@@ -5839,7 +5206,7 @@ def open_main_window(root, db_verified=True, batch_mode=False,
         # AFTER this window has already opened -- that remains fully in
         # effect regardless of db_verified.
         if not db_verified:
-            for _db_radio in (parcel_radio_db, road_radio_db, out_radio_db):
+            for _db_radio in (parcel_radio_db, road_radio_db):
                 disable_db_radio(_db_radio)
                 attach_no_db_tooltip(_db_radio)
     else:
