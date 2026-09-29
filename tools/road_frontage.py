@@ -215,9 +215,17 @@ def show_tool_dialog(parent, title, message, body_icon="success"):
     tk.Button(win, text="OK", width=10, command=win.destroy).pack(pady=(0, 15))
 
     win.update_idletasks()
-    x = parent.winfo_rootx() + (parent.winfo_width() - win.winfo_width()) // 2
-    y = parent.winfo_rooty() + (parent.winfo_height() - win.winfo_height()) // 2
-    win.geometry(f"+{x}+{y}")
+    # Centered on the SCREEN, not on `parent` -- parent here is the
+    # app's invisible off-screen anchor window, so centering against it
+    # would place this dialog off-screen too. Same fix already applied
+    # to this file's other dialogs (see ask_overwrite_dialog()).
+    screen_w = win.winfo_screenwidth()
+    screen_h = win.winfo_screenheight()
+    req_w = win.winfo_reqwidth()
+    req_h = win.winfo_reqheight()
+    x = (screen_w - req_w) // 2
+    y = (screen_h - req_h) // 2
+    win.geometry(f"+{max(x, 0)}+{max(y, 0)}")
 
     win.grab_set()      # modal, same as messagebox
     win.wait_window()
