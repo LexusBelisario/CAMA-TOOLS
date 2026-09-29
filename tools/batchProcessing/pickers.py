@@ -68,11 +68,20 @@ def pick_db_table(win, on_select):
     Parcel Source and Output Destination, so it is written once here
     rather than inside SourcePicker itself (which stays a pure UI
     class, with no DB-fetch logic of its own).
+
+    fetch_tables() returns None when the table list could not be
+    obtained; it has ALREADY shown its own error dialog in that case, so
+    this function shows nothing more. Only a genuinely empty schema
+    (an empty list) reaches the "No Tables" warning below.
     """
     creds = load_db_credentials()
     if not creds:
         return
     tables = fetch_tables(creds["schema"])
+    if tables is None:
+        # fetch_tables() has ALREADY shown the error dialog -- show
+        # nothing more (None means "could not obtain", not "empty").
+        return
     if not tables:
         messagebox.showwarning(
             "No Tables", "No tables found in the database schema.",

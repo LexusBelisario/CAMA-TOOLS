@@ -78,12 +78,32 @@ PURPOSE:
             db_output.py          <- future: overwrite-confirmation
                                  dialogs
 
+    NON-TECHNICAL ERROR WORDING (added by the database-error-messages
+    task): this module is also the single home of the short, plain-
+    English wording shown to a non-technical user for a database
+    connection failure -- see friendly_connection_error_message() below.
+    It is deliberately placed here rather than in core/startup_and_db_ui.py
+    because the 11 tool files (and tools/batchProcessing/pickers.py) must
+    never import anything from core/ -- only utils/ modules are shared
+    across the core/tools boundary. core/startup_and_db_ui.py imports
+    this function from here instead of keeping its own private copy.
+
 INPUTS:
     _get_credentials_path() / get_credentials_path(): none.
     load_db_credentials(): none (reads pg_credentials.json from the path
     _get_credentials_path() resolves).
     fetch_tables(schema): schema (str) -- the PostGIS/PostgreSQL schema
     name to list tables from.
+    friendly_connection_error_message(e, context="saved"): e -- the
+    caught Exception from a psycopg2.connect() (or SQLAlchemy-wrapped
+    psycopg2) call. context -- "saved" (the operation is using
+    information already saved in Database Management, e.g. a tool's
+    Database Table picker or the Update Map / Update Database
+    pre-check) or "entered" (the user just typed the values into the
+    Configure Database / Database Management dialog and is testing
+    them). Any other value (including None or a typo) is treated the
+    same as "saved" -- this function never raises over an unrecognized
+    context.
 
 OUTPUTS:
     _get_credentials_path() -> str: absolute path to pg_credentials.json
@@ -94,9 +114,24 @@ OUTPUTS:
     load_db_credentials() -> dict | None: the parsed, validated
     credentials dict (host, port, database, username, password, schema),
     or None if the file is missing, malformed, or missing a required key.
-    fetch_tables(schema) -> list[str]: table names found in the given
-    schema, or an empty list if credentials are missing/invalid or the
-    connection/query fails.
+    A short, non-technical Tkinter messagebox dialog is shown before
+    returning None; no raw exception text or file path ever appears in
+    that dialog (the raw text, when there is one, is printed to stderr
+    instead -- this module has no logging facility of its own).
+    fetch_tables(schema) -> list[str] | None: table names found in the
+    given schema (possibly an empty list, when the schema genuinely has
+    no tables), or None when the table list could not be obtained at
+    all (missing/invalid credentials, or a connection/query failure).
+    On None, a single non-technical messagebox dialog has ALREADY been
+    shown (either by load_db_credentials() for a credentials problem,
+    or by fetch_tables() itself for a connection/query problem) --
+    callers must not show a second dialog for a None return. An empty
+    list ([]) is a successful result and never accompanied by a dialog.
+    friendly_connection_error_message(e, context="saved") -> str: a
+    short, non-technical, English-only message with no exception class
+    names, driver wording, hostnames, ports, usernames, or trailing
+    "try again" / "contact support" instruction -- safe to show directly
+    in a messagebox.
 
 DEPENDENCIES:
     os, sys, json, shutil, tkinter.messagebox (stdlib). psycopg2
@@ -109,9 +144,11 @@ SIDE EFFECTS:
     into that folder (see _get_credentials_path()'s own docstring).
     Opens (and closes) a live PostgreSQL/PostGIS network connection via
     psycopg2. Shows a Tkinter messagebox error dialog on any
-    credential, connection, or query failure. No side effects occur at
-    import time -- all of the above happens only when these functions
-    are actually called.
+    credential, connection, or query failure. Prints raw exception text
+    to stderr (never to a dialog) when a credentials file cannot be
+    read or a connection/query fails. No side effects occur at import
+    time -- all of the above happens only when these functions are
+    actually called.
 """
 import os
 import sys
@@ -198,6 +235,134 @@ def get_credentials_path():
     return _get_credentials_path()
 
 
+def friendly_connection_error_message(e, context="saved"):
+    """
+    Translates a psycopg2 (or SQLAlchemy-wrapped psycopg2) connection
+    exception into a short, non-technical message safe to show directly
+    in a Tkinter messagebox -- the single shared translator for every
+    database-connection failure a non-technical user can see anywhere
+    in the application (a tool's Database Table picker, the Update Map
+    / Update Database pre-check, and the Configure Database / Database
+    Management dialog's own connection test).
+
+    psycopg2 does not expose a structured, reliable error-code
+    attribute for every failure mode a plain psycopg2.connect() call
+    can raise, so this matches on the exception's own message text --
+    the same approach any non-technical-facing wrapper around a
+    driver-level exception has to take when the driver's own message is
+    the only signal available. Matching is case-insensitive substring
+    matching against str(e).lower(), which also works unchanged when
+    psycopg2's exception arrives wrapped by SQLAlchemy (e.g.
+    "(psycopg2.OperationalError) connection to server ... failed:
+    FATAL: password authentication failed ...") since the original
+    driver wording is still present inside the wrapped text.
+
+    The two contexts produce different wording for the same underlying
+    failure, because the two situations are different for the user:
+    "saved" means the operation is using information already saved in
+    Database Management (so the fix is to go open Database Management),
+    while "entered" means the user is inside the Database Management
+    (Configure Database) dialog right now, testing values they just
+    typed (so "you entered" is the accurate description). Any context
+    value other than the literal string "entered" (including None, an
+    empty string, or a typo) is treated as "saved" -- this function
+    never raises over an unrecognized context.
+
+    Matching order (checked in this exact sequence -- order matters,
+    since some patterns are substrings of what other failures can also
+    contain):
+        1. "authentication failed" in text, OR ('role "' in text AND
+           "does not exist" in text)
+           -> wrong username/password. This ordering is what fixes a
+           real defect: PostgreSQL's password-auth failure text does
+           NOT reveal whether the role itself is unknown or the
+           password is simply wrong (both say "password authentication
+           failed for user ..."), and a separate, unknown-role failure
+           can independently say `role "x" does not exist` -- both
+           must map to the credentials message, and checking this rule
+           BEFORE the database-name rule below is what keeps
+           `role "x" does not exist` from being misread as an unknown
+           database name.
+        2. "database" in text AND "does not exist" in text
+           -> database name not found.
+        3. "invalid integer value" in text OR "invalid port" in text
+           -> invalid port value.
+        4. "could not translate host name" in text, OR
+           "name or service not known" in text, OR
+           "unknown host" in text, OR "no such host" in text, OR
+           "getaddrinfo" in text
+           -> host not found / connection refused wording.
+        5. "connection refused" in text OR "actively refused" in text
+           -> host not found / connection refused wording (same
+           message as rule 4 -- from the user's point of view, an
+           unreachable host and a refused connection look identical:
+           "something about the saved/entered connection information
+           is wrong").
+        6. "timeout" in text OR "timed out" in text
+           -> the database did not respond in time. Identical wording
+           in both contexts (E.4) -- a slow/unreachable server is not
+           attributed to a typo the user made.
+        7. "no pg_hba.conf entry" in text
+           -> the server rejected the connection. Identical wording in
+           both contexts (E.4) -- a server-side access rule is not
+           something either context's wording implies the user can fix
+           by re-checking what they saved or typed.
+        8. none of the above matched
+           -> generic fallback: "Could not connect to the database."
+           (identical wording in both contexts -- deliberately vague
+           when the specific cause is unknown, rather than guessing).
+
+    Args:
+        e: the caught Exception from psycopg2.connect() (or a
+            SQLAlchemy-wrapped connection/query failure that still
+            contains the original psycopg2/libpq text).
+        context (str): "saved" or "entered" -- see above. Defaults to
+            "saved". Any other value is treated as "saved".
+
+    Returns:
+        str: a short, user-facing, English-only message. No exception
+        class names, no port numbers, no hostnames, no usernames, no
+        driver/SQL wording, and no trailing instruction sentence (e.g.
+        no "try again" or "contact your administrator").
+    """
+    text = str(e).lower()
+    entered = (context == "entered")
+
+    if "authentication failed" in text or ('role "' in text and "does not exist" in text):
+        if entered:
+            return "The username or password you entered is incorrect."
+        return "The username or password saved in Database Management is incorrect."
+
+    if "database" in text and "does not exist" in text:
+        if entered:
+            return "The database name you entered could not be found on the server."
+        return "The database name saved in Database Management could not be found on the server."
+
+    if "invalid integer value" in text or "invalid port" in text:
+        if entered:
+            return "The port you entered is not valid."
+        return "The port saved in Database Management is not valid."
+
+    if ("could not translate host name" in text
+            or "name or service not known" in text
+            or "unknown host" in text
+            or "no such host" in text
+            or "getaddrinfo" in text
+            or "connection refused" in text
+            or "actively refused" in text):
+        if entered:
+            return "Could not connect to the database using the information you entered."
+        return "Could not connect to the database using the information saved in Database Management."
+
+    if "timeout" in text or "timed out" in text:
+        return "The database did not respond in time."
+
+    if "no pg_hba.conf entry" in text:
+        return "The database server did not allow this connection."
+
+    return "Could not connect to the database."
+
+
 def load_db_credentials():
     """
     Loads and validates pg_credentials.json.
@@ -205,15 +370,20 @@ def load_db_credentials():
     Returns:
         dict | None: the parsed credentials dict (host, port, database,
         username, password, schema) on success. Returns None -- after
-        showing a Tkinter messagebox error dialog -- if the file is
-        missing, is not valid JSON, or is missing any required key.
+        showing a short, non-technical Tkinter messagebox error dialog
+        -- if the file is missing, is not valid JSON, or is missing any
+        required key. Dialog titles are unchanged ("Missing
+        Credentials", "Invalid Credentials", "Credential Error"); no
+        dialog body names a file path, a specific missing key, or
+        contains raw exception text -- for the unreadable/malformed
+        case the raw exception is printed to stderr instead (this
+        module has no logging facility of its own).
     """
     path = _get_credentials_path()
     if not os.path.exists(path):
         messagebox.showerror(
             "Missing Credentials",
-            f"⚠️ File not found: {path}\n\n"
-            "Please create pg_credentials.json with host, port, database, username, password, and schema.",
+            "No database information has been saved in Database Management yet.",
         )
         return None
     try:
@@ -222,11 +392,18 @@ def load_db_credentials():
         required = ["host", "port", "database", "username", "password", "schema"]
         for key in required:
             if key not in creds:
-                messagebox.showerror("Invalid Credentials", f"Missing '{key}' in pg_credentials.json")
+                messagebox.showerror(
+                    "Invalid Credentials",
+                    "The database information saved in Database Management is incomplete.",
+                )
                 return None
         return creds
     except Exception as e:
-        messagebox.showerror("Credential Error", str(e))
+        print(f"[db_discovery] could not read credentials: {type(e).__name__}: {e}", file=sys.stderr)
+        messagebox.showerror(
+            "Credential Error",
+            "The database information saved in Database Management could not be read.",
+        )
         return None
 
 
@@ -238,14 +415,26 @@ def fetch_tables(schema):
         schema (str): the PostGIS/PostgreSQL schema name to query.
 
     Returns:
-        list[str]: table names found in `schema`, ordered by name.
-        Returns an empty list -- after showing a Tkinter messagebox error
-        dialog -- if credentials are missing/invalid, or if the
-        connection or query fails.
+        list[str] | None: table names found in `schema`, ordered by
+        name -- an empty list is a successful result when the schema
+        genuinely has no tables. Returns None -- after showing exactly
+        one short, non-technical Tkinter messagebox error dialog -- when
+        the table list could not be obtained at all:
+          - credentials are missing/invalid: load_db_credentials() has
+            ALREADY shown its own dialog in that case, so this function
+            shows nothing further and simply returns None.
+          - the connection or query itself fails: this function shows
+            one "DB Error" dialog with friendly_connection_error_message
+            (e, context="saved"), prints the raw exception to stderr,
+            and returns None.
+        Callers must treat None as "a dialog has already been shown,
+        show nothing more" and must not show a second dialog for it --
+        only a genuinely empty list should ever reach the existing
+        "No Tables" warning.
     """
     creds = load_db_credentials()
     if not creds:
-        return []
+        return None
     try:
         conn = psycopg2.connect(
             host=creds["host"],
@@ -266,5 +455,6 @@ def fetch_tables(schema):
         conn.close()
         return tables
     except Exception as e:
-        messagebox.showerror("DB Error", str(e))
-        return []
+        print(f"[db_discovery] fetch_tables failed: {type(e).__name__}: {e}", file=sys.stderr)
+        messagebox.showerror("DB Error", friendly_connection_error_message(e, context="saved"))
+        return None
