@@ -134,7 +134,7 @@ from pathlib import Path
 
 import psycopg2
 from rapidfuzz import process, fuzz
-from PIL import Image, ImageTk, ImageDraw
+from PIL import Image, ImageTk, ImageDraw, ImageFont
 
 from utils_paths import resource_path
 
@@ -190,6 +190,104 @@ def apply_icon(win, ico_filename="BLGF.ico", png_filename="BLGF.png"):
         except Exception:
             pass
     force_png_icon(win, png_filename)
+
+
+_active_splash = None  # holds the splash window while GM/CAMA Tools loads, if any
+
+
+def show_splash():
+    # borderless always-on-top window shown while the app finishes loading
+    splash = tk.Toplevel()
+    splash.overrideredirect(True)
+    splash.attributes("-topmost", True)
+
+    img = Image.open(resource_path("resources/splash.png"))
+
+    # cap splash size so it never fills the screen, keep aspect ratio
+    max_w, max_h = 1000, 850
+    img.thumbnail((max_w, max_h), Image.LANCZOS)
+    photo = ImageTk.PhotoImage(img)
+
+    w, h = img.size
+    sw, sh = splash.winfo_screenwidth(), splash.winfo_screenheight()
+    splash.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+
+    label = tk.Label(splash, image=photo, borderwidth=0)
+    label.image = photo  # keep a reference so it doesn't get garbage collected
+    label.pack()
+
+    splash.update()
+    return splash
+
+
+def _draw_question_icon(size=48):
+    # blue circle with a white "?" -- drawn in code, no separate image asset needed
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    pad = 2
+    draw.ellipse([pad, pad, size - pad, size - pad], fill=(41, 128, 185, 255))
+    try:
+        font = ImageFont.truetype("segoeuib.ttf", int(size * 0.55))
+    except Exception:
+        try:
+            font = ImageFont.truetype("arialbd.ttf", int(size * 0.55))
+        except Exception:
+            font = ImageFont.load_default()
+    text = "?"
+    bbox = draw.textbbox((0, 0), text, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    draw.text(((size - tw) / 2 - bbox[0], (size - th) / 2 - bbox[1]), text,
+              fill=(255, 255, 255, 255), font=font)
+    return img
+
+
+def show_confirm_dialog(parent, title, message):
+    # messagebox.askyesno look-alike, but with the app's own icon (IGDI, not BLGF)
+    result = {"proceed": False}
+
+    win = tk.Toplevel(parent)
+    win.title(title)
+    win.resizable(False, False)
+    win.transient(parent)
+    apply_icon(win, "resources/igdi_icon.ico", "resources/igdi_icon.png")
+
+    body = tk.Frame(win, padx=20, pady=15)
+    body.pack(fill="both", expand=True)
+
+    icon_img = _draw_question_icon()
+    icon_photo = ImageTk.PhotoImage(icon_img)
+    icon_label = tk.Label(body, image=icon_photo)
+    icon_label.image = icon_photo  # keep a reference so it doesn't get garbage collected
+    icon_label.pack(side="left", anchor="n", padx=(0, 15))
+
+    tk.Label(body, text=message, justify="left", wraplength=380).pack(side="left")
+
+    def choose(value):
+        result["proceed"] = value
+        win.destroy()
+
+    win.protocol("WM_DELETE_WINDOW", lambda: choose(False))
+
+    btn_frame = tk.Frame(win)
+    btn_frame.pack(pady=(0, 15))
+    tk.Button(btn_frame, text="Yes", width=10, command=lambda: choose(True)).pack(side="left", padx=4)
+    tk.Button(btn_frame, text="No", width=10, command=lambda: choose(False)).pack(side="left", padx=4)
+
+    win.update_idletasks()
+    # Centered on the SCREEN, not on `parent` -- parent here is the
+    # app's invisible off-screen anchor window, so centering against it
+    # would place this dialog off-screen too.
+    screen_w = win.winfo_screenwidth()
+    screen_h = win.winfo_screenheight()
+    req_w = win.winfo_reqwidth()
+    req_h = win.winfo_reqheight()
+    x = (screen_w - req_w) // 2
+    y = (screen_h - req_h) // 2
+    win.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
+    win.grab_set()      # modal, same as messagebox
+    win.wait_window()
+    return result["proceed"]
 
 
 import sys, importlib, argparse
@@ -1472,7 +1570,8 @@ def update_database_from_geopackage():
     # manual checkpoint, not real validation: a user who clicks "Yes"
     # without actually highlighting a layer will still hit the wrong menu
     # downstream. This dialog only prevents the *unattended/forgot* case.
-    proceed = messagebox.askyesno(
+    proceed = show_confirm_dialog(
+        root,
         "Confirm Before Updating Database",
         "Before continuing, please make sure that:\n\n"
         "\u2022 The layer you want to update is the only one highlighted in Global Mapper's Control Center.\n"
@@ -4604,8 +4703,9 @@ def _on_start(workspace_path):
     set later, if and when the user commits a connection via the
     mid-session Configure Database dialog (see _on_credentials_changed()
     above)."""
-    global selected_gmw_file
+    global selected_gmw_file, _active_splash
     selected_gmw_file = workspace_path
+    _active_splash = show_splash()  # closed once GM window is confirmed open
     launch_global_mapper(db_less=True)
 
 
@@ -5745,6 +5845,14 @@ def wait_for_global_mapper():
         ready = got_rect and visible and not minimized and width > 100 and height > 100
 
     if ready:
+        # splash's only job is "did a real GM window appear" -- close it
+        # the instant that's true, without waiting for the stability lock below
+        global _active_splash
+        if _active_splash is not None:
+            _active_splash.destroy()
+            _active_splash = None
+            root.update()  # force the splash to actually disappear now, not later
+
         _gm_stable_count[0] += 1
         if _gm_stable_count[0] >= 2:      # stable for 2 consecutive checks (2s)
             # Lock onto the verified candidate HWND -- not gm_windows[0],
