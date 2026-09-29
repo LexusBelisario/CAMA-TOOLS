@@ -127,6 +127,7 @@ from utils.db_discovery import load_db_credentials, fetch_tables
 from utils.window_icon import apply_icon
 from utils.gpkg_io import write_gpkg_atomic as _write_gpkg
 from utils.db_gate_ui import disable_db_radio, attach_no_db_tooltip
+from utils.geometry_dimension import normalize_geometry_dimension
 from utils.batch_mode_ui import build_save_cancel_row
 from PIL import Image, ImageTk, ImageDraw
 
@@ -1337,6 +1338,11 @@ def _write_db_output_safely(engine, schema, gdf, resolved_table_name,
     comment on this file's Cancel granularity) -- nothing inside this
     function is cancelable, by design.
 
+    Geometry is forced to 2D (Z coordinates dropped) immediately before
+    the staging write: the application treats parcel geometry as planar
+    cadastral boundaries, and a mixed 2D/3D frame would otherwise make
+    PostGIS reject the write (see utils/geometry_dimension.py).
+
     Args:
         engine: SQLAlchemy engine.
         schema (str): destination schema.
@@ -1379,6 +1385,7 @@ def _write_db_output_safely(engine, schema, gdf, resolved_table_name,
     # file's own pre-existing to_postgis()-inside-engine.begin() pattern
     # -- a failure partway through this call rolls back cleanly rather
     # than leaving a half-written staging table.
+    gdf, _ = normalize_geometry_dimension(gdf)
     with engine.begin() as conn:
         gdf.to_postgis(staging_name, conn, schema=schema,
                         if_exists="replace", index=False)
@@ -3044,6 +3051,10 @@ def open_main_window(root, db_verified=True, batch_mode=False,
             if not creds:
                 return
             tables = fetch_tables(creds["schema"])
+            if tables is None:
+                # fetch_tables() has ALREADY shown the error dialog -- show
+                # nothing more (None means "could not obtain", not "empty").
+                return
             if not tables:
                 messagebox.showwarning("No Tables", "No tables found in the database schema.")
                 return
@@ -4693,6 +4704,10 @@ def open_main_window(root, db_verified=True, batch_mode=False,
         if not creds:
             return
         tables = fetch_tables(creds["schema"])
+        if tables is None:
+            # fetch_tables() has ALREADY shown the error dialog -- show
+            # nothing more (None means "could not obtain", not "empty").
+            return
         if not tables:
             messagebox.showwarning("No Tables", "No tables found in the database schema.")
             return

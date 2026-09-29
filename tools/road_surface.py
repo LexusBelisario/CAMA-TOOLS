@@ -101,11 +101,12 @@ from sqlalchemy import create_engine, inspect, text
 
 from utils.table_name_matching import normalize_name, find_matching_tables
 from utils.resource_path import resource_path
-from utils.db_discovery import load_db_credentials, fetch_tables
+from utils.db_discovery import load_db_credentials, fetch_tables, friendly_connection_error_message
 from utils.column_detection import detect_existing_output_columns
 from utils.window_icon import apply_icon
 from utils.gpkg_io import write_gpkg_atomic as _write_gpkg
 from utils.db_gate_ui import disable_db_radio, attach_no_db_tooltip
+from utils.geometry_dimension import normalize_geometry_dimension
 from utils.batch_mode_ui import build_save_cancel_row
 from PIL import Image, ImageTk, ImageDraw
 
@@ -1151,10 +1152,18 @@ def open_main_window(root, db_verified=True, batch_mode=False,
             creds = load_db_credentials()
             if not creds:
                 return
-            engine = create_engine(
-                f"postgresql://{creds['username']}:{creds['password']}@{creds['host']}:{creds['port']}/{creds['database']}"
-            )
-            tables = inspect(engine).get_table_names(schema=creds["schema"])
+            try:
+                engine = create_engine(
+                    f"postgresql://{creds['username']}:{creds['password']}@{creds['host']}:{creds['port']}/{creds['database']}"
+                )
+                # create_engine() is lazy -- the real connection is made by
+                # get_table_names(), so both statements sit inside the try.
+                tables = inspect(engine).get_table_names(schema=creds["schema"])
+            except Exception as e:
+                # Raw text: console only, never in a dialog.
+                print(f"[picker] could not list tables: {type(e).__name__}: {e}", file=sys.stderr)
+                messagebox.showerror("DB Error", friendly_connection_error_message(e, context="saved"))
+                return
             if not tables:
                 messagebox.showwarning("No Tables", "No tables found in the database schema.")
                 return
@@ -1240,10 +1249,18 @@ def open_main_window(root, db_verified=True, batch_mode=False,
         creds = load_db_credentials()
         if not creds:
             return
-        engine = create_engine(
-            f"postgresql://{creds['username']}:{creds['password']}@{creds['host']}:{creds['port']}/{creds['database']}"
-        )
-        tables = inspect(engine).get_table_names(schema=creds["schema"])
+        try:
+            engine = create_engine(
+                f"postgresql://{creds['username']}:{creds['password']}@{creds['host']}:{creds['port']}/{creds['database']}"
+            )
+            # create_engine() is lazy -- the real connection is made by
+            # get_table_names(), so both statements sit inside the try.
+            tables = inspect(engine).get_table_names(schema=creds["schema"])
+        except Exception as e:
+            # Raw text: console only, never in a dialog.
+            print(f"[picker] could not list tables: {type(e).__name__}: {e}", file=sys.stderr)
+            messagebox.showerror("DB Error", friendly_connection_error_message(e, context="saved"))
+            return
         if not tables:
             messagebox.showwarning("No Tables", "No tables found in the database schema.")
             return
@@ -1791,6 +1808,11 @@ def _write_db_output_safely(engine, schema, gdf, resolved_table_name,
     comment on this file's Cancel granularity) -- nothing inside this
     function is cancelable, by design.
 
+    Geometry is forced to 2D (Z coordinates dropped) immediately before
+    the staging write: the application treats parcel geometry as planar
+    cadastral boundaries, and a mixed 2D/3D frame would otherwise make
+    PostGIS reject the write (see utils/geometry_dimension.py).
+
     Args:
         engine: SQLAlchemy engine.
         schema (str): destination schema.
@@ -1832,6 +1854,7 @@ def _write_db_output_safely(engine, schema, gdf, resolved_table_name,
     # file's own pre-existing to_postgis()-inside-engine.begin() pattern
     # -- a failure partway through this call rolls back cleanly rather
     # than leaving a half-written staging table.
+    gdf, _ = normalize_geometry_dimension(gdf)
     with engine.begin() as conn:
         gdf.to_postgis(staging_name, conn, schema=schema,
                         if_exists="replace", index=False)

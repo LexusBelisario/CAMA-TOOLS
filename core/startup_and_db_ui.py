@@ -38,7 +38,18 @@ PURPOSE:
     explicitly by the caller. This module never imports
     core.tool_exclusivity itself either -- is_any_tool_active (and, as
     of this task, activate_manual/deactivate_all) are passed through as
-    plain callables by MAIN.py, keeping this a true leaf module.
+    plain callables by MAIN.py. As of the database-error-messages task,
+    this module imports exactly one function from utils/ --
+    friendly_connection_error_message() from utils.db_discovery, the
+    single shared translator for non-technical connection-failure
+    wording (see _attempt_test_connection()/test_live_connection()
+    below) -- since the 11 tool files (and tools/batchProcessing/
+    pickers.py) must never import anything from core/, that wording had
+    to live in a utils/ module for all of them to share it, and this
+    module simply imports it back rather than keeping its own private
+    copy. Everything else this module needs still comes from MAIN.py as
+    a passed-in callable/value, exactly as before -- this one named
+    import is the sole exception to "true leaf module" from here on.
 
 DB STATE MACHINE (two states -- identical rules used by BOTH the
 startup dialog, which no longer has any credential fields to apply them
@@ -189,11 +200,14 @@ DEPENDENCIES:
     the workspace-picker resize hook is done by the resize_file_dialog_fn
     callable MAIN.py supplies, not by this module).
     third-party: psycopg2 (connection test).
-    local: none. This module is deliberately leaf-level, matching
-    core/tool_exclusivity.py's own DEPENDENCIES section. It no longer
-    depends on PIL -- the hub was an icon-swapping Canvas in an earlier
-    version of this module; it is now a plain, color-driven tk.Button
-    (see create_hub_button()), which needs no image assets at all.
+    local: utils.db_discovery.friendly_connection_error_message -- the
+    one exception to this module's otherwise deliberately leaf-level
+    design (see module docstring above); everything else it needs is
+    still passed in by MAIN.py, matching core/tool_exclusivity.py's own
+    DEPENDENCIES section. It no longer depends on PIL -- the hub was an
+    icon-swapping Canvas in an earlier version of this module; it is
+    now a plain, color-driven tk.Button (see create_hub_button()),
+    which needs no image assets at all.
 
 SCOPE NOTE (this file only): this module does not touch MAIN.py or
 core/tool_exclusivity.py. Wiring show_startup_dialog(), create_hub_button(),
@@ -214,6 +228,8 @@ import sys
 import threading
 
 import psycopg2
+
+from utils.db_discovery import friendly_connection_error_message
 
 
 # ============================================================
@@ -296,56 +312,6 @@ def _bind_edit_invalidation(field_entries, extra_on_edit=None):
 # ============================================================
 # SHARED TEST CONNECTION LOGIC
 # ============================================================
-def _friendly_connection_error_message(e):
-    """
-    Translates a psycopg2 connection exception into a short,
-    non-technical message for the Test Connection failure dialog --
-    called from _attempt_test_connection()'s except block below.
-
-    psycopg2 does not expose a structured, reliable error-code
-    attribute for every failure mode a plain psycopg2.connect() call
-    can raise (unlike, say, a dedicated SQLSTATE lookup for a query
-    error against an already-open connection), so this matches on the
-    exception's own message text -- the same approach any
-    non-technical-facing wrapper around a driver-level exception has
-    to take when the driver's own message is the only signal
-    available. Matching is case-insensitive and checks for a handful
-    of substrings each candidate psycopg2/libpq message is known to
-    contain, rather than an exact string match, since the exact
-    wording can vary slightly (e.g. by libpq version).
-
-    Falls back to a single generic message (see the final return
-    below) for any error that matches none of the specific patterns --
-    psycopg2 can raise for many reasons this function does not attempt
-    to enumerate exhaustively (SSL certificate problems, server-side
-    resource exhaustion, protocol/version mismatches, and so on); the
-    fallback is written to remain accurate and non-alarming regardless
-    of the real underlying cause, rather than guessing at one.
-
-    Args:
-        e: the caught Exception from psycopg2.connect().
-
-    Returns:
-        str: a short, user-facing message with no driver-level
-        wording, port numbers, or hex error codes.
-    """
-    text = str(e).lower()
-
-    if "password authentication failed" in text or "authentication failed" in text:
-        return "The username or password was incorrect."
-    if "does not exist" in text:
-        return "The database name could not be found on the server."
-    if "timeout" in text or "timed out" in text:
-        return ("Could not reach the database server. Please check the "
-                "host address and your network connection, then try again.")
-    if "connection refused" in text:
-        return "The server refused the connection. Please check the host and port."
-
-    return ("Could not connect to the database. Please check your "
-            "connection details and try again.\n\n"
-            "If the problem continues, contact your system administrator.")
-
-
 def _attempt_test_connection(field_entries, get_credentials_path_fn):
     """
     Reads the current live field values and attempts psycopg2.connect()
@@ -408,7 +374,11 @@ def _attempt_test_connection(field_entries, get_credentials_path_fn):
         tuple[bool, str | None, dict]: (True, None, values) on a
         successful connection test; (False, message, values) on
         failure, where message is the short, non-technical string from
-        _friendly_connection_error_message(). values is always the
+        utils.db_discovery.friendly_connection_error_message(e,
+        context="entered") -- "entered" because this function always
+        tests values the user just typed into this dialog's own live
+        fields, never values already saved in Database Management.
+        values is always the
         exact field-values dict this function read and tested against
         -- _finish() passes it straight through to on_result() (only if
         not cancelled) so the caller has the EXACT values this specific
@@ -432,12 +402,12 @@ def _attempt_test_connection(field_entries, get_credentials_path_fn):
         )
         conn.close()
     except Exception as e:
-        return False, _friendly_connection_error_message(e), values
+        return False, friendly_connection_error_message(e, context="entered"), values
 
     return True, None, values
 
 
-def test_live_connection(host, port, database, username, password):
+def test_live_connection(host, port, database, username, password, log_fn=None):
     """
     Public, thin wrapper around the SAME connectivity probe
     _attempt_test_connection() above performs -- exists for callers
@@ -449,30 +419,47 @@ def test_live_connection(host, port, database, username, password):
     credentials (stored_username/stored_password/DB_HOST/DB_PORT/
     DB_NAME) before attempting their own real work, using this
     function so their failure message uses the exact same short,
-    non-technical wording _friendly_connection_error_message() already
-    gives the Configure Database dialog's own Test Connection --
-    rather than MAIN.py duplicating that translation logic itself, or
-    (as confirmed happening before this function existed) letting the
-    raw driver-level exception reach the user unfiltered.
+    non-technical wording utils.db_discovery.friendly_connection_error_
+    message() gives the Configure Database dialog's own connection
+    test -- rather than MAIN.py duplicating that translation logic
+    itself, or (as confirmed happening before this function existed)
+    letting the raw driver-level exception reach the user unfiltered.
+    Called with context="saved" (not "entered") -- unlike
+    _attempt_test_connection() above, every caller of this function is
+    testing credentials already saved in Database Management, never
+    values a user just typed into a dialog's live fields.
 
     A pure probe, same as _attempt_test_connection() -- no side
-    effects: does NOT touch _db_state, _verified_fields, or
-    pg_credentials.json, does not know or care who is calling it or
-    why. Runs on WHATEVER thread calls it -- no threading of its own;
-    a caller that does not want to block its own UI while this runs
-    (psycopg2.connect() can take up to connect_timeout=60 seconds) is
-    responsible for calling this from a background thread itself, the
-    same way _run_test_connection_threaded() already does for this
-    module's own two dialogs.
+    effects on session state: does NOT touch _db_state,
+    _verified_fields, or pg_credentials.json, does not know or care who
+    is calling it or why. Runs on WHATEVER thread calls it -- no
+    threading of its own; a caller that does not want to block its own
+    UI while this runs (psycopg2.connect() can take up to
+    connect_timeout=60 seconds) is responsible for calling this from a
+    background thread itself, the same way _run_test_connection_threaded()
+    already does for this module's own two dialogs.
 
     Args:
         host, port, database, username, password: plain strings.
+        log_fn: optional callable(str), default None. On a failed
+            connection attempt only, called with the raw exception text
+            (f"{type(e).__name__}: {e}") BEFORE this function returns --
+            the one side effect this otherwise-pure probe has, and only
+            when the caller opts in. Exists so MAIN.py can route the raw,
+            technical exception text into its own log file (see _log())
+            while the returned message stays the short, non-technical
+            string described below; this function itself never prints,
+            logs, or shows anything on its own. When log_fn is None (the
+            default), behavior is identical to before this parameter
+            existed -- nothing is called, nothing is logged.
 
     Returns:
         tuple[bool, str | None]: (True, None) on a successful
         connection test; (False, message) on failure, where message is
         the short, non-technical string from
-        _friendly_connection_error_message().
+        utils.db_discovery.friendly_connection_error_message(e,
+        context="saved"). Return shape is unchanged by the addition of
+        log_fn.
     """
     try:
         conn = psycopg2.connect(
@@ -482,7 +469,9 @@ def test_live_connection(host, port, database, username, password):
         )
         conn.close()
     except Exception as e:
-        return False, _friendly_connection_error_message(e)
+        if log_fn is not None:
+            log_fn(f"{type(e).__name__}: {e}")
+        return False, friendly_connection_error_message(e, context="saved")
 
     return True, None
 
@@ -550,7 +539,10 @@ def _run_test_connection_threaded(field_entries, get_credentials_path_fn,
             background attempt finishes, AFTER the spinner has already
             been stopped and cleared. error_message is None on success,
             or the short, non-technical string from
-            _friendly_connection_error_message() on failure. values is
+            utils.db_discovery.friendly_connection_error_message()
+            (called with context="entered" -- see
+            _attempt_test_connection()'s own docstring) on failure.
+            values is
             the exact field-values dict _attempt_test_connection() read
             and tested against (see that function's own Returns:
             section) -- the caller uses it to remember what was tested,
@@ -1641,7 +1633,9 @@ def show_configure_db_dialog(root, apply_icon_fn, get_credentials_path_fn, db_ga
       follow-up dialogs is shown depending on whether the
       pg_credentials.json write itself succeeded (see _do_commit()).
     - FAILURE: shows ONE combined dialog -- the existing non-technical
-      error message from _friendly_connection_error_message(), together
+      error message from _attempt_test_connection() (via
+      utils.db_discovery.friendly_connection_error_message(),
+      context="entered" -- see that function's own docstring), together
       with "Do you want to continue and change your database connection
       anyway?", Yes/No, NOT as two separate dialogs (per this task's own
       explicit requirement). No commits nothing (the fields are reverted
