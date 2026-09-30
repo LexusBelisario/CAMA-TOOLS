@@ -3,19 +3,28 @@ tools/meters_from_school_shop_transport_church.py
 
 PURPOSE:
     CAMA Tools tool ("METERS FROM (SCHOOL, SHOP, TRANSPORT, CHURCH)" in
-    MAIN.py's dispatch table): for each Land Parcel, computes network-
-    routed distance (falling back to straight-line distance) to the 3
-    nearest POIs of each type present in ALLOWED_FCLASS (school, church,
-    shop, transport, university), writing up to 3 ranked distance +
-    name columns per type (CAMA_{TYPE}{1-3} and its _NAME companion --
-    the corresponding POI's own name, or Python None if missing/
-    unavailable). Only types actually present in the selected POI
-    source get any columns at all, and only ranks that are
-    categorically achievable from that type's total POI count (see
-    task()'s pre-init notes) -- a type with, say, only 1 total POI
-    never gets CAMA_{TYPE}2/3 columns. Tool-style version, mirroring
-    road_width.py's overall architecture (progress dialog, DB-output
-    resolution flow, window-chrome handling).
+    MAIN.py's dispatch table): for each Land Parcel, finds the SINGLE
+    nearest POI (by straight-line distance) of each type present in
+    ALLOWED_FCLASS (school, church, shop, transport, university), and
+    reports TWO independent, always-present distance measurements to
+    that one landmark -- CAMA_{TYPE}_ROAD (a component-aware network-
+    routed distance; see graph_from_roads()/_find_road_candidates()
+    below) and CAMA_{TYPE}_STRAIGHT (the plain Euclidean distance) --
+    plus CAMA_{TYPE}_NAME (that landmark's own "name" attribute value,
+    or Python None if missing/unavailable). There is no ranking/top-3
+    concept anymore: exactly one winner per present type, never three.
+    CAMA_{TYPE}_ROAD is 0.0 only when no connected road path exists
+    between the parcel and the landmark within
+    ROAD_CANDIDATE_SEARCH_RADIUS_M on either side (a genuine "no
+    connection found" sentinel -- never a silent stand-in for the
+    Straight distance); a real Road distance of exactly 0.0 (parcel
+    and landmark snap to the identical point on the road network) is
+    instead reported as 1.0, so the sentinel stays unambiguous (see
+    worker_process()'s own comment at that exact branch for why).
+    Only types actually present in the selected POI source get any
+    columns at all. Tool-style version, mirroring road_width.py's
+    overall architecture (progress dialog, DB-output resolution flow,
+    window-chrome handling).
 
 DISPATCH:
     Run as an isolated subprocess by MAIN.py via its `--tool` dispatch
@@ -331,10 +340,36 @@ ALLOWED_FCLASS = {"school", "church", "shop", "transport", "university"}
 # touched by this addition. "school", "university", and every other
 # education-related fclass (elementary_school, high_school,
 # kindergarten, college, etc.) are now routed through the separate,
-# unified CAMA_SCHOOL{1-3} pool below (see _is_education_fclass() /
+# unified CAMA_SCHOOL pool below (see _is_education_fclass() /
 # _classify_education_poi() and task()'s own education-pool
 # construction) instead of this ordinary fixed-type path.
 ORDINARY_FIXED_FCLASS = {"church", "shop", "transport"}
+
+# Component-aware road-distance algorithm parameters (redesign; see the
+# task's own Doc 1 §2.3/§2.4/§3 for the full evidence). Both values
+# were validated against the developer's real data --
+# RoadNetwork_Caluan.gpkg (1,424 road features) and LandParcel.gpkg
+# (11,911 parcels) -- not chosen theoretically.
+#
+# ROAD_VERTEX_SNAP_TOLERANCE_M: two road-graph vertices within this
+# distance of each other are treated as the same node (closes small
+# digitizing gaps before connected components are computed). 15.0 m
+# sits in the middle of a wide, safe band (13-37 m) measured on the
+# real network -- any value in that band gives IDENTICAL results on
+# this dataset; nothing between 13 m and 37 m changes which vertices
+# get merged.
+ROAD_VERTEX_SNAP_TOLERANCE_M = 15.0
+
+# ROAD_CANDIDATE_SEARCH_RADIUS_M: how far (from the parcel boundary,
+# and separately from the landmark point) to search for road edges
+# when building per-component routing candidates. At 800 m, 0% of the
+# 11,911 real parcels had zero roads nearby at all, and the count of
+# parcels with NO connected path to any candidate on the other side
+# ("genuinely stuck") dropped to 95 (0.80%), down from 282 (2.37%) at
+# 500 m. Distinct components found within 800 m: 1 for 84.0% of real
+# parcels, 2 for 12.2%, 3 for 2.6%, 4+ for the remaining 1.2% (max 11
+# seen once) -- confirming no fixed candidate-count cap is needed.
+ROAD_CANDIDATE_SEARCH_RADIUS_M = 800.0
 
 # Priority-ordered keyword -> CAMA_SCHOOL*_TYPE value mapping, checked
 # in this exact order against a POI's own combined fclass+name
@@ -615,22 +650,24 @@ def read_postgis_clean(table, engine, schema):
 # Business decision (confirmed): only check for types that are actually
 # PRESENT in the selected POI source this run -- if there's no
 # "university" POI in the selected POI layer, there's no reason to
-# check for a pre-existing CAMA_UNIVERSITY1 conflict. Every rank that
-# is categorically achievable for a present type (per that type's own
-# total POI count -- see task()'s pre-init notes) is checked, plus each
-# rank's _NAME companion column, e.g. present type "school" with 3+
-# total POIs -> CAMA_SCHOOL1, CAMA_SCHOOL1_NAME, CAMA_SCHOOL2,
-# CAMA_SCHOOL2_NAME, CAMA_SCHOOL3, CAMA_SCHOOL3_NAME.
+# check for a pre-existing CAMA_UNIVERSITY_ROAD conflict. There is no
+# ranking concept anymore (single nearest landmark per type -- see
+# _realizable_targets()) -- every present type is checked for its flat
+# ROAD/STRAIGHT/NAME target set, e.g. present type "school" ->
+# CAMA_SCHOOL_ROAD, CAMA_SCHOOL_STRAIGHT, CAMA_SCHOOL_NAME,
+# CAMA_SCHOOL_TYPE.
 #
 # RESOLVED (previously flagged here as an accepted, unfixed gap): the
-# main-output pre-init loop in task() below now iterates fixed_types
-# (present-only) and rank-caps via min(3, that type's total POI count)
-# instead of unconditionally pre-creating all three ranks for the full
-# static ALLOWED_FCLASS set -- a type absent from this run's POI source
-# gets no columns at all, and a present type with fewer than 3 total
-# POIs only gets the ranks it could ever actually populate. The two
-# steps (this conflict CHECK, and the actual pre-init) are therefore
-# consistent with each other again.
+# main-output pre-init loop in task() below iterates present-only
+# types (ordinary_fixed_types/other_type_map/"SCHOOL" in poi_coords)
+# instead of unconditionally pre-creating columns for the full static
+# ALLOWED_FCLASS set -- a type absent from this run's POI source gets
+# no columns at all. Since there is no longer a ranking concept
+# (single nearest landmark per type, not top-3 -- see
+# _realizable_targets()), there is no longer a per-rank achievability
+# cap to reconcile either: a present type always gets its full flat
+# ROAD/STRAIGHT/NAME (or ROAD/STRAIGHT/NAME/TYPE for SCHOOL) column
+# set, matching this conflict CHECK's own target list exactly.
 def _sanitize_fclass_to_suffix(normalized_fclass):
     """
     PART 2: converts one already-normalized (lowercase, stripped)
@@ -664,12 +701,19 @@ def _int_to_letter_tier(n):
     """
     PART 2: deterministic 0-indexed integer -> letter-tier string,
     used only to disambiguate colliding sanitized suffixes (0->"A",
-    1->"B", ..., 25->"Z", 26->"AA", 27->"AB", ...). A LETTER tier is
-    used specifically because the existing CAMA_{TYPE}{1-3} convention
-    already appends a bare digit (1/2/3) for rank -- disambiguating
-    with digits too (e.g. "_1") would make "CAMA_SUFFIX_11" ambiguous
-    between disambiguator "_1" + rank "1" and a literal rank "11".
-    Letters can never be confused with that numeric rank suffix.
+    1->"B", ..., 25->"Z", 26->"AA", 27->"AB", ...). A LETTER tier was
+    originally chosen specifically because the CAMA_{TYPE}{1-3}
+    convention appended a bare digit (1/2/3) for rank, and
+    disambiguating with digits too (e.g. "_1") would have made
+    "CAMA_SUFFIX_11" ambiguous between disambiguator "_1" + rank "1"
+    and a literal rank "11". That rank suffix no longer exists in the
+    output naming scheme (single nearest landmark per type now, no
+    ranking -- see _realizable_targets()), but this function's own
+    behavior/mechanism is UNCHANGED and out of scope for that redesign
+    (Instructions E.11) -- letters are kept as-is rather than switched
+    to digits now that the original collision reason is gone, since
+    changing an already-shipped column-naming convention for "Other
+    Landmark Types" was not requested.
     """
     n += 1
     letters = ""
@@ -742,46 +786,37 @@ def _realizable_targets(poi_types):
     for the MAIN CAMA output -- only for POI types present in poi_types
     (already filtered to ALLOWED_FCLASS and normalized/lowercased
     upstream, or already a pre-assigned dynamic suffix -- see task()).
-    Six targets per type, interleaved per rank: CAMA_{TYPE}1,
-    CAMA_{TYPE}1_NAME, CAMA_{TYPE}2, CAMA_{TYPE}2_NAME, CAMA_{TYPE}3,
-    CAMA_{TYPE}3_NAME -- matching the exact column order task() now
-    pre-creates in the main output (see its pre-init loop).
 
-    NOTE: this always checks all three ranks unconditionally, even
-    though task()'s actual pre-init step only creates a rank's columns
-    when that rank is categorically achievable (>= that many total
-    POIs of that type in the source). This function has no access to
-    per-type POI counts -- it only ever receives a list of type name
-    strings, at both of its call sites (task() below, and on_run()'s
-    lighter pre-check earlier in this file) -- and checking for a
-    conflict on a column name that happens not to exist is harmless:
-    it simply never matches, never produces a false conflict. Trading
-    a little unnecessary over-checking here avoids plumbing per-type
-    POI counts through the pre-check flow, which is out of scope for
-    this change.
+    Three targets per type, no rank: CAMA_{TYPE}_ROAD,
+    CAMA_{TYPE}_STRAIGHT, CAMA_{TYPE}_NAME -- matching the exact column
+    order task() now pre-creates in the main output (see its pre-init
+    loop). There is no ranking concept anymore (single nearest
+    landmark per type only), so there is nothing to cap/check per-rank
+    here either -- every present type always gets exactly these
+    targets (four for SCHOOL, see below).
 
     _METHOD is intentionally NOT generated here -- this is the MAIN
     CAMA output's target list only. The separate, dormant
     poi_routes.gpkg QA/diagnostic export (see worker_process()'s
-    route_records) is completely untouched by this change and still
-    carries its own METHOD internally; it has no target-list/conflict-
-    check concept of its own today, so there is nothing to update for
-    it here.
+    route_records) is completely untouched by this change and has no
+    target-list/conflict-check concept of its own today, so there is
+    nothing to update for it here.
     SCHOOL is a deliberate, narrow special case: it represents the
     unified education pool (see task()'s own construction of it, and
     _classify_education_poi()/_is_education_fclass() above), which
-    carries a third per-rank value -- CAMA_SCHOOL{N}_TYPE -- alongside
-    its distance and name. No other type in poi_types has this third
+    carries a fourth value -- CAMA_SCHOOL_TYPE -- alongside its Road,
+    Straight, and Name. No other type in poi_types has this fourth
     dimension, so this is intentionally NOT a generic mechanism applied
     to every type; it only fires when t.upper() == "SCHOOL".
     """
     targets = []
     for t in poi_types:
-        for i in range(1, 4):
-            targets.append(f"CAMA_{t.upper()}{i}")
-            targets.append(f"CAMA_{t.upper()}{i}_NAME")
-            if t.upper() == "SCHOOL":
-                targets.append(f"CAMA_{t.upper()}{i}_TYPE")
+        u = t.upper()
+        targets.append(f"CAMA_{u}_ROAD")
+        targets.append(f"CAMA_{u}_STRAIGHT")
+        targets.append(f"CAMA_{u}_NAME")
+        if u == "SCHOOL":
+            targets.append(f"CAMA_{u}_TYPE")
     return targets
 
 
@@ -987,23 +1022,160 @@ def graph_from_roads(road_gdf):
     Builds an undirected networkx graph from a road GeoDataFrame's
     LineString/MultiLineString geometry, one edge per consecutive
     coordinate pair (i.e. no simplification -- every vertex in the
-    input geometry becomes a graph node).
+    input geometry becomes a graph node) -- THEN snaps together any
+    two vertices within ROAD_VERTEX_SNAP_TOLERANCE_M of each other
+    (closing small digitizing gaps) and labels every edge with its own
+    connected-component ID, both done ONCE here at graph-build time
+    (not per parcel) -- see the component-aware road-distance redesign
+    (Doc 1 §2.3 Steps 1-2).
 
     Args:
         road_gdf (geopandas.GeoDataFrame): road network layer. Non-line
         geometry (Polygons, Points) is silently skipped.
 
     Returns:
-        tuple: (G, edges, nodes_coords, edge_geoms) where G is the
-        networkx.Graph, edges is a list of (u, v, length) tuples,
-        nodes_coords is an (N, 2) numpy array of every distinct node
-        coordinate (for nearest-neighbor queries elsewhere), and
-        edge_geoms is a list of shapely LineString objects -- one per
-        entry in `edges`, in the same order/index -- built for an
-        edge-level STRtree spatial index so callers can snap an
-        arbitrary point to its true nearest point ON a road segment
-        (not just to the nearest existing vertex; see worker_process()
-        below).
+        tuple: (G, edges, nodes_coords, edge_geoms, edge_comp) where G
+        is the networkx.Graph (built AFTER the vertex snap below, so
+        its own node identities already reflect any merged vertices),
+        edges is a list of (u, v, length) tuples whose u/v endpoints
+        are ALSO already the post-snap canonical coordinates (this
+        matters because worker_process() rebuilds its own local graph
+        from `edges` rather than from `G` directly -- see its own
+        docstring), nodes_coords is an (N, 2) numpy array of every
+        distinct POST-SNAP node coordinate (for nearest-neighbor
+        queries elsewhere), edge_geoms is a list of shapely LineString
+        objects -- one per entry in `edges`, in the same order/index,
+        UNCHANGED by the snap (a physical road segment's geometry does
+        not move; only which node ID represents its endpoint can
+        change) -- built for an edge-level STRtree spatial index so
+        callers can snap an arbitrary point to its true nearest point
+        ON a road segment (not just to the nearest existing vertex;
+        see worker_process() below), and edge_comp is a list of
+        integer connected-component IDs, same length/order as `edges`/
+        `edge_geoms` (0 = the largest component by node count,
+        ascending from there) -- looked up from either endpoint of
+        that edge (guaranteed equal, since the two endpoints of one
+        edge are always in the same component).
+
+    Vertex-snap mechanics (Doc 1 §2.3 Step 1, CORRECTED during Phase 2
+    -- see the standalone correction notes below): every distinct
+    PRE-snap vertex coordinate is checked against every other via
+    scipy.spatial.cKDTree.query_pairs(r=ROAD_VERTEX_SNAP_TOLERANCE_M),
+    but a pair is only eligible for union if the two vertices share NO
+    road_gdf source row in common (see the correction notes for why a
+    share-any-row test, not an exact-row-set-equality test, is what is
+    actually needed).
+    Eligible pairs are then unioned transitively (union-find) so that
+    e.g. A-B < tolerance and B-C < tolerance also merges A and C into
+    the same group even if A-C itself exceeds tolerance (a standard,
+    accepted consequence of any tolerance-based snap -- a "chain" of
+    close points can span a little more than one tolerance-width end to
+    end; see the correction note's own accepted-limitation paragraph
+    for the one remaining way this can still surprise). For each group
+    of 2+ coordinates, the CANONICAL representative used everywhere
+    downstream is the first coordinate encountered in nodes_coords's
+    own set-iteration order for that group -- a deliberate, simple
+    choice over e.g. a centroid: these are real digitized endpoints
+    already within ROAD_VERTEX_SNAP_TOLERANCE_M of each other, so
+    "first seen" vs. "centroid of the group" makes no meaningful
+    positional difference for routing purposes, and avoids computing
+    and re-snapping a synthetic point that isn't itself any of the
+    original vertices.
+
+    CORRECTION TO DOC 1 §2.3 STEP 1 (found and fixed during Phase 2,
+    NOT part of the originally locked design -- documented here rather
+    than silently folded in): the first Phase-2 implementation unioned
+    ANY two vertices within tolerance, regardless of which road_gdf row
+    they came from. On the real RoadNetwork_Caluan.gpkg data, this
+    produced groups of up to 33 vertices chain-merging along a single
+    winding, densely-digitized road (consecutive vertices spaced far
+    closer than ROAD_VERTEX_SNAP_TOLERANCE_M apart, as is completely
+    normal for one road feature) -- collapsing runs of that road's own
+    original edges into self-loops (over 2,500 of 7,943 raw edges were
+    silently dropped this way) and materially undercounting connected
+    components as a result. The root cause: transitive snapping has no
+    meaningful concept of "closing a gap between two separate features"
+    if it is allowed to walk along a single feature's own interior
+    vertex chain -- a digitizing gap is, by definition, a break BETWEEN
+    two different road features, never a property of one feature's own
+    vertex spacing. The fix: track each vertex's originating road_gdf
+    row index, and only allow query_pairs() results between vertices
+    that share NO row in common to be unioned at all -- a pair sharing
+    at least one row is excluded from snapping entirely, regardless of
+    how close together they are (they are already connected via that
+    shared feature's own edges, so there is nothing to gain by snapping
+    them, and real harm in doing so, as shown above). This also
+    correctly preserves T-intersections (an endpoint of one road
+    meeting another road's INTERIOR vertex, not just another endpoint)
+    -- excluded here only because the two vertices happen to share a
+    row, never because of which position (endpoint vs. interior) either
+    vertex occupies within its own row.
+
+    SECOND CORRECTION WITHIN THIS SAME FIX (found and fixed during
+    Phase 2, a refinement of the fix immediately above, not a separate
+    bug in its own right): the row-exclusion test was first written as
+    an EXACT set-equality check (rows_i == rows_j) rather than a
+    set-intersection check (rows_i & rows_j). Equality is too narrow --
+    it misses a real, common case: an intersection vertex shared by two
+    rows (row-membership {A, B}) compared against a plain interior
+    vertex of row A alone (row-membership {A}) are NOT equal sets
+    ({A} != {A, B}), so the exact-equality test would WRONGLY treat
+    this pair as eligible for snapping -- even though the interior
+    vertex already sits on row A, the very same row the intersection
+    vertex also belongs to, so there is no second, genuinely different
+    feature involved between these two points at all; snapping them
+    together is still interior-vertex spacing along a feature they
+    share, exactly the case this exclusion exists to catch, and
+    equality let it slip through. The two sets DO still need only a
+    shared row, not an identical full set of rows, to correctly signal
+    "no second feature here" -- {A} and {A, B} already share row A in
+    common ({A} & {A, B} == {A}, non-empty), which is precisely what
+    the intersection test checks for and equality does not. Changed to
+    the correct, more general test: exclude a pair whenever their
+    row-membership sets share ANY row at all (a non-empty
+    intersection), not only when the two full sets are identical.
+
+    ACCEPTED, KNOWN LIMITATION (flagged, not solved here): two
+    genuinely distinct, long, roughly-parallel road features (e.g. a
+    divided highway's two carriageways digitized as separate rows)
+    could still chain-merge if a long run of their respective vertices
+    happens to sit consistently within ROAD_VERTEX_SNAP_TOLERANCE_M of
+    each other for their entire shared length -- the same-row exclusion
+    only prevents a feature from merging with ITSELF (or two features
+    that already share a row); it does nothing to prevent two different
+    features with NO row in common from merging with EACH OTHER if
+    they are geometrically close along their whole length. This is a
+    real, if narrower, residual risk of the same underlying transitive-
+    chaining behavior, left unaddressed here as agreed -- worth the
+    developer's own attention if it is ever observed on real data, not
+    a defect to chase preemptively without evidence it occurs on data
+    actually used with this tool.
+
+    SECOND, DISTINCT CORRECTION TO DOC 1 §2.3 STEP 1 (found and fixed
+    during Phase 2, on top of and SEPARATE from the same-row exclusion
+    above -- a different bug, a different cause, documented separately
+    so a future reader does not conflate the two): even with the
+    same-row exclusion in place, a snap GROUP can still span more than
+    one road_gdf row via transitive chaining (e.g. vertices from three
+    or more different, genuinely nearby small features all landing in
+    one union-find group). If EVERY one of that group's own members
+    collapses to a single canonical coordinate, every original edge
+    with both endpoints inside the group becomes a self-loop and is
+    dropped (see the "Build the post-snap graph" step below) -- and if
+    the group has NO edge reaching a node outside itself, the entire
+    cluster's road geometry vanishes from the graph with nothing left
+    to route through. Confirmed on the real RoadNetwork_Caluan.gpkg
+    data: two tiny, nearby 3-vertex road fragments (6 vertices, 4
+    edges total, no connection to the wider network) disappeared
+    completely under the same-row fix alone. The fix: before finalizing
+    canonical representatives, every union-find group with 2+ members
+    is checked for at least one edge connecting it to a node OUTSIDE
+    the group (see roots_to_skip below); a group with no such edge is
+    excluded from the snap entirely -- its members remain their own
+    distinct, unsnapped nodes, so the cluster's own internal edges
+    survive using their original coordinates. This check and its
+    fallback are PER-GROUP: excluding one self-contained group has no
+    effect on any other group's own snap in the same run.
 
     Raises:
         Exception: if road_gdf has no LineString/MultiLineString
@@ -1012,7 +1184,19 @@ def graph_from_roads(road_gdf):
     G = nx.Graph()
     edges = []
     edge_geoms = []
-    nodes_coords = set()
+    nodes_coords_set = set()
+    # Maps each distinct vertex coordinate to the set of road_gdf row
+    # indices it was seen on -- a vertex sitting at the shared endpoint
+    # of two different rows (a real intersection, already connected
+    # through the graph by virtue of both rows' own edges meeting
+    # there) legitimately belongs to more than one row; that is fine
+    # and expected, and does not by itself trigger the same-row
+    # exclusion below (the exclusion fires for a CANDIDATE PAIR whose
+    # two coordinates share AT LEAST ONE row in common -- see the
+    # same-row check below for the exact condition, and this
+    # function's own docstring correction notes for why "any overlap"
+    # is the right test rather than "identical full sets").
+    row_ids_for_coord = {}
 
     geom_types = road_gdf.geometry.geom_type.dropna().unique().tolist()
     print(f"ℹ️ Road geometry types found: {geom_types}")
@@ -1024,7 +1208,8 @@ def graph_from_roads(road_gdf):
             f"Please select a line/road layer, not a polygon or point layer."
         )
 
-    for _, row in road_gdf.iterrows():
+    raw_edges = []  # (u, v) pre-snap coordinate pairs, one per graph edge
+    for row_pos, (_, row) in enumerate(road_gdf.iterrows()):
         geom = row.geometry
         if geom is None or geom.is_empty:
             continue
@@ -1041,87 +1226,267 @@ def graph_from_roads(road_gdf):
                 for i in range(len(coords) - 1):
                     u = (float(coords[i][0]), float(coords[i][1]))
                     v = (float(coords[i + 1][0]), float(coords[i + 1][1]))
-                    length = Point(u).distance(Point(v))
-                    G.add_edge(u, v, length=float(length))
-                    edges.append((u, v, float(length)))
-                    edge_geoms.append(LineString([u, v]))
-                    nodes_coords.add(u)
-                    nodes_coords.add(v)
+                    raw_edges.append((u, v))
+                    nodes_coords_set.add(u)
+                    nodes_coords_set.add(v)
+                    row_ids_for_coord.setdefault(u, set()).add(row_pos)
+                    row_ids_for_coord.setdefault(v, set()).add(row_pos)
         except Exception:
             continue
 
-    nodes_coords = np.array(list(nodes_coords)) if nodes_coords else np.zeros((0, 2))
-    return G, edges, nodes_coords, edge_geoms
+    # --- Vertex snap (Doc 1 §2.3 Step 1, corrected -- see docstring) -----
+    # Union-find over every distinct pre-snap vertex coordinate, but
+    # ONLY for candidate pairs that do not come exclusively from the
+    # same road_gdf row (the correction above) -- two vertices within
+    # tolerance are excluded from snapping if their row-membership sets
+    # are IDENTICAL (both belong only to the same single row/feature);
+    # a vertex that is shared by multiple rows (a real, already-
+    # connected intersection point) is never excluded on that basis.
+    distinct_coords = list(nodes_coords_set)
+    coord_to_idx = {c: i for i, c in enumerate(distinct_coords)}
+    parent = list(range(len(distinct_coords)))
+
+    def _find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def _union(i, j):
+        ri, rj = _find(i), _find(j)
+        if ri != rj:
+            parent[rj] = ri
+
+    if distinct_coords:
+        coord_array = np.array(distinct_coords)
+        tree_for_snap = cKDTree(coord_array)
+        pairs = tree_for_snap.query_pairs(r=ROAD_VERTEX_SNAP_TOLERANCE_M)
+        for i, j in pairs:
+            rows_i = row_ids_for_coord.get(distinct_coords[i], set())
+            rows_j = row_ids_for_coord.get(distinct_coords[j], set())
+            if rows_i & rows_j:
+                # The two vertices share AT LEAST ONE road_gdf row in
+                # common (not necessarily an identical full set) --
+                # excluded, per the correction below: an exact-set-
+                # equality check (rows_i == rows_j) is too narrow and
+                # misses a real case -- two vertices that both sit on
+                # the SAME shared row (e.g. one is an interior vertex
+                # of road A, the other is an intersection point where
+                # road A meets road B) still involve no SECOND
+                # different feature from each other's perspective on
+                # that shared row; snapping them together is still
+                # interior-vertex spacing along a feature they have in
+                # common, not a gap between two mutually exclusive
+                # features, regardless of what ELSE either vertex's
+                # row-membership set contains.
+                continue
+            _union(i, j)
+
+    # --- Self-collapse guard (SECOND correction to Doc 1 §2.3 Step 1,
+    # found and fixed during Phase 2, DISTINCT from the same-row
+    # exclusion above -- see the standalone correction note in this
+    # function's docstring for why these are two separate bugs with two
+    # separate causes, not one combined change) --------------------------
+    # A snap-GROUP (a whole union-find equivalence class, which can span
+    # more than one road_gdf row via transitive chaining even after the
+    # same-row exclusion above) is only safe to collapse to a single
+    # canonical point if at least one of its own INTERNAL edges (an
+    # original raw_edges entry whose both endpoints fall inside this
+    # same group) survives the collapse as a real edge elsewhere in the
+    # graph. If EVERY one of a group's own internal edges would become
+    # a self-loop (both endpoints mapping to the identical canonical
+    # coordinate), collapsing it destroys that entire local cluster's
+    # own connectivity with nothing to replace it -- confirmed on the
+    # real RoadNetwork_Caluan.gpkg data as two tiny, nearby 3-vertex
+    # road fragments (a total of 6 vertices, 4 edges) that vanished
+    # from the graph completely under the FIRST fix alone (the same-row
+    # exclusion prevents a feature colliding with ITSELF, but does not
+    # prevent a whole tight cluster of several DIFFERENT small features
+    # from transitively chaining into one group whose every vertex ends
+    # up equal to every other). The fix here is PER-GROUP, not global:
+    # for any group whose internal edges would ALL become self-loops,
+    # that specific group is excluded from the snap entirely (every
+    # member reverts to being its own distinct, unsnapped node) -- this
+    # does not affect any other group's own snap in the same run, since
+    # the check and the fallback are scoped strictly to the one
+    # offending group's own union-find root.
+    # A group is a genuine self-collapse risk only if it has at least
+    # 2 members AND none of its members has an edge reaching OUTSIDE
+    # the group -- see roots_to_skip below for the actual computation
+    # this reduces to.
+    root_members = {}
+    for i in range(len(distinct_coords)):
+        root_members.setdefault(_find(i), []).append(i)
+
+    roots_to_skip = set()
+    for root, member_idxs in root_members.items():
+        if len(member_idxs) < 2:
+            continue  # singleton group -- nothing to collapse, never a risk
+        member_set = set(member_idxs)
+        has_external_edge = False
+        for u_raw, v_raw in raw_edges:
+            iu, iv = coord_to_idx[u_raw], coord_to_idx[v_raw]
+            in_u = iu in member_set
+            in_v = iv in member_set
+            if in_u != in_v:
+                # Exactly one endpoint is in this group -- an edge that
+                # connects this group to the rest of the network. As
+                # long as at least one such edge exists, the group's
+                # canonical point stays reachable after collapse, so
+                # the group is safe.
+                has_external_edge = True
+                break
+        if not has_external_edge:
+            roots_to_skip.add(root)
+
+    # Canonical representative per group = the first coordinate
+    # encountered in nodes_coords_set's own (arbitrary but fixed, for
+    # this one call) iteration order -- see docstring above for why.
+    # Groups in roots_to_skip are excluded here: each of their members
+    # is treated as its own canonical point (i.e. left unsnapped),
+    # per-group, per the self-collapse guard above.
+    canonical_for_root = {}
+    canonical_coord = [None] * len(distinct_coords)
+    for i, c in enumerate(distinct_coords):
+        root = _find(i)
+        if root in roots_to_skip:
+            canonical_coord[i] = c
+            continue
+        if root not in canonical_for_root:
+            canonical_for_root[root] = c
+        canonical_coord[i] = canonical_for_root[root]
+
+    def _snap(coord):
+        return canonical_coord[coord_to_idx[coord]]
+
+    # --- Build the post-snap graph/edges/edge_geoms ----------------------
+    for u_raw, v_raw in raw_edges:
+        u = _snap(u_raw)
+        v = _snap(v_raw)
+        if u == v:
+            # Both endpoints snapped to the same canonical node (e.g. a
+            # near-zero-length digitizing artifact folded together by
+            # the snap) -- skip; a self-loop edge carries no routing
+            # value and would otherwise sit in G with length 0. Groups
+            # excluded by the self-collapse guard above never reach
+            # this branch via a group-wide collapse (their members stay
+            # distinct), though a genuine zero-length original edge
+            # (u_raw == v_raw already) can still legitimately hit it.
+            continue
+        length = Point(u).distance(Point(v))
+        G.add_edge(u, v, length=float(length))
+        edges.append((u, v, float(length)))
+        edge_geoms.append(LineString([u, v]))
+
+    nodes_coords = np.array(list(set(canonical_coord))) if canonical_coord else np.zeros((0, 2))
+
+    # --- Connected components (Doc 1 §2.3 Step 2), computed ONCE --------
+    component_id_for_node = {}
+    for comp_idx, component_nodes in enumerate(
+        sorted(nx.connected_components(G), key=len, reverse=True)
+    ):
+        for node in component_nodes:
+            component_id_for_node[node] = comp_idx
+
+    edge_comp = [component_id_for_node.get(u, -1) for u, v, _ in edges]
+
+    return G, edges, nodes_coords, edge_geoms, edge_comp
 
 
 # ========================================
 # ROUTING WORKER
 # ========================================
-# Snapping (PART 1 fix): a parcel/POI point is now snapped to the true
-# geometric nearest point on the road network -- interpolated along a
-# road segment via an edge-level STRtree + nearest_points() projection
-# if that is closer than any existing vertex, inserted as a "virtual"
-# graph node connected to that edge's two endpoints -- instead of the
-# previous nearest-existing-vertex-only snap. Same silent-to-
-# straight-line fallback behavior as before on any lookup/projection/
-# routing failure. Also returns a METHOD label and the route geometry,
-# so what the baseline was already doing internally becomes visible
-# instead of hidden.
+# Component-aware road-distance redesign (Doc 1 §2.3): a parcel/POI
+# point is snapped to the true geometric nearest point on the road
+# network -- interpolated along a road segment via an edge-level
+# STRtree + nearest_points() projection if that is closer than any
+# existing vertex, inserted as a "virtual" graph node connected to
+# that edge's two endpoints -- exactly as before (this mechanism
+# itself, _snap_to_road(), is unchanged; only how many times and from
+# where it's called has changed: once per CANDIDATE now, via
+# _find_road_candidates() below, instead of once per point). Road
+# distance is no longer a silent fallback to Straight on any failure
+# -- the two are independent, always-computed measurements (see the
+# module docstring and Doc 1 §2.2).
 def worker_process(args):
     """
-    For one parcel centroid, finds the 3 nearest POIs of each type in
-    poi_types and computes the distance to each: network-routed via
-    the road graph if a path exists, else straight-line.
+    For one parcel, finds the SINGLE nearest POI (by straight-line
+    distance) of each type in poi_types, and reports two independent
+    distances to that one landmark: a component-aware network-routed
+    Road distance (see _find_road_candidates() below and Doc 1 §2.3),
+    and the plain Euclidean Straight distance (always computed, never
+    conditional on routing success).
 
     Args:
-        args: (row_idx, centroid_xy, poi_types, poi_coords_dict,
-        poi_names_dict, poi_types_tag_dict, edges_list, nodes_coords,
-        edge_geoms) tuple -- packed this way so this function can be
-        called uniformly whether or not the caller parallelizes (see
+        args: (row_idx, centroid_xy, parcel_boundary_geom, poi_types,
+        poi_coords_dict, poi_names_dict, poi_types_tag_dict,
+        edges_list, nodes_coords, edge_geoms, edge_comp) tuple --
+        packed this way so this function can be called uniformly
+        whether or not the caller parallelizes (see
         run_cpu_parallel_with_progress(), which currently calls this
-        sequentially). poi_names_dict mirrors poi_coords_dict exactly
-        (same keys, same per-type ordering) -- type -> list of each
-        POI's own "name" attribute value (Python None where missing or
-        where the source has no name column at all -- never the
-        string "None", never an empty string). poi_types_tag_dict is
-        SPARSE -- it only ever has a "SCHOOL" key (the unified
-        education pool; see task()'s own construction of it and
-        _classify_education_poi()/_is_education_fclass() above), with
-        the same per-index ordering as poi_coords_dict["SCHOOL"]/
-        poi_names_dict["SCHOOL"] -- type -> CAMA_SCHOOL*_TYPE
-        classification value (e.g. "MONTESSORI") or None per POI. Every
-        other type has no entry in this dict at all, and is completely
-        unaffected -- this is a deliberate, narrow addition for the
-        school pool only, not a generic third dimension for every type.
-        Built from the SAME filtered subset as poi_coords_dict for each
-        type (see task()), so a given index pi always refers to the
-        same POI across all three dicts. edge_geoms is a picklable
-        list[LineString] (one per edges_list entry, same index) -- NOT
-        a live STRtree, which is rebuilt fresh inside this function
-        from edge_geoms, matching the existing rebuild-per-call
-        convention already used for nodes_kdtree/G_local, so this
-        function stays safe to call from a future multiprocessing pool
-        even though it currently runs sequentially.
+        sequentially). centroid_xy is used ONLY for the Straight
+        distance measurement now (Doc 1 §2.2 defines Straight as
+        parcel-centroid-to-landmark) -- it is no longer used as a
+        routing endpoint at all; parcel_boundary_geom (the parcel's
+        own, un-simplified polygon/multipolygon geometry, in the same
+        working CRS as centroid_xy) is the geometry
+        _find_road_candidates() searches from on the parcel side, and
+        each resulting candidate's own snapped point is itself used as
+        the Dijkstra routing endpoint -- there is no longer a single,
+        fixed "start" node shared across every candidate/type the way
+        centroid_xy's snap used to be. poi_names_dict mirrors
+        poi_coords_dict exactly (same keys, same per-type ordering) --
+        type -> list of each POI's own "name" attribute value (Python
+        None where missing or where the source has no name column at
+        all -- never the string "None", never an empty string).
+        poi_types_tag_dict is SPARSE -- it only ever has a "SCHOOL" key
+        (the unified education pool; see task()'s own construction of
+        it and _classify_education_poi()/_is_education_fclass()
+        above), with the same per-index ordering as
+        poi_coords_dict["SCHOOL"]/poi_names_dict["SCHOOL"] -- type ->
+        CAMA_SCHOOL*_TYPE classification value (e.g. "MONTESSORI") or
+        None per POI. Every other type has no entry in this dict at
+        all, and is completely unaffected -- this is a deliberate,
+        narrow addition for the school pool only, not a generic third
+        dimension for every type. Built from the SAME filtered subset
+        as poi_coords_dict for each type (see task()), so a given
+        index pi always refers to the same POI across all three dicts.
+        edge_geoms is a picklable list[LineString] (one per
+        edges_list entry, same index) -- NOT a live STRtree, which is
+        rebuilt fresh inside this function from edge_geoms, matching
+        the existing rebuild-per-call convention already used for
+        G_local, so this function stays safe to call from a future
+        multiprocessing pool even though it currently runs
+        sequentially. edge_comp is a list of integer connected-
+        component IDs, same length/order as edges_list/edge_geoms (see
+        graph_from_roads()) -- looked up once per candidate below to
+        decide, cheaply, which parcel/landmark candidate pairs can
+        possibly be routed before ever calling bidirectional_dijkstra
+        (Doc 1 §2.3 Step 4).
 
     Returns:
         tuple: (row_idx, results, route_records). results is a dict of
-        CAMA_{TYPE}{1-3} / CAMA_{TYPE}{1-3}_NAME -> value for this
-        parcel's MAIN output row (the corresponding POI's own name, or
-        None if missing/unavailable -- never written for a rank this
-        type doesn't have enough total POIs to reach; see task()'s
-        pre-init notes), PLUS CAMA_SCHOOL{1-3}_TYPE for the school pool
-        specifically (see poi_types_tag_dict above). route_records is a
-        list of per-route dicts (parcel index, category, rank, METHOD,
-        distance, route geometry) used ONLY by the separate, still-
-        disabled poi_routes.gpkg QA/diagnostic export (see its own
-        comment further below) -- this is intentionally untouched by
-        the MAIN-output METHOD->NAME change: the `method` variable
-        computed below is still fully alive and still flows into
-        route_records exactly as before. On error, results is
-        {"_error": str(e)} instead.
+        CAMA_{TYPE}_ROAD / CAMA_{TYPE}_STRAIGHT / CAMA_{TYPE}_NAME ->
+        value for this parcel's MAIN output row (the corresponding
+        POI's own name, or None if missing/unavailable), PLUS
+        CAMA_SCHOOL_TYPE for the school pool specifically (see
+        poi_types_tag_dict above). There is no ranking/rank-index
+        concept anymore -- one winner per present type, full stop.
+        route_records is a list of per-route dicts (parcel index,
+        category, Road distance, Straight distance, geometry) used
+        ONLY by the separate, still-disabled poi_routes.gpkg QA/
+        diagnostic export (see its own comment further below) -- its
+        field shape changed from a single METHOD+DIST_M pair to
+        ROAD_DIST_M/STRAIGHT_DIST_M because there is no longer a
+        single "the" distance+method per record to log (see that
+        export's own comment for why this minimal shape change was
+        needed even though the export itself remains out of scope/
+        disabled). On error, results is {"_error": str(e)} instead.
     """
-    (row_idx, centroid_xy, poi_types, poi_coords_dict, poi_names_dict, poi_types_tag_dict, edges_list, nodes_coords, edge_geoms) = args
-    route_records = []  # (typ, rank, method, dist, geometry)
+    (row_idx, centroid_xy, parcel_boundary_geom, poi_types, poi_coords_dict,
+     poi_names_dict, poi_types_tag_dict, edges_list, nodes_coords, edge_geoms,
+     edge_comp) = args
+    route_records = []  # per-type dicts; see docstring above
     try:
         if len(nodes_coords) == 0:
             return row_idx, {}, route_records
@@ -1131,10 +1496,10 @@ def worker_process(args):
             G_local.add_edge(tuple(u), tuple(v), length=float(length))
 
         # Edge-level spatial index for true nearest-point-on-road
-        # snapping (PART 1 fix). Rebuilt fresh from the picklable
-        # edge_geoms list on every call, matching the existing
-        # rebuild-per-call convention already used above for G_local
-        # (and previously for nodes_kdtree) -- see the args docstring
+        # snapping, and for the candidate-search buffer query below.
+        # Rebuilt fresh from the picklable edge_geoms list on every
+        # call, matching the existing rebuild-per-call convention
+        # already used above for G_local -- see the args docstring
         # note on why a live STRtree is never passed through args.
         edge_tree = STRtree(edge_geoms) if edge_geoms else None
 
@@ -1142,13 +1507,13 @@ def worker_process(args):
         # so far during THIS call: edge_idx -> sorted list of
         # (proj_dist_along_edge, node_id), always seeded lazily with
         # the edge's own two original endpoints (proj_dist 0 and
-        # elen). Needed so that if a second point (e.g. the centroid's
-        # start-snap and a POI's end-snap) lands on the SAME edge as
-        # an earlier point, it gets connected to its correct
-        # immediate neighbor(s) on that edge -- not just to that
-        # edge's far-apart original endpoints, which would silently
-        # produce a too-long route between two points that are
-        # actually close together on the same segment.
+        # elen). Needed so that if a second point (e.g. a parcel-side
+        # candidate snap and a landmark-side candidate snap) lands on
+        # the SAME edge as an earlier point, it gets connected to its
+        # correct immediate neighbor(s) on that edge -- not just to
+        # that edge's far-apart original endpoints, which would
+        # silently produce a too-long route between two points that
+        # are actually close together on the same segment.
         edge_chains = {}
 
         def _snap_to_road(point_xy):
@@ -1160,42 +1525,44 @@ def worker_process(args):
             (x, y) coordinate tuple to use as a G_local routing
             endpoint.
 
-            If the edge this point snaps to has not been touched
-            before in this call, the new point is inserted as a
-            virtual node connected to that edge's two original
-            endpoints (distance-weighted), same as before. If the
-            edge HAS already had one or more points placed on it
-            earlier in this same call, the new point is instead
-            spliced into the existing ordered chain of points on that
-            edge: it is connected only to its immediate left/right
-            neighbors on the edge (with the correct sub-distances),
-            and the single now-superseded edge directly between those
-            two neighbors is removed -- so two points on the same
-            road segment always route at their true along-segment
-            distance from each other, not via that segment's far
-            endpoints.
+            UNCHANGED mechanism from the previous design (Doc 1 §2.3
+            Step 5) -- if the edge this point snaps to has not been
+            touched before in this call, the new point is inserted as
+            a virtual node connected to that edge's two original
+            endpoints (distance-weighted). If the edge HAS already had
+            one or more points placed on it earlier in this same call,
+            the new point is instead spliced into the existing ordered
+            chain of points on that edge: it is connected only to its
+            immediate left/right neighbors on the edge (with the
+            correct sub-distances), and the single now-superseded edge
+            directly between those two neighbors is removed -- so two
+            points on the same road segment always route at their true
+            along-segment distance from each other, not via that
+            segment's far endpoints. What HAS changed is how often this
+            is called: once per distinct candidate (see
+            _find_road_candidates() below), not once per parcel/POI
+            point -- a parcel or landmark with 3 candidate components
+            within radius now calls this up to 3 times on that side,
+            not once.
 
             The virtual node's ID is its own (x, y) coordinate tuple
-            -- required because route_geom = LineString(path) further
-            below assumes every graph node ID IS an (x, y) coordinate,
-            same as every existing road-vertex node ID already is.
+            -- required because route geometry (if ever reconstructed)
+            assumes every graph node ID IS an (x, y) coordinate, same
+            as every existing road-vertex node ID already is.
 
             Collision handling: if the projected coordinate already
             matches an existing node in G_local -- an original road
             vertex, or a virtual node inserted earlier in THIS SAME
-            call (e.g. the projection lands exactly on an existing
-            vertex, or two different input points project to the same
-            location) -- that existing node is reused as-is; no new
-            node or edges are inserted, avoiding both an unintended
-            overwrite of that node's existing edges and a zero-length
-            self-loop.
+            call -- that existing node is reused as-is; no new node or
+            edges are inserted, avoiding both an unintended overwrite
+            of that node's existing edges and a zero-length self-loop.
 
             Returns:
                 tuple[float, float] | None: the node ID to route
                 to/from, or None if the edge lookup or projection
-                fails for any reason. A None here is treated by the
-                caller exactly like "no path found" -- it falls back
-                to the existing straight-line distance, never raises.
+                fails for any reason. A None here means this candidate
+                contributes nothing (the caller simply excludes it),
+                never raises.
             """
             if edge_tree is None:
                 return None
@@ -1258,13 +1625,94 @@ def worker_process(args):
             except Exception:
                 return None
 
-        # The centroid's true nearest-point-on-road snap is the same
-        # for every POI type/candidate queried below -- computed once
-        # here instead of being recomputed identically on every
-        # candidate iteration (previous behavior queried this inside
-        # the innermost loop even though centroid_xy never changes
-        # within this call).
-        start = _snap_to_road(centroid_xy)
+        def _find_road_candidates(point_or_boundary):
+            """
+            Doc 1 §2.3 Step 3 / Instructions E.5. Returns a list of
+            (component_id, snapped_node_xy) -- one entry per distinct
+            connected component with at least one road edge within
+            ROAD_CANDIDATE_SEARCH_RADIUS_M of point_or_boundary. The
+            snapped_node_xy for each component is that component's own
+            single nearest point on the road network, found via
+            _snap_to_road() above (the existing true-nearest-point-on-
+            line technique) -- called once per distinct component
+            here, not once per edge and not once per point. This same
+            function is used for BOTH the parcel side (called with the
+            parcel's own boundary/polygon geometry) and the landmark
+            side (called with a single shapely Point) -- identical
+            logic either side, only the input geometry differs.
+
+            Candidate edges within radius are found via an STRtree
+            query against point_or_boundary.buffer(radius) -- the same
+            buffered-STRtree-query technique used in the developer's
+            own validation script (Doc 1 §3/Instructions E.5) -- then
+            grouped by edge_comp[idx]; for each distinct component
+            group, only the single geometrically nearest edge in that
+            group is actually snapped via _snap_to_road() (the other
+            edges in that same group/component are redundant for
+            candidate purposes -- Doc 1 §3 confirmed distinct ROAD
+            FEATURES within a component add no new reachable
+            components, only distinct COMPONENTS matter).
+
+            Returns:
+                list[tuple[int, tuple[float, float]]]: possibly empty
+                (no road edge of any component within radius) or
+                containing more than one entry (multiple distinct
+                components nearby) -- Doc 1 §3 found this is usually 1
+                (84.0% of real parcels), occasionally 2-4, rarely more
+                (max 11 seen once); no fixed cap is applied here.
+            """
+            if edge_tree is None or not edge_geoms:
+                return []
+            try:
+                buffered = point_or_boundary.buffer(ROAD_CANDIDATE_SEARCH_RADIUS_M)
+                nearby = edge_tree.query(buffered)
+            except Exception:
+                return []
+            if nearby is None or len(nearby) == 0:
+                return []
+
+            # STRtree.query() may return indices (newer shapely) or
+            # geometries (older shapely) -- same int-vs-geometry
+            # compatibility handled in _snap_to_road() above.
+            candidate_idxs = []
+            for item in nearby:
+                if isinstance(item, (int, np.integer)):
+                    candidate_idxs.append(int(item))
+                else:
+                    try:
+                        candidate_idxs.append(edge_geoms.index(item))
+                    except ValueError:
+                        continue
+
+            best_dist_for_comp = {}
+            best_idx_for_comp = {}
+            for idx in candidate_idxs:
+                comp = edge_comp[idx]
+                if comp < 0:
+                    continue  # defensive: should not occur (see graph_from_roads())
+                d = point_or_boundary.distance(edge_geoms[idx])
+                if comp not in best_dist_for_comp or d < best_dist_for_comp[comp]:
+                    best_dist_for_comp[comp] = d
+                    best_idx_for_comp[comp] = idx
+
+            candidates = []
+            for comp, idx in best_idx_for_comp.items():
+                # Snap FROM the true nearest point of point_or_boundary
+                # on this edge, not from an arbitrary point on it --
+                # nearest_points() gives the true closest pair between
+                # the input geometry and this edge's line.
+                nearest_on_edge = nearest_points(point_or_boundary, edge_geoms[idx])[1]
+                snapped = _snap_to_road((nearest_on_edge.x, nearest_on_edge.y))
+                if snapped is not None:
+                    candidates.append((comp, snapped))
+            return candidates
+
+        # Parcel-side candidates depend only on the parcel's own
+        # boundary geometry, not on POI type -- computed once here and
+        # reused for every type below (the same "compute once, reuse
+        # across types" role centroid_xy's single snap used to play,
+        # now holding a list of candidates instead of one fixed node).
+        parcel_candidates = _find_road_candidates(parcel_boundary_geom)
 
         results = {}
         for typ in poi_types:
@@ -1277,47 +1725,84 @@ def worker_process(args):
             # note above.
             types_tag = poi_types_tag_dict.get(typ)
 
-            k = min(3, len(coords))
+            # Single nearest POI by straight-line distance (Doc 1
+            # §2.1, LOCKED) -- k=1, not top-3. Tie-break (Instructions
+            # E.6/I1): whichever cKDTree's own query returns first for
+            # k=1 -- its own internal, deterministic tie-break,
+            # documented here rather than left to accidental behavior.
             tree = cKDTree(coords)
-            _, idxs = tree.query([centroid_xy], k=k)
+            _, idxs = tree.query([centroid_xy], k=1)
+            pi = int(idxs[0])
 
-            idxs = [int(idxs[0])] if k == 1 else [int(i) for i in idxs[0]]
+            poi_xy = coords[pi]
+            poi_name = names[pi] if pi < len(names) else None
+            poi_type_tag = types_tag[pi] if types_tag is not None and pi < len(types_tag) else None
 
-            network_results = []
-            for pi in idxs:
-                poi_xy = coords[pi]
-                poi_name = names[pi] if pi < len(names) else None
-                poi_type_tag = types_tag[pi] if types_tag is not None and pi < len(types_tag) else None
-                end = _snap_to_road(poi_xy)
+            # Straight -- always computed, unconditionally, never
+            # dependent on routing success (Doc 1 §2.2, LOCKED).
+            straight_dist = float(Point(centroid_xy).distance(Point(poi_xy)))
 
-                method = "Straight"
-                route_geom = LineString([centroid_xy, tuple(poi_xy)])
-                try:
-                    if start is not None and end is not None and nx.has_path(G_local, start, end):
-                        dist, path = nx.bidirectional_dijkstra(G_local, start, end, weight="length")
-                        method = "Road"
-                        route_geom = LineString(path)
-                    else:
-                        dist = Point(centroid_xy).distance(Point(poi_xy))
-                except Exception:
-                    dist = Point(centroid_xy).distance(Point(poi_xy))
+            # Road -- component-aware candidate pairing (Doc 1 §2.3
+            # Step 4). Only pairs whose component IDs match are ever
+            # routed; a mismatched pair is skipped without calling
+            # bidirectional_dijkstra at all (a route is mathematically
+            # impossible between different components, so there is
+            # nothing for Dijkstra to usefully compute there).
+            landmark_candidates = _find_road_candidates(Point(poi_xy))
 
-                network_results.append((round(dist, 2), method, route_geom, poi_name, poi_type_tag))
+            best_road_dist = float("inf")
+            for pc_comp, pc_node in parcel_candidates:
+                for lc_comp, lc_node in landmark_candidates:
+                    if pc_comp != lc_comp:
+                        continue
+                    try:
+                        dist, _path = nx.bidirectional_dijkstra(
+                            G_local, pc_node, lc_node, weight="length")
+                    except Exception:
+                        continue
+                    if dist < best_road_dist:
+                        best_road_dist = dist
 
-            network_results = sorted(network_results, key=lambda r: r[0])
-            for i, (dist, method, route_geom, poi_name, poi_type_tag) in enumerate(network_results[:3], start=1):
-                results[f"CAMA_{typ.upper()}{i}"] = float(dist)
-                results[f"CAMA_{typ.upper()}{i}_NAME"] = poi_name
-                if types_tag is not None:
-                    results[f"CAMA_{typ.upper()}{i}_TYPE"] = poi_type_tag
-                route_records.append({
-                    "PARCEL_IDX": row_idx,
-                    "CATEGORY": typ.upper(),
-                    "RANK": i,
-                    "METHOD": method,
-                    "DIST_M": dist,
-                    "geometry": route_geom,
-                })
+            # Three-way sentinel resolution (new rule, confirmed this
+            # session -- not in the original Doc 1 §2.2 text, added
+            # during Phase 1 review):
+            #   - inf  (no candidate pair shared a component -- no
+            #     matching component anywhere in range on either side)
+            #     -> Road = 0.0, the ONE genuine "no connection found"
+            #     sentinel (Doc 1 §2.2/§2.3 Step 4).
+            #   - exactly 0.0 (a matching component WAS found and
+            #     bidirectional_dijkstra actually ran and returned a
+            #     real distance that happens to be exactly zero -- the
+            #     parcel candidate and landmark candidate snapped to
+            #     the identical point on the road network, e.g. two
+            #     POIs directly facing each other on the same nearest
+            #     road) -> remapped to 1.0, so a genuine, essentially-
+            #     adjacent CONNECTION is never indistinguishable from
+            #     the "no connection at all" sentinel above. This is
+            #     an exact equality check on 0.0 only -- no "close to
+            #     zero" threshold -- any other real distance (0.3,
+            #     2.1, etc.) is written unrounded and unchanged.
+            #   - else -> the real, unmodified Dijkstra distance.
+            if best_road_dist == float("inf"):
+                road_dist = 0.0
+            elif best_road_dist == 0.0:
+                road_dist = 1.0
+            else:
+                road_dist = float(best_road_dist)
+
+            u = typ.upper()
+            results[f"CAMA_{u}_ROAD"] = road_dist
+            results[f"CAMA_{u}_STRAIGHT"] = straight_dist
+            results[f"CAMA_{u}_NAME"] = poi_name
+            if types_tag is not None:
+                results[f"CAMA_{u}_TYPE"] = poi_type_tag
+
+            route_records.append({
+                "PARCEL_IDX": row_idx,
+                "CATEGORY": u,
+                "ROAD_DIST_M": road_dist,
+                "STRAIGHT_DIST_M": straight_dist,
+            })
 
         return row_idx, results, route_records
 
@@ -1335,10 +1820,11 @@ def run_cpu_parallel_with_progress(
     original_geometry=None,
 ):
     """
-    Builds the road graph once, then runs worker_process() sequentially
-    (despite the name -- see Notes) for every parcel centroid in gdf,
-    writing results back into gdf and posting a "count" message to
-    progress_queue per parcel.
+    Builds the road graph once (now including the vertex-snap and
+    connected-component labeling -- see graph_from_roads()), then runs
+    worker_process() sequentially (despite the name -- see Notes) for
+    every parcel in gdf, writing results back into gdf and posting a
+    "count" message to progress_queue per parcel.
 
     Args:
         gdf, poi_gdf, road_gdf (geopandas.GeoDataFrame): parcel, POI,
@@ -1353,15 +1839,15 @@ def run_cpu_parallel_with_progress(
         the POI source has no name column at all, never the string
         "None" or an empty string. Threaded straight through to
         worker_process() via args_list below for the MAIN output's
-        CAMA_{TYPE}{N}_NAME columns.
+        CAMA_{TYPE}_NAME columns.
         poi_types_tag_dict (dict): SPARSE -- only ever has a "SCHOOL"
         key (the unified education pool; see worker()'s own construction
         of it), same per-index ordering as poi_coords_dict["SCHOOL"] --
         type -> list of each POI's CAMA_SCHOOL*_TYPE classification
         value (e.g. "MONTESSORI") or None. Every other type has no
         entry here at all. Threaded straight through to
-        worker_process() for the MAIN output's CAMA_SCHOOL{N}_TYPE
-        columns.
+        worker_process() for the MAIN output's CAMA_SCHOOL_TYPE
+        column.
         output_path (str | None): if given, the result is written here
         via _write_gpkg() after processing (local output mode). None
         for DB output mode, where the caller writes to PostGIS instead.
@@ -1416,22 +1902,35 @@ def run_cpu_parallel_with_progress(
     # transform coordinates -- that's what .to_crs() is for).
     projected_crs = gdf.crs
 
-    G_main, edges_list, nodes_coords, edge_geoms = graph_from_roads(road_gdf)
+    G_main, edges_list, nodes_coords, edge_geoms, edge_comp = graph_from_roads(road_gdf)
     if len(edges_list) == 0:
         raise Exception("No valid edges found in road network.")
 
-    # NOTE (Part A3 investigation, resolved as NOT needed): same
-    # centroid-only pattern already confirmed safe in road_density.py
-    # and terrain.py -- only row.geometry.centroid is read from each
-    # parcel below, never the full polygon via buffer/intersection/
-    # union. Road geometry (graph_from_roads() above) is built from raw
-    # LineString coordinates, not a union/buffer either. No
-    # fix_geometry() added.
+    # Component-aware road-distance redesign (Doc 1 §2.3 Step 3): the
+    # parcel-side candidate search now runs against the parcel's own
+    # boundary geometry, not just its centroid -- centroid_xy is still
+    # captured and passed through (worker_process() still needs it for
+    # the Straight distance measurement, Doc 1 §2.2), but
+    # row.geometry itself (the full, un-simplified polygon/
+    # multipolygon, same as gdf already holds at this point) is now
+    # ALSO passed through as parcel_boundary_geom, a new element in
+    # args_list -- it was not previously threaded into worker_process()
+    # at all (only the derived centroid was). This mirrors the same
+    # "compute once here, thread it down as one more args_list element"
+    # pattern already used for centroid_xy itself.
+    #
+    # NOTE (Part A3 investigation, resolved as NOT needed): still true
+    # for the geometry READ here -- only row.geometry is read directly
+    # (now for its boundary, previously only for its centroid), never a
+    # buffer/intersection/union of it. Road geometry (graph_from_roads()
+    # above) is built from raw LineString coordinates, not a
+    # union/buffer either. No fix_geometry() added.
     args_list = []
     for idx, row in gdf.iterrows():
         centroid_xy = (row.geometry.centroid.x, row.geometry.centroid.y)
         args_list.append(
-            (idx, centroid_xy, poi_types, poi_coords_dict, poi_names_dict, poi_types_tag_dict, edges_list, nodes_coords, edge_geoms)
+            (idx, centroid_xy, row.geometry, poi_types, poi_coords_dict, poi_names_dict,
+             poi_types_tag_dict, edges_list, nodes_coords, edge_geoms, edge_comp)
         )
 
     total = len(args_list)
@@ -1506,24 +2005,41 @@ def run_cpu_parallel_with_progress(
         _write_gpkg(gdf, output_path)
 
         # ------------------------------------------------------------------
-        # poi_routes.gpkg write -- DISABLED (commented out, not removed).
-        # Per-task decision to suppress this secondary/diagnostic-only
-        # routes/audit output so a successful Run Processing always
-        # produces exactly ONE output file per tool. all_route_records
-        # itself is still computed above (line 569's initialization, line
-        # 587's per-parcel .extend()) -- route_records is a byproduct of
-        # the same worker_process() loop that produces the main
-        # CAMA_{TYPE}{N}/CAMA_{TYPE}{N}_METHOD output columns -- only this
-        # write (and its own early `return routes_path`) is disabled.
-        # This function's existing `return None` immediately below (kept
-        # active, untouched) already covers every resulting code path: it
-        # was already the fallback whenever output_path was falsy (DB-
-        # output mode) or all_route_records was empty, and now it is the
-        # ONLY reachable return, since nothing above it can early-return
-        # anymore. The caller's existing `if routes_path:` guard (see
-        # run_cpu_parallel_with_progress()'s single call site) continues
-        # to work exactly as before, just always taking the "no routes
-        # layer" path.
+        # poi_routes.gpkg write -- DISABLED (commented out, not removed),
+        # already the case BEFORE this task (single-landmark/component-
+        # aware routing redesign; see the module docstring and Doc 1).
+        # Per an earlier, separate task decision to suppress this
+        # secondary/diagnostic-only routes/audit output so a successful
+        # Run Processing always produces exactly ONE output file per
+        # tool. all_route_records itself is still computed above (this
+        # function's own initialization, and its per-parcel .extend()
+        # call) -- route_records is a byproduct of the same
+        # worker_process() loop that produces the main CAMA_{TYPE}_ROAD/
+        # CAMA_{TYPE}_STRAIGHT output columns -- only this write (and its
+        # own early `return routes_path`) is disabled.
+        #
+        # STRUCTURAL NOTE (this task): worker_process()'s own
+        # route_records dicts changed shape as a DIRECT, unavoidable
+        # consequence of the single-landmark/two-independent-distances
+        # redesign -- there is no longer a single winning "route"
+        # geometry per type/rank to log (each type can now try several
+        # parcel-candidate x landmark-candidate pairs before keeping the
+        # minimum, and Road/Straight are two independent numbers, not a
+        # method label attached to one chosen distance) -- so a
+        # "geometry" key and the old METHOD/DIST_M/RANK fields no longer
+        # exist on each dict; ROAD_DIST_M/STRAIGHT_DIST_M replace them
+        # (see worker_process()'s own route_records.append() for the
+        # exact current shape). This is the MINIMUM edit needed to keep
+        # this comment (and a future re-enabler's expectations) honest
+        # about what all_route_records actually contains now -- the
+        # write itself remains untouched/disabled, and no GeoDataFrame
+        # construction below was fixed to match the new (geometry-less)
+        # shape, since doing so is out of scope for a dormant feature
+        # (Doc 1 §5/Instructions E.13): if and when this export is ever
+        # re-enabled, it will need a route geometry re-added to
+        # route_records first (e.g. the winning pair's own path), since
+        # gpd.GeoDataFrame(...) below still assumes a "geometry" key that
+        # no longer exists.
         # ------------------------------------------------------------------
         # if all_route_records:
             # routes_gdf = gpd.GeoDataFrame(all_route_records, crs=projected_crs)
@@ -1531,7 +2047,7 @@ def run_cpu_parallel_with_progress(
             # if original_crs is not None:
                 # routes_gdf = routes_gdf.to_crs(original_crs)
             # _write_gpkg(routes_gdf, routes_path)
-            # print(f"ℹ️ Exported {len(routes_gdf)} route(s) with Road/Straight labels: {routes_path}")
+            # print(f"ℹ️ Exported {len(routes_gdf)} route(s): {routes_path}")
             # return routes_path
     return None
 
@@ -3997,7 +4513,7 @@ def run_with_progress(app_root):
             # Whether this POI source has a usable "name" attribute at
             # all -- "name" is treated as OPTIONAL (unlike "fclass",
             # which the whole pipeline already requires): if this
-            # column is absent, every CAMA_{TYPE}{N}_NAME value below
+            # column is absent, every CAMA_{TYPE}_NAME value below
             # simply becomes Python None for every candidate, the run
             # is never invalidated, and nothing crashes.
             has_poi_name_column = "name" in poi_gdf.columns
@@ -4008,8 +4524,8 @@ def run_with_progress(app_root):
                 names list from the SAME filtered subset of poi_gdf,
                 in the SAME row order -- required so a given
                 candidate's name always travels with its own
-                coordinate through the ranking pipeline in
-                worker_process() (never independently re-filtered,
+                coordinate through worker_process()'s own nearest-
+                POI lookup (never independently re-filtered,
                 which could otherwise let the two drift out of
                 alignment). A missing/NULL "name" value becomes Python
                 None here -- never the literal string "None", never an
@@ -4034,19 +4550,21 @@ def run_with_progress(app_root):
                 poi_coords[suffix], poi_names[suffix] = _coords_and_names_for(raw_t)
 
             # ------------------------------------------------------------------
-            # Unified education pool ("CAMA_SCHOOL{1-3}"). Every POI whose
+            # Unified education pool ("CAMA_SCHOOL_*"). Every POI whose
             # normalized fclass passes _is_education_fclass() (bare "school",
             # every literal "*_school" variant, or exactly university/
-            # college/kindergarten/preschool) is gathered into ONE pool,
-            # ranked purely by distance regardless of sub-type -- NOT split
-            # into separate per-subtype buckets/columns. Each POI's own
-            # classification (_classify_education_poi(), keyword-matched
-            # against its own fclass+name -- see that function's docstring
-            # for why a POI whose fclass alone already says "university" or
-            # "middle school" resolves automatically without needing a name
-            # at all) travels alongside its coordinate and name as a third
-            # parallel array, written to CAMA_SCHOOL{rank}_TYPE by
-            # worker_process(). "SCHOOL" is used as the literal poi_types/
+            # college/kindergarten/preschool) is gathered into ONE pool, from
+            # which the single nearest (by straight-line distance) is picked
+            # regardless of sub-type -- NOT split into separate per-subtype
+            # buckets/columns. Each POI's own classification
+            # (_classify_education_poi(), keyword-matched against its own
+            # fclass+name -- see that function's docstring for why a POI
+            # whose fclass alone already says "university" or "middle
+            # school" resolves automatically without needing a name at all)
+            # travels alongside its coordinate and name as a third parallel
+            # array, written to CAMA_SCHOOL_TYPE by worker_process() for
+            # whichever POI in the pool ends up being the nearest one.
+            # "SCHOOL" is used as the literal poi_types/
             # poi_coords/poi_names/poi_types_tag key -- typ.upper() on it
             # downstream is a no-op, exactly like every other already-
             # uppercase dynamic suffix.
@@ -4102,58 +4620,45 @@ def run_with_progress(app_root):
             # order (NOT relying on pandas' .at[] lazy-column-creation
             # inside worker_process()'s caller below, which would
             # otherwise append each column in first-write order instead
-            # -- previously the exact reason METHOD columns ended up
-            # grouped at the very end of the output, in a non-
-            # deterministic order dependent on which parcel happened to
-            # populate a given type/rank first).
+            # -- previously the exact reason columns ended up grouped at
+            # the very end of the output, in a non-deterministic order
+            # dependent on which parcel happened to populate a given
+            # type first).
             #
-            # For every realizable type, only the ranks that are
-            # CATEGORICALLY POSSIBLE get columns at all: capped via
-            # min(3, total POIs of that type in this source) -- the
-            # exact same cap already used per-parcel for k in
-            # worker_process()'s cKDTree query, so a type with e.g. only
-            # 1 total POI can never populate a CAMA_{TYPE}2/3 value for
-            # ANY parcel in this run, and therefore never gets those
-            # columns pre-created either. This closes the previously-
-            # flagged gap where ALL FIVE ALLOWED_FCLASS types' columns
-            # were unconditionally created regardless of presence (see
-            # the standing comment above _sanitize_fclass_to_suffix()) --
-            # now using ordinary_fixed_types (present-only) instead of
-            # the full static ALLOWED_FCLASS set.
+            # There is no ranking/rank-cap concept anymore (Doc 1 §2.1,
+            # LOCKED -- single nearest landmark per type, not top-3), so
+            # there is nothing to cap via min(3, ...) here either: every
+            # realizable type (already present-only, via
+            # ordinary_fixed_types/other_type_map/"SCHOOL" in poi_coords
+            # -- each built only from types that actually have >= 1 POI
+            # in this source) gets exactly ROAD/STRAIGHT/NAME columns,
+            # full stop.
             #
-            # Each rank's distance column is immediately followed by its
-            # _NAME column (CAMA_{TYPE}1, CAMA_{TYPE}1_NAME,
-            # CAMA_{TYPE}2, CAMA_{TYPE}2_NAME, ...) -- this insertion
-            # order IS the final output column order, matching
-            # _realizable_targets()'s own interleaved ordering above.
-            # METHOD is intentionally not pre-initialized here at all --
-            # removed from the MAIN output entirely (the internal
-            # `method` variable itself is untouched inside
-            # worker_process(), still feeding the separate, dormant
-            # poi_routes.gpkg QA export unchanged).
+            # CAMA_{TYPE}_ROAD is immediately followed by CAMA_{TYPE}_
+            # STRAIGHT, then CAMA_{TYPE}_NAME -- this insertion order IS
+            # the final output column order, matching
+            # _realizable_targets()'s own ordering above.
             for t in ordinary_fixed_types:
-                max_rank = min(3, len(poi_coords[t]))
-                for i in range(1, max_rank + 1):
-                    gdf[f"CAMA_{t.upper()}{i}"] = np.nan
-                    gdf[f"CAMA_{t.upper()}{i}_NAME"] = None
+                u = t.upper()
+                gdf[f"CAMA_{u}_ROAD"] = np.nan
+                gdf[f"CAMA_{u}_STRAIGHT"] = np.nan
+                gdf[f"CAMA_{u}_NAME"] = None
 
             for suffix in other_type_map.values():
-                max_rank = min(3, len(poi_coords[suffix]))
-                for i in range(1, max_rank + 1):
-                    gdf[f"CAMA_{suffix}{i}"] = np.nan
-                    gdf[f"CAMA_{suffix}{i}_NAME"] = None
+                gdf[f"CAMA_{suffix}_ROAD"] = np.nan
+                gdf[f"CAMA_{suffix}_STRAIGHT"] = np.nan
+                gdf[f"CAMA_{suffix}_NAME"] = None
 
-            # Unified education pool pre-init -- same rank-capping
-            # rule as every other type above, PLUS a third column per
-            # rank (_TYPE) unique to the school pool (see
-            # poi_types_tag's own docstring notes in worker_process()
-            # and run_cpu_parallel_with_progress()).
+            # Unified education pool pre-init -- same flat (no-rank)
+            # shape as every other type above, PLUS a fourth column
+            # (_TYPE) unique to the school pool (see poi_types_tag's
+            # own docstring notes in worker_process() and
+            # run_cpu_parallel_with_progress()).
             if "SCHOOL" in poi_coords:
-                max_rank = min(3, len(poi_coords["SCHOOL"]))
-                for i in range(1, max_rank + 1):
-                    gdf[f"CAMA_SCHOOL{i}"] = np.nan
-                    gdf[f"CAMA_SCHOOL{i}_NAME"] = None
-                    gdf[f"CAMA_SCHOOL{i}_TYPE"] = None
+                gdf["CAMA_SCHOOL_ROAD"] = np.nan
+                gdf["CAMA_SCHOOL_STRAIGHT"] = np.nan
+                gdf["CAMA_SCHOOL_NAME"] = None
+                gdf["CAMA_SCHOOL_TYPE"] = None
 
             if output_mode[0] == "local":
                 # output_mode[1] is always the Land Parcel source's
