@@ -7,20 +7,42 @@ PURPOSE:
     nearest POI (by straight-line distance) of each type present in
     ALLOWED_FCLASS (school, church, shop, transport, university), and
     reports TWO independent, always-present distance measurements to
-    that one landmark -- CAMA_{TYPE}_ROAD (a component-aware network-
-    routed distance; see graph_from_roads()/_find_road_candidates()
-    below) and CAMA_{TYPE}_STRAIGHT (the plain Euclidean distance) --
+    that one landmark -- CAMA_{TYPE}_ROAD and CAMA_{TYPE}_STRAIGHT --
     plus CAMA_{TYPE}_NAME (that landmark's own "name" attribute value,
     or Python None if missing/unavailable). There is no ranking/top-3
     concept anymore: exactly one winner per present type, never three.
-    CAMA_{TYPE}_ROAD is 0.0 only when no connected road path exists
-    between the parcel and the landmark within
-    ROAD_CANDIDATE_SEARCH_RADIUS_M on either side (a genuine "no
-    connection found" sentinel -- never a silent stand-in for the
-    Straight distance); a real Road distance of exactly 0.0 (parcel
-    and landmark snap to the identical point on the road network) is
-    instead reported as 1.0, so the sentinel stays unambiguous (see
-    worker_process()'s own comment at that exact branch for why).
+    CAMA_{TYPE}_STRAIGHT is the plain Euclidean distance from the
+    parcel's CENTROID to the landmark -- always computed, never
+    conditional on anything else.
+    CAMA_{TYPE}_ROAD is a full REAL-WORLD TRAVEL distance (a
+    deliberate semantic choice, not a silent redefinition -- see
+    worker_process()'s own comment at the exact point this is
+    computed for the full reasoning and the real-data evidence that
+    drove it): off-road access from the parcel's BOUNDARY to its
+    nearest usable road point, plus the routed distance along the road
+    network, plus off-road access from that road to the landmark --
+    not merely a network-only routed segment between two points
+    already on the road, which is what this column used to mean under
+    two earlier, now fully-removed designs (see
+    graph_from_roads()/_find_nearest_road()/_find_nearest_in_component()
+    below for what IS still reused unmodified from those designs).
+    There is no search-radius cutoff of any kind -- the true globally
+    nearest connected road is always found and routed, however far
+    away it is. CAMA_{TYPE}_ROAD is 0.0 only when no real connected
+    component anywhere yields a usable point on BOTH the parcel side
+    and the landmark side (an extreme edge case under the current
+    all-components design -- see worker_process()'s own comment at
+    that exact check), the ONE genuine "no connection exists"
+    sentinel; a real Road distance of exactly 0.0 is instead reported
+    as 1.0, so the sentinel stays unambiguous. Because
+    CAMA_{TYPE}_STRAIGHT is centroid-based while CAMA_{TYPE}_ROAD's
+    fast-path case routes from the boundary's nearest point TO THE
+    ROAD (a different point from the boundary's own nearest point to
+    the landmark), ROAD shorter than STRAIGHT by anywhere from a few
+    meters up to a couple hundred meters on a large/elongated parcel
+    is normal and expected for that case, not a bug -- see
+    worker_process()'s own note at that exact point for the full
+    explanation and the real-data confirmation.
     Only types actually present in the selected POI source get any
     columns at all. Tool-style version, mirroring road_width.py's
     overall architecture (progress dialog, DB-output resolution flow,
@@ -345,11 +367,11 @@ ALLOWED_FCLASS = {"school", "church", "shop", "transport", "university"}
 # construction) instead of this ordinary fixed-type path.
 ORDINARY_FIXED_FCLASS = {"church", "shop", "transport"}
 
-# Component-aware road-distance algorithm parameters (redesign; see the
-# task's own Doc 1 §2.3/§2.4/§3 for the full evidence). Both values
-# were validated against the developer's real data --
-# RoadNetwork_Caluan.gpkg (1,424 road features) and LandParcel.gpkg
-# (11,911 parcels) -- not chosen theoretically.
+# Component-aware road-distance algorithm parameter (redesign; see the
+# task's own Doc 1 §2.3/§2.4/§3 for the full evidence). Validated
+# against the developer's real data -- RoadNetwork_Caluan.gpkg (1,424
+# road features) and LandParcel.gpkg (11,911 parcels) -- not chosen
+# theoretically.
 #
 # ROAD_VERTEX_SNAP_TOLERANCE_M: two road-graph vertices within this
 # distance of each other are treated as the same node (closes small
@@ -360,16 +382,19 @@ ORDINARY_FIXED_FCLASS = {"church", "shop", "transport"}
 # get merged.
 ROAD_VERTEX_SNAP_TOLERANCE_M = 15.0
 
-# ROAD_CANDIDATE_SEARCH_RADIUS_M: how far (from the parcel boundary,
-# and separately from the landmark point) to search for road edges
-# when building per-component routing candidates. At 800 m, 0% of the
-# 11,911 real parcels had zero roads nearby at all, and the count of
-# parcels with NO connected path to any candidate on the other side
-# ("genuinely stuck") dropped to 95 (0.80%), down from 282 (2.37%) at
-# 500 m. Distinct components found within 800 m: 1 for 84.0% of real
-# parcels, 2 for 12.2%, 3 for 2.6%, 4+ for the remaining 1.2% (max 11
-# seen once) -- confirming no fixed candidate-count cap is needed.
-ROAD_CANDIDATE_SEARCH_RADIUS_M = 800.0
+# NOTE: there used to be a second parameter here,
+# ROAD_CANDIDATE_SEARCH_RADIUS_M (800.0), bounding how far the
+# parcel-side and landmark-side candidate search would look for a
+# routable road edge. It has been REMOVED (not just renamed/reused --
+# candidate search is now unbounded; see
+# _find_nearest_road()/_find_nearest_in_component() in worker_process()
+# below and the module docstring above). Re-tested on the real data
+# without any radius: 97.0% of parcels land on the road network's
+# dominant connected component on the first, cheapest lookup; the
+# remaining 3.0% require the per-component fallback, for which the
+# real connected distance found has a median around 802.7 m and an
+# observed maximum around 1,228.2 m in the sampled data -- real
+# numbers, not an arbitrarily chosen cutoff.
 
 # Priority-ordered keyword -> CAMA_SCHOOL*_TYPE value mapping, checked
 # in this exact order against a POI's own combined fclass+name
@@ -1034,28 +1059,40 @@ def graph_from_roads(road_gdf):
         geometry (Polygons, Points) is silently skipped.
 
     Returns:
-        tuple: (G, edges, nodes_coords, edge_geoms, edge_comp) where G
-        is the networkx.Graph (built AFTER the vertex snap below, so
-        its own node identities already reflect any merged vertices),
-        edges is a list of (u, v, length) tuples whose u/v endpoints
-        are ALSO already the post-snap canonical coordinates (this
-        matters because worker_process() rebuilds its own local graph
-        from `edges` rather than from `G` directly -- see its own
-        docstring), nodes_coords is an (N, 2) numpy array of every
-        distinct POST-SNAP node coordinate (for nearest-neighbor
-        queries elsewhere), edge_geoms is a list of shapely LineString
-        objects -- one per entry in `edges`, in the same order/index,
-        UNCHANGED by the snap (a physical road segment's geometry does
-        not move; only which node ID represents its endpoint can
-        change) -- built for an edge-level STRtree spatial index so
-        callers can snap an arbitrary point to its true nearest point
-        ON a road segment (not just to the nearest existing vertex;
-        see worker_process() below), and edge_comp is a list of
-        integer connected-component IDs, same length/order as `edges`/
+        tuple: (G, edges, nodes_coords, edge_geoms, edge_comp,
+        comp_edge_index) where G is the networkx.Graph (built AFTER
+        the vertex snap below, so its own node identities already
+        reflect any merged vertices), edges is a list of (u, v,
+        length) tuples whose u/v endpoints are ALSO already the
+        post-snap canonical coordinates (this matters because
+        worker_process() rebuilds its own local graph from `edges`
+        rather than from `G` directly -- see its own docstring),
+        nodes_coords is an (N, 2) numpy array of every distinct
+        POST-SNAP node coordinate (for nearest-neighbor queries
+        elsewhere), edge_geoms is a list of shapely LineString objects
+        -- one per entry in `edges`, in the same order/index, UNCHANGED
+        by the snap (a physical road segment's geometry does not move;
+        only which node ID represents its endpoint can change) --
+        built for an edge-level STRtree spatial index so callers can
+        snap an arbitrary point to its true nearest point ON a road
+        segment (not just to the nearest existing vertex; see
+        worker_process() below), edge_comp is a list of integer
+        connected-component IDs, same length/order as `edges`/
         `edge_geoms` (0 = the largest component by node count,
         ascending from there) -- looked up from either endpoint of
         that edge (guaranteed equal, since the two endpoints of one
-        edge are always in the same component).
+        edge are always in the same component), and comp_edge_index is
+        a dict mapping each distinct component ID present in edge_comp
+        to its OWN (STRtree, edge_idx_list) pair -- an STRtree built
+        from ONLY that component's own edge_geoms entries, plus a
+        parallel list mapping the STRtree's own internal geometry
+        order back to the corresponding index into the full edges/
+        edge_geoms lists. Built ONCE here, at graph-load time,
+        alongside edge_comp itself (never rebuilt per parcel or per
+        landmark -- see the unbounded candidate-search redesign,
+        Instructions E.4, and worker_process()'s own
+        _find_nearest_in_component() below, which is this index's only
+        consumer).
 
     Vertex-snap mechanics (Doc 1 §2.3 Step 1, CORRECTED during Phase 2
     -- see the standalone correction notes below): every distinct
@@ -1390,21 +1427,45 @@ def graph_from_roads(road_gdf):
 
     edge_comp = [component_id_for_node.get(u, -1) for u, v, _ in edges]
 
-    return G, edges, nodes_coords, edge_geoms, edge_comp
+    # --- Per-component spatial index (Instructions E.4/I2), computed
+    # ONCE here, right alongside edge_comp above -- the unbounded
+    # candidate-search redesign needs, for a given target component ID,
+    # a fast "nearest edge WITHIN this component only" lookup
+    # (worker_process()'s own _find_nearest_in_component() below); doing
+    # that with a single edge_tree over ALL components would require
+    # filtering every query result by edge_comp, an O(n) scan per
+    # lookup. One small STRtree per component, built once here and
+    # reused for every parcel/landmark that ever needs that component's
+    # fallback lookup, keeps that same query as fast as the existing
+    # edge_tree.nearest() call elsewhere in this file.
+    comp_edge_index = {}
+    comp_geoms_by_id = {}
+    comp_orig_idx_by_id = {}
+    for idx, comp in enumerate(edge_comp):
+        if comp < 0:
+            continue  # defensive: should not occur (see edge_comp above)
+        comp_geoms_by_id.setdefault(comp, []).append(edge_geoms[idx])
+        comp_orig_idx_by_id.setdefault(comp, []).append(idx)
+    for comp, geoms in comp_geoms_by_id.items():
+        comp_edge_index[comp] = (STRtree(geoms), comp_orig_idx_by_id[comp])
+
+    return G, edges, nodes_coords, edge_geoms, edge_comp, comp_edge_index
 
 
 # ========================================
 # ROUTING WORKER
 # ========================================
-# Component-aware road-distance redesign (Doc 1 §2.3): a parcel/POI
-# point is snapped to the true geometric nearest point on the road
-# network -- interpolated along a road segment via an edge-level
-# STRtree + nearest_points() projection if that is closer than any
-# existing vertex, inserted as a "virtual" graph node connected to
-# that edge's two endpoints -- exactly as before (this mechanism
-# itself, _snap_to_road(), is unchanged; only how many times and from
-# where it's called has changed: once per CANDIDATE now, via
-# _find_road_candidates() below, instead of once per point). Road
+# Component-aware road-distance design (Doc 1 §2.3, search-radius
+# removed): a parcel/POI point is snapped to the true geometric
+# nearest point on the road network -- interpolated along a road
+# segment via an edge-level STRtree + nearest_points() projection if
+# that is closer than any existing vertex, inserted as a "virtual"
+# graph node connected to that edge's two endpoints -- exactly as
+# before (this mechanism itself, _snap_to_road(), is unchanged; only
+# how the candidate(s) to snap are found has changed: no radius, no
+# per-component candidate list -- just the single globally nearest
+# point, plus, only when needed, one targeted per-component lookup;
+# see _find_nearest_road()/_find_nearest_in_component() below). Road
 # distance is no longer a silent fallback to Straight on any failure
 # -- the two are independent, always-computed measurements (see the
 # module docstring and Doc 1 §2.2).
@@ -1413,16 +1474,20 @@ def worker_process(args):
     For one parcel, finds the SINGLE nearest POI (by straight-line
     distance) of each type in poi_types, and reports two independent
     distances to that one landmark: a component-aware network-routed
-    Road distance (see _find_road_candidates() below and Doc 1 §2.3),
-    and the plain Euclidean Straight distance (always computed, never
-    conditional on routing success).
+    Road distance (see _find_nearest_road()/_find_nearest_in_component()
+    below) and the plain Euclidean Straight distance (always computed,
+    never conditional on routing success). Road-distance candidate
+    search has NO distance limit of any kind (see the module docstring
+    and Instructions E of the search-radius-removal revision) -- the
+    true globally nearest connected road is always found and routed,
+    however far away it genuinely is.
 
     Args:
         args: (row_idx, centroid_xy, parcel_boundary_geom, poi_types,
         poi_coords_dict, poi_names_dict, poi_types_tag_dict,
-        edges_list, nodes_coords, edge_geoms, edge_comp) tuple --
-        packed this way so this function can be called uniformly
-        whether or not the caller parallelizes (see
+        edges_list, nodes_coords, edge_geoms, edge_comp,
+        comp_edge_index) tuple -- packed this way so this function can
+        be called uniformly whether or not the caller parallelizes (see
         run_cpu_parallel_with_progress(), which currently calls this
         sequentially). centroid_xy is used ONLY for the Straight
         distance measurement now (Doc 1 §2.2 defines Straight as
@@ -1430,27 +1495,27 @@ def worker_process(args):
         routing endpoint at all; parcel_boundary_geom (the parcel's
         own, un-simplified polygon/multipolygon geometry, in the same
         working CRS as centroid_xy) is the geometry
-        _find_road_candidates() searches from on the parcel side, and
-        each resulting candidate's own snapped point is itself used as
-        the Dijkstra routing endpoint -- there is no longer a single,
-        fixed "start" node shared across every candidate/type the way
-        centroid_xy's snap used to be. poi_names_dict mirrors
-        poi_coords_dict exactly (same keys, same per-type ordering) --
-        type -> list of each POI's own "name" attribute value (Python
-        None where missing or where the source has no name column at
-        all -- never the string "None", never an empty string).
-        poi_types_tag_dict is SPARSE -- it only ever has a "SCHOOL" key
-        (the unified education pool; see task()'s own construction of
-        it and _classify_education_poi()/_is_education_fclass()
-        above), with the same per-index ordering as
-        poi_coords_dict["SCHOOL"]/poi_names_dict["SCHOOL"] -- type ->
-        CAMA_SCHOOL*_TYPE classification value (e.g. "MONTESSORI") or
-        None per POI. Every other type has no entry in this dict at
-        all, and is completely unaffected -- this is a deliberate,
-        narrow addition for the school pool only, not a generic third
-        dimension for every type. Built from the SAME filtered subset
-        as poi_coords_dict for each type (see task()), so a given
-        index pi always refers to the same POI across all three dicts.
+        _find_nearest_road() searches from on the parcel side, and the
+        resulting single nearest point is itself used as the Dijkstra
+        routing endpoint -- there is no longer a single, fixed "start"
+        node shared across every type the way centroid_xy's snap used
+        to be. poi_names_dict mirrors poi_coords_dict exactly (same
+        keys, same per-type ordering) -- type -> list of each POI's
+        own "name" attribute value (Python None where missing or
+        where the source has no name column at all -- never the
+        string "None", never an empty string). poi_types_tag_dict is
+        SPARSE -- it only ever has a "SCHOOL" key (the unified
+        education pool; see task()'s own construction of it and
+        _classify_education_poi()/_is_education_fclass() above), with
+        the same per-index ordering as poi_coords_dict["SCHOOL"]/
+        poi_names_dict["SCHOOL"] -- type -> CAMA_SCHOOL*_TYPE
+        classification value (e.g. "MONTESSORI") or None per POI.
+        Every other type has no entry in this dict at all, and is
+        completely unaffected -- this is a deliberate, narrow addition
+        for the school pool only, not a generic third dimension for
+        every type. Built from the SAME filtered subset as
+        poi_coords_dict for each type (see task()), so a given index
+        pi always refers to the same POI across all three dicts.
         edge_geoms is a picklable list[LineString] (one per
         edges_list entry, same index) -- NOT a live STRtree, which is
         rebuilt fresh inside this function from edge_geoms, matching
@@ -1459,10 +1524,14 @@ def worker_process(args):
         multiprocessing pool even though it currently runs
         sequentially. edge_comp is a list of integer connected-
         component IDs, same length/order as edges_list/edge_geoms (see
-        graph_from_roads()) -- looked up once per candidate below to
-        decide, cheaply, which parcel/landmark candidate pairs can
-        possibly be routed before ever calling bidirectional_dijkstra
-        (Doc 1 §2.3 Step 4).
+        graph_from_roads()) -- used to decide, cheaply, whether the
+        parcel's and landmark's single globally-nearest points already
+        share a component before ever calling bidirectional_dijkstra.
+        comp_edge_index (see graph_from_roads()) is a dict of
+        component ID -> (STRtree, edge_idx_list) built ONCE at
+        graph-load time -- the only thing _find_nearest_in_component()
+        below ever queries, never rebuilt in this function or per
+        parcel/landmark.
 
     Returns:
         tuple: (row_idx, results, route_records). results is a dict of
@@ -1485,7 +1554,7 @@ def worker_process(args):
     """
     (row_idx, centroid_xy, parcel_boundary_geom, poi_types, poi_coords_dict,
      poi_names_dict, poi_types_tag_dict, edges_list, nodes_coords, edge_geoms,
-     edge_comp) = args
+     edge_comp, comp_edge_index) = args
     route_records = []  # per-type dicts; see docstring above
     try:
         if len(nodes_coords) == 0:
@@ -1539,11 +1608,12 @@ def worker_process(args):
             points on the same road segment always route at their true
             along-segment distance from each other, not via that
             segment's far endpoints. What HAS changed is how often this
-            is called: once per distinct candidate (see
-            _find_road_candidates() below), not once per parcel/POI
-            point -- a parcel or landmark with 3 candidate components
-            within radius now calls this up to 3 times on that side,
-            not once.
+            is called: at most twice per parcel/POI point now (once for
+            the initial globally-nearest lookup, once more only if the
+            per-component fallback lookup below is needed -- see
+            _find_nearest_road()/_find_nearest_in_component() below),
+            versus once per distinct nearby component under the
+            earlier, now-removed radius-based design.
 
             The virtual node's ID is its own (x, y) coordinate tuple
             -- required because route geometry (if ever reconstructed)
@@ -1625,94 +1695,111 @@ def worker_process(args):
             except Exception:
                 return None
 
-        def _find_road_candidates(point_or_boundary):
+        def _find_nearest_road(point_or_boundary):
             """
-            Doc 1 §2.3 Step 3 / Instructions E.5. Returns a list of
-            (component_id, snapped_node_xy) -- one entry per distinct
-            connected component with at least one road edge within
-            ROAD_CANDIDATE_SEARCH_RADIUS_M of point_or_boundary. The
-            snapped_node_xy for each component is that component's own
-            single nearest point on the road network, found via
-            _snap_to_road() above (the existing true-nearest-point-on-
-            line technique) -- called once per distinct component
-            here, not once per edge and not once per point. This same
-            function is used for BOTH the parcel side (called with the
-            parcel's own boundary/polygon geometry) and the landmark
-            side (called with a single shapely Point) -- identical
-            logic either side, only the input geometry differs.
+            Doc 1 §1.2 Step 1/2 / Instructions E.5 item 1. Returns the
+            SINGLE, globally nearest point on the road network to
+            point_or_boundary -- NO distance limit of any kind -- as
+            (component_id, snapped_node_xy), or None if the road graph
+            is empty. This same function is used for BOTH the parcel
+            side (called with the parcel's own boundary/polygon
+            geometry) and the landmark side (called with a single
+            shapely Point) -- identical logic either side, only the
+            input geometry differs.
 
-            Candidate edges within radius are found via an STRtree
-            query against point_or_boundary.buffer(radius) -- the same
-            buffered-STRtree-query technique used in the developer's
-            own validation script (Doc 1 §3/Instructions E.5) -- then
-            grouped by edge_comp[idx]; for each distinct component
-            group, only the single geometrically nearest edge in that
-            group is actually snapped via _snap_to_road() (the other
-            edges in that same group/component are redundant for
-            candidate purposes -- Doc 1 §3 confirmed distinct ROAD
-            FEATURES within a component add no new reachable
-            components, only distinct COMPONENTS matter).
+            Uses the existing edge_tree (an STRtree over every edge in
+            the whole graph, all components together) via its own
+            .nearest() query -- the same true-nearest-edge lookup
+            _snap_to_road() below already performs for a single point,
+            reused here without any buffer/radius pre-filtering. The
+            resulting edge's own true nearest point (via
+            nearest_points()) is then handed to _snap_to_road() to
+            become a routable graph node, exactly as the old
+            radius-based design already did per-candidate.
 
             Returns:
-                list[tuple[int, tuple[float, float]]]: possibly empty
-                (no road edge of any component within radius) or
-                containing more than one entry (multiple distinct
-                components nearby) -- Doc 1 §3 found this is usually 1
-                (84.0% of real parcels), occasionally 2-4, rarely more
-                (max 11 seen once); no fixed cap is applied here.
+                tuple[int, tuple[float, float]] | None: (component_id,
+                snapped_node_xy), or None if edge_tree is empty/absent
+                or the snap itself fails.
             """
             if edge_tree is None or not edge_geoms:
-                return []
+                return None
             try:
-                buffered = point_or_boundary.buffer(ROAD_CANDIDATE_SEARCH_RADIUS_M)
-                nearby = edge_tree.query(buffered)
+                nearest = edge_tree.nearest(point_or_boundary)
             except Exception:
-                return []
-            if nearby is None or len(nearby) == 0:
-                return []
+                return None
+            if nearest is None:
+                return None
+            if isinstance(nearest, (int, np.integer)):
+                edge_idx = int(nearest)
+            else:
+                try:
+                    edge_idx = edge_geoms.index(nearest)
+                except ValueError:
+                    return None
 
-            # STRtree.query() may return indices (newer shapely) or
-            # geometries (older shapely) -- same int-vs-geometry
-            # compatibility handled in _snap_to_road() above.
-            candidate_idxs = []
-            for item in nearby:
-                if isinstance(item, (int, np.integer)):
-                    candidate_idxs.append(int(item))
-                else:
-                    try:
-                        candidate_idxs.append(edge_geoms.index(item))
-                    except ValueError:
-                        continue
+            comp = edge_comp[edge_idx]
+            if comp < 0:
+                return None  # defensive: should not occur (see graph_from_roads())
 
-            best_dist_for_comp = {}
-            best_idx_for_comp = {}
-            for idx in candidate_idxs:
-                comp = edge_comp[idx]
-                if comp < 0:
-                    continue  # defensive: should not occur (see graph_from_roads())
-                d = point_or_boundary.distance(edge_geoms[idx])
-                if comp not in best_dist_for_comp or d < best_dist_for_comp[comp]:
-                    best_dist_for_comp[comp] = d
-                    best_idx_for_comp[comp] = idx
+            nearest_on_edge = nearest_points(point_or_boundary, edge_geoms[edge_idx])[1]
+            snapped = _snap_to_road((nearest_on_edge.x, nearest_on_edge.y))
+            if snapped is None:
+                return None
+            return (comp, snapped)
 
-            candidates = []
-            for comp, idx in best_idx_for_comp.items():
-                # Snap FROM the true nearest point of point_or_boundary
-                # on this edge, not from an arbitrary point on it --
-                # nearest_points() gives the true closest pair between
-                # the input geometry and this edge's line.
-                nearest_on_edge = nearest_points(point_or_boundary, edge_geoms[idx])[1]
-                snapped = _snap_to_road((nearest_on_edge.x, nearest_on_edge.y))
-                if snapped is not None:
-                    candidates.append((comp, snapped))
-            return candidates
+        def _find_nearest_in_component(point_or_boundary, target_comp):
+            """
+            Doc 1 §1.2 Step 4 / Instructions E.5 item 2 / E.6. Returns
+            the nearest point on the road network to point_or_boundary,
+            restricted to ONLY the edges belonging to target_comp -- NO
+            distance limit -- using that component's own dedicated
+            STRtree from comp_edge_index (built once, at graph-load
+            time, in graph_from_roads(); see Instructions E.4). This is
+            the fallback lookup: called only when the parcel's and the
+            landmark's own single globally-nearest points
+            (_find_nearest_road() above) land in different components,
+            to search specifically within a component known to already
+            be shared with the other side -- guaranteeing, unlike the
+            unrestricted lookup above, that a route is mathematically
+            possible once this succeeds.
 
-        # Parcel-side candidates depend only on the parcel's own
+            Returns:
+                tuple[float, float] | None: the snapped routing node,
+                or None if target_comp has no entry in comp_edge_index
+                (should not occur for any component that actually
+                appears in edge_comp) or the snap itself fails.
+            """
+            entry = comp_edge_index.get(target_comp)
+            if entry is None:
+                return None
+            comp_tree, comp_edge_idxs = entry
+            if not comp_edge_idxs:
+                return None
+            try:
+                nearest = comp_tree.nearest(point_or_boundary)
+            except Exception:
+                return None
+            if nearest is None:
+                return None
+            if isinstance(nearest, (int, np.integer)):
+                local_idx = int(nearest)
+            else:
+                try:
+                    comp_geoms = [edge_geoms[i] for i in comp_edge_idxs]
+                    local_idx = comp_geoms.index(nearest)
+                except ValueError:
+                    return None
+            edge_idx = comp_edge_idxs[local_idx]
+
+            nearest_on_edge = nearest_points(point_or_boundary, edge_geoms[edge_idx])[1]
+            return _snap_to_road((nearest_on_edge.x, nearest_on_edge.y))
+
+        # Parcel-side nearest point depends only on the parcel's own
         # boundary geometry, not on POI type -- computed once here and
         # reused for every type below (the same "compute once, reuse
-        # across types" role centroid_xy's single snap used to play,
-        # now holding a list of candidates instead of one fixed node).
-        parcel_candidates = _find_road_candidates(parcel_boundary_geom)
+        # across types" role centroid_xy's single snap used to play).
+        parcel_nearest = _find_nearest_road(parcel_boundary_geom)
 
         results = {}
         for typ in poi_types:
@@ -1742,47 +1829,176 @@ def worker_process(args):
             # dependent on routing success (Doc 1 §2.2, LOCKED).
             straight_dist = float(Point(centroid_xy).distance(Point(poi_xy)))
 
-            # Road -- component-aware candidate pairing (Doc 1 §2.3
-            # Step 4). Only pairs whose component IDs match are ever
-            # routed; a mismatched pair is skipped without calling
-            # bidirectional_dijkstra at all (a route is mathematically
-            # impossible between different components, so there is
-            # nothing for Dijkstra to usefully compute there).
-            landmark_candidates = _find_road_candidates(Point(poi_xy))
+            # Road -- SEMANTIC CHANGE, confirmed explicitly as a
+            # deliberate decision, not a silent redefinition (see this
+            # revision's own analysis): CAMA_{TYPE}_ROAD no longer means
+            # "network-routed distance between two points already ON the
+            # road" alone. It now means the full real-world travel
+            # distance from the parcel to the landmark: off-road access
+            # from the parcel to its nearest usable road point, PLUS the
+            # routed distance along the road network, PLUS off-road
+            # access from that road to the landmark. This is a more
+            # useful number for land valuation (a parcel's real
+            # constraint is total travel distance, not an arbitrary
+            # network-only segment) and replaces TWO earlier, now-
+            # discarded designs that were both confirmed broken against
+            # real Caluan data: (1) a radius-bounded candidate search
+            # (removed in an earlier revision), and (2) an unbounded
+            # two-direction asymmetric fallback with a shared, centroid-
+            # based "straight_dist" rejection floor -- which could still
+            # select a geometrically wrong point (nearest-to-the-OTHER-
+            # SIDE'S-location but confined to a small, unrelated
+            # component), and whose single shared floor was itself
+            # wrong for any parcel whose boundary sits much closer to a
+            # road than its centroid does (confirmed on real fid=11088,
+            # a parcel literally touching a road, which the floor
+            # wrongly rejected down to a false ROAD=0.0 "disconnected"
+            # result). Both of those designs' code is REMOVED entirely
+            # here, not deprecated or left as dead code.
+            landmark_nearest = _find_nearest_road(Point(poi_xy))
 
+            # New design: if the parcel's and landmark's own single
+            # globally-nearest road points already share a component,
+            # route directly (fast path, UNCHANGED from before) -- no
+            # access distance is added here, because pc_node/lc_node ARE
+            # the parcel-side/landmark-side road points being routed
+            # between; there is no "other component" being bridged, so
+            # this routed distance already IS the full real-world
+            # distance. Otherwise (components differ), search EVERY
+            # real connected component in comp_edge_index (built once,
+            # at graph-load time -- see graph_from_roads()/Instructions
+            # E.4): for each one, find the parcel's and the landmark's
+            # own nearest point WITHIN that component
+            # (_find_nearest_in_component(), reused completely
+            # unmodified from the prior design), compute the real
+            # access distance on each side (straight-line, off-road),
+            # add the routed distance between those two points within
+            # that component, and keep whichever component yields the
+            # lowest TOTAL (access + routed + access) real-world
+            # distance. Confirmed against real Caluan data: this
+            # correctly resolves every case the two prior designs got
+            # wrong (fid 10044/10067/10068/10052 -- previously a
+            # spurious short "ROAD<STRAIGHT" value from a wrong-
+            # component match; fid 11088 -- previously a false
+            # "disconnected" 0.0 from the overly strict centroid floor)
+            # to a real, sensible ROAD >= STRAIGHT value in all 5 cases.
             best_road_dist = float("inf")
-            for pc_comp, pc_node in parcel_candidates:
-                for lc_comp, lc_node in landmark_candidates:
-                    if pc_comp != lc_comp:
-                        continue
+            if parcel_nearest is not None and landmark_nearest is not None:
+                pc_comp, pc_node = parcel_nearest
+                lc_comp, lc_node = landmark_nearest
+                if pc_comp == lc_comp:
                     try:
                         dist, _path = nx.bidirectional_dijkstra(
                             G_local, pc_node, lc_node, weight="length")
-                    except Exception:
-                        continue
-                    if dist < best_road_dist:
                         best_road_dist = dist
+                    except Exception:
+                        pass
+                else:
+                    # All-components search (replaces the two-direction
+                    # asymmetric fallback entirely -- that code, and the
+                    # shared centroid-based rejection floor it relied
+                    # on, are both fully removed, not left in place
+                    # alongside this). best_score accumulates the
+                    # lowest TOTAL real-world distance (access + routed
+                    # + access) found across every real component that
+                    # yields a usable point on both the parcel side and
+                    # the landmark side -- not merely the shortest
+                    # ROUTED segment, which is exactly what made the
+                    # prior two designs pick geometrically wrong,
+                    # spuriously short matches.
+                    best_score = float("inf")
+                    for comp in comp_edge_index.keys():
+                        P = _find_nearest_in_component(parcel_boundary_geom, comp)
+                        L = _find_nearest_in_component(Point(poi_xy), comp)
+                        if P is None or L is None:
+                            continue
+                        access_a = parcel_boundary_geom.distance(Point(P))
+                        access_b = Point(poi_xy).distance(Point(L))
+                        try:
+                            routed, _path = nx.bidirectional_dijkstra(
+                                G_local, P, L, weight="length")
+                        except Exception:
+                            continue
+                        score = access_a + routed + access_b
+                        if score < best_score:
+                            best_score = score
+                    best_road_dist = best_score
 
-            # Three-way sentinel resolution (new rule, confirmed this
-            # session -- not in the original Doc 1 §2.2 text, added
-            # during Phase 1 review):
-            #   - inf  (no candidate pair shared a component -- no
-            #     matching component anywhere in range on either side)
-            #     -> Road = 0.0, the ONE genuine "no connection found"
-            #     sentinel (Doc 1 §2.2/§2.3 Step 4).
-            #   - exactly 0.0 (a matching component WAS found and
-            #     bidirectional_dijkstra actually ran and returned a
-            #     real distance that happens to be exactly zero -- the
-            #     parcel candidate and landmark candidate snapped to
-            #     the identical point on the road network, e.g. two
-            #     POIs directly facing each other on the same nearest
-            #     road) -> remapped to 1.0, so a genuine, essentially-
-            #     adjacent CONNECTION is never indistinguishable from
-            #     the "no connection at all" sentinel above. This is
-            #     an exact equality check on 0.0 only -- no "close to
-            #     zero" threshold -- any other real distance (0.3,
-            #     2.1, etc.) is written unrounded and unchanged.
-            #   - else -> the real, unmodified Dijkstra distance.
+            # Three-way sentinel resolution (if/elif/else itself
+            # unchanged from the prior design -- only this comment's
+            # wording is updated to describe what best_road_dist now
+            # holds, a full real-world distance rather than a route-
+            # only segment):
+            #   - inf  (parcel_nearest/landmark_nearest missing, OR --
+            #     for the all-components search -- no real component in
+            #     comp_edge_index yielded a usable point on BOTH the
+            #     parcel side and the landmark side. In practice this is
+            #     now an EXTREME edge case: comp_edge_index holds every
+            #     real component that exists in the graph, and
+            #     _find_nearest_in_component() only returns None on an
+            #     actual lookup/snap failure, not on "wrong location" --
+            #     so with the dominant component searched like every
+            #     other one, a usable P and L are found for almost any
+            #     real geometry. Reaching inf here now essentially means
+            #     a genuinely empty/corrupt road network or a
+            #     pathological geometry exception on every single
+            #     component, not ordinary geographic disconnection) ->
+            #     Road = 0.0, the ONE genuine "no connection found"
+            #     sentinel.
+            #   - exactly 0.0 (the FINAL value about to be written --
+            #     the fast path's own routed distance, or the winning
+            #     component's full access_a + routed + access_b score --
+            #     happens to be exactly zero. This check is applied to
+            #     that final value, not to an intermediate "routed"
+            #     distance alone: a winning component with routed==0.0
+            #     but a nonzero access_a or access_b would NOT be this
+            #     case at all, since its score would be a real, nonzero
+            #     number -- the sentinel's purpose is to flag a written
+            #     0.0 that means "genuinely adjacent", and only the
+            #     actually-written value can mean that) -> remapped to
+            #     1.0, so a genuine, essentially-adjacent CONNECTION is
+            #     never indistinguishable from the "no connection at
+            #     all" sentinel above. This is an exact equality check
+            #     on 0.0 only -- no "close to zero" threshold -- any
+            #     other real distance is written unrounded and
+            #     unchanged, with no cap of any kind (Instructions E.7,
+            #     still honored: no new radius or distance cap is
+            #     introduced anywhere in this revision either).
+            #   - else -> the real, unmodified final distance (the fast
+            #     path's routed distance, or the winning component's
+            #     full access + routed + access total).
+            #
+            # NOTE on ROAD vs STRAIGHT for FAST-PATH cases specifically:
+            # CAMA_{TYPE}_STRAIGHT is always measured from the parcel's
+            # CENTROID, while the fast-path CAMA_{TYPE}_ROAD above is
+            # routed from pc_node -- the single point on the parcel's
+            # BOUNDARY nearest to the ROAD network (per
+            # _find_nearest_road()), which is generally a DIFFERENT
+            # point from the boundary's own nearest point TO THE
+            # LANDMARK. Because of that, there is no small, fixed
+            # ceiling on how much shorter ROAD can legitimately be than
+            # STRAIGHT -- pc_node can sit anywhere on the boundary
+            # depending on where the nearest road actually is, and for
+            # a large or elongated parcel that point can already be
+            # substantially closer to the landmark's general direction
+            # than the centroid is. Confirmed on real Caluan data: gaps
+            # of a few meters up to just over 200 m were observed and,
+            # in every case checked, traced to exactly this cause (a
+            # real pc_node measurably closer to the landmark than the
+            # centroid, for a large/elongated parcel) -- not a new
+            # instance of the ROAD<STRAIGHT bugs this revision and the
+            # prior one fixed. The one guarantee that DOES always hold,
+            # and that the fast path enforces structurally (it is
+            # exactly what bidirectional_dijkstra computes): ROAD can
+            # never be shorter than the straight-line distance between
+            # the SAME TWO POINTS actually used for routing (pc_node to
+            # lc_node) -- not between the centroid and the landmark.
+            # ROAD shorter than STRAIGHT by any amount is therefore not,
+            # by itself, evidence of a problem; what WOULD be a red flag
+            # is ROAD shorter than the straight-line distance between
+            # pc_node and lc_node themselves, which should never happen
+            # and would indicate a routing defect, not a measurement
+            # artifact of this kind.
             if best_road_dist == float("inf"):
                 road_dist = 0.0
             elif best_road_dist == 0.0:
@@ -1902,7 +2118,7 @@ def run_cpu_parallel_with_progress(
     # transform coordinates -- that's what .to_crs() is for).
     projected_crs = gdf.crs
 
-    G_main, edges_list, nodes_coords, edge_geoms, edge_comp = graph_from_roads(road_gdf)
+    G_main, edges_list, nodes_coords, edge_geoms, edge_comp, comp_edge_index = graph_from_roads(road_gdf)
     if len(edges_list) == 0:
         raise Exception("No valid edges found in road network.")
 
@@ -1930,7 +2146,8 @@ def run_cpu_parallel_with_progress(
         centroid_xy = (row.geometry.centroid.x, row.geometry.centroid.y)
         args_list.append(
             (idx, centroid_xy, row.geometry, poi_types, poi_coords_dict, poi_names_dict,
-             poi_types_tag_dict, edges_list, nodes_coords, edge_geoms, edge_comp)
+             poi_types_tag_dict, edges_list, nodes_coords, edge_geoms, edge_comp,
+             comp_edge_index)
         )
 
     total = len(args_list)
