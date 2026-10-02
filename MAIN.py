@@ -363,6 +363,23 @@ def _log(msg):
         pass
 
 
+class UserFacingError(RuntimeError):
+    """
+    Raised only for messages already written for a non-technical user --
+    i.e. the string passed to this exception IS the dialog body, verbatim,
+    safe to show directly. Every other exception (anything not explicitly
+    raised as this class) is technical/unexpected, and the code that
+    catches it must show a short, generic sentence instead of str(e),
+    logging the raw text via _log() first. Deliberately a RuntimeError
+    subclass rather than a new base Exception -- the one pre-existing
+    `except RuntimeError` in this file (around get_credentials_path() at
+    module import time, before any GUI is shown) is a disjoint, unrelated
+    code path, confirmed by inspection, so this does not change its
+    behavior.
+    """
+    pass
+
+
 def _log_session_start(func_name):
     """Marks the start of a new automation run in the log file."""
     _log(f"{'=' * 60}")
@@ -958,7 +975,7 @@ def _cleanup_and_raise(save_path, msg):
             os.remove(save_path)
     except Exception:
         pass
-    raise RuntimeError(msg)
+    raise UserFacingError(msg)
 
 
 def _wait_for_gpkg_export(save_path, tk_root):
@@ -1486,7 +1503,7 @@ def _check_live_db_connection(title_prefix):
     result = {"ok": None, "error": None}
 
     def _worker():
-        ok, err = test_live_connection(DB_HOST, DB_PORT, DB_NAME, stored_username, stored_password)
+        ok, err = test_live_connection(DB_HOST, DB_PORT, DB_NAME, stored_username, stored_password, log_fn=_log)
         result["ok"] = ok
         result["error"] = err
 
@@ -1548,6 +1565,7 @@ def update_database_from_geopackage():
     from sqlalchemy import create_engine
     from sqlalchemy.engine import URL
     from geoalchemy2 import Geometry  # needed for dtype in to_postgis
+    from utils.geometry_dimension import normalize_geometry_dimension
 
     pyautogui.FAILSAFE = False
     _log_session_start("update_database_from_geopackage")
@@ -1586,7 +1604,7 @@ def update_database_from_geopackage():
 
     if not all([stored_username, stored_password]):
         _log("ABORT: not logged in")
-        messagebox.showerror("Error", "You must log in first before updating the database.")
+        messagebox.showerror("Error", "No database information has been saved in Database Management yet.")
         return
 
     if not _check_live_db_connection("Update Database"):
@@ -1677,8 +1695,7 @@ def update_database_from_geopackage():
             _log(f"ABORT: could not create/verify {TEMP_DIR}: {e}")
             messagebox.showerror(
                 "Folder Error",
-                f"Could not create or access the required temp folder:\n"
-                f"{TEMP_DIR}\n\n{e}"
+                f"Could not create or access the required temp folder:\n{TEMP_DIR}"
             )
             return
 
@@ -1692,7 +1709,7 @@ def update_database_from_geopackage():
                 _log(f"pre-export cleanup: removed stale {save_path}")
             except Exception as e:
                 _log(f"ABORT: could not delete stale export file: {e}")
-                messagebox.showerror("File Error", f"Could not delete existing file:\n{e}")
+                messagebox.showerror("File Error", f"Could not delete the existing temp file:\n{save_path}")
                 return
         else:
             _log("pre-export cleanup: no stale export file present")
@@ -1819,7 +1836,7 @@ def update_database_from_geopackage():
         # error instead of continuing to send keystrokes blind.
         if _step1_result is None:
             _dump_windows("export navigation lost focus after EXPORT menu item (update_database)")
-            raise RuntimeError(
+            raise UserFacingError(
                 "Update Database was aborted before any further "
                 "keystrokes were sent to avoid typing into the wrong "
                 "window.\n\n"
@@ -1903,13 +1920,18 @@ def update_database_from_geopackage():
 
             if _tip_or_geo_result is None:
                 _dump_windows("neither Tip nor GeoPackage Export Options appeared (update_database)")
-                raise RuntimeError(
+                _log(
                     "Export navigation failed: neither the 'Tip' dialog "
                     "nor the 'GeoPackage Export Options' dialog appeared "
                     f"within the expected time (focused window was "
                     f"'{_last_fg_seen}' instead). Update Database was "
                     "aborted before any further keystrokes were sent, to "
                     "avoid typing into the wrong window."
+                )
+                raise UserFacingError(
+                    "Global Mapper did not open the expected window, so "
+                    "nothing was changed. Close any other window in Global "
+                    "Mapper and try again."
                 )
 
         if _tip_or_geo_result == "tip":
@@ -1920,12 +1942,17 @@ def update_database_from_geopackage():
             # Export Options", which is NOT skippable (always appears).
             if not _wait_and_activate("GeoPackage Export Options", timeout=5.0):
                 _dump_windows("GeoPackage Export Options dialog not found after Tip (update_database)")
-                raise RuntimeError(
+                _log(
                     "Export navigation failed: the 'GeoPackage Export "
                     "Options' dialog did not appear after confirming "
                     "the 'Tip' dialog. Update Database was aborted "
                     "before any further keystrokes were sent, to avoid "
                     "typing into the wrong window."
+                )
+                raise UserFacingError(
+                    "Global Mapper did not open the expected window, so "
+                    "nothing was changed. Close any other window in Global "
+                    "Mapper and try again."
                 )
             _log(f"GeoPackage Export Options focused | fg='{_fg_title()}'")
 
@@ -1970,11 +1997,16 @@ def update_database_from_geopackage():
             _log(f"Save As dialog found and activated | fg='{_fg_title()}'")
         else:
             _dump_windows("Save As not found (update_database)")
-            raise RuntimeError(
+            _log(
                 "Export navigation failed: the 'Save As' dialog did "
                 "not appear within the expected time. Update Database "
                 "was aborted before typing the export path, to avoid "
                 "typing it into the wrong window."
+            )
+            raise UserFacingError(
+                "Global Mapper did not open the expected window, so "
+                "nothing was changed. Close any other window in Global "
+                "Mapper and try again."
             )
 
         # Focus filename field and type the full absolute path directly.
@@ -2016,7 +2048,10 @@ def update_database_from_geopackage():
 
     except Exception as e:
         _log(f"EXPORT FAILED: {type(e).__name__}: {e}")
-        messagebox.showerror("Export Failed", f"Export failed:\n{e}")
+        if isinstance(e, UserFacingError):
+            messagebox.showerror("Export Failed", str(e))
+        else:
+            messagebox.showerror("Export Failed", "The layer could not be exported from Global Mapper.")
         return
 
     try:
@@ -2224,6 +2259,16 @@ def update_database_from_geopackage():
             gdf = to_wgs84(gdf)
             gdf = gdf.rename_geometry("geom")
 
+            # Force geometry to 2D: the application treats parcel geometry
+            # as planar cadastral boundaries, and a mixed 2D/3D column (or
+            # a single 3D row landing in an otherwise-2D staging column)
+            # makes PostGIS reject the whole COPY with "Column has Z
+            # dimension but geometry does not." See
+            # utils/geometry_dimension.py for the full rationale.
+            gdf, n_z = normalize_geometry_dimension(gdf)
+            if n_z > 0:
+                _log(f"Layer '{layer}': dropped Z coordinates from {n_z} of {len(gdf)} features")
+
             # Geometry type stored as generic GEOMETRY with SRID 4326.
             # Using GEOMETRY (not MULTIPOLYGON etc.) because GM exports
             # may promote geometry types (Polygon → MultiPolygon) and
@@ -2303,9 +2348,13 @@ def update_database_from_geopackage():
 
                 # Hard requirement 1: staging table must exist.
                 if not staging_columns:
-                    raise RuntimeError(
+                    _log(
                         f"Staging table '{staging_name}' was not found in the database "
                         f"after import. The write may have failed silently."
+                    )
+                    raise UserFacingError(
+                        f"The layer '{layer}' could not be written to the "
+                        "database. The existing table was not changed."
                     )
 
                 # Hard requirement 2: geometry column must be present.
@@ -2314,10 +2363,15 @@ def update_database_from_geopackage():
                 if "geom" not in staging_columns:
                     cursor.execute(f'DROP TABLE IF EXISTS "{DB_SCHEMA}"."{staging_name}" CASCADE;')
                     conn.connection.commit()
-                    raise RuntimeError(
+                    _log(
                         f"Staging table '{staging_name}' has no geometry column. "
                         f"The incoming layer '{layer}' may be non-spatial or incorrectly matched. "
                         f"Staging table has been dropped. Existing table '{target_name}' is untouched."
+                    )
+                    raise UserFacingError(
+                        f"The layer '{layer}' has no map data, so it cannot "
+                        "be loaded into the database. The existing table "
+                        "was not changed."
                     )
 
                 # Step D.5: Primary key resolution.
@@ -2339,12 +2393,56 @@ def update_database_from_geopackage():
                 # into uniqueness; ud_id exists alongside it as the table's
                 # stable row identity.
                 pk_chosen = None
+
+                # Computed ONCE, before the loop, only if ud_id is present
+                # at all. None = not applicable (ud_id absent). True/False =
+                # ud_id is present and is/isn't a numeric type holding only
+                # whole numbers. Kept OUTSIDE the loop and as a flag, rather
+                # than special-cased inside the loop body, so the loop stays
+                # fully generic for every other candidate -- this check has
+                # no effect on how 'id', 'pin', 'parcel_id', etc. are
+                # evaluated. Scoped to ud_id only: every other candidate is
+                # used as-is, with no type cast, so a float or text primary
+                # key elsewhere is valid PostgreSQL behavior and must not
+                # change. A ud_id column that is unique and non-null but
+                # holds fractional values (e.g. 1, 2.5, 3) would otherwise
+                # pass the null/duplicate check below and be silently
+                # promoted as-is -- checked here, before any promotion
+                # attempt, so that case is caught too.
+                ud_id_repairable_type = None
+                if "ud_id" in staging_columns:
+                    NUMERIC_UDT_NAMES = {"int2", "int4", "int8", "float4", "float8", "numeric"}
+                    ud_id_udt = staging_columns["ud_id"]
+                    if ud_id_udt not in NUMERIC_UDT_NAMES:
+                        ud_id_repairable_type = False
+                        _log(f"  PK: 'ud_id' for {staging_name} is not a numeric "
+                             f"type ({ud_id_udt}) -- cannot be repaired")
+                    else:
+                        cursor.execute(
+                            f'SELECT COUNT(*) FROM "{DB_SCHEMA}"."{staging_name}" '
+                            f'WHERE "ud_id" IS NOT NULL AND "ud_id" != trunc("ud_id"::numeric);'
+                        )
+                        non_whole_count = cursor.fetchone()[0]
+                        ud_id_repairable_type = (non_whole_count == 0)
+                        if not ud_id_repairable_type:
+                            _log(f"  PK: 'ud_id' for {staging_name} holds "
+                                 f"{non_whole_count} non-whole-number value(s) -- "
+                                 f"cannot be repaired")
+
                 for candidate in PK_CANDIDATES:
                     # staging_columns keys are already lowercase (from the
                     # earlier information_schema.columns query), and gdf
                     # columns were lowercased in Step A, so a direct lowercase
                     # comparison is sufficient here.
                     if candidate not in staging_columns:
+                        continue
+                    # ud_id with a non-repairable type/values is never
+                    # eligible for direct promotion here, even with zero
+                    # nulls and zero duplicates -- every other candidate's
+                    # handling is completely unaffected by this check.
+                    if candidate == "ud_id" and ud_id_repairable_type is False:
+                        _log(f"  PK: candidate 'ud_id' skipped for {staging_name} "
+                             f"(non-repairable type or values)")
                         continue
                     cursor.execute(
                         f'SELECT COUNT(*), COUNT("{candidate}"), COUNT(DISTINCT "{candidate}") '
@@ -2369,37 +2467,51 @@ def update_database_from_geopackage():
 
                 if pk_chosen is None:
                     if "ud_id" in staging_columns:
-                        # With "ud_id" now in PK_CANDIDATES above, the only
-                        # way to reach this point with an existing ud_id
-                        # column is that it was already checked and
-                        # REJECTED there (NULLs and/or duplicate values --
-                        # see the "PK: candidate 'ud_id' rejected" log line
-                        # just above). Blindly running ADD COLUMN here would
-                        # fail with an opaque DuplicateColumn error (this is
-                        # the exact failure this guard replaces), so raise
-                        # a specific, actionable error instead. The staging
-                        # table is left in place (not dropped) so it can be
-                        # inspected directly -- matches this function's
-                        # existing pattern of surfacing a precise cause
-                        # rather than a generic catch-all.
-                        raise RuntimeError(
-                            f"Staging table '{staging_name}' already has a "
-                            f"'ud_id' column, but it has NULL and/or duplicate "
-                            f"values, so it cannot be reused or safely "
-                            f"replaced as the primary key automatically. This "
-                            f"usually means the incoming data already went "
-                            f"through Update Map/Update Database before and "
-                            f"its 'ud_id' values were altered afterward. "
-                            f"Please inspect '{DB_SCHEMA}.{staging_name}' "
-                            f"manually before retrying."
+                        if ud_id_repairable_type is False:
+                            # Reuses the flag computed once above -- does
+                            # NOT re-run the type/whole-number checks.
+                            raise UserFacingError(
+                                "This layer has an ID column named ud_id that could not be "
+                                "repaired automatically. The table was not changed."
+                            )
+                        # NULL rows and the 2nd+ occurrence of any duplicated
+                        # value receive MAX(ud_id)+1, +2, ... in physical
+                        # (= export) order; the first occurrence of a
+                        # duplicated value keeps its own value. ud_id is
+                        # only a row identity -- nothing else references it.
+                        null_before, dup_before = null_count, dup_count
+                        cursor.execute(
+                            f'ALTER TABLE "{DB_SCHEMA}"."{staging_name}" '
+                            f'ALTER COLUMN "ud_id" TYPE bigint USING round("ud_id"::numeric)::bigint;'
                         )
-                    cursor.execute(
-                        f'ALTER TABLE "{DB_SCHEMA}"."{staging_name}" '
-                        f'ADD COLUMN ud_id SERIAL PRIMARY KEY;'
-                    )
-                    conn.connection.commit()
-                    _log(f"  PK: no qualifying candidate found for {staging_name} — "
-                         f"created surrogate 'ud_id' SERIAL PRIMARY KEY")
+                        cursor.execute(
+                            f'''
+                            WITH mx AS (SELECT COALESCE(MAX("ud_id"), 0) AS m FROM "{DB_SCHEMA}"."{staging_name}"),
+                                 ranked AS (SELECT ctid AS c, "ud_id",
+                                                   ROW_NUMBER() OVER (PARTITION BY "ud_id" ORDER BY ctid) AS occ
+                                            FROM "{DB_SCHEMA}"."{staging_name}"),
+                                 todo AS (SELECT c, ROW_NUMBER() OVER (ORDER BY c) AS rn
+                                          FROM ranked WHERE "ud_id" IS NULL OR occ > 1)
+                            UPDATE "{DB_SCHEMA}"."{staging_name}" s SET "ud_id" = mx.m + todo.rn
+                            FROM mx, todo WHERE s.ctid = todo.c;
+                            '''
+                        )
+                        repaired_count = cursor.rowcount
+                        cursor.execute(
+                            f'ALTER TABLE "{DB_SCHEMA}"."{staging_name}" ADD PRIMARY KEY ("ud_id");'
+                        )
+                        conn.connection.commit()
+                        pk_chosen = "ud_id"
+                        _log(f"  PK: 'ud_id' repaired ({repaired_count} rows given new ids; "
+                             f"was NULLs={null_before}, duplicates={dup_before}) and promoted")
+                    else:
+                        cursor.execute(
+                            f'ALTER TABLE "{DB_SCHEMA}"."{staging_name}" '
+                            f'ADD COLUMN ud_id SERIAL PRIMARY KEY;'
+                        )
+                        conn.connection.commit()
+                        _log(f"  PK: no qualifying candidate found for {staging_name} — "
+                             f"created surrogate 'ud_id' SERIAL PRIMARY KEY")
             except Exception as staging_err:
                 # NEW (generalized staging cleanup, requested after the
                 # "ud_id already exists" incident): every failure point
@@ -2537,10 +2649,12 @@ def update_database_from_geopackage():
                     conn.connection.commit()
                 except Exception:
                     pass
-                raise RuntimeError(
-                    f"Atomic swap failed for layer '{layer}'. "
-                    f"Original table '{target_name}' is untouched. "
-                    f"Staging table has been dropped.\n\nCause: {swap_err}"
+                _log(f"Atomic swap failed for layer '{layer}'. "
+                     f"Original table '{target_name}' is untouched. "
+                     f"Staging table has been dropped. Cause: {swap_err}")
+                raise UserFacingError(
+                    f"The table for layer '{layer}' could not be replaced. "
+                    "The existing table was not changed."
                 )
 
             # Step F: Drop backup table now that new data is confirmed live.
@@ -2592,7 +2706,10 @@ def update_database_from_geopackage():
 
     except Exception as e:
         _log(f"DB PHASE FAILED: {type(e).__name__}: {e}")
-        messagebox.showerror("Database Update Failed", f"Database load failed:\n{e}")
+        if isinstance(e, UserFacingError):
+            messagebox.showerror("Database Update Failed", str(e))
+        else:
+            messagebox.showerror("Database Update Failed", "The database could not be updated.")
     finally:
         # FIX: previously conn.close()/engine.dispose() only ran on the
         # success path (see above, right before the Success dialog).
@@ -2666,7 +2783,7 @@ def update_map_and_select_recorded():
 
     if not all([stored_username, stored_password]):
         _log("ABORT: not logged in")
-        messagebox.showerror("Error", "You must log in first before updating the map.")
+        messagebox.showerror("Error", "No database information has been saved in Database Management yet.")
         return
 
     if not _check_live_db_connection("Update Map"):
@@ -2749,8 +2866,7 @@ def update_map_and_select_recorded():
             _log(f"ABORT: could not create/verify {TEMP_DIR}: {e}")
             messagebox.showerror(
                 "Folder Error",
-                f"Could not create or access the required temp folder:\n"
-                f"{TEMP_DIR}\n\n{e}"
+                f"Could not create or access the required temp folder:\n{TEMP_DIR}"
             )
             return
 
@@ -2762,7 +2878,7 @@ def update_map_and_select_recorded():
                 _log(f"pre-export cleanup: removed stale {save_path}")
             except Exception as e:
                 _log(f"ABORT: could not delete stale export file: {e}")
-                messagebox.showerror("File Error", f"Could not delete existing file:\n{e}")
+                messagebox.showerror("File Error", f"Could not delete the existing temp file:\n{save_path}")
                 return
         else:
             _log("pre-export cleanup: no stale export file present")
@@ -2861,7 +2977,7 @@ def update_map_and_select_recorded():
         # error instead of continuing to send keystrokes blind.
         if _step1_result is None:
             _dump_windows("export navigation lost focus after EXPORT menu item (update_map)")
-            raise RuntimeError(
+            raise UserFacingError(
                 "Update Map was aborted before any further keystrokes "
                 "were sent to avoid typing into the wrong window.\n\n"
                 "Please select the layer you want to update and make "
@@ -2939,13 +3055,18 @@ def update_map_and_select_recorded():
 
             if _tip_or_geo_result is None:
                 _dump_windows("neither Tip nor GeoPackage Export Options appeared (update_map)")
-                raise RuntimeError(
+                _log(
                     "Export navigation failed: neither the 'Tip' dialog "
                     "nor the 'GeoPackage Export Options' dialog appeared "
                     f"within the expected time (focused window was "
                     f"'{_last_fg_seen}' instead). Update Map was aborted "
                     "before any further keystrokes were sent, to avoid "
                     "typing into the wrong window."
+                )
+                raise UserFacingError(
+                    "Global Mapper did not open the expected window, so "
+                    "nothing was changed. Close any other window in Global "
+                    "Mapper and try again."
                 )
 
         if _tip_or_geo_result == "tip":
@@ -2956,12 +3077,17 @@ def update_map_and_select_recorded():
             # Export Options", which is NOT skippable (always appears).
             if not _wait_and_activate("GeoPackage Export Options", timeout=5.0):
                 _dump_windows("GeoPackage Export Options dialog not found after Tip (update_map)")
-                raise RuntimeError(
+                _log(
                     "Export navigation failed: the 'GeoPackage Export "
                     "Options' dialog did not appear after confirming "
                     "the 'Tip' dialog. Update Map was aborted before "
                     "any further keystrokes were sent, to avoid typing "
                     "into the wrong window."
+                )
+                raise UserFacingError(
+                    "Global Mapper did not open the expected window, so "
+                    "nothing was changed. Close any other window in Global "
+                    "Mapper and try again."
                 )
             _log(f"GeoPackage Export Options focused | fg='{_fg_title()}'")
 
@@ -2991,11 +3117,16 @@ def update_map_and_select_recorded():
             _log(f"Save As dialog focused | fg='{_fg_title()}'")
         else:
             _dump_windows("Save As not found (update_map)")
-            raise RuntimeError(
+            _log(
                 "Export navigation failed: the 'Save As' dialog did "
                 "not appear within the expected time. Update Map was "
                 "aborted before typing the export path, to avoid "
                 "typing it into the wrong window."
+            )
+            raise UserFacingError(
+                "Global Mapper did not open the expected window, so "
+                "nothing was changed. Close any other window in Global "
+                "Mapper and try again."
             )
 
         pyautogui.hotkey("alt", "n")
@@ -3130,11 +3261,10 @@ def update_map_and_select_recorded():
                     # genuinely happened, and a confusing, technical-
                     # looking message for what is really just an empty
                     # schema.
-                    raise RuntimeError(
-                        f"No tables were found in schema '{DB_SCHEMA}'. "
-                        "There is nothing to match the exported layer(s) "
-                        "against, so Update Map was aborted before any "
-                        "changes were made to Global Mapper."
+                    raise UserFacingError(
+                        "No tables were found in the database, so the "
+                        "layer could not be matched. Nothing was changed "
+                        "in Global Mapper."
                     )
                 schema_prefix = DB_SCHEMA + "_"
                 matched_pairs = []      # [(original_layer_name, matched_table_name), ...]
@@ -3164,17 +3294,19 @@ def update_map_and_select_recorded():
                 _log(f"matched pairs ({len(matched_pairs)}): {matched_pairs}")
                 if unmatched_layers:
                     _log(f"unmatched layers ({len(unmatched_layers)}): {unmatched_layers}")
-                    raise RuntimeError(
-                        "The following layer(s) could not be matched to any "
-                        f"table in schema '{DB_SCHEMA}': "
-                        f"{', '.join(unmatched_layers)}. Update Map was "
-                        "aborted before any data was touched."
+                    raise UserFacingError(
+                        "These layers could not be matched to a table in "
+                        f"the database: {', '.join(unmatched_layers)}. "
+                        "Nothing was changed in Global Mapper."
                     )
             except Exception as match_err:
                 _log(f"MATCHING PHASE FAILED: {type(match_err).__name__}: {match_err}")
                 _log(f"MATCHING PHASE traceback:\n{traceback.format_exc()}")
                 _close_status_window()
-                messagebox.showerror("Update Map Failed - Matching", str(match_err))
+                if isinstance(match_err, UserFacingError):
+                    messagebox.showerror("Update Map Failed - Matching", str(match_err))
+                else:
+                    messagebox.showerror("Update Map Failed - Matching", "Update Map could not match the layer to a database table.")
                 return
 
             # ============================================================
@@ -3225,13 +3357,13 @@ def update_map_and_select_recorded():
                 for layer_name, table_name in matched_pairs:
                     _geom_col = _get_geometry_column(table_name)
                     if not _geom_col:
-                        raise RuntimeError(
-                            f"Could not determine the geometry column for "
-                            f"table '{DB_SCHEMA}.{table_name}' (no entry "
-                            "found in PostGIS's geometry_columns catalog). "
-                            "The table may not have a registered geometry "
-                            "column. Update Map was aborted before any "
-                            "changes were made to Global Mapper."
+                        _log(f"Could not determine the geometry column for "
+                             f"table '{DB_SCHEMA}.{table_name}' (no entry "
+                             "found in PostGIS's geometry_columns catalog).")
+                        raise UserFacingError(
+                            f"The table '{table_name}' does not contain map "
+                            "data that Update Map can use. Nothing was "
+                            "changed in Global Mapper."
                         )
                     _log(f"  detected geometry column '{_geom_col}' for table '{table_name}'")
                     sql = f'SELECT * FROM "{DB_SCHEMA}"."{table_name}"'
@@ -3242,12 +3374,12 @@ def update_map_and_select_recorded():
                     # a technical error - read_postgis() succeeded - but
                     # every matched table is required to contain data.
                     if gdf.empty:
-                        raise RuntimeError(
-                            f"The table '{DB_SCHEMA}.{table_name}' was read "
-                            "successfully but contains no features. Update "
-                            "Map requires every matched table to contain "
-                            "data, so the operation was aborted before any "
-                            "changes were made to Global Mapper."
+                        _log(f"The table '{DB_SCHEMA}.{table_name}' was read "
+                             "successfully but contains no features.")
+                        raise UserFacingError(
+                            f"The table '{table_name}' has no features, so "
+                            "it cannot be loaded. Nothing was changed in "
+                            "Global Mapper."
                         )
                     read_results.append((table_name, gdf))
                     _log(f"read '{DB_SCHEMA}.{table_name}': {len(gdf)} feature(s)")
@@ -3255,7 +3387,10 @@ def update_map_and_select_recorded():
                 _log(f"DATABASE READ PHASE FAILED: {type(read_err).__name__}: {read_err}")
                 _log(f"DATABASE READ PHASE traceback:\n{traceback.format_exc()}")
                 _close_status_window()
-                messagebox.showerror("Update Map Failed - Database Read", str(read_err))
+                if isinstance(read_err, UserFacingError):
+                    messagebox.showerror("Update Map Failed - Database Read", str(read_err))
+                else:
+                    messagebox.showerror("Update Map Failed - Database Read", "Update Map could not read the table from the database.")
                 return
 
             # ============================================================
@@ -3339,10 +3474,9 @@ def update_map_and_select_recorded():
                 # experiment, so there is no reason to change it here.
                 written_layers = fiona.listlayers(new_gpkg_path)
                 if not written_layers:
-                    raise RuntimeError(
-                        "The exported GeoPackage contains no layers. "
-                        "Update Map was aborted before loading into "
-                        "Global Mapper."
+                    raise UserFacingError(
+                        "The exported file contains no layers. Nothing "
+                        "was changed in Global Mapper."
                     )
                 _log(f"local GeoPackage written: {new_gpkg_path} "
                      f"(layers: {written_layers})")
@@ -3362,7 +3496,10 @@ def update_map_and_select_recorded():
                 _log(f"GEOPACKAGE WRITE PHASE FAILED: {type(write_err).__name__}: {write_err}")
                 _log(f"GEOPACKAGE WRITE PHASE traceback:\n{traceback.format_exc()}")
                 _close_status_window()
-                messagebox.showerror("Update Map Failed - GeoPackage Write", str(write_err))
+                if isinstance(write_err, UserFacingError):
+                    messagebox.showerror("Update Map Failed - GeoPackage Write", str(write_err))
+                else:
+                    messagebox.showerror("Update Map Failed - GeoPackage Write", "Update Map could not prepare the data for Global Mapper.")
                 return
 
             # Matching/DB-read/write phase complete - close this status
@@ -3507,7 +3644,7 @@ def update_map_and_select_recorded():
             except Exception as load_err:
                 _log(f"GLOBAL MAPPER LOAD PHASE FAILED: {type(load_err).__name__}: {load_err}")
                 _log(f"GLOBAL MAPPER LOAD PHASE traceback:\n{traceback.format_exc()}")
-                messagebox.showerror("Update Map Failed - Global Mapper Load", str(load_err))
+                messagebox.showerror("Update Map Failed - Global Mapper Load", "Update Map could not load the layer into Global Mapper.")
                 return
 
             # ============================================================
@@ -3606,7 +3743,7 @@ def update_map_and_select_recorded():
             except Exception as delete_err:
                 _log(f"DELETE-OLD-LAYER PHASE FAILED: {type(delete_err).__name__}: {delete_err}")
                 _log(f"DELETE-OLD-LAYER PHASE traceback:\n{traceback.format_exc()}")
-                messagebox.showerror("Update Map Failed - Closing Old Layer", str(delete_err))
+                messagebox.showerror("Update Map Failed - Closing Old Layer", "Update Map could not close the old layer in Global Mapper.")
                 return
 
             if not close_dialog_appeared:
@@ -3739,7 +3876,10 @@ def update_map_and_select_recorded():
 
     except Exception as e:
         _log(f"UPDATE MAP FAILED: {type(e).__name__}: {e}")
-        messagebox.showerror("Update Map Failed", str(e))
+        if isinstance(e, UserFacingError):
+            messagebox.showerror("Update Map Failed", str(e))
+        else:
+            messagebox.showerror("Update Map Failed", "Update Map could not be completed.")
 
 
 
@@ -3897,6 +4037,365 @@ def get_global_mapper_path() -> str:
     return exe or ""
 
 GM_EXE_PATH = ""  # Will be resolved after login
+
+
+# ============================================================
+# NEW: Database Management "LOAD TABLE" orchestration (Database
+# Management task)
+# ============================================================
+#
+# Thin orchestration only -- per Instructions E.4/E.7, all actual
+# Global-Mapper-script-automation logic lives in core/gm_script_runner.py
+# (imported below), and this function's own job is limited to: call
+# into that module to get the currently-loaded-layer list, compare
+# each selected table against it, and for anything not yet loaded,
+# query the database directly and open the result into Global Mapper
+# via a NEW, independent mirror of update_map_and_select_recorded()'s
+# own confirmed "PHASE: Global Mapper Ctrl+O load" block (see that
+# function's own code, further up in this file, for the original this
+# mirrors) -- NOT a call into that function itself, and NOT a shared
+# helper extracted from it (Instructions E.10: update_map_and_
+# select_recorded() must not be touched or refactored by this task).
+#
+# Deliberately does NOT reuse update_map_and_select_recorded()'s own
+# "export an existing GM layer, match it to a DB table, re-import it"
+# workflow in full -- that function solves a different problem (
+# refreshing a layer ALREADY in Global Mapper from its own matching
+# database table, via a right-click export out of GM itself). This
+# function's own starting point is a table the user picked in the NEW
+# Database Management table list, which has no existing GM layer to
+# match against or export from -- only the direct database-query-
+# then-export-then-Ctrl+O portion of that function's own logic
+# applies here, mirrored independently below.
+from core.gm_script_runner import run_and_get_loaded_layers, is_table_already_loaded
+from utils.gpkg_io import write_gpkg_atomic
+
+
+def load_database_table_into_gm(schema, selected_tables):
+    """
+    The Database Management dialog's own LOAD TABLE button handler
+    (show_configure_db_dialog()'s on_load_table argument -- see
+    _open_configure_db_dialog() further down in this file for the call
+    site). For each table the user selected in the new table list:
+      1. Checks whether it is already loaded in the visible Global
+         Mapper workspace (via core/gm_script_runner.py's headless
+         check -- called ONCE for the whole batch, not once per table,
+         since the loaded-layer list it returns does not change
+         between individual table checks within this one call).
+      2. If already loaded: shows a plain "already loaded" message for
+         that table and does not reload it.
+      3. If not loaded: queries the table directly from the database
+         (the same gpd.read_postgis() pattern update_map_and_select_
+         recorded() already uses for its own, different purpose),
+         exports it to a temp GeoPackage via the shared, already-
+         proven utils.gpkg_io.write_gpkg_atomic(), then opens that
+         file into the already-running Global Mapper instance via a
+         new, independent mirror of update_map_and_select_recorded()'s
+         own confirmed Ctrl+O load sequence (see module-level comment
+         above this function for why this is a mirror, not a shared
+         call or extracted helper).
+
+    Per Instructions E.9: if the loaded-layer check itself fails
+    (Global Mapper busy, the headless script run failed, the output
+    could not be read), this function aborts ENTIRELY with a plain
+    error message and does not load ANY of the selected tables
+    blindly -- it never falls through to "couldn't confirm, so just
+    load it anyway."
+
+    Args:
+        schema: str, the Schema field's current text from the Database
+            Management dialog at the moment LOAD TABLE was clicked.
+        selected_tables: list[str], the table names currently selected
+            in the Database Management dialog's new table list.
+
+    Returns:
+        None. All outcomes (success, already-loaded, failure) are
+        communicated via messagebox dialogs shown directly by this
+        function -- there is no return value for a caller to inspect,
+        matching show_configure_db_dialog()'s own on_load_table
+        contract (see that function's own docstring).
+
+    VERIFICATION STATUS (Instructions E.11/G.4): the loaded-layer check
+    (via core/gm_script_runner.py) and the already-loaded/not-loaded
+    comparison logic (is_table_already_loaded()) were independently
+    confirmed hands-on, end to end, by the developer against their own
+    licensed Global Mapper Pro installation -- see that module's own
+    sign-off for the full breakdown. The NOT-loaded path implemented in
+    THIS function (the database query, utils.gpkg_io.write_gpkg_atomic()
+    export, and the new, independent Ctrl+O-load mirror below) has NOT
+    yet been run against the real Global Mapper Pro GUI -- it is built
+    directly from update_map_and_select_recorded()'s own confirmed,
+    screenshot-verified Ctrl+O sequence (same keystrokes, same
+    "Loading GeoPackage" title-polling, same non-focus-stealing status
+    window pattern), but as a new, separate code path it still requires
+    its own on-machine confirmation before this feature can be
+    considered fully verified.
+    """
+    import os
+    import time
+
+    import pygetwindow as gw
+    import pyautogui
+    from tkinter import messagebox
+    import tkinter as tk
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.engine import URL
+    import geopandas as gpd
+
+    global GM_EXE_PATH
+    if not GM_EXE_PATH:
+        GM_EXE_PATH = get_global_mapper_path()
+    if not GM_EXE_PATH:
+        messagebox.showerror("Load Table Failed", "global_mapper.exe not found. Please locate it.")
+        return
+
+    if not all([stored_username, stored_password]):
+        messagebox.showerror(
+            "Load Table Failed",
+            "No database information has been saved in Database Management yet.",
+        )
+        return
+
+    _log_session_start("load_database_table_into_gm")
+    _log(f"schema='{schema}' selected_tables={selected_tables}")
+
+    # ---- Step 1: ask Global Mapper what is currently loaded (ONCE for
+    # the whole batch) ----
+    ok, loaded_layers, error_msg = run_and_get_loaded_layers(
+        TEMP_DIR, GM_EXE_PATH, log_fn=_log)
+    if not ok:
+        _log(f"ABORT: could not determine currently-loaded layers: {error_msg}")
+        messagebox.showerror("Load Table Failed", error_msg)
+        return
+    _log(f"currently loaded layers ({len(loaded_layers)}): {loaded_layers}")
+
+    already_loaded = []
+    to_load = []
+    for table in selected_tables:
+        if is_table_already_loaded(schema, table, loaded_layers):
+            already_loaded.append(table)
+        else:
+            to_load.append(table)
+
+    if already_loaded:
+        messagebox.showinfo(
+            "Already Loaded",
+            "The following table(s) are already loaded in Global Mapper "
+            "and will not be reloaded:\n\n" + "\n".join(already_loaded),
+        )
+
+    if not to_load:
+        _log("nothing left to load -- all selected tables were already loaded")
+        return
+
+    # ---- Step 2: for each table not yet loaded, query it directly and
+    # open it into Global Mapper ----
+    try:
+        os.makedirs(TEMP_DIR, exist_ok=True)
+    except Exception as e:
+        _log(f"ABORT: could not create/verify {TEMP_DIR}: {e}")
+        messagebox.showerror(
+            "Folder Error",
+            f"Could not create or access the required temp folder:\n{TEMP_DIR}"
+        )
+        return
+
+    connection_url = URL.create(
+        drivername="postgresql+psycopg2",
+        username=stored_username,
+        password=stored_password,
+        host=DB_HOST,
+        port=DB_PORT,
+        database=DB_NAME,
+    )
+    engine = create_engine(connection_url)
+
+    def _get_geometry_column(schema_name, table_name):
+        """
+        Dynamically detects the actual geometry column name for a
+        table by querying PostGIS's own geometry_columns catalog view --
+        the SAME approach update_map_and_select_recorded() already uses
+        for its own, different purpose (see that function's own
+        _get_geometry_column(), further up in this file), duplicated
+        here rather than shared, per this task's own E.10 (that
+        function itself is not to be touched) and this codebase's own
+        established convention of duplicating this specific small
+        amount of logic per new consumer rather than extracting a
+        shared helper prematurely (Instructions G.5). Avoids assuming
+        the geometry column is literally named "geom" -- a table never
+        written by CAMA Tools' own Safe Replace Workflow (e.g. created
+        via QGIS, shp2pgsql, or a manual import) commonly uses
+        "geometry", "the_geom", or another convention instead.
+
+        Returns the column name as a string, or None if not found.
+        """
+        try:
+            with engine.connect() as conn:
+                result = conn.execute(
+                    text(
+                        "SELECT f_geometry_column FROM geometry_columns "
+                        "WHERE f_table_schema = :schema AND f_table_name = :table"
+                    ),
+                    {"schema": schema_name, "table": table_name}
+                )
+                row = result.fetchone()
+                return row[0] if row else None
+        except Exception as geom_col_err:
+            _log(f"  geometry column detection failed for "
+                 f"'{schema_name}.{table_name}': "
+                 f"{type(geom_col_err).__name__}: {geom_col_err}")
+            return None
+
+    failed_tables = []
+    loaded_this_run = []
+
+    try:
+        for table in to_load:
+            _log(f"--- loading table '{schema}.{table}' ---")
+            _geom_col = _get_geometry_column(schema, table)
+            if not _geom_col:
+                _log(f"  could not determine the geometry column for "
+                     f"'{schema}.{table}' -- skipping")
+                failed_tables.append(table)
+                continue
+            try:
+                sql = f'SELECT * FROM "{schema}"."{table}"'
+                gdf = gpd.read_postgis(sql, con=engine, geom_col=_geom_col)
+            except Exception as e:
+                _log(f"  query failed for '{schema}.{table}': "
+                     f"{type(e).__name__}: {e}")
+                failed_tables.append(table)
+                continue
+
+            if gdf.empty:
+                _log(f"  '{schema}.{table}' read successfully but contains "
+                     "no features -- skipping")
+                failed_tables.append(table)
+                continue
+
+            export_path = os.path.join(TEMP_DIR, f"loadtable_{table}.gpkg")
+            try:
+                write_gpkg_atomic(gdf, export_path)
+                _log(f"  exported '{schema}.{table}' to {export_path}")
+            except Exception as e:
+                _log(f"  export failed for '{schema}.{table}': "
+                     f"{type(e).__name__}: {e}")
+                failed_tables.append(table)
+                continue
+
+            # ---- Ctrl+O load into Global Mapper -- a new, independent
+            # mirror of update_map_and_select_recorded()'s own confirmed
+            # "PHASE: Global Mapper Ctrl+O load" block (see module-level
+            # comment above this function). Duplicated here rather than
+            # calling or extracting from that function, per Instructions
+            # E.10/E.4 and this codebase's own established convention of
+            # duplicating this specific small amount of GM-automation
+            # code per new entry point rather than sharing it (see
+            # core/gm_script_runner.py's own module docstring for the
+            # same convention applied there).
+            gm_window = None
+            for w in gw.getWindowsWithTitle("Global Mapper Pro"):
+                if "global mapper" in w.title.lower():
+                    gm_window = w
+                    break
+            if not gm_window:
+                _log(f"  ABORT for '{schema}.{table}': Global Mapper window not found")
+                failed_tables.append(table)
+                continue
+
+            was_maximized = gm_window.isMaximized
+            gm_window.minimize(); time.sleep(0.1)
+            gm_window.restore();  time.sleep(0.1)
+            if was_maximized:
+                gm_window.maximize()
+            gm_window.activate(); time.sleep(0.1)
+            _log(f"  GM focused before Ctrl+O | fg='{_fg_title()}'")
+
+            pyautogui.hotkey("ctrl", "o")
+            time.sleep(0.5)
+            pyautogui.typewrite(export_path)
+            pyautogui.press("enter")
+            _log(f"  typed '{export_path}' and pressed Enter | fg='{_fg_title()}'")
+
+            # Non-focus-stealing status window -- same pattern as
+            # update_map_and_select_recorded()'s own (overrideredirect,
+            # topmost, never grabs focus), duplicated here for the same
+            # reason as the rest of this block.
+            _status_win = None
+            try:
+                _status_win = tk.Toplevel(root)
+                _status_win.overrideredirect(True)
+                _status_win.attributes("-topmost", True)
+                _status_win.configure(bg="#2b2b2b")
+                _status_label = tk.Label(
+                    _status_win,
+                    text=f"Loading '{table}' into Global Mapper...",
+                    bg="#2b2b2b", fg="white", font=("Segoe UI", 9),
+                    padx=12, pady=8,
+                )
+                _status_label.pack()
+                _status_win.geometry(f"+{gm_window.left + 20}+{gm_window.top + 20}")
+                _status_win.update_idletasks()
+            except Exception:
+                _status_win = None
+
+            _LOAD_APPEARANCE_TIMEOUT_S = 5.0
+            _LOAD_COMPLETION_TIMEOUT_S = 15.0
+
+            def _update_load_status(_text):
+                try:
+                    if _status_win is not None:
+                        _status_label.config(text=_text)
+                    root.update()
+                except tk.TclError:
+                    pass
+
+            _phase1_start = time.monotonic()
+            _loading_seen = False
+            while time.monotonic() - _phase1_start < _LOAD_APPEARANCE_TIMEOUT_S:
+                _fg = _fg_title()
+                if "loading geopackage" in _fg.lower():
+                    _loading_seen = True
+                    break
+                _update_load_status(f"Loading '{table}' into Global Mapper...")
+                time.sleep(0.2)
+
+            if _loading_seen:
+                _phase2_start = time.monotonic()
+                while time.monotonic() - _phase2_start < _LOAD_COMPLETION_TIMEOUT_S:
+                    _fg = _fg_title()
+                    if "loading geopackage" not in _fg.lower():
+                        break
+                    time.sleep(0.2)
+
+            try:
+                if _status_win is not None:
+                    _status_win.destroy()
+            except Exception:
+                pass
+
+            _log(f"  '{schema}.{table}' Ctrl+O load wait complete")
+            loaded_this_run.append(table)
+
+    finally:
+        try:
+            engine.dispose()
+        except Exception:
+            pass
+
+    if loaded_this_run:
+        messagebox.showinfo(
+            "Load Table",
+            "Successfully loaded into Global Mapper:\n\n" +
+            "\n".join(loaded_this_run),
+        )
+    if failed_tables:
+        messagebox.showerror(
+            "Load Table Failed",
+            "Could not load the following table(s):\n\n" +
+            "\n".join(failed_tables),
+        )
+
 
 LAST_EDITED_FILE = "last_edit_source.json"
 
@@ -5579,7 +6078,7 @@ def _open_configure_db_dialog():
     try:
         show_configure_db_dialog(
             root, apply_icon, get_credentials_path, db_gate,
-            _on_credentials_changed,
+            _on_credentials_changed, load_database_table_into_gm,
         )
     finally:
         deactivate_all(canvas_refs, icon_img_ids, icons)

@@ -221,15 +221,16 @@ this file.
 """
 
 from tkinter import (
-    Toplevel, Frame, Label, Entry, Button,
+    Toplevel, Frame, Label, Entry, Button, Listbox, Scrollbar,
     messagebox, TclError,
 )
+from tkinter import MULTIPLE as _LISTBOX_MULTIPLE
 import sys
 import threading
 
 import psycopg2
 
-from utils.db_discovery import friendly_connection_error_message
+from utils.db_discovery import friendly_connection_error_message, fetch_tables
 
 
 # ============================================================
@@ -1166,7 +1167,7 @@ def create_hub_button(parent_frame, update_btn, update_map_btn,
         widget, for MAIN.py to pack/place.
     """
     hub_btn = Button(
-        parent_frame, text="Configure\nDatabase",
+        parent_frame, text="Database\nManagement",
         width=12, relief="flat", justify="center",
         font=("Segoe UI", 8, "bold"),
     )
@@ -1589,7 +1590,7 @@ _TOOLTIP_TEXT_SAME = (
 
 
 def show_configure_db_dialog(root, apply_icon_fn, get_credentials_path_fn, db_gate,
-                              on_credentials_changed):
+                              on_credentials_changed, on_load_table):
     """
     Shows the mid-session Configure Database dialog -- the hub button's
     click target, and, as of this task, the ONLY place the session's
@@ -1710,10 +1711,24 @@ def show_configure_db_dialog(root, apply_icon_fn, get_credentials_path_fn, db_ga
             stored_username/stored_password/DB_HOST/DB_PORT/DB_NAME/
             DB_SCHEMA globals -- see module docstring and this task's
             own bug-fix notes.
+        on_load_table: callable(schema: str, tables: list[str]) -> None,
+            the LOAD TABLE button's own click target (see the new
+            table-list panel built below) -- a thin call straight
+            through to MAIN.py's own new orchestration function (this
+            module has no Global-Mapper-automation logic of its own;
+            see core/gm_script_runner.py's module docstring for where
+            that actually lives). Called with the Schema field's
+            current live text and the table names currently selected
+            in the new Listbox. This module does not block on it, does
+            not know how long it takes, and does not interpret its
+            return value (there is none) -- any success/failure
+            messaging for a LOAD TABLE click is MAIN.py's own
+            orchestration function's responsibility to show, not this
+            dialog's.
     """
     win = Toplevel(root)
     apply_icon_fn(win, "resources/igdi_icon.ico", "resources/igdi_icon.png")
-    win.title("Configure Database Connection")
+    win.title("Database Management")
     win.resizable(False, False)
     _remove_minmax_buttons(win)
     win.grab_set()
@@ -1752,6 +1767,125 @@ def show_configure_db_dialog(root, apply_icon_fn, get_credentials_path_fn, db_ga
     # no longer applies here; this task's own instruction is explicit
     # and unambiguous about all six.
     _REQUIRED_FIELD_KEYS = ("host", "port", "database", "schema", "username", "password")
+
+    # ============================================================
+    # NEW: Database-table list + LOAD TABLE (Database Management task)
+    # ============================================================
+    #
+    # Placed in its own Frame at column=2, spanning the same row range
+    # as the six Database Information fields (row=1..6) -- an always-
+    # visible embedded panel beside them, not a popup triggered by a
+    # button, per this task's own confirmed design. The LOAD TABLE
+    # button sits at row=7, column=2, directly parallel to this
+    # dialog's own TEST & SAVE CONNECTION button at row=7, column=0-1 --
+    # the two halves of the dialog read as one 2-column layout
+    # (connection details on the left, table selection on the right).
+    #
+    # The Listbox widget itself follows the SAME widget pattern (a
+    # plain tkinter Listbox, selectmode for multi-select) already
+    # established by tools/road_width.py's own _pick_db_tables() --
+    # but is NOT a call to that function: _pick_db_tables() builds its
+    # OWN popup Toplevel window and lives in a tools/ file, which this
+    # core/ module must never import from (Instructions A.1 -- core/
+    # modules never depend on tools/ files). This is new, independent
+    # code that borrows only the widget pattern (Listbox +
+    # selectmode=MULTIPLE), embedded directly in THIS dialog's own
+    # outer Frame instead of a separate popup window.
+    table_list_frame = Frame(outer)
+    table_list_frame.grid(row=1, column=2, rowspan=len(_FIELD_LABELS),
+                           sticky="ns", padx=(14, 0))
+
+    Label(table_list_frame, text="Tables:").pack(anchor="w")
+
+    _table_listbox_frame = Frame(table_list_frame)
+    _table_listbox_frame.pack(fill="both", expand=True)
+    table_scrollbar = Scrollbar(_table_listbox_frame, orient="vertical")
+    table_listbox = Listbox(
+        _table_listbox_frame, selectmode=_LISTBOX_MULTIPLE,
+        width=30, height=len(_FIELD_LABELS) * 2,
+        yscrollcommand=table_scrollbar.set,
+    )
+    table_scrollbar.config(command=table_listbox.yview)
+    table_listbox.pack(side="left", fill="both", expand=True)
+    table_scrollbar.pack(side="right", fill="y")
+
+    def _repopulate_table_list():
+        """
+        Refreshes table_listbox's own contents from the database schema
+        currently on record in pg_credentials.json, via the existing,
+        already-non-technical-error-handled utils.db_discovery.
+        fetch_tables(schema) (Instructions E.8 -- reused as-is, no new
+        "ask the database what tables exist" logic written here).
+
+        Deliberately reads the SAVED (pg_credentials.json) schema, not
+        the live Schema field's current, possibly-unsaved text --
+        fetch_tables() itself only ever reads from disk (see that
+        function's own docstring; it calls load_db_credentials()
+        internally, with no parameter for live field values), so this
+        is the only schema this function COULD query against. This is
+        intentional, not a shortcut: see this task's own Phase 1
+        analysis (I2) for why "populate on dialog-open, then again
+        after every successful commit" is the right timing for this --
+        those are exactly the two moments at which pg_credentials.json
+        is guaranteed to reflect a real, just-confirmed connection.
+
+        fetch_tables() returning None means it has ALREADY shown its
+        own non-technical error dialog (missing/invalid credentials,
+        or a real connection/query failure) -- this function shows
+        nothing further in that case, per that function's own
+        documented contract, and simply leaves table_listbox empty.
+        A successful call with zero tables (a valid, non-error result)
+        also leaves it empty, with no separate messaging here -- an
+        empty table list is self-explanatory from the panel itself.
+        """
+        table_listbox.delete(0, "end")
+        schema = _read_fields(field_entries).get("schema", "").strip()
+        if not schema:
+            return
+        tables = fetch_tables(schema)
+        if tables is None:
+            return
+        for t in tables:
+            table_listbox.insert("end", t)
+
+    # Initial population -- covers the case where pg_credentials.json
+    # already holds a complete, usable connection when this dialog
+    # opens (the same condition _refresh_change_conn_enabled() below
+    # checks via _change_conn_disabled_reason() == "same"). If
+    # credentials are missing/incomplete, fetch_tables() -> 
+    # load_db_credentials() silently returns None with no dialog in
+    # that specific case (see that function's own docstring) --
+    # consistent with this dialog's own general policy of not
+    # interrupting the user with an error for an expected, normal
+    # starting state (an unconfigured connection).
+    _repopulate_table_list()
+
+    def _do_load_table():
+        """
+        LOAD TABLE button handler -- a thin call straight through to
+        on_load_table(schema, tables), per this function's own
+        docstring (Instructions E.4/E.7: this dialog has no Global-
+        Mapper-automation logic of its own). Reads the Schema field's
+        current LIVE text (not necessarily the same as whatever schema
+        table_listbox was last populated from, if the user edited the
+        field without yet re-committing -- MAIN.py's own orchestration
+        function is responsible for whatever it does with that schema
+        value; this handler does not second-guess or validate it)
+        together with whichever table names are currently selected in
+        table_listbox. Does nothing if no table is selected -- there is
+        no plausible action to take on an empty selection, and no
+        confusing error dialog is needed for what is simply "nothing
+        was picked yet."
+        """
+        schema = _read_fields(field_entries).get("schema", "").strip()
+        selected_tables = [table_listbox.get(i) for i in table_listbox.curselection()]
+        if not selected_tables:
+            return
+        on_load_table(schema, selected_tables)
+
+    load_table_btn = Button(table_list_frame, text="LOAD TABLE",
+                             command=_do_load_table, width=20)
+    load_table_btn.pack(pady=(6, 0))
 
     def _get_reference_values():
         """The connection to compare the current fields against, and
@@ -1927,6 +2061,17 @@ def show_configure_db_dialog(root, apply_icon_fn, get_credentials_path_fn, db_ga
             messagebox.showwarning(_CHANGE_CONN_UNSAVED_TITLE, _CHANGE_CONN_UNSAVED_MSG)
         # Deliberately does NOT close this dialog -- see this
         # function's own docstring.
+
+        # Refresh the table list against the connection just committed
+        # -- deliberately AFTER the success/unsaved-write dialog above,
+        # not before it, so the commit's own visual feedback (the
+        # messagebox) is never delayed by fetch_tables()'s own
+        # synchronous database round-trip. Per this task's own Phase 1
+        # analysis (I2): this, together with this function's own
+        # initial call above, are the only two moments table_listbox is
+        # repopulated -- never on every keystroke in the Schema field,
+        # only once a connection is actually committed.
+        _repopulate_table_list()
 
     def _on_test_result(ok, error_message, values):
         active_test_cancel["fn"] = None
