@@ -4788,6 +4788,17 @@ def _translate_exception(e, source_label):
             "or required fields). Please verify that you selected\n"
             "the correct dataset."
         )
+    if "SHAPE_RESTORE_SHX" in str(e) or (".shx" in str(e).lower() and "unable to open" in str(e).lower()):
+        # GDAL's raw error when a shapefile is missing one of its
+        # required companion files (.shx, .dbf, etc.) -- a shapefile
+        # is several files that only work together as a set
+        return (
+            "This shapefile is incomplete and cannot be opened.\n"
+            "A shapefile is made up of several files (.shp, .shx, .dbf,\n"
+            "and others) that must all be present together in the\n"
+            "same folder. Please check that the complete set of files\n"
+            "is there, then try again."
+        )
     return f"An unexpected error occurred while processing '{source_label}'."
 
 
@@ -5277,11 +5288,7 @@ def run_processing(app_root):
                 def progress_cb(_):
                     nonlocal current_step
                     current_step += 1
-                    msg = (
-                        f"Measuring road width...\n"
-                        f"Parcel {current_step} / {total_features}\n"
-                        f"Source: {current_source_label[0]}"
-                    )
+                    msg = f"Measuring Road Width: {current_step}/{total_features}"
                     q.put(("update", msg, current_step, total_features))
 
                 def status_cb(message, value=None, total=None, cancelable=None):
@@ -5402,8 +5409,10 @@ def run_processing(app_root):
                 # itself couldn't be loaded) -- genuinely affects the whole
                 # batch, since nothing can be measured without it. Not
                 # per-source, so not added to failed_sources -- this aborts
-                # the whole run with its own dialog instead.
-                q.put(("fatal_error", str(e), None, None))
+                # the whole run with its own dialog instead. Routed through
+                # _translate_exception() so the user sees plain language,
+                # not a raw GDAL/library error string.
+                q.put(("fatal_error", _translate_exception(e, "the selected file"), None, None))
         finally:
             # D-Cancel: released here regardless of how the try block
             # above exits -- clean success, a Cancel, or an exception. A
@@ -5464,10 +5473,7 @@ def run_processing(app_root):
 
                 elif kind == "fatal_error":
                     progress.close()
-                    messagebox.showerror(
-                        "Error",
-                        f"Could not complete processing: {msg[1]}"
-                    )
+                    messagebox.showerror("Error", msg[1])
                     return
 
         except queue.Empty:

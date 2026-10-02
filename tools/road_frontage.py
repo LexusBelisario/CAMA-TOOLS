@@ -1700,7 +1700,7 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
             # D-Cancel: explicit False only -- see this function's own
             # progress-contract docstring. None/True/no-return all mean
             # "continue," so an old-style caller keeps working unchanged.
-            if progress(f"{source_name}: {i}/{total}", i, total) is False:
+            if progress(f"Measuring Road Frontage: {i}/{total}", i, total) is False:
                 cancelled_pass1 = True
                 break
 
@@ -1989,7 +1989,7 @@ def process_frontage_single(brgy_gdf, road_gdf, source_name="", progress=None, c
             # depths/dwrs are treated as a completed result -- see the
             # discard check immediately after this loop, before those
             # lists are ever assigned onto brgy_gdf.
-            if progress(f"{source_name}: {i}/{total}", i, total) is False:
+            if progress(f"Measuring Road Frontage: {i}/{total}", i, total) is False:
                 cancelled_pass3 = True
                 break
 
@@ -2752,6 +2752,23 @@ def _prompt_orphaned_cama_tables(root, orphans, schema, creds):
     win.wait_window()
 
 
+def _friendly_error_message(e):
+    # translates a caught exception into plain language for the error
+    # dialog; falls back to the raw message for anything not covered
+    msg = str(e)
+    if "SHAPE_RESTORE_SHX" in msg or (".shx" in msg.lower() and "unable to open" in msg.lower()):
+        # GDAL's raw error when a shapefile is missing a companion file
+        # (.shx, .dbf, etc.) -- a shapefile only works as a complete set
+        return (
+            "This shapefile is incomplete and cannot be opened.\n"
+            "A shapefile is made up of several files (.shp, .shx, .dbf,\n"
+            "and others) that must all be present together in the\n"
+            "same folder. Please check that the complete set of files\n"
+            "is there, then try again."
+        )
+    return msg
+
+
 # ========================================
 # MAIN PROCESS
 # ========================================
@@ -3088,7 +3105,7 @@ def run_processing(app_root):
             q.put(("done", summary, None, None))
 
         except Exception as e:
-            q.put(("error", str(e), None, None))
+            q.put(("error", _friendly_error_message(e), None, None))
         finally:
             # D-Cancel: released here regardless of how the try block
             # above exits -- clean success, a Cancel (the `return` right

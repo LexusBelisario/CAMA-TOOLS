@@ -4283,6 +4283,23 @@ def _prompt_orphaned_cama_tables(root, orphans, schema, creds):
     win.wait_window()
 
 
+def _friendly_error_message(e):
+    # translates a caught exception into plain language for the error
+    # dialog; falls back to the raw message for anything not covered
+    msg = str(e)
+    if "SHAPE_RESTORE_SHX" in msg or (".shx" in msg.lower() and "unable to open" in msg.lower()):
+        # GDAL's raw error when a shapefile is missing a companion file
+        # (.shx, .dbf, etc.) -- a shapefile only works as a complete set
+        return (
+            "This shapefile is incomplete and cannot be opened.\n"
+            "A shapefile is made up of several files (.shp, .shx, .dbf,\n"
+            "and others) that must all be present together in the\n"
+            "same folder. Please check that the complete set of files\n"
+            "is there, then try again."
+        )
+    return msg
+
+
 # ========================================
 # RUN / ORCHESTRATION
 # ========================================
@@ -4991,7 +5008,7 @@ def run_with_progress(app_root):
                 q.put(("cancelled_discarding",))
 
         except Exception as e:
-            error_message = str(e)
+            error_message = _friendly_error_message(e)
         finally:
             # D-Cancel: released here regardless of how the try block
             # above exits -- clean success, Cancel (the
