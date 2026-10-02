@@ -129,6 +129,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, Listbox
 import subprocess
 import os
+import glob
 import json
 from pathlib import Path
 
@@ -170,7 +171,7 @@ from core.startup_and_db_ui import (
 # ========================================
 # ICON HELPERS
 # ========================================
-def force_png_icon(win, png_filename="BLGF.png"):
+def force_png_icon(win, png_filename="resources/igdi_icon.png"):
     """Sets win's taskbar/titlebar icon from the given .png via
     iconphoto(), holding a reference on the window to prevent garbage
     collection."""
@@ -180,7 +181,7 @@ def force_png_icon(win, png_filename="BLGF.png"):
         win.iconphoto(True, img)
         win._icon_ref = img  # prevent garbage collection
 
-def apply_icon(win, ico_filename="BLGF.ico", png_filename="BLGF.png"):
+def apply_icon(win, ico_filename="resources/igdi_icon.ico", png_filename="resources/igdi_icon.png"):
     """Sets win's icon from the given .ico file (iconbitmap), falling
     back to force_png_icon() for the taskbar/titlebar icon."""
     ico = resource_path(ico_filename)
@@ -212,10 +213,35 @@ def show_splash():
     sw, sh = splash.winfo_screenwidth(), splash.winfo_screenheight()
     splash.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
 
+    # image Label fills the whole splash; the status Label below is
+    # placed on top of it so the text sits ON the image, not below it
     label = tk.Label(splash, image=photo, borderwidth=0)
     label.image = photo  # keep a reference so it doesn't get garbage collected
-    label.pack()
+    label.place(x=0, y=0, width=w, height=h)
 
+    # sample the image's own pixel color where the text sits, so the
+    # label blends into the image instead of showing as a visible box
+    status_y = h - 28
+    bg_rgb = img.convert("RGB").getpixel((w // 2, min(status_y, h - 1)))
+    bg_hex = "#%02x%02x%02x" % bg_rgb
+
+    status_var = tk.StringVar(master=splash, value="Loading...")
+    status_label = tk.Label(
+        splash, textvariable=status_var, font=("Segoe UI", 10, "bold"),
+        fg="white", bg=bg_hex, borderwidth=0, highlightthickness=0,
+    )
+    status_label.place(relx=0.5, y=status_y, anchor="center")
+
+    def set_status(text):
+        # updates the text shown over the splash; call this between
+        # startup stages so the user sees real progress, not a frozen image
+        try:
+            status_var.set(text)
+            splash.update()
+        except tk.TclError:
+            pass  # splash was already closed, nothing to update
+
+    splash.set_status = set_status  # attach so callers can update it by reference
     splash.update()
     return splash
 
@@ -438,17 +464,17 @@ def dispatch_tool_if_requested():
     ap.add_argument("--db-verified", default="0")
     args, _ = ap.parse_known_args()
 
-    # ✅ If no tool specified, do normal launcher flow
+    # if no tool specified, do normal launcher flow
     if not args.tool:
         return False
 
-    # ✅ Apply icon for the tool subprocess
+    # apply icon for the tool subprocess
     if args.icon:
         try:
             icon_path = resource_path(args.icon)
             tmp = tk.Tk()
             tmp.withdraw()
-            apply_icon(tmp)
+            apply_icon(tmp)  # uses IGDI icon by default now, not BLGF
         except Exception:
             pass
 
@@ -472,8 +498,8 @@ def dispatch_tool_if_requested():
 
                 # Apply icon bound to THIS root — never reuse PhotoImage
                 # from another Tk instance (causes TclError)
-                ico = resource_path("BLGF.ico")
-                png = resource_path("BLGF.png")
+                ico = resource_path("resources/igdi_icon.ico")
+                png = resource_path("resources/igdi_icon.png")
                 if os.path.exists(ico):
                     try:
                         _tool_root.iconbitmap(ico)
@@ -1488,7 +1514,15 @@ def _check_live_db_connection(title_prefix):
 
     error_message = result["error"] or "Could not connect to the database."
     _log(f"{title_prefix}: connection pre-check failed: {error_message}")
-    messagebox.showerror(f"{title_prefix} Failed", error_message)
+    full_message = (
+        "Cannot connect to the database.\n\n"
+        "Please check the following:\n"
+        "- Your database credentials (username/password) are correct\n"
+        "- Your internet or network connection is active\n"
+        "- The database server is running and reachable\n\n"
+        f"Details: {error_message}"
+    )
+    messagebox.showerror("Database Connection Failed", full_message)
     return False
 
 
@@ -3762,37 +3796,100 @@ if not os.path.exists(GM_PATH_FILE):
         except Exception:
             pass
 
+def _is_valid_gm_exe(path: str) -> bool:
+    # confirms a path still points to a real file, not just a stale
+    # record left over from an uninstall or a move
+    return bool(path) and os.path.isfile(path) and os.path.getsize(path) > 0
+
+
+def _parse_gm_version(display_name: str, display_version: str) -> tuple:
+    # DisplayVersion is the reliable field, but fall back to pulling
+    # digits out of the display name in case an install is missing it
+    import re
+    source = display_version or display_name
+    nums = re.findall(r"\d+", source or "")
+    return tuple(int(n) for n in nums) if nums else (0,)
+
+
+def _find_global_mapper_via_registry() -> str:
+    # every properly installed Windows program registers its install
+    # location here, so this finds Global Mapper regardless of which
+    # drive or folder the user installed it to
+    import winreg
+
+    uninstall_roots = [
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+    ]
+    found = []  # (version_tuple, exe_path) for every installed copy found
+    for hive, root_path in uninstall_roots:
+        try:
+            with winreg.OpenKey(hive, root_path) as root_key:
+                for i in range(winreg.QueryInfoKey(root_key)[0]):
+                    try:
+                        subkey_name = winreg.EnumKey(root_key, i)
+                        with winreg.OpenKey(root_key, subkey_name) as subkey:
+                            display_name, _ = winreg.QueryValueEx(subkey, "DisplayName")
+                            if "global mapper" not in display_name.lower():
+                                continue
+                            install_loc, _ = winreg.QueryValueEx(subkey, "InstallLocation")
+                            exe = os.path.join(install_loc, "global_mapper.exe")
+                            if not os.path.exists(exe):
+                                continue
+                            try:
+                                display_version, _ = winreg.QueryValueEx(subkey, "DisplayVersion")
+                            except (FileNotFoundError, OSError):
+                                display_version = ""
+                            found.append((_parse_gm_version(display_name, display_version), exe))
+                    except (FileNotFoundError, OSError):
+                        continue  # this entry has no DisplayName/InstallLocation, skip it
+        except (FileNotFoundError, OSError):
+            continue  # this registry root doesn't exist on this machine, skip it
+
+    if not found:
+        return ""
+    # multiple installs found -- use the newest one
+    found.sort(key=lambda pair: pair[0], reverse=True)
+    return found[0][1]
+
+
 def get_global_mapper_path() -> str:
     """
-    Resolves the Global Mapper executable path: reuses a previously
-    saved path (GM_PATH_FILE) if it still exists on disk, otherwise
-    prompts the user to locate it and saves that choice for next time.
+    Resolves the Global Mapper executable path, in order: a previously
+    saved path (if it still exists), a Windows registry lookup (finds
+    any version at any install location), a default Program Files
+    path guess, then a manual file picker as a last resort. Whichever
+    one succeeds gets saved to GM_PATH_FILE for next time.
 
     Returns:
         str: absolute path to the Global Mapper executable.
     """
-    # 1) previously saved?
+    # 1) previously saved, but re-check it still exists -- catches an
+    # uninstall/move that happened since it was last saved
     if os.path.exists(GM_PATH_FILE):
         try:
-            return json.load(open(GM_PATH_FILE, "r")).get("exe", "")
+            saved_exe = json.load(open(GM_PATH_FILE, "r")).get("exe", "")
+            if _is_valid_gm_exe(saved_exe):
+                return saved_exe
         except Exception:
             pass
 
-    # 2) common installs
-    candidates = [
-        r"C:\Program Files\GlobalMapper25.2_64bit\global_mapper.exe",
-        r"C:\Program Files\GlobalMapper26.0_64bit\global_mapper.exe",
-        r"C:\Program Files\GlobalMapper26.2_64bit\global_mapper.exe",
-        r"C:\Program Files\GlobalMapper26_64bit\global_mapper.exe",
-        r"C:\Program Files\GlobalMapper27_64bit\global_mapper.exe",
-        r"C:\Program Files\GlobalMapper\global_mapper.exe",
-    ]
+    # 2) registry lookup -- works for any install location, any version
+    exe = _find_global_mapper_via_registry()
+    if _is_valid_gm_exe(exe):
+        json.dump({"exe": exe}, open(GM_PATH_FILE, "w"))
+        return exe
+
+    # 3) common default installs -- wildcard matches any version folder,
+    # so a new Global Mapper release doesn't need a code change here
+    matches = sorted(glob.glob(r"C:\Program Files\GlobalMapper*_64bit\global_mapper.exe"), reverse=True)
+    candidates = matches + [r"C:\Program Files\GlobalMapper\global_mapper.exe"]
     for p in candidates:
-        if os.path.exists(p):
+        if _is_valid_gm_exe(p):
             json.dump({"exe": p}, open(GM_PATH_FILE, "w"))
             return p
 
-    # 3) prompt user
+    # 4) prompt user
     exe = filedialog.askopenfilename(title="Locate global_mapper.exe",
                                      filetypes=[("Executable", "global_mapper.exe")])
     if exe:
@@ -4075,7 +4172,7 @@ def run_tool_by_label(label: str):
         "GEOGRAPHICALLY WEIGHTED REGRESSION": "gwr1.ico",
     }
 
-    icon_name = icon_map.get(label, "BLGF.ico")
+    icon_name = icon_map.get(label, "resources/igdi_icon.ico")
 
     if IS_FROZEN:
         # ── Production: spawn a new process (existing behaviour) ──
@@ -4703,9 +4800,21 @@ def _on_start(workspace_path):
     set later, if and when the user commits a connection via the
     mid-session Configure Database dialog (see _on_credentials_changed()
     above)."""
-    global selected_gmw_file, _active_splash
+    global selected_gmw_file, _active_splash, GM_EXE_PATH
     selected_gmw_file = workspace_path
+
+    # resolve Global Mapper BEFORE showing the splash -- if it's missing
+    # or moved, the user should see that immediately, not a splash that
+    # just sits there while a file picker silently waits in the background
+    if not GM_EXE_PATH:
+        GM_EXE_PATH = get_global_mapper_path()
+    if not GM_EXE_PATH:
+        messagebox.showerror("Global Mapper", "global_mapper.exe not found. Please locate it.")
+        root.destroy()  # nothing else CAMA Tools can do without Global Mapper, so close it
+        return
+
     _active_splash = show_splash()  # closed once GM window is confirmed open
+    _active_splash.set_status("Launching Global Mapper...")
     launch_global_mapper(db_less=True)
 
 
@@ -4745,6 +4854,29 @@ def do_nothing():
     window's close button/Alt+F4."""
     pass
 root.protocol("WM_DELETE_WINDOW", do_nothing)
+
+# gray out the titlebar X (still visible, but visibly disabled) and
+# remove the maximize button, so the titlebar matches what actually
+# works -- closing and maximizing are both blocked already above
+GWL_STYLE      = -16
+WS_MAXIMIZEBOX = 0x00010000
+MF_BYCOMMAND   = 0x00000000
+MF_GRAYED      = 0x00000001
+SC_CLOSE       = 0xF060
+
+def disable_titlebar_buttons():
+    hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
+
+    # remove the maximize button entirely
+    style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_STYLE)
+    style &= ~WS_MAXIMIZEBOX
+    ctypes.windll.user32.SetWindowLongW(hwnd, GWL_STYLE, style)
+
+    # gray out Close in the system menu -- this also grays the titlebar X
+    sys_menu = ctypes.windll.user32.GetSystemMenu(hwnd, False)
+    ctypes.windll.user32.EnableMenuItem(sys_menu, SC_CLOSE, MF_BYCOMMAND | MF_GRAYED)
+
+root.after(600, disable_titlebar_buttons)  # runs after resizable() and other window setup below, so our style change is the one that sticks
 
 # ── GM canvas offsets (skip GM's panels/toolbars) ────────────────────
 GM_TITLEBAR_H   = 130
@@ -5283,11 +5415,10 @@ for label in buttons_1st_row:
 
     make_bindings(canvas, label, bg_img_id)
 
-    # ✅ Tooltip with icon and label. Falls back to the already-bundled
-    # BLGF.png (same resource apply_icon() already relies on
-    # everywhere) for any button with no entry in icon_paths yet --
-    # add_tooltip() always needs a real, openable image path.
-    tooltip_icon_path = icon_paths.get(label, resource_path("BLGF.png"))
+    # tooltip with icon and label; falls back to the IGDI icon for any
+    # button with no entry in icon_paths yet -- add_tooltip() always
+    # needs a real, openable image path
+    tooltip_icon_path = icon_paths.get(label, resource_path("resources/igdi_icon.png"))
     add_tooltip(canvas, tooltip_icon_path, label, tooltip_descriptions.get(label, "Launch tool"), canvas=canvas, bg_id=bg_img_id)
     canvas.pack(side="left", padx=(2, 2), pady=(2, 2))
 
@@ -5590,11 +5721,12 @@ def launch_global_mapper(db_less=False):
     import shutil
     import tempfile
 
-    global GM_EXE_PATH
+    global GM_EXE_PATH, _active_splash
     if not GM_EXE_PATH:
         GM_EXE_PATH = get_global_mapper_path()
     if not GM_EXE_PATH:
         messagebox.showerror("Global Mapper", "global_mapper.exe not found. Please locate it.")
+        root.destroy()  # nothing else CAMA Tools can do without Global Mapper, so close it
         return
 
     gmw_path = selected_gmw_file
@@ -5603,6 +5735,8 @@ def launch_global_mapper(db_less=False):
     if db_less:
         print("ℹ DB-less mode: launching original .gmw unmodified (patch step skipped).")
     else:
+        if _active_splash is not None:
+            _active_splash.set_status("Preparing workspace file...")
         try:
             with open(gmw_path, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read()
@@ -5663,8 +5797,12 @@ def launch_global_mapper(db_less=False):
     # connect), so _gm_stable_count[0]/_gm_stable_hwnd[0] never need a
     # reset here.
     _gm_existing_hwnds[0] = snapshot_gm_hwnds()
+    if _active_splash is not None:
+        _active_splash.set_status("Starting Global Mapper...")
     _gm_proc = subprocess.Popen([GM_EXE_PATH, patched_path], shell=False)
     _gm_launch_pid[0] = _gm_proc.pid
+    if _active_splash is not None:
+        _active_splash.set_status("Waiting for Global Mapper to open...")
     wait_for_global_mapper()
 
 # ========================================
